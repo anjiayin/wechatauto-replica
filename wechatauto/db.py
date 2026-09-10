@@ -358,6 +358,16 @@ def _decrypt_page(enc_key: bytes, page: bytes, pgno: int) -> bytes:
     return _aes_cbc_decrypt(enc_key[:32] if len(enc_key) == 48 else enc_key, iv, enc) + b"\x00" * RESERVE_SZ
 
 
+def _wal_checksum(data: bytes, s0: int, s1: int, big_endian: bool) -> tuple:
+    """SQLite WAL 校验和算法：按 32 位字累加，字序由 WAL magic 低位决定。"""
+    cnt = len(data) // 4
+    words = struct.unpack((">" if big_endian else "<") + "%dI" % cnt, data[: cnt * 4])
+    for i in range(0, cnt, 2):
+        s0 = (s0 + words[i] + s1) & 0xFFFFFFFF
+        s1 = (s1 + words[i + 1] + s0) & 0xFFFFFFFF
+    return s0, s1
+
+
 def _extract_text_from_blob(content: bytes) -> Optional[str]:
     """从微信消息容器头中还原 UTF-8 明文文本。
 
@@ -695,11 +705,25 @@ class WeChatDB:
         return keys
 
     def _find_weixin_pids(self) -> List[int]:
-        import subprocess
+        """查找 Weixin.exe 进程 PID。
 
+        优先使用 psutil（基于原生 Windows API，不依赖 WMI），
+        若 psutil 不可用则回退到 tasklist（不带 /FI 过滤以避免 WMI 依赖）。
+        """
+        try:
+            import psutil
+            return [
+                p.info["pid"]
+                for p in psutil.process_iter(["pid", "name"])
+                if p.info["name"] and p.info["name"].lower() == "weixin.exe"
+            ]
+        except Exception:
+            pass
+        # psutil 不可用时的兜底：tasklist 不带 /FI（避免 WMI "Invalid class" 错误）
+        import subprocess
         try:
             r = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq Weixin.exe", "/FO", "CSV", "/NH"],
+                ["tasklist", "/FO", "CSV", "/NH"],
                 capture_output=True, text=True,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
@@ -708,7 +732,7 @@ class WeChatDB:
         pids = []
         for line in r.stdout.strip().splitlines():
             parts = line.strip('"').split('","')
-            if len(parts) >= 2 and parts[1].isdigit():
+            if len(parts) >= 2 and parts[0].lower() == "weixin.exe" and parts[1].isdigit():
                 pids.append(int(parts[1]))
         return pids
 
@@ -851,20 +875,31 @@ class WeChatDB:
             print("[wechatauto]  >> 当前 Python 是 %d 位，而微信 4.x 是 64 位进程。"
                   "请改用 64 位 Python（python -c \"import struct; print(struct.calcsize('P')*8)\" 应输出 64）"
                   % bits, file=sys.stderr)
-        import subprocess as _sp
-        try:
-            r = _sp.run(
-                ["tasklist", "/FI", "IMAGENAME eq Weixin.exe", "/FO", "CSV", "/NH"],
-                capture_output=True, text=True,
-                creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
-            )
-        except OSError:
-            return
         pids = []
-        for line in r.stdout.strip().splitlines():
-            parts = line.strip('"').split('","')
-            if len(parts) >= 2 and parts[1].isdigit():
-                pids.append(int(parts[1]))
+        try:
+            import psutil
+            for proc in psutil.process_iter(["pid", "name"]):
+                try:
+                    if proc.info["name"] and proc.info["name"].lower() == "weixin.exe":
+                        pids.append(proc.info["pid"])
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        if not pids:
+            import subprocess as _sp
+            try:
+                r = _sp.run(
+                    ["tasklist", "/FO", "CSV", "/NH"],
+                    capture_output=True, text=True,
+                    creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+                )
+                for line in r.stdout.strip().splitlines():
+                    parts = line.strip('"').split('","')
+                    if len(parts) >= 2 and parts[0].lower() == "weixin.exe" and parts[1].isdigit():
+                        pids.append(int(parts[1]))
+            except OSError:
+                pass
         if not pids:
             print("[wechatauto]  >> 未检测到 Weixin.exe 进程，请先登录微信并保持窗口打开",
                   file=sys.stderr)
@@ -962,7 +997,27 @@ class WeChatDB:
                     f.write("%d,%f,%d,%f,%d,%d"
                             % (STAMP_VERSION, src_mtime, src_size, wal_mtime, wal_size, applied))
             elif attempt >= 3:
-                raise RuntimeError("数据库合并失败(文件被微信并发改写): %s" % rel)
+                # WAL 合并反复失败，尝试仅解密主库(不含 WAL 增量)作为兜底
+                sys.stderr.write(
+                    "[wechatauto] WAL 合并失败(%s)，尝试仅解密主库...\n" % rel
+                )
+                self._decrypt_file(src, dst, key)
+                if self._check_merged(dst):
+                    applied = 0
+                    build = False
+                    os.makedirs(os.path.dirname(stamp), exist_ok=True)
+                    with open(stamp, "w") as f:
+                        f.write("%d,%f,%d,%f,%d,%d"
+                                % (STAMP_VERSION, src_mtime, src_size, 0, 0, 0))
+                    sys.stderr.write(
+                        "[wechatauto] 主库解密成功(WAL 增量已跳过，部分最新消息可能缺失): %s\n" % rel
+                    )
+                else:
+                    raise RuntimeError(
+                        "数据库解密失败(WAL 合并与主库解密均未通过校验): %s。"
+                        "请确认微信已登录，若仍复现请运行 "
+                        "python -m wechatauto.diagnose_keys 排查。" % rel
+                    )
             else:
                 old = None  # 合并结果损坏 → 全量重建重试
         conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
@@ -973,11 +1028,14 @@ class WeChatDB:
     @staticmethod
     def _check_merged(dst: str) -> bool:
         """校验解密/合并结果可完整读取。
-
+        
         只兜底 sqlite_master 无法发现数据页损坏：WAL 若带入过期/错位页，
         schema 树可能仍正常，但表数据页已损坏，直到 SELECT 才抛
         "database disk image is malformed"。这里用 PRAGMA quick_check
         全库校验（含数据页与索引页），损坏时返回 False，触发全量重建重试。
+        
+        "never used" 页面不是数据损坏，只是 SQLCipher 预分配但 SQLite 未使用的空间，
+        单独过滤不计为失败。
         """
         try:
             conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
@@ -985,8 +1043,28 @@ class WeChatDB:
                 rows = conn.execute("PRAGMA quick_check").fetchall()
             finally:
                 conn.close()
-            return bool(rows) and all(str(r[0]) == "ok" for r in rows)
-        except sqlite3.Error:
+            if not rows:
+                return False
+            real_errors = []
+            for r in rows:
+                msg = str(r[0])
+                if msg == "ok":
+                    continue
+                if "never used" in msg:
+                    continue  # trailing preallocated pages, not corruption
+                real_errors.append(msg)
+            if real_errors:
+                sys.stderr.write(
+                    "[wechatauto] quick_check %s FAILED (first 3 issues): %s\n"
+                    % (os.path.basename(dst), real_errors[:3])
+                )
+                return False
+            return True
+        except sqlite3.Error as exc:
+            sys.stderr.write(
+                "[wechatauto] quick_check %s ERROR: %s\n"
+                % (os.path.basename(dst), exc)
+            )
             return False
 
     def _wal_path(self, rel: str) -> Optional[str]:
@@ -994,65 +1072,159 @@ class WeChatDB:
         return wal if os.path.exists(wal) else None
 
     def _merge_wal(self, dst: str, wal_path: str, key: bytes, from_frame: int) -> int:
-        """把 -wal 中的加密帧按页号覆盖进已解密的主库文件，返回已应用帧数。
+        """把 -wal 中当前世代的已提交帧合并进已解密的主库文件，返回已扫描帧数。
 
-        帧结构（WCDB，全部大端）：[0:4] 页号, [4:8] 提交标记, [8:16] salt, [16:24] 校验。
-        帧内页面与主库页相同加密格式，直接用库密钥解密。
-        页 1 帧用页 1 专用布局（数据区 [16:4016]，IV 在 [4016:4032]）解密。
+        WAL 头（32B 大端）：[0:4] magic, [4:8] 版本, [8:12] 页大小,
+        [12:16] checkpoint 序号, [16:24] salt（当前世代）, [24:32] 头校验和。
+        帧头（24B）：[0:4] 页号, [4:8] 提交后库页数（非 0 = 提交帧）,
+        [8:16] salt, [16:24] 帧校验和；帧内页面与主库页同格式加密。
 
-        只合并 salt 与当前 WAL 头一致的帧：微信 checkpoint 会重置 WAL（salt+1 并
-        清零写游标），旧世代帧若被合并会用过期页覆盖新数据，造成库损坏。
+        合并规则（对齐 SQLite walIndexRecover 语义）：
+        1. 只合并 salt 与 WAL 头一致的帧（当前世代）——checkpoint 重置 WAL 时
+           salt-1 自增、salt-2 换随机值，旧世代帧被合并会用过期页覆盖新数据；
+        2. 只合并到最后一个提交帧为止——提交帧之后的未提交尾部事务回滚；
+        3. 允许库增长：新页帧直接写入并扩展文件，但要求新页区间连续无空洞，
+           避免稀疏零字节页；
+        4. 合并后按最后提交帧的 nTruncate 修正头部页数并截断文件。
         """
         if not os.path.exists(dst):
             return 0
+        # ---- 读 WAL 头并校验 ----
+        with open(wal_path, "rb") as wal:
+            wal_hdr = wal.read(self.WAL_HEADER_SZ)
+            if len(wal_hdr) < self.WAL_HEADER_SZ:
+                return 0
+            magic = struct.unpack(">I", wal_hdr[0:4])[0]
+            if (magic & 0xFFFFFFFE) != 0x377F0682:
+                sys.stderr.write(
+                    "[wechatauto] WAL %s: 非法 magic 0x%08x，跳过\n"
+                    % (os.path.basename(wal_path), magic)
+                )
+                return 0
+            big_endian = bool(magic & 1)
+            wal_pgsize = struct.unpack(">I", wal_hdr[8:12])[0]
+            if wal_pgsize != PAGE_SZ:
+                sys.stderr.write(
+                    "[wechatauto] WAL %s: 页大小 %d != %d，跳过\n"
+                    % (os.path.basename(wal_path), wal_pgsize, PAGE_SZ)
+                )
+                return 0
+            wal_salt = wal_hdr[16:24]
+            ckpt_seq = struct.unpack(">I", wal_hdr[12:16])[0]
+            # 头校验和：对头前 24 字节从 (0,0) 起算，仅作诊断参考
+            h0, h1 = _wal_checksum(wal_hdr[:24], 0, 0, big_endian)
+            hdr_ck_ok = struct.pack(">II", h0, h1) == wal_hdr[24:32]
+            wal_size = os.path.getsize(wal_path)
+            n = (wal_size - self.WAL_HEADER_SZ) // self.WAL_FRAME_SZ
+            # ---- 扫描全部帧：记录世代分布（诊断）并收集当前世代帧 ----
+            gen_map = []          # [(起始帧号, salt前4字节hex)] 世代变迁
+            prev_salt = None
+            cur = []              # 当前世代帧 [(帧号, pgno, n_trunc, page)]
+            for i in range(n):
+                wal.seek(self.WAL_HEADER_SZ + i * self.WAL_FRAME_SZ)
+                hdr = wal.read(24)
+                page = wal.read(PAGE_SZ)
+                if len(page) < PAGE_SZ:
+                    break
+                fsalt = hdr[8:16]
+                if fsalt != prev_salt:
+                    gen_map.append((i, fsalt[:4].hex()))
+                    prev_salt = fsalt
+                if fsalt == wal_salt:
+                    pgno = struct.unpack(">I", hdr[:4])[0]
+                    n_trunc = struct.unpack(">I", hdr[4:8])[0]
+                    cur.append((i, pgno, n_trunc, page))
+        db_pages = (os.path.getsize(dst) + PAGE_SZ - 1) // PAGE_SZ
+        sys.stderr.write(
+            "[wechatauto] WAL %s: ckpt=%d hdr_ck=%s frames=%d gens=%s cur=%d\n"
+            % (os.path.basename(wal_path), ckpt_seq, hdr_ck_ok, n,
+               ",".join("%d:%s" % g for g in gen_map[:8]), len(cur))
+        )
+        if not cur:
+            return n
+        # ---- 只保留到最后一个提交帧（n_trunc != 0）----
+        last_commit = -1
+        final_pages = 0
+        for j, (_, _, n_trunc, _) in enumerate(cur):
+            if n_trunc:
+                last_commit = j
+                final_pages = n_trunc
+        if last_commit < 0:
+            sys.stderr.write(
+                "[wechatauto] WAL %s: 当前世代 %d 帧均未提交，跳过\n"
+                % (os.path.basename(wal_path), len(cur))
+            )
+            return n
+        cur = cur[: last_commit + 1]
+        # ---- 解密并校验页面内容 ----
+        page_data = {}
+        valid_skip = 0
+        for _, pgno, _, page in cur:
+            if pgno < 1:
+                valid_skip += 1
+                continue
+            pt = _decrypt_page(key, page, pgno)
+            if pgno == 1:
+                if len(key) == 48:
+                    ok = pt[16:18] == b"\x01\x01"
+                else:
+                    ok = pt[:16] == b"SQLite format 3\x00"
+            else:
+                ok = pt[0] in (0, 2, 5, 10, 13)
+            if not ok:
+                valid_skip += 1
+                continue
+            page_data[pgno] = pt  # 同页后帧覆盖前帧
+        if not page_data:
+            return n
+        # ---- 库增长连续性检查：新页区间 (db_pages, max_pgno] 必须全部有帧覆盖 ----
+        max_pgno = max(page_data)
+        extended = False
+        if max_pgno > db_pages:
+            missing = [p for p in range(db_pages + 1, max_pgno + 1) if p not in page_data]
+            if missing:
+                sys.stderr.write(
+                    "[wechatauto] WAL %s: 新页区间有空洞（缺 %d 页，如 %s），"
+                    "仅合并已存在页\n"
+                    % (os.path.basename(wal_path), len(missing), missing[:5])
+                )
+                for p in [p for p in page_data if p > db_pages]:
+                    del page_data[p]
+                if not page_data:
+                    return n
+                max_pgno = max(page_data)
+            else:
+                extended = True
+        # ---- 写入并按提交帧页数修正 ----
         out = open(dst, "r+b")
         try:
-            db_pages = (os.path.getsize(dst) + 4095) // PAGE_SZ
-            max_pgno = 0
-            last = from_frame
-            with open(wal_path, "rb") as wal:
-                wal_hdr = wal.read(self.WAL_HEADER_SZ)
-                wal_salt = wal_hdr[16:24]
-                wal_size = os.path.getsize(wal_path)
-                n = (wal_size - self.WAL_HEADER_SZ) // self.WAL_FRAME_SZ
-                for i in range(from_frame, n):
-                    wal.seek(self.WAL_HEADER_SZ + i * self.WAL_FRAME_SZ)
-                    hdr = wal.read(24)
-                    page = wal.read(PAGE_SZ)
-                    if len(page) < PAGE_SZ:
-                        break
-                    pgno = struct.unpack(">I", hdr[:4])[0]
-                    last = i + 1
-                    if hdr[8:16] != wal_salt:
-                        continue
-                    pt = _decrypt_page(key, page, pgno)
-                    if pgno == 1:
-                        # 明文头模式（48B key）页 1 解密后保留明文头，
-                        # 头部 magic 可能不是标准 SQLite；用版本字节兜底校验。
-                        if len(key) == 48:
-                            if len(pt) < PAGE_SZ or pt[16:18] != b"\x01\x01":
-                                continue
-                        elif pt[:16] != b"SQLite format 3\x00":
-                            continue
-                    elif pt[0] not in (0, 2, 5, 10, 13):
-                        continue
-                    out.seek((pgno - 1) * PAGE_SZ)
-                    out.write(pt)
-                    max_pgno = max(max_pgno, pgno)
+            for pgno in sorted(page_data):
+                out.seek((pgno - 1) * PAGE_SZ)
+                out.write(page_data[pgno])
             out.flush()
-            db_pages = (os.path.getsize(dst) + 4095) // PAGE_SZ
+            file_pages = (os.path.getsize(dst) + PAGE_SZ - 1) // PAGE_SZ
+            if 0 < final_pages <= file_pages:
+                new_pages = final_pages
+            else:
+                new_pages = file_pages
+            if new_pages < file_pages:
+                out.truncate(new_pages * PAGE_SZ)
             out.seek(0)
             page1 = out.read(PAGE_SZ)
-            hdr_pages = struct.unpack(">I", page1[28:32])[0]
-            new_pages = max(hdr_pages, max_pgno, db_pages)
-            if new_pages != hdr_pages:
+            if len(page1) >= 32 and struct.unpack(">I", page1[28:32])[0] != new_pages:
                 page1 = page1[:28] + struct.pack(">I", new_pages) + page1[32:]
                 out.seek(0)
                 out.write(page1)
             out.flush()
+            sys.stderr.write(
+                "[wechatauto] WAL merge %s: cur_frames=%d committed=%d "
+                "valid_skip=%d applied=%d extend=%s pages=%d->%d\n"
+                % (os.path.basename(wal_path), len(cur), last_commit + 1,
+                   valid_skip, len(page_data), extended, db_pages, new_pages)
+            )
         finally:
             out.close()
-        return last
+        return n
 
     def _decrypt_file(self, src: str, dst: str, key: bytes) -> None:
         size = os.path.getsize(src)
@@ -1066,6 +1238,18 @@ class WeChatDB:
                 if len(page) < PAGE_SZ:
                     page = page + b"\x00" * (PAGE_SZ - len(page))
                 fout.write(_decrypt_page(key, page, pgno))
+        # Truncate trailing unused pages: SQLCipher may preallocate beyond the
+        # logical database size, causing PRAGMA quick_check "never used" errors.
+        try:
+            with open(dst, "r+b") as f:
+                page1 = f.read(PAGE_SZ)
+                if len(page1) >= 32:
+                    hdr_pages = struct.unpack(">I", page1[28:32])[0]
+                    file_pages = (os.path.getsize(dst) + PAGE_SZ - 1) // PAGE_SZ
+                    if 0 < hdr_pages < file_pages:
+                        f.truncate(hdr_pages * PAGE_SZ)
+        except OSError:
+            pass
 
     def _message_dbs(self) -> List[str]:
         """返回当前所有消息分片库。微信运行中可能新建分片（如 message_5.db），
@@ -1117,16 +1301,19 @@ class WeChatDB:
             rel for rel, _, _ in self._db_files if not self._key_works(rel)
         ]
 
-    def _find_msg_table(self, user: str, conns: List[sqlite3.Connection]) -> Optional[Tuple[sqlite3.Connection, str]]:
+    def _find_msg_tables(self, user: str, conns: List[sqlite3.Connection]) -> List[Tuple[sqlite3.Connection, str]]:
+        """定位用户消息表。微信 4.x 把同一会话的历史消息分散在多个分片
+        （如 message_0 存最近一段、message_8 存更新一段），返回全部命中分片。"""
         target = "Msg_" + _md5_hex(user.encode())
+        found = []
         for conn in conns:
             row = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
                 (target,),
             ).fetchone()
             if row:
-                return conn, target
-        return None
+                found.append((conn, target))
+        return found
 
     def _invalidate_cache(self) -> None:
         """删除 workdir 中全部解密缓存(.db/.stamp)，key 缓存除外。
@@ -1148,12 +1335,12 @@ class WeChatDB:
         if removed:
             sys.stderr.write("[wechatauto] 已清 %d 个缓存文件等待重建\n" % removed)
 
-    def _msg_conn(self, user: str, _retry: bool = True) -> Optional[Tuple[sqlite3.Connection, str]]:
-        """打开消息库并定位用户消息表（调用方负责 close 连接）"""
+    def _msg_conn(self, user: str, _retry: bool = True) -> Optional[List[Tuple[sqlite3.Connection, str]]]:
+        """打开消息库并定位用户消息表，返回全部命中分片（调用方负责 close）"""
         conns = []
         try:
             conns = [self._open(rel) for rel in self._message_dbs()]
-            found = self._find_msg_table(user, conns)
+            found = self._find_msg_tables(user, conns)
         except sqlite3.DatabaseError as exc:
             for c in conns:
                 c.close()
@@ -1171,16 +1358,17 @@ class WeChatDB:
                 c.close()
             return None
         # 只保留命中的连接，其余分片库立即关闭，避免 Windows 下删除缓存被占用
-        target = found[0]
+        hit = {id(c) for c, _ in found}
         for c in conns:
-            if c is not target:
+            if id(c) not in hit:
                 c.close()
         return found
 
     def _run_msg_query(self, user: str, build):
         """对消息库执行只读查询；查询到库损坏时清缓存重建并重试一次。
 
-        build(conn, table) -> rows（同 _msg_conn 的 found 连接/表名）。
+        build(found) -> rows，found 为全部命中分片 [(conn, table), ...]
+        （同一会话可能分布在多个分片，build 需合并各分片结果）。
         _msg_conn 已处理 schema 损坏重建，本方法兜底数据页损坏。
         重试后仍失败则抛原始异常（Listener 捕获后跳过本轮，不阻断运行）。
         找不到该会话返回 None。
@@ -1189,9 +1377,8 @@ class WeChatDB:
             found = self._msg_conn(user)
             if found is None:
                 return None
-            conn, table = found
             try:
-                return build(conn, table)
+                return build(found)
             except sqlite3.DatabaseError as exc:
                 if attempt or not _is_malformed(exc):
                     raise
@@ -1200,34 +1387,49 @@ class WeChatDB:
                 )
                 self._invalidate_cache()
             finally:
-                conn.close()
+                for conn, _ in found:
+                    conn.close()
         return None
 
     def get_messages(self, user: str, limit: int = 20, offset: int = 0) -> List[dict]:
-        """读取指定会话（微信号/群号）的最近消息"""
-        return self._run_msg_query(
-            user,
-            lambda conn, table: [
-                self._msg_row_to_dict(r) for r in conn.execute(
+        """读取指定会话（微信号/群号）的最近消息。
+
+        同一会话的历史消息可能分布在多个 message_N 分片，
+        各分片各取 limit+offset 条后按 sort_seq 全局归并再分页。
+        """
+        def build(found):
+            rows = []
+            for conn, table in found:
+                rows.extend(conn.execute(
                     "SELECT local_id, local_type, real_sender_id, create_time, "
                     "message_content, source, packed_info_data, compress_content, sort_seq "
-                    "FROM %s ORDER BY sort_seq DESC LIMIT ? OFFSET ?" % table,
-                    (limit, offset),
-                ).fetchall()
-            ],
-        ) or []
+                    "FROM %s ORDER BY sort_seq DESC LIMIT ?" % table,
+                    (limit + offset,),
+                ).fetchall())
+            rows.sort(key=lambda r: r["sort_seq"], reverse=True)
+            return [self._msg_row_to_dict(r) for r in rows[offset: offset + limit]]
+        return self._run_msg_query(user, build) or []
 
     def get_message_row(self, user: str, local_id: int) -> Optional[dict]:
-        """按 local_id 读取一条消息的完整原始字段（媒体下载用，含 server_id/packed_info）"""
-        row = self._run_msg_query(
-            user,
-            lambda conn, table: conn.execute(
-                "SELECT local_id, local_type, server_id, real_sender_id, create_time, "
-                "message_content, source, packed_info_data, compress_content, sort_seq "
-                "FROM %s WHERE local_id=? LIMIT 1" % table,
-                (local_id,),
-            ).fetchone(),
-        )
+        """按 local_id 读取一条消息的完整原始字段（媒体下载用，含 server_id/packed_info）。
+
+        local_id 在分片间可能重复，取各分片命中中 sort_seq 最大的一条。
+        """
+        def build(found):
+            best = None
+            for conn, table in found:
+                row = conn.execute(
+                    "SELECT local_id, local_type, server_id, real_sender_id, create_time, "
+                    "message_content, source, packed_info_data, compress_content, sort_seq "
+                    "FROM %s WHERE local_id=? LIMIT 1" % table,
+                    (local_id,),
+                ).fetchone()
+                if row is not None and (
+                    best is None or (row["sort_seq"] or 0) > (best["sort_seq"] or 0)
+                ):
+                    best = row
+            return best
+        row = self._run_msg_query(user, build)
         if not row:
             return None
         sender_id = row["real_sender_id"]
@@ -1256,29 +1458,41 @@ class WeChatDB:
         """按 local_type 直接查该会话全部媒体 local_id（降序），不受总消息分页限制。
 
         供批量下载场景使用（如一次性拉取某群全部图片）。
+        跨分片命中时按 sort_seq 全局降序归并。
         """
         placeholders = ",".join("?" * len(types))
-        rows = self._run_msg_query(
-            user,
-            lambda conn, table: conn.execute(
-                "SELECT local_id FROM %s WHERE local_type IN (%s) "
-                "ORDER BY sort_seq DESC" % (table, placeholders),
-                tuple(sorted(types)),
-            ).fetchall(),
-        )
-        return [r["local_id"] for r in rows] if rows else []
+
+        def build(found):
+            rows = []
+            for conn, table in found:
+                rows.extend(conn.execute(
+                    "SELECT local_id, sort_seq FROM %s WHERE local_type IN (%s) "
+                    "ORDER BY sort_seq DESC" % (table, placeholders),
+                    tuple(sorted(types)),
+                ).fetchall())
+            rows.sort(key=lambda r: r["sort_seq"], reverse=True)
+            return [r["local_id"] for r in rows]
+
+        return self._run_msg_query(user, build) or []
 
     def get_new_messages(self, user: str, since_seq: int = 0, limit: int = 200) -> List[dict]:
-        """返回 sort_seq > since_seq 的新消息（升序），供轮询监听使用"""
-        rows = self._run_msg_query(
-            user,
-            lambda conn, table: conn.execute(
-                "SELECT local_id, local_type, real_sender_id, create_time, "
-                "message_content, source, packed_info_data, compress_content, sort_seq "
-                "FROM %s WHERE sort_seq > ? ORDER BY sort_seq ASC LIMIT ?" % table,
-                (since_seq, limit),
-            ).fetchall(),
-        )
+        """返回 sort_seq > since_seq 的新消息（升序），供轮询监听使用。
+
+        跨分片命中时按 sort_seq 全局升序归并后截取 limit。
+        """
+        def build(found):
+            rows = []
+            for conn, table in found:
+                rows.extend(conn.execute(
+                    "SELECT local_id, local_type, real_sender_id, create_time, "
+                    "message_content, source, packed_info_data, compress_content, sort_seq "
+                    "FROM %s WHERE sort_seq > ? ORDER BY sort_seq ASC" % table,
+                    (since_seq,),
+                ).fetchall())
+            rows.sort(key=lambda r: r["sort_seq"])
+            return rows[:limit]
+
+        rows = self._run_msg_query(user, build)
         return [self._msg_row_to_dict(r) for r in rows] if rows else []
 
     def _msg_row_to_dict(self, r) -> dict:
