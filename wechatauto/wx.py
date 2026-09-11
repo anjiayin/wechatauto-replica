@@ -814,6 +814,21 @@ class WeChat(Chat, Listener):
             ))
         return sessions
 
+    def GetContacts(self, kind: str = 'friend', limit: int = 0) -> List[dict]:
+        """获取联系人列表（读本地 contact.db，无需 UI 操作）。
+
+        Args:
+            kind: "friend"（好友，默认）/ "chatroom"（群聊）/
+                  "official"（公众号服务号）/ "openim"（企微客服联系人）/
+                  "all"（全部，含群内非好友等）。
+            limit: 最多返回条数，0 = 不限。
+
+        Returns:
+            List[dict]，每条含 username / alias / nick_name / remark /
+            description / avatar / local_type。
+        """
+        return self._db.get_contacts(kind=kind, limit=limit)
+
     @uilock
     def ChatWith(
         self,

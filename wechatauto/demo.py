@@ -20,7 +20,7 @@ def demo_basic():
     # 获取会话列表
     sessions = wx.GetSession()
     for session in sessions[:5]:
-        print(f"会话：{session.name}，未读：{session.unread_count}")
+        print(f"会话：{session.name}，未读：{session.unread}")
 
     # 打开与好友的聊天窗口
     who = "文件传输助手"

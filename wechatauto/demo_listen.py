@@ -28,7 +28,7 @@ try:
 except Exception:
     pass
 try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 except AttributeError:
     pass
 
@@ -51,7 +51,8 @@ def make_callback(db, chat_name: str):
     def on_msg(msg: dict, lst: Listener):
         sender = sender_name(db, msg["sender_id"])
         t = fmt_time(msg["create_time"])
-        print(f"[{t}] {chat_name} | {sender} ({msg['type']}) {msg['content']}")
+        # flush=True：回调在后台线程触发，确保管道/重定向场景也实时可见
+        print(f"[{t}] {chat_name} | {sender} ({msg['type']}) {msg['content']}", flush=True)
         # 可在此扩展业务：msg['content'] 含关键字时自动回复等
     return on_msg
 

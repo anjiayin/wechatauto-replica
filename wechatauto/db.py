@@ -122,6 +122,15 @@ def _md5_hex(data: bytes) -> str:
     return hashlib.md5(data).hexdigest()
 
 
+# 微信内置系统/官方账号（不属于好友，get_contacts(kind="friend") 时排除）
+_SYSTEM_USERNAMES = frozenset({
+    "filehelper", "fmessage", "medianote", "qqmail", "qqsync", "qmessage",
+    "tmessage", "weibo", "weixin", "weixinreminder", "weixinteam",
+    "floatbottle", "bulletmessage", "newsapp", "brandsessionholder",
+    "notification_messages", "exmail_tool", "weixin_bonus",
+})
+
+
 def _is_malformed(exc) -> bool:
     """是否 SQLite "database disk image is malformed" 类库损坏（数据页损坏）。"""
     return isinstance(exc, sqlite3.DatabaseError) and "malformed" in str(exc).lower()
@@ -356,16 +365,6 @@ def _decrypt_page(enc_key: bytes, page: bytes, pgno: int) -> bytes:
         return b"SQLite format 3\x00" + _aes_cbc_decrypt(enc_key, iv, enc) + b"\x00" * RESERVE_SZ
     enc = page[: PAGE_SZ - RESERVE_SZ]
     return _aes_cbc_decrypt(enc_key[:32] if len(enc_key) == 48 else enc_key, iv, enc) + b"\x00" * RESERVE_SZ
-
-
-def _wal_checksum(data: bytes, s0: int, s1: int, big_endian: bool) -> tuple:
-    """SQLite WAL 校验和算法：按 32 位字累加，字序由 WAL magic 低位决定。"""
-    cnt = len(data) // 4
-    words = struct.unpack((">" if big_endian else "<") + "%dI" % cnt, data[: cnt * 4])
-    for i in range(0, cnt, 2):
-        s0 = (s0 + words[i] + s1) & 0xFFFFFFFF
-        s1 = (s1 + words[i + 1] + s0) & 0xFFFFFFFF
-    return s0, s1
 
 
 def _extract_text_from_blob(content: bytes) -> Optional[str]:
@@ -981,16 +980,27 @@ class WeChatDB:
             attempt += 1
             full = (not old or old["mtime"] != src_mtime or old["size"] != src_size
                     or wal_size < old["wal_size"] or wal_size == 0)
+            mtime_before = -1.0
             if full:
+                mtime_before = os.path.getmtime(src)
                 self._decrypt_file(src, dst, key)
                 applied = 0
             else:
-                applied = old["applied"]
+                applied = old["applied"] if old else 0
+            merged_pages = 0
             if wal_path and wal_size > self.WAL_HEADER_SZ:
-                applied = self._merge_wal(dst, wal_path, key, applied)
+                applied, merged_pages = self._merge_wal(dst, wal_path, key, applied)
             else:
                 applied = 0
-            if self._check_merged(dst):
+            # 轮询场景下 quick_check 整库校验(大分片秒级)是延迟大头，
+            # 在可证明安全时跳过：
+            # - 增量合并未写入任何页 → 缓存与上次已验证状态完全一致；
+            # - 全量解密期间主库 mtime 未变（快照一致）且 WAL 无当前世代帧
+            #   → 解密是确定性的，结果必然有效。
+            # 其余情形（写入过帧/读取期间被写/重试）仍全库校验。
+            skip_check = (attempt == 1 and merged_pages == 0
+                          and (not full or os.path.getmtime(src) == mtime_before))
+            if skip_check or self._check_merged(dst):
                 build = False
                 os.makedirs(os.path.dirname(stamp), exist_ok=True)
                 with open(stamp, "w") as f:
@@ -1054,9 +1064,11 @@ class WeChatDB:
                     continue  # trailing preallocated pages, not corruption
                 real_errors.append(msg)
             if real_errors:
+                # quick_check 单条消息可能含数百行，只保留每条前 160 字符
+                brief = [e[:160] for e in real_errors[:3]]
                 sys.stderr.write(
-                    "[wechatauto] quick_check %s FAILED (first 3 issues): %s\n"
-                    % (os.path.basename(dst), real_errors[:3])
+                    "[wechatauto] quick_check %s FAILED: %s\n"
+                    % (os.path.basename(dst), brief)
                 )
                 return False
             return True
@@ -1071,8 +1083,12 @@ class WeChatDB:
         wal = self._db_path(rel) + "-wal"
         return wal if os.path.exists(wal) else None
 
-    def _merge_wal(self, dst: str, wal_path: str, key: bytes, from_frame: int) -> int:
-        """把 -wal 中当前世代的已提交帧合并进已解密的主库文件，返回已扫描帧数。
+    def _merge_wal(self, dst: str, wal_path: str, key: bytes, from_frame: int) -> Tuple[int, int]:
+        """把 -wal 中当前世代的已提交帧合并进已解密的主库文件。
+
+        返回 (已扫描帧数, 落盘页数)。from_frame 仅作兼容保留：
+        WAL 预分配复用，checkpoint 重置后新帧从 0 号开始，
+        必须全量扫描再靠 salt 世代过滤，不能按帧号截断。
 
         WAL 头（32B 大端）：[0:4] magic, [4:8] 版本, [8:12] 页大小,
         [12:16] checkpoint 序号, [16:24] salt（当前世代）, [24:32] 头校验和。
@@ -1088,61 +1104,36 @@ class WeChatDB:
         4. 合并后按最后提交帧的 nTruncate 修正头部页数并截断文件。
         """
         if not os.path.exists(dst):
-            return 0
+            return 0, 0
         # ---- 读 WAL 头并校验 ----
         with open(wal_path, "rb") as wal:
             wal_hdr = wal.read(self.WAL_HEADER_SZ)
             if len(wal_hdr) < self.WAL_HEADER_SZ:
-                return 0
+                return 0, 0
             magic = struct.unpack(">I", wal_hdr[0:4])[0]
             if (magic & 0xFFFFFFFE) != 0x377F0682:
-                sys.stderr.write(
-                    "[wechatauto] WAL %s: 非法 magic 0x%08x，跳过\n"
-                    % (os.path.basename(wal_path), magic)
-                )
-                return 0
-            big_endian = bool(magic & 1)
+                return 0, 0
             wal_pgsize = struct.unpack(">I", wal_hdr[8:12])[0]
             if wal_pgsize != PAGE_SZ:
-                sys.stderr.write(
-                    "[wechatauto] WAL %s: 页大小 %d != %d，跳过\n"
-                    % (os.path.basename(wal_path), wal_pgsize, PAGE_SZ)
-                )
-                return 0
+                return 0, 0
             wal_salt = wal_hdr[16:24]
-            ckpt_seq = struct.unpack(">I", wal_hdr[12:16])[0]
-            # 头校验和：对头前 24 字节从 (0,0) 起算，仅作诊断参考
-            h0, h1 = _wal_checksum(wal_hdr[:24], 0, 0, big_endian)
-            hdr_ck_ok = struct.pack(">II", h0, h1) == wal_hdr[24:32]
             wal_size = os.path.getsize(wal_path)
             n = (wal_size - self.WAL_HEADER_SZ) // self.WAL_FRAME_SZ
-            # ---- 扫描全部帧：记录世代分布（诊断）并收集当前世代帧 ----
-            gen_map = []          # [(起始帧号, salt前4字节hex)] 世代变迁
-            prev_salt = None
-            cur = []              # 当前世代帧 [(帧号, pgno, n_trunc, page)]
+            # ---- 收集当前世代帧 [(帧号, pgno, n_trunc, page)] ----
+            cur = []
             for i in range(n):
                 wal.seek(self.WAL_HEADER_SZ + i * self.WAL_FRAME_SZ)
                 hdr = wal.read(24)
                 page = wal.read(PAGE_SZ)
                 if len(page) < PAGE_SZ:
                     break
-                fsalt = hdr[8:16]
-                if fsalt != prev_salt:
-                    gen_map.append((i, fsalt[:4].hex()))
-                    prev_salt = fsalt
-                if fsalt == wal_salt:
+                if hdr[8:16] == wal_salt:
                     pgno = struct.unpack(">I", hdr[:4])[0]
                     n_trunc = struct.unpack(">I", hdr[4:8])[0]
                     cur.append((i, pgno, n_trunc, page))
-        db_pages = (os.path.getsize(dst) + PAGE_SZ - 1) // PAGE_SZ
-        sys.stderr.write(
-            "[wechatauto] WAL %s: ckpt=%d hdr_ck=%s frames=%d gens=%s cur=%d\n"
-            % (os.path.basename(wal_path), ckpt_seq, hdr_ck_ok, n,
-               ",".join("%d:%s" % g for g in gen_map[:8]), len(cur))
-        )
         if not cur:
-            return n
-        # ---- 只保留到最后一个提交帧（n_trunc != 0）----
+            return n, 0
+        # ---- 只保留到最后一个提交帧（n_trunc != 0），未提交尾部事务回滚 ----
         last_commit = -1
         final_pages = 0
         for j, (_, _, n_trunc, _) in enumerate(cur):
@@ -1150,18 +1141,12 @@ class WeChatDB:
                 last_commit = j
                 final_pages = n_trunc
         if last_commit < 0:
-            sys.stderr.write(
-                "[wechatauto] WAL %s: 当前世代 %d 帧均未提交，跳过\n"
-                % (os.path.basename(wal_path), len(cur))
-            )
-            return n
+            return n, 0
         cur = cur[: last_commit + 1]
         # ---- 解密并校验页面内容 ----
         page_data = {}
-        valid_skip = 0
         for _, pgno, _, page in cur:
             if pgno < 1:
-                valid_skip += 1
                 continue
             pt = _decrypt_page(key, page, pgno)
             if pgno == 1:
@@ -1172,29 +1157,21 @@ class WeChatDB:
             else:
                 ok = pt[0] in (0, 2, 5, 10, 13)
             if not ok:
-                valid_skip += 1
                 continue
             page_data[pgno] = pt  # 同页后帧覆盖前帧
         if not page_data:
-            return n
+            return n, 0
         # ---- 库增长连续性检查：新页区间 (db_pages, max_pgno] 必须全部有帧覆盖 ----
+        db_pages = (os.path.getsize(dst) + PAGE_SZ - 1) // PAGE_SZ
         max_pgno = max(page_data)
-        extended = False
         if max_pgno > db_pages:
             missing = [p for p in range(db_pages + 1, max_pgno + 1) if p not in page_data]
             if missing:
-                sys.stderr.write(
-                    "[wechatauto] WAL %s: 新页区间有空洞（缺 %d 页，如 %s），"
-                    "仅合并已存在页\n"
-                    % (os.path.basename(wal_path), len(missing), missing[:5])
-                )
+                # 新页区间有空洞，仅合并已存在页，避免稀疏零字节页
                 for p in [p for p in page_data if p > db_pages]:
                     del page_data[p]
                 if not page_data:
-                    return n
-                max_pgno = max(page_data)
-            else:
-                extended = True
+                    return n, 0
         # ---- 写入并按提交帧页数修正 ----
         out = open(dst, "r+b")
         try:
@@ -1203,10 +1180,7 @@ class WeChatDB:
                 out.write(page_data[pgno])
             out.flush()
             file_pages = (os.path.getsize(dst) + PAGE_SZ - 1) // PAGE_SZ
-            if 0 < final_pages <= file_pages:
-                new_pages = final_pages
-            else:
-                new_pages = file_pages
+            new_pages = final_pages if 0 < final_pages <= file_pages else file_pages
             if new_pages < file_pages:
                 out.truncate(new_pages * PAGE_SZ)
             out.seek(0)
@@ -1216,15 +1190,9 @@ class WeChatDB:
                 out.seek(0)
                 out.write(page1)
             out.flush()
-            sys.stderr.write(
-                "[wechatauto] WAL merge %s: cur_frames=%d committed=%d "
-                "valid_skip=%d applied=%d extend=%s pages=%d->%d\n"
-                % (os.path.basename(wal_path), len(cur), last_commit + 1,
-                   valid_skip, len(page_data), extended, db_pages, new_pages)
-            )
         finally:
             out.close()
-        return n
+        return n, len(page_data)
 
     def _decrypt_file(self, src: str, dst: str, key: bytes) -> None:
         size = os.path.getsize(src)
@@ -1612,6 +1580,81 @@ class WeChatDB:
                 })
             break
         return results
+
+    def get_contacts(self, kind: str = "friend", limit: int = 0) -> List[dict]:
+        """获取联系人列表（contact.db）。
+
+        Args:
+            kind: 筛选类别，不区分大小写：
+                - "friend"  : 好友 = 通讯录好友（local_type=3，含企业微信好友）
+                              + 仅聊天联系人（type=1 中的人类账号），
+                              排除公众号/系统号/群聊/自己；
+                - "chatroom": 群聊（username 以 @chatroom 结尾）；
+                - "official": 公众号/服务号（username 以 gh_ 开头）；
+                - "openim"  : 企业微信/客服联系人（@openim / @kefu.openim）；
+                - "all"     : 全部（含群内非好友等，可能数万条）。
+            limit: 最多返回条数，0 = 不限。
+
+        Returns:
+            List[dict]，每条含 username / alias / nick_name / remark /
+            description / avatar（大头像 URL）/ local_type。
+            已删除（delete_flag=1）的联系人始终排除。
+
+        说明：local_type 实测分布（微信 4.x）：3=通讯录好友（flag=4），
+        2=群聊，1=混合桶（系统号/关注的公众号/仅聊天联系人/自己），
+        0=非好友交互者，5-7=企业微信侧。
+        """
+        kind = (kind or "friend").lower()
+        if kind == "friend":
+            where = ("(local_type=3 OR (local_type=1 AND "
+                     "username NOT LIKE '%@chatroom' "
+                     "AND username NOT LIKE 'gh\\_%' ESCAPE '\\' "
+                     "AND username NOT LIKE '%@openim' "
+                     "AND username NOT LIKE '%@kefu%' "
+                     "AND username NOT LIKE '%@app'))")
+        elif kind == "chatroom":
+            where = "username LIKE '%@chatroom'"
+        elif kind == "official":
+            where = "username LIKE 'gh\\_%' ESCAPE '\\'"
+        elif kind == "openim":
+            where = "(username LIKE '%@openim' OR username LIKE '%@kefu%')"
+        elif kind == "all":
+            where = "1=1"
+        else:
+            raise ValueError(
+                "kind 仅支持 friend/chatroom/official/openim/all，收到: %r" % kind)
+        sql = ("SELECT username, alias, nick_name, remark, description, "
+               "big_head_url, local_type FROM contact "
+               "WHERE delete_flag=0 AND " + where + " ORDER BY username")
+        conn = self._contact_conn()
+        if not conn:
+            return []
+        try:
+            rows = conn.execute(sql).fetchall()
+        finally:
+            conn.close()
+        out = [{
+            "username": r["username"],
+            "alias": r["alias"],
+            "nick_name": r["nick_name"],
+            "remark": r["remark"],
+            "description": r["description"],
+            "avatar": r["big_head_url"],
+            "local_type": r["local_type"],
+        } for r in rows]
+        if kind == "friend":
+            # 排除系统号与自己（它们与仅聊天联系人同在 local_type=1）
+            self_user = ""
+            try:
+                self_user = (self.get_self_info() or {}).get("username") or ""
+            except Exception:
+                pass
+            out = [c for c in out
+                   if c["username"] not in _SYSTEM_USERNAMES
+                   and c["username"] != self_user]
+        if limit and limit > 0:
+            out = out[:limit]
+        return out
 
     def get_nickname(self, user: str) -> str:
         """通过微信号查昵称（用于显示）"""
