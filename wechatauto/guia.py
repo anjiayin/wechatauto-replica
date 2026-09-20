@@ -342,33 +342,44 @@ class ScreenOCR:
 
     @staticmethod
     def recognize(image: Image.Image) -> List[Tuple[str, int, int, int, int]]:
-        from winsdk.windows.media.ocr import OcrEngine
-        from winsdk.windows.graphics.imaging import BitmapDecoder
-        from winsdk.windows.storage import StorageFile
+        """在新线程中运行 OCR，避免主线程 COM/MTA 冲突导致 WinRT 挂起。"""
+        import concurrent.futures
 
-        async def _run() -> List[Tuple[str, int, int, int, int]]:
-            tmp = os.path.join(tempfile.gettempdir(), 'wechatauto_ocr_tmp.png')
-            image.save(tmp)
-            f = await StorageFile.get_file_from_path_async(tmp)
-            s = await f.open_async(0)
-            dec = await BitmapDecoder.create_async(s)
-            bmp = await dec.get_software_bitmap_async()
-            eng = OcrEngine.try_create_from_user_profile_languages()
-            if eng is None:
-                return []
-            res = await eng.recognize_async(bmp)
-            out = []
-            for line in res.lines:
-                text = line.text.replace(' ', '')
-                if not text:
-                    continue
-                r = line.words[0].bounding_rect
-                out.append((text, int(r.x), int(r.y), int(r.width), int(r.height)))
-            return out
+        def _thread_entry() -> List[Tuple[str, int, int, int, int]]:
+            from winsdk.windows.media.ocr import OcrEngine
+            from winsdk.windows.graphics.imaging import BitmapDecoder
+            from winsdk.windows.storage import StorageFile
+
+            async def _run() -> List[Tuple[str, int, int, int, int]]:
+                tmp = os.path.join(tempfile.gettempdir(), 'wechatauto_ocr_tmp.png')
+                image.save(tmp)
+                f = await StorageFile.get_file_from_path_async(tmp)
+                s = await f.open_async(0)
+                dec = await BitmapDecoder.create_async(s)
+                bmp = await dec.get_software_bitmap_async()
+                eng = OcrEngine.try_create_from_user_profile_languages()
+                if eng is None:
+                    return []
+                res = await eng.recognize_async(bmp)
+                out = []
+                for line in res.lines:
+                    text = line.text.replace(' ', '')
+                    if not text:
+                        continue
+                    r = line.words[0].bounding_rect
+                    out.append((text, int(r.x), int(r.y), int(r.width), int(r.height)))
+                return out
+
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(asyncio.wait_for(_run(), timeout=8))
+            finally:
+                loop.close()
 
         try:
-            return asyncio.run(asyncio.wait_for(_run(), timeout=8))
-        except asyncio.TimeoutError:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                return ex.submit(_thread_entry).result(timeout=12)
+        except (asyncio.TimeoutError, concurrent.futures.TimeoutError):
             wxlog.debug('OCR 识别超时（8s）')
             return []
         except Exception as e:
