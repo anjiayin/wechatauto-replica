@@ -1,0 +1,109 @@
+classDiagram
+    direction LR
+
+    class WeChatDB {
+        <<wechatauto 只读复用>>
+        +wxid: str
+        +get_new_messages(user, since_seq, limit) List[dict]
+        +get_messages(user, limit, offset) List[dict]
+        +get_sessions(limit) List[dict]
+        +search_contact(keyword) List[dict]
+        +get_contacts(kind, limit) List[dict]
+        +get_group_members(chatroom) List[dict]
+        +get_nickname(user) str
+    }
+    class Listener {
+        <<wechatauto 只读复用>>
+        +watermark: Dict~str,int~
+        +add_listener(user, callback)
+        +remove_listener(user, callback)
+        +start() / stop()
+    }
+    class WeChatGUI {
+        <<wechatauto 只读复用>>
+        +is_alive() bool
+        +bring_to_front() bool
+        +ensure_visible() bool
+        +open_chat(name) bool
+        +send_msg(text, who, verify) WxResponse
+        +at_member(member, text, who) WxResponse
+        +quote_msg(text, who) WxResponse
+    }
+
+    class WechatService {
+        -db: WeChatDB
+        -listener: Listener
+        +start() / stop()
+        +status() dict
+        +register_targets(targets) / unregister(username)
+        +flush_watermarks()
+    }
+    class Aggregator {
+        -buffers: Dict~tuple, Buffer~
+        +feed(msg: dict)
+        -_flush(key, buffer)
+        -_scheduler_loop()
+    }
+    class Analyzer {
+        -client: OpenAI
+        +build_messages(unit, types, strictness) list
+        +analyze(unit) AnalysisResult
+        +prescreen(text) bool
+        +test_connection() dict
+    }
+    class Pipeline {
+        -queue: Queue~AnalysisUnit~ maxsize=500
+        -workers: List~Thread~
+        +enqueue(unit)
+        -_worker_loop()
+        -_handle(unit)
+    }
+    class Notifier {
+        -clients: Set~WebSocket~
+        +broadcast(event, data)
+        +send_result(task_id, ok, message)
+    }
+    class Sender {
+        -queue: Queue~SendTask~
+        -gui: WeChatGUI (线程内)
+        +submit(task) str
+        -_loop()
+        -_do_send(task)
+    }
+    class DAO {
+        <<db.py 函数集>>
+        +init_db()
+        +get_setting(key) / set_setting(key, value)
+        +list_targets() / add_target / patch_target / delete_target
+        +list_types() / add_type / patch_type / delete_type
+        +insert_opportunity(row) int
+        +list_opportunities(filters) dict
+        +get_opportunity(id) / patch_opportunity_status
+        +insert_analysis_log(row)
+        +load_watermarks() / save_watermarks(dict)
+    }
+    class Crypto {
+        +encrypt(text) str
+        +decrypt(token) str
+        +mask(token) str
+    }
+    class FastAPIApp {
+        <<main.py>>
+        +lifespan(app)
+        +routers
+        +StaticFiles(frontend dist)
+    }
+
+    WechatService --> Listener : 持有并注册回调
+    WechatService --> WeChatDB : 持有
+    WechatService --> DAO : watermark 持久化
+    Listener ..> Aggregator : on_message 回调
+    Aggregator ..> Pipeline : 窗口期满 enqueue(unit)
+    Pipeline --> Analyzer : analyze(unit)
+    Pipeline --> DAO : 落库 opportunities/analysis_logs
+    Pipeline ..> Notifier : opportunity_new
+    Sender --> WeChatGUI : 串行调用(前置窗口/发送/校验)
+    Notifier --> FastAPIApp : /ws/events
+    FastAPIApp --> DAO : API 读写
+    FastAPIApp --> Crypto : Key 加解密
+    FastAPIApp --> Sender : reply 接口 submit

@@ -1,0 +1,9 @@
+# kefu-system 后端依赖（Python 3.10+）
+fastapi>=0.110
+# standardextra 附带 websockets，保证 /ws/events 事件推送可用
+uvicorn[standard]>=0.29
+pydantic>=2.6
+openai>=1.30
+cryptography>=42.0
+# 测试
+pytest>=8.0

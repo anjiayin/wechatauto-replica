@@ -14,6 +14,12 @@ wxauto_logs/
 @AutomationLog.txt
 *.log
 
+# Node / frontend third-party modules
+node_modules/
+
+# kefu-system runtime data (business DB, Fernet secret key, logs)
+kefu-system/data/
+
 # Virtual environments
 .venv/
 venv/

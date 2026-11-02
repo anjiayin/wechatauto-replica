@@ -1,0 +1,52 @@
+sequenceDiagram
+    participant W as 微信SQLite(加密)
+    participant L as Listener(wechatauto)
+    participant A as Aggregator
+    participant Q as AnalysisQueue(有界500)
+    participant P as PipelineWorker×2
+    participant AI as AI接口(OpenAI兼容)
+    participant DB as kefu SQLite
+    participant N as Notifier(WS)
+    participant FE as 前端
+
+    Note over L: 启动：wechat_service 加载 watermarks 表→Listener(db, watermark=…)
+    L->>W: get_new_messages(user, since_seq) 每1s轮询
+    W-->>L: 新消息dict(local_id/type/sender_id/content/sort_seq/username)
+    L->>L: 持久化 watermark（定期刷 watermarks 表）
+    L->>A: on_message(msg) 回调（非文本→记 analysis_logs(skipped) 后丢弃）
+    A->>A: 按(session, sender)缓冲，重置5分钟窗口计时
+    Note over A: 窗口静默期满 → flush 合并文本
+    A->>Q: put(AnalysisUnit) （队列满→丢弃+计数告警）
+    Q->>P: get()
+    P->>P: 预筛开关开启？关键词/正则未命中→analysis_logs(skipped)，结束
+    P->>AI: chat.completions(系统提示词+消息文本, json_object)
+    AI-->>P: {hit,type,points,confidence,quote}
+    alt hit=true 且 confidence≥min_confidence
+        P->>DB: INSERT opportunities + analysis_logs(ok)
+        P->>N: broadcast opportunity_new
+        N-->>FE: WS事件→未读角标+1、可选提示音、列表失效刷新
+    else hit=true 但低于门槛
+        P->>DB: analysis_logs(below_threshold)
+    else AI失败(重试2次退避)
+        P->>DB: analysis_logs(error)
+    end
+
+    rect rgb(235, 245, 255)
+    Note over FE,W: 用户回复流程
+    FE->>N: 订阅 /ws/events
+    FE->>DB: GET /api/opportunities/{id}（详情+上下文）
+    FE->>N: POST /api/opportunities/{id}/reply {text, at?, quote?}
+    N->>N: 目标校验①（会话存在性）→ Sender.submit(task)
+    N-->>FE: 202 受理
+    Note over N: SenderThread 串行处理（同一时刻仅一个 GUI 操作）
+    N->>N: is_alive？bring_to_front + ensure_visible
+    alt 窗口不可用
+        N-->>FE: send_result(failed,"微信窗口不可见/未登录")
+    else 可用
+        N->>W: open_chat(会话名)（校验② _chat_open_confirmed）
+        N->>W: at_member / quote_msg / send_msg(verify=True)（校验③ _verify_sent）
+        W-->>N: WxResponse
+        N->>DB: UPDATE opportunities status='replied'
+        N-->>FE: send_result(success) → 状态徽标更新
+    end
+    end

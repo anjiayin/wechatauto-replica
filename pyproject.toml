@@ -25,6 +25,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
+    "websockets>=12.0",
     "uiautomation>=2.0.18",
     "pywin32>=305",
     "pyperclip>=1.8.2",
@@ -48,8 +49,11 @@ Homepage = "https://github.com/fanyuantaier/wechatauto-replica"
 Repository = "https://github.com/fanyuantaier/wechatauto-replica"
 Issues = "https://github.com/fanyuantaier/wechatauto-replica/issues"  # 上游 wxauto 项目主页（wechatauto 为其复刻版）
 
+[project.scripts]
+wechat-adapter = "adapter.main:main"
+
 [tool.setuptools.packages.find]
-include = ["wechatauto*"]
+include = ["wechatauto*", "adapter*"]
 
 [tool.setuptools.package-data]
 wechatauto = ["py.typed"]

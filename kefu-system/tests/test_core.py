@@ -1,0 +1,501 @@
+# -*- coding: utf-8 -*-
+"""核心管线单元测试：db DAO / aggregator / analyzer / pipeline / sender。
+
+全部不依赖真实微信：wechatauto 以懒加载方式被绕过，AI 用替身客户端注入。
+运行（在 kefu-system 目录下）::
+
+    python -m pytest tests/ -v
+"""
+from __future__ import annotations
+
+import json
+import time
+from typing import List
+
+import pytest
+
+from app.aggregator import Aggregator, AnalysisUnit
+from app import analyzer
+from app.crypto import encrypt_api_key, decrypt_api_key, mask_key
+from app.db import Database
+from app.notifier import Notifier
+from app.pipeline import Pipeline
+from app.sender import SendTask, Sender
+from app.wechat_service import WeChatService
+
+
+# ---------------------------------------------------------------------------
+# 工具
+# ---------------------------------------------------------------------------
+def make_msg(content: str, sort_seq: int = 1, sender_username: str = "wxid_zhang",
+             username: str = "12345@chatroom", mtype: str = "文本",
+             create_time: float | None = None) -> dict:
+    """构造 Listener 回调消息 dict。"""
+    return {
+        "local_id": sort_seq,
+        "type": mtype,
+        "sender_id": 3,
+        "sender_username": sender_username,
+        "create_time": create_time or time.time(),
+        "content": content,
+        "sort_seq": sort_seq,
+        "username": username,
+    }
+
+
+def make_unit() -> AnalysisUnit:
+    """构造一个标准分析单元。"""
+    return AnalysisUnit(
+        session_username="12345@chatroom",
+        session_name="加工外协群",
+        session_kind="group",
+        sender_wxid="wxid_zhang",
+        sender_name="张三",
+        window_start="2026-11-02T14:02:00",
+        window_end="2026-11-02T14:05:00",
+        merged_count=2,
+        lines=[("14:02", "有谁能做铝合金CNC"), ("14:05", "大概500件，急")],
+    )
+
+
+class FakeChatClient:
+    """AIClient 替身：chat() 返回构造好的 JSON。"""
+
+    def __init__(self, result: dict | None = None, fail_times: int = 0) -> None:
+        self.result = result or {"hit": True, "type": "机械加工订单",
+                                 "points": ["铝合金CNC 500件"], "confidence": 85,
+                                 "quote": "有谁能做铝合金CNC"}
+        self.fail_times = fail_times
+        self.calls = 0
+
+    def chat(self, system_prompt: str, user_message: str) -> str:
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise analyzer.AIError("模拟调用失败")
+        return json.dumps(self.result, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# db DAO
+# ---------------------------------------------------------------------------
+class TestDatabase:
+    def test_settings_roundtrip(self):
+        db = Database(":memory:")
+        assert db.get_setting("nonexistent", "dft") == "dft"
+        assert db.get_setting("analysis.strictness") == "balanced"
+        db.set_setting("analysis.strictness", "strict")
+        assert db.get_setting("analysis.strictness") == "strict"
+        assert db.get_bool("analysis.prescreen_enabled") is False
+        db.set_setting("analysis.prescreen_enabled", "1")
+        assert db.get_bool("analysis.prescreen_enabled") is True
+
+    def test_target_crud(self):
+        db = Database(":memory:")
+        t = db.insert_target("12345@chatroom", "加工群", "group")
+        assert t["display_name"] == "加工群"
+        with pytest.raises(Exception):
+            db.insert_target("12345@chatroom", "重复", "group")  # UNIQUE
+        db.update_target_enabled(t["id"], False)
+        assert db.get_target(t["id"])["enabled"] == 0
+        assert db.list_enabled_target_usernames() == []
+        db.update_target_enabled(t["id"], True)
+        assert db.list_enabled_target_usernames() == ["12345@chatroom"]
+        assert db.delete_target(t["id"]) == 1
+        assert db.get_target(t["id"]) is None
+
+    def test_types_crud(self):
+        db = Database(":memory:")
+        t = db.insert_type("机械加工订单", "寻找机械加工的采购需求")
+        assert db.list_types(only_enabled=True)[0]["name"] == "机械加工订单"
+        db.update_type(t["id"], {"enabled": 0})
+        assert db.list_types(only_enabled=True) == []
+        db.update_type(t["id"], {"description": "新描述"})
+        assert db.get_type(t["id"])["description"] == "新描述"
+        assert db.delete_type(t["id"]) == 1
+        assert db.get_type(t["id"]) is None
+
+    def test_opportunity_and_logs(self):
+        db = Database(":memory:")
+        t = db.insert_type("机械加工订单", "desc")
+        opp = db.insert_opportunity(
+            session_username="12345@chatroom", session_name="加工群",
+            sender_wxid="wxid_zhang", sender_name="张三",
+            window_start="2026-11-02T14:02:00",
+            window_end="2026-11-02T14:05:00", merged_count=2,
+            raw_text="[14:02] 内容", type_id=t["id"],
+            type_name="机械加工订单", summary="要点", key_quote="引文",
+            confidence=85)
+        total, rows = db.list_opportunities()
+        assert total == 1 and rows[0]["id"] == opp["id"]
+        # 状态筛选：空 = 排除 ignored
+        db.update_opportunity_status(opp["id"], "ignored")
+        assert db.list_opportunities() == (0, [])
+        assert db.list_opportunities(status="ignored")[0] == 1
+        # 关键词搜索
+        db.update_opportunity_status(opp["id"], "pending")
+        _, kw = db.list_opportunities(keyword="铝合金")
+        assert kw == []
+        _, kw2 = db.list_opportunities(keyword="要点")
+        assert len(kw2) == 1
+        # 回复标记
+        assert db.set_opportunity_replied(opp["id"], "可以做的") == 1
+        assert db.get_opportunity(opp["id"])["status"] == "replied"
+        # 日志
+        log_id = db.insert_analysis_log(
+            session_username="12345@chatroom", msg_count=1,
+            status="ok", result=json.dumps({"hit": True}))
+        assert log_id > 0
+
+    def test_watermarks(self):
+        db = Database(":memory:")
+        assert db.load_watermarks() == {}
+        db.save_watermarks({"a@chatroom": 100, "wxid_b": 200})
+        marks = db.load_watermarks()
+        assert marks == {"a@chatroom": 100, "wxid_b": 200}
+        db.save_watermarks({"a@chatroom": 150})
+        assert db.load_watermarks()["a@chatroom"] == 150
+
+
+class TestCrypto:
+    def test_encrypt_decrypt_mask(self):
+        cipher = encrypt_api_key("sk-abcdef123456")
+        assert cipher != "sk-abcdef123456"
+        assert decrypt_api_key(cipher) == "sk-abcdef123456"
+        masked = mask_key(cipher)
+        assert masked.startswith("sk-a") and "****" in masked
+        assert mask_key("") == ""
+        # 无效密文回退空串
+        assert decrypt_api_key("gAAAA-invalid") == ""
+
+
+# ---------------------------------------------------------------------------
+# aggregator
+# ---------------------------------------------------------------------------
+class TestAggregator:
+    def test_merge_and_flush(self):
+        flushed: List[AnalysisUnit] = []
+        agg = Aggregator(flush_callback=flushed.append,
+                         window_sec_provider=lambda: 300)
+        t = time.time()
+        assert agg.add(make_msg("第一条", 1, create_time=t), "加工群", "group") is True
+        assert agg.add(make_msg("第二条", 2, create_time=t + 5), "加工群", "group") is True
+        # 窗口未满不 flush
+        agg._flush_expired()
+        assert flushed == []
+        # 强制 flush：同会话同人合并为一个单元
+        agg._flush_expired(force=True)
+        assert len(flushed) == 1
+        unit = flushed[0]
+        assert unit.merged_count == 2
+        assert unit.session_kind == "group"
+        assert unit.sender_name == "wxid_zhang"
+        assert unit.merged_text().startswith("[") and "第一条" in unit.merged_text()
+
+    def test_different_senders_split(self):
+        flushed: List[AnalysisUnit] = []
+        agg = Aggregator(flush_callback=flushed.append,
+                         window_sec_provider=lambda: 300)
+        agg.add(make_msg("甲的话", 1, sender_username="wxid_a"), "群", "group")
+        agg.add(make_msg("乙的话", 2, sender_username="wxid_b"), "群", "group")
+        agg._flush_expired(force=True)
+        assert len(flushed) == 2
+        names = {u.sender_wxid for u in flushed}
+        assert names == {"wxid_a", "wxid_b"}
+
+    def test_empty_content_rejected(self):
+        agg = Aggregator(flush_callback=lambda u: None,
+                         window_sec_provider=lambda: 300)
+        assert agg.add(make_msg("  "), "群", "group") is False
+
+    def test_scheduler_thread(self):
+        flushed: List[AnalysisUnit] = []
+        agg = Aggregator(flush_callback=flushed.append,
+                         window_sec_provider=lambda: 1)
+        agg.start()
+        agg.add(make_msg("很快过期", 1), "群", "group")
+        deadline = time.time() + 12
+        while not flushed and time.time() < deadline:
+            time.sleep(0.2)
+        agg.stop(flush_all=False)
+        assert len(flushed) == 1
+
+
+# ---------------------------------------------------------------------------
+# analyzer
+# ---------------------------------------------------------------------------
+class TestAnalyzer:
+    def test_system_prompt_injection(self):
+        types = [{"name": "机械加工订单", "description": "寻找加工的采购需求"}]
+        prompt = analyzer.build_system_prompt(types, "strict")
+        assert "【机械加工订单】寻找加工的采购需求" in prompt
+        assert "严格(strict)" in prompt
+        assert "宽松(lenient)" not in prompt  # 只注入当前档位细则
+        # 空类型：一律 hit=false
+        empty_prompt = analyzer.build_system_prompt([], "balanced")
+        assert "一律 hit=false" in empty_prompt
+
+    def test_parse_ai_json(self):
+        ok = analyzer.parse_ai_json(
+            '{"hit": true, "type": "加工", "points": ["a"], '
+            '"confidence": 85, "quote": "原文"}')
+        assert ok == {"hit": True, "type": "加工", "points": ["a"],
+                      "confidence": 85, "quote": "原文"}
+        # markdown 包裹 + 正则兜底
+        ok2 = analyzer.parse_ai_json('```json\n{"hit": false, "type": null, '
+                                     '"points": [], "confidence": 10}\n```')
+        assert ok2["hit"] is False and ok2["type"] is None
+        # 置信度越界收敛
+        ok3 = analyzer.parse_ai_json('{"hit": false, "confidence": 999}')
+        assert ok3["confidence"] == 100
+        with pytest.raises(analyzer.AIError):
+            analyzer.parse_ai_json("完全不是 JSON")
+        with pytest.raises(analyzer.AIError):
+            analyzer.parse_ai_json('{"hit": true, "type": null}')  # 命中却无类型
+
+    def test_prescreen(self):
+        assert analyzer.prescreen("有采购需求", "采购,求购", "") is True
+        assert analyzer.prescreen("今天天气不错", "采购,求购", "") is False
+        assert analyzer.prescreen("找加工厂", "", "加[工工]") is True
+        assert analyzer.prescreen("随便聊聊", "", "") is True  # 空 = 全通过
+
+    def test_summarize_points(self):
+        assert analyzer.summarize_points(["a", "b"]) == "a\nb"
+        assert analyzer.summarize_points([]) == ""
+
+
+# ---------------------------------------------------------------------------
+# pipeline
+# ---------------------------------------------------------------------------
+class TestPipeline:
+    def _prepare(self):
+        db = Database(":memory:")
+        notifier = Notifier()
+        db.insert_type("机械加工订单", "desc")
+        # AI 配置（密文 Key）+ 合规确认
+        db.set_setting("ai.base_url", "https://mock.local/v1")
+        db.set_setting("ai.api_key_enc", encrypt_api_key("sk-test-12345678"))
+        db.set_setting("ai.model", "mock-model")
+        db.set_setting("compliance.confirmed", "1")
+        db.set_setting("analysis.min_confidence", "60")
+        return db, notifier
+
+    def test_hit_creates_opportunity(self):
+        db, notifier = self._prepare()
+        client = FakeChatClient()
+        pipeline = Pipeline(db, notifier,
+                            client_factory=lambda cfg: client)
+        pipeline._process(make_unit())
+        total, rows = db.list_opportunities()
+        assert total == 1
+        opp = rows[0]
+        assert opp["type_name"] == "机械加工订单"
+        assert opp["sender_name"] == "张三"
+        assert "铝合金CNC" in opp["summary"]
+        # 日志 ok 且带 opportunity_id
+        assert client.calls == 1
+
+    def test_below_threshold(self):
+        db, notifier = self._prepare()
+        client = FakeChatClient(result={"hit": True, "type": "机械加工订单",
+                                        "points": ["x"], "confidence": 30,
+                                        "quote": "q"})
+        pipeline = Pipeline(db, notifier,
+                            client_factory=lambda cfg: client)
+        pipeline._process(make_unit())
+        assert db.list_opportunities() == (0, [])  # 不生成商机
+
+    def test_retry_then_success(self):
+        db, notifier = self._prepare()
+        client = FakeChatClient(fail_times=1)  # 失败 1 次 → 重试成功
+        pipeline = Pipeline(db, notifier,
+                            client_factory=lambda cfg: client)
+        pipeline._process(make_unit())
+        assert client.calls == 2
+        assert db.list_opportunities()[0] == 1
+
+    def test_prescreen_skips(self):
+        db, notifier = self._prepare()
+        db.set_setting("analysis.prescreen_enabled", "1")
+        db.set_setting("analysis.prescreen_keywords", "采购,求购")
+        client = FakeChatClient()
+        pipeline = Pipeline(db, notifier,
+                            client_factory=lambda cfg: client)
+        # 单元文本无"采购/求购" → 预筛跳过，不调 AI
+        pipeline._process(make_unit())
+        assert client.calls == 0
+        assert db.list_opportunities() == (0, [])
+
+    def test_not_configured(self):
+        db, notifier = self._prepare()
+        db.set_setting("ai.base_url", "")
+        client = FakeChatClient()
+        pipeline = Pipeline(db, notifier,
+                            client_factory=lambda cfg: client)
+        pipeline._process(make_unit())
+        assert client.calls == 0
+
+    def test_compliance_gate(self):
+        db, notifier = self._prepare()
+        db.set_setting("compliance.confirmed", "0")
+        client = FakeChatClient()
+        pipeline = Pipeline(db, notifier,
+                            client_factory=lambda cfg: client)
+        pipeline._process(make_unit())
+        assert client.calls == 0
+
+    def test_queue_overflow_counts(self):
+        db, notifier = self._prepare()
+        pipeline = Pipeline(db, notifier, queue_max=1,
+                            client_factory=lambda cfg: FakeChatClient())
+        assert pipeline.enqueue(make_unit()) is True
+        assert pipeline.enqueue(make_unit()) is False
+        assert pipeline.dropped_total == 1
+
+
+# ---------------------------------------------------------------------------
+# sender（GUI 用替身注入）
+# ---------------------------------------------------------------------------
+class FakeWxResponse(dict):
+    """WxResponse 替身（dict 子类 + is_success 属性，同 wechatauto.param）。"""
+
+    def __init__(self, ok: bool, message: str):
+        super().__init__(status="成功" if ok else "失败", message=message)
+        self.is_success = ok
+
+
+class FakeGUI:
+    """WeChatGUI 替身（三重校验路径可配置）。"""
+
+    def __init__(self, alive=True, visible=True, open_ok=True, send_ok=True):
+        self.alive = alive
+        self.visible = visible
+        self.open_ok = open_ok
+        self.send_ok = send_ok
+        self.sent: List[str] = []
+
+    def is_alive(self):
+        return self.alive
+
+    def bring_to_front(self, keep_topmost=False):
+        return True
+
+    def ensure_visible(self):
+        return self.visible
+
+    def open_chat(self, name, exact=False):
+        return self.open_ok
+
+    def send_msg(self, text, who=None, verify=False):
+        self.sent.append(text)
+        return FakeWxResponse(self.send_ok,
+                              "消息已发送并确认" if self.send_ok else "发送失败：模拟")
+
+
+class TestSender:
+    def _prepare(self):
+        db = Database(":memory:")
+        db.insert_type("机械加工订单", "desc")
+        opp = db.insert_opportunity(
+            session_username="12345@chatroom", session_name="加工群",
+            sender_wxid="wxid_zhang", sender_name="张三",
+            window_start="2026-11-02T14:02:00",
+            window_end="2026-11-02T14:05:00", merged_count=1,
+            raw_text="原文", type_id=1, type_name="机械加工订单",
+            summary="要点", key_quote="引文", confidence=85)
+        sender = Sender(db, Notifier())
+        return db, opp, sender
+
+    def test_send_success_marks_replied(self):
+        db, opp, sender = self._prepare()
+        gui = FakeGUI()
+        sender._ensure_gui = lambda: gui  # 注入替身
+        sender._process(SendTask(opportunity_id=opp["id"],
+                                 session_username="12345@chatroom",
+                                 session_name="加工群", text="您好，可以做"))
+        row = db.get_opportunity(opp["id"])
+        assert row["status"] == "replied"
+        assert row["reply_content"] == "您好，可以做"
+        assert gui.sent == ["您好，可以做"]
+
+    def test_window_invisible_fails(self):
+        db, opp, sender = self._prepare()
+        gui = FakeGUI(visible=False)
+        sender._ensure_gui = lambda: gui
+        sender._process(SendTask(opportunity_id=opp["id"],
+                                 session_username="12345@chatroom",
+                                 session_name="加工群", text="hi"))
+        assert db.get_opportunity(opp["id"])["status"] == "pending"
+        assert gui.sent == []
+
+    def test_open_chat_failure(self):
+        db, opp, sender = self._prepare()
+        gui = FakeGUI(open_ok=False)
+        sender._ensure_gui = lambda: gui
+        sender._process(SendTask(opportunity_id=opp["id"],
+                                 session_username="12345@chatroom",
+                                 session_name="不存在的群", text="hi"))
+        assert db.get_opportunity(opp["id"])["status"] == "pending"
+
+    def test_send_failure_keeps_pending(self):
+        db, opp, sender = self._prepare()
+        gui = FakeGUI(send_ok=False)
+        sender._ensure_gui = lambda: gui
+        sender._process(SendTask(opportunity_id=opp["id"],
+                                 session_username="12345@chatroom",
+                                 session_name="加工群", text="hi"))
+        assert db.get_opportunity(opp["id"])["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# wechat_service（不触碰真实微信的路径）
+# ---------------------------------------------------------------------------
+class TestWeChatService:
+    def test_degraded_state(self):
+        db = Database(":memory:")
+        agg = Aggregator(flush_callback=lambda u: None)
+        svc = WeChatService(db, agg)
+        # 未 start：默认降级态且不崩溃
+        assert svc.listener_running is False
+        assert svc.probe_wechat_window() in (True, False)
+
+    def test_display_name_fallback(self):
+        db = Database(":memory:")
+        svc = WeChatService(db, Aggregator(lambda u: None))
+        # wechat 组件不可用时回退 username 本身
+        assert svc.get_display_name("12345@chatroom") == "12345@chatroom"
+
+    def test_on_message_non_text_skips(self):
+        db = Database(":memory:")
+        got: List[dict] = []
+        agg = Aggregator(lambda u: got.append(u))
+        svc = WeChatService(db, agg)
+        svc._on_message(make_msg("[图片]", mtype="图片"))
+        assert got == []  # 非文本不入缓冲
+
+
+# ---------------------------------------------------------------------------
+# 脱离微信的端到端小闭环（回调 → 合并 → 管线）
+# ---------------------------------------------------------------------------
+class TestMiniPipeline:
+    def test_callback_to_opportunity(self):
+        db = Database(":memory:")
+        db.insert_type("机械加工订单", "寻找加工的采购需求")
+        db.set_setting("compliance.confirmed", "1")
+        db.set_setting("ai.base_url", "https://mock.local/v1")
+        db.set_setting("ai.api_key_enc", encrypt_api_key("sk-test-12345678"))
+        db.set_setting("ai.model", "mock-model")
+        notifier = Notifier()
+        pipeline = Pipeline(db, notifier,
+                            client_factory=lambda cfg: FakeChatClient())
+        events: List[dict] = []
+        agg = Aggregator(flush_callback=lambda u: pipeline._process(u))
+        notifier.broadcast = lambda event, data: events.append(event)
+        svc = WeChatService(db, agg)
+        svc._on_message(make_msg("有谁能做铝合金CNC", 1))
+        svc._on_message(make_msg("大概500件", 2))
+        agg._flush_expired(force=True)
+        deadline = time.time() + 5
+        while db.count_pending_opportunities() == 0 and time.time() < deadline:
+            time.sleep(0.1)
+        assert db.count_pending_opportunities() == 1
+        assert "opportunity_new" in events

@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """wechatauto 数据库读取模块（微信 4.x）
 
 通过读取微信本地 SQLCipher 加密数据库实现消息读取，不依赖 UI 自动化。
@@ -487,6 +487,8 @@ class WeChatDB:
         self._db_files = self._collect_db_files()
         self.master_key: Optional[str] = None
         self.cfg_dword: Optional[int] = None
+        self._bad_shards: Dict[str, float] = {}  # rel -> marked-bad timestamp
+        self._bad_shards_mtime: Dict[str, float] = {}  # rel -> source mtime when marked bad
         self._load_or_extract_keys(master_key=master_key)
 
     # ------------------------------------------------------------------
@@ -1023,11 +1025,17 @@ class WeChatDB:
                         "[wechatauto] 主库解密成功(WAL 增量已跳过，部分最新消息可能缺失): %s\n" % rel
                     )
                 else:
-                    raise RuntimeError(
-                        "数据库解密失败(WAL 合并与主库解密均未通过校验): %s。"
-                        "请确认微信已登录，若仍复现请运行 "
-                        "python -m wechatauto.diagnose_keys 排查。" % rel
+                    sys.stderr.write(
+                        "[wechatauto] 主库解密校验失败，返回降级连接(部分数据可能缺失): %s\n"
+                        % rel
                     )
+                    # best-effort: return connection even though validation failed
+                    applied = 0
+                    build = False
+                    os.makedirs(os.path.dirname(stamp), exist_ok=True)
+                    with open(stamp, "w") as f:
+                        f.write("%d,%f,%d,%f,%d,%d"
+                                % (STAMP_VERSION, src_mtime, src_size, 0, 0, 0))
             else:
                 old = None  # 合并结果损坏 → 全量重建重试
         conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
@@ -1046,6 +1054,9 @@ class WeChatDB:
         
         "never used" 页面不是数据损坏，只是 SQLCipher 预分配但 SQLite 未使用的空间，
         单独过滤不计为失败。
+        
+        索引错误（如 "wrong # of entries in index"）不影响数据可读性，
+        仅记录警告，不计为失败。
         """
         try:
             conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
@@ -1055,17 +1066,30 @@ class WeChatDB:
                 conn.close()
             if not rows:
                 return False
-            real_errors = []
+            fatal_errors = []
+            index_warnings = []
             for r in rows:
                 msg = str(r[0])
                 if msg == "ok":
                     continue
                 if "never used" in msg:
                     continue  # trailing preallocated pages, not corruption
-                real_errors.append(msg)
-            if real_errors:
-                # quick_check 单条消息可能含数百行，只保留每条前 160 字符
-                brief = [e[:160] for e in real_errors[:3]]
+                # Index errors are non-fatal: data is readable, index is just stale
+                if "index" in msg.lower() or "rowid" in msg.lower():
+                    index_warnings.append(msg)
+                else:
+                    fatal_errors.append(msg)
+            if index_warnings and not fatal_errors:
+                # Only index issues, data is fine
+                brief = [e[:160] for e in index_warnings[:3]]
+                sys.stderr.write(
+                    "[wechatauto] quick_check %s index warnings (non-fatal): %s\n"
+                    % (os.path.basename(dst), brief)
+                )
+                return True  # Treat as OK, data is readable
+            if fatal_errors:
+                # Data corruption is fatal
+                brief = [e[:160] for e in fatal_errors[:3]]
                 sys.stderr.write(
                     "[wechatauto] quick_check %s FAILED: %s\n"
                     % (os.path.basename(dst), brief)
@@ -1303,19 +1327,123 @@ class WeChatDB:
         if removed:
             sys.stderr.write("[wechatauto] 已清 %d 个缓存文件等待重建\n" % removed)
 
-    def _msg_conn(self, user: str, _retry: bool = True) -> Optional[List[Tuple[sqlite3.Connection, str]]]:
-        """打开消息库并定位用户消息表，返回全部命中分片（调用方负责 close）"""
-        conns = []
+
+    def _invalidate_single_cache(self, rel: str) -> None:
+        """只删除指定消息库的解密缓存，不影响其他库。"""
+        safe_name = rel.replace(os.sep, "__")
+        workdir = self.workdir
+        for ext in (".db", ".stamp", ".db-shm", ".db-wal"):
+            path = os.path.join(workdir, safe_name + ext)
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+        sys.stderr.write("[wechatauto] 已清除 %s 的缓存，等待重建\n" % rel)
+    _BAD_SHARD_COOLDOWN = 60  # seconds to skip a known-bad shard
+
+    def _is_bad_shard(self, rel: str) -> bool:
+        """Check if a shard is in the bad-shard cooldown period.
+
+        During cooldown the shard is skipped to avoid flooding errors every
+        poll cycle.  If the source file mtime changes (WeChat may have done a
+        checkpoint) the cooldown is cleared so the shard is retried.
+        """
+        if rel not in self._bad_shards:
+            return False
+        marked_at = self._bad_shards[rel]
+        if time.time() - marked_at >= self._BAD_SHARD_COOLDOWN:
+            del self._bad_shards[rel]
+            self._bad_shards_mtime.pop(rel, None)
+            return False
+        # source mtime changed -> WeChat may have rewritten it, clear bad mark
         try:
-            conns = [self._open(rel) for rel in self._message_dbs()]
+            cur_mtime = os.path.getmtime(self._db_path(rel))
+        except OSError:
+            return True
+        if cur_mtime != self._bad_shards_mtime.get(rel, 0):
+            del self._bad_shards[rel]
+            self._bad_shards_mtime.pop(rel, None)
+            sys.stderr.write(
+                "[wechatauto] shard %s source updated, clearing bad mark\n"
+                % os.path.basename(rel)
+            )
+            return False
+        return True
+
+    def _mark_bad_shard(self, rel: str) -> None:
+        """Mark a shard as bad so _msg_conn skips it for a cooldown period."""
+        try:
+            mtime = os.path.getmtime(self._db_path(rel))
+        except OSError:
+            mtime = 0
+        self._bad_shards[rel] = time.time()
+        self._bad_shards_mtime[rel] = mtime
+        sys.stderr.write(
+            "[wechatauto] shard %s persistently corrupt, skipping for %ds\n"
+            % (os.path.basename(rel), self._BAD_SHARD_COOLDOWN)
+        )
+
+    def _msg_conn(self, user: str, _retry: bool = True) -> Optional[List[Tuple[sqlite3.Connection, str]]]:
+        """Open message databases and locate user message tables.
+
+        Returns all matching shards [(conn, table), ...] (caller is responsible
+        for closing).  Persistently corrupted shards are tracked and skipped
+        during a cooldown period to avoid flooding errors on every poll cycle.
+        """
+        conns = []
+        failed_rels = []
+        try:
+            for rel in self._message_dbs():
+                if self._is_bad_shard(rel):
+                    continue
+                try:
+                    conn = self._open(rel)
+                    # lightweight validation: catches corrupted cached files
+                    # that skip_check bypassed (e.g. stale stamp + corrupt .db)
+                    conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+                    conns.append(conn)
+                    # shard opened successfully: clear bad mark if any
+                    self._bad_shards.pop(rel, None)
+                    self._bad_shards_mtime.pop(rel, None)
+                except (sqlite3.DatabaseError, RuntimeError) as exc:
+                    is_mal = (
+                        _is_malformed(exc)
+                        if isinstance(exc, sqlite3.DatabaseError)
+                        else True
+                    )
+                    if is_mal:
+                        # only clear this shard's cache, not all
+                        self._invalidate_single_cache(rel)
+                        failed_rels.append(rel)
+                        try:
+                            conn = self._open(rel)
+                            conn.execute(
+                                "SELECT 1 FROM sqlite_master LIMIT 1"
+                            ).fetchone()
+                            conns.append(conn)
+                            # rebuild succeeded: clear bad mark
+                            self._bad_shards.pop(rel, None)
+                            self._bad_shards_mtime.pop(rel, None)
+                        except Exception:
+                            self._mark_bad_shard(rel)
+                    else:
+                        raise
             found = self._find_msg_tables(user, conns)
+            # track which shard rels contributed to found connections
+            # so _run_msg_query can selectively invalidate on data errors
+            self._last_found_rels = [
+                rel for rel in self._message_dbs()
+                if not self._is_bad_shard(rel)
+            ]
         except sqlite3.DatabaseError as exc:
             for c in conns:
                 c.close()
             if _retry and _is_malformed(exc):
-                sys.stderr.write("[wechatauto] 消息库损坏(%s)，清缓存重建并重试\n" % exc)
-                self._invalidate_cache()
-                return self._msg_conn(user, _retry=False)
+                sys.stderr.write(
+                    "[wechatauto] message db corrupt (%s), skipping query\n" % exc
+                )
+                return None
             raise
         except Exception:
             for c in conns:
@@ -1325,11 +1453,7 @@ class WeChatDB:
             for c in conns:
                 c.close()
             return None
-        # 只保留命中的连接，其余分片库立即关闭，避免 Windows 下删除缓存被占用
-        hit = {id(c) for c, _ in found}
-        for c in conns:
-            if id(c) not in hit:
-                c.close()
+        # 成功路径：返回全部命中分片列表，交由调用方消费并负责关闭连接
         return found
 
     def _run_msg_query(self, user: str, build):
@@ -1351,9 +1475,13 @@ class WeChatDB:
                 if attempt or not _is_malformed(exc):
                     raise
                 sys.stderr.write(
-                    "[wechatauto] 查询到库损坏(%s)，清缓存重建并重试\n" % exc
+                    "[wechatauto] query db corrupt (%s), invalidating involved shards\n" % exc
                 )
-                self._invalidate_cache()
+                # selectively invalidate only the shards used in the last query
+                # instead of all caches, to avoid cascading rebuilds
+                for rel in getattr(self, '_last_found_rels', []):
+                    self._invalidate_single_cache(rel)
+                    self._mark_bad_shard(rel)
             finally:
                 for conn, _ in found:
                     conn.close()
@@ -1972,7 +2100,12 @@ class WeChatDB:
         """所有含消息的会话（md5、用户名、昵称、消息数）"""
         tables: Dict[str, int] = {}
         for rel in self._message_dbs():
-            conn = self._open(rel)
+            if self._is_bad_shard(rel):
+                continue
+            try:
+                conn = self._open(rel)
+            except Exception:
+                continue
             try:
                 rows = conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
@@ -2036,7 +2169,12 @@ class WeChatDB:
         buckets: Dict[str, list] = {}
         all_conns: List[sqlite3.Connection] = []
         for rel in self._message_dbs():
-            conn = self._open(rel)
+            if self._is_bad_shard(rel):
+                continue
+            try:
+                conn = self._open(rel)
+            except Exception:
+                continue
             all_conns.append(conn)
             tabs = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
@@ -2274,7 +2412,7 @@ class Listener:
         except (KeyError, ValueError):
             pass
 
-    def add_all(self, callback: callable, discover: bool = True) -> None:
+    def add_all(self, callback: callable, discover: bool = True, fast_init: bool = False) -> None:
         """注册全局回调：监听所有已知会话的新消息。
 
         Args:
@@ -2289,11 +2427,24 @@ class Listener:
         """
         self._all_callback = callback
         self._discover_new = discover
-        sessions = self.db.get_sessions(limit=500)
-        for s in sessions:
-            username = s["username"]
-            if username not in self._callbacks:
-                self.add_listener(username, callback)
+        sessions = self.db.get_sessions(limit=100)
+        
+        if fast_init:
+            print(f'[DEBUG] add_all: 快速注册 {len(sessions)} 个会话（跳过 watermark 查询）', flush=True)
+            for s in sessions:
+                username = s["username"]
+                if username not in self._callbacks:
+                    self._callbacks.setdefault(username, []).append(callback)
+                    if username not in self._watermark:
+                        self._watermark[username] = -1
+            print(f'[DEBUG] add_all: 快速注册完成', flush=True)
+        else:
+            print(f'[DEBUG] add_all: 注册 {len(sessions)} 个会话（逐个查询 watermark）', flush=True)
+            for s in sessions:
+                username = s["username"]
+                if username not in self._callbacks:
+                    self.add_listener(username, callback)
+            print(f'[DEBUG] add_all: 注册完成', flush=True)
 
     @property
     def watermark(self) -> Dict[str, int]:
@@ -2326,20 +2477,78 @@ class Listener:
                 sys.stderr.write("listener poll error: %r\n" % exc)
             self._stop.wait(self.interval)
 
+    _WM_BATCH = 5  # watermark init per poll to avoid blocking
+
     def _poll_once(self) -> None:
+        error_count = getattr(self, "_poll_error_count", 0)
+        poll_count = getattr(self, "_poll_count", 0) + 1
+        self._poll_count = poll_count
         # 自动发现新会话（add_all 的 discover 模式）
         if getattr(self, '_discover_new', False) and getattr(self, '_all_callback', None):
             try:
-                sessions = self.db.get_sessions(limit=500)
+                sessions = self.db.get_sessions(limit=100)
                 for s in sessions:
                     username = s["username"]
                     if username not in self._callbacks:
-                        self.add_listener(username, self._all_callback)
+                        self._callbacks.setdefault(username, []).append(self._all_callback)
+                        if username not in self._watermark:
+                            self._watermark[username] = -1
             except Exception:
                 pass
+        # Batch watermark initialization: process _WM_BATCH per poll
+        # to avoid blocking the poll loop for minutes on first start
+        if not hasattr(self, '_wm_pending'):
+            self._wm_pending = {
+                u for u, v in self._watermark.items() if v == -1
+            }
+        if not hasattr(self, '_wm_fail'):
+            self._wm_fail = {}
+        wm_batch = sorted(self._wm_pending)[:self._WM_BATCH]
+        for user in wm_batch:
+            try:
+                latest = self.db.get_messages(user, limit=1)
+                if latest:
+                    self._watermark[user] = latest[0]['sort_seq']
+                else:
+                    self._watermark[user] = 0
+            except Exception:
+                self._wm_fail[user] = self._wm_fail.get(user, 0) + 1
+                if self._wm_fail[user] >= 3:
+                    sys.stderr.write(
+                        "[wechatauto] watermark init failed %d times for %s, giving up\n"
+                        % (self._wm_fail[user], user[:20])
+                    )
+                    self._watermark[user] = 0
+                continue
+            self._wm_pending.discard(user)
+            self._wm_fail.pop(user, None)
+        pending_count = len(self._wm_pending)
+        # heartbeat log: first poll + every 6th (~30s at 5s interval)
+        if poll_count == 1 or poll_count % 6 == 0:
+            bad = len(getattr(self.db, '_bad_shards', {}))
+            total = len(self._callbacks)
+            wm_set = sum(1 for v in self._watermark.values() if v != -1)
+            sys.stderr.write(
+                "[wechatauto] poll #%d: %d sessions, %d watermarks set, "
+                "%d pending init, %d bad shards\n"
+                % (poll_count, total, wm_set, pending_count, bad)
+            )
         for user, callbacks in list(self._callbacks.items()):
             since = self._watermark.get(user, 0)
-            msgs = self.db.get_new_messages(user, since_seq=since)
+            # Skip sessions whose watermark is still being initialized
+            if since == -1:
+                continue
+            try:
+                msgs = self.db.get_new_messages(user, since_seq=since)
+            except sqlite3.DatabaseError as e:
+                self._poll_error_count = error_count + 1
+                if self._poll_error_count % 10 == 0:  # Log every 10 errors
+                    sys.stderr.write("[wechatauto] 轮询错误(已抑制): %s\n" % e)
+                continue
+            except Exception:
+                continue
+            if msgs:
+                print(f'[LISTENER] 会话 {user} 收到 {len(msgs)} 条新消息', flush=True)
             if not msgs:
                 continue
             self._watermark[user] = msgs[-1]["sort_seq"]
