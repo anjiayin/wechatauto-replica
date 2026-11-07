@@ -1,5 +1,5 @@
-import { useEffect, useMemo } from 'react'
-import { NavLink, Route, Routes } from 'react-router-dom'
+import { useEffect, useState } from 'react'
+import { NavLink, Route, Routes, useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import {
   Alert,
@@ -11,6 +11,7 @@ import {
   ListItemButton,
   ListItemIcon,
   ListItemText,
+  Snackbar,
   Toolbar,
   Typography,
 } from '@mui/material'
@@ -20,14 +21,30 @@ import SettingsIcon from '@mui/icons-material/Settings'
 import { apiGet } from './api/client'
 import type { StatusOut } from './api/types'
 import { useEvents } from './hooks/useEvents'
+import { armAudioUnlock, playOpportunitySound } from './hooks/sound'
+import { setPendingOpportunity } from './hooks/pendingOpportunity'
 import OpportunityList from './pages/OpportunityList'
 import MessageBrowse from './pages/MessageBrowse'
 import SettingsPage from './pages/SettingsPage'
 
 const DRAWER_WIDTH = 200
 
-/** 全局框架：左侧导航、WS 事件接入、顶部状态横幅。 */
+/** 新商机 toast 数据（useEvents 派发 kefu-opportunity-toast） */
+interface OppToastData {
+  id: number
+  session_name: string
+  summary: string
+}
+
+/** AI 分析失败提示数据（useEvents 派发 kefu-analysis-error） */
+interface AnalysisErrorData {
+  error: string
+  consecutive_failures: number
+}
+
+/** 全局框架：左侧导航、WS 事件接入、顶部状态横幅、全局提醒。 */
 export default function App() {
+  const navigate = useNavigate()
   useEvents() // WS 订阅 + react-query 失效联动
 
   // 状态轮询：WS 断开时的兜底刷新通道
@@ -37,32 +54,80 @@ export default function App() {
     refetchInterval: 5000,
   })
 
-  // 全局提示音（设置页保存后写入 localStorage；opportunity_new 时由 useEvents 派发事件）
-  const soundEnabled = useMemo(
+  // 全局提示音（设置页保存后写入 localStorage；opportunity_new 时由 useEvents 派发事件）。
+  // 提示音经 Web Audio 合成；首次交互解锁以绕过浏览器自动播放策略。
+  // 开关状态响应式：storage 事件（跨页签）+ kefu-sound-settings-changed
+  // 自定义事件（同页保存，storage 事件同页不触发），无需刷新即生效。
+  const [soundEnabled, setSoundEnabled] = useState(
     () => window.localStorage.getItem('kefu.sound_enabled') === '1',
-    [],
   )
   useEffect(() => {
-    if (!soundEnabled) return
-    const handler = () => {
-      try {
-        const ctx = new AudioContext()
-        const osc = ctx.createOscillator()
-        const gain = ctx.createGain()
-        osc.connect(gain)
-        gain.connect(ctx.destination)
-        osc.frequency.value = 880
-        gain.gain.setValueAtTime(0.15, ctx.currentTime)
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.5)
-        osc.start()
-        osc.stop(ctx.currentTime + 0.5)
-      } catch {
-        // 忽略音频设备异常
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === 'kefu.sound_enabled') {
+        setSoundEnabled(window.localStorage.getItem('kefu.sound_enabled') === '1')
       }
     }
+    const onSoundChanged = () => {
+      setSoundEnabled(window.localStorage.getItem('kefu.sound_enabled') === '1')
+    }
+    window.addEventListener('storage', onStorage)
+    window.addEventListener('kefu-sound-settings-changed', onSoundChanged)
+    return () => {
+      window.removeEventListener('storage', onStorage)
+      window.removeEventListener('kefu-sound-settings-changed', onSoundChanged)
+    }
+  }, [])
+  useEffect(() => {
+    if (!soundEnabled) return
+    armAudioUnlock() // 页面加载即武装解锁监听，首次交互后恢复播放能力
+    const handler = () => playOpportunitySound()
     window.addEventListener('kefu-opportunity-new-sound', handler)
     return () => window.removeEventListener('kefu-opportunity-new-sound', handler)
   }, [soundEnabled])
+
+  // 新商机到达提醒（右上角 toast，点击跳转商机详情；全局任何页面生效）
+  const [oppToast, setOppToast] = useState<{
+    id: number
+    content: string
+  } | null>(null)
+  useEffect(() => {
+    const handler = (ev: Event) => {
+      const d = (ev as CustomEvent<OppToastData>).detail
+      const firstLine =
+        String(d.summary ?? '')
+          .split('\n')
+          .map((l) => l.trim())
+          .find(Boolean) ?? ''
+      setOppToast({
+        id: d.id,
+        content: [d.session_name, firstLine].filter(Boolean).join('：'),
+      })
+    }
+    window.addEventListener('kefu-opportunity-toast', handler)
+    return () => window.removeEventListener('kefu-opportunity-toast', handler)
+  }, [])
+
+  // AI 分析失败提醒（analysis_error WS 事件；连续失败 ≥3 次转常驻横幅）
+  const [aiErrorSnack, setAiErrorSnack] = useState<string | null>(null)
+  useEffect(() => {
+    const handler = (ev: Event) => {
+      const d = (ev as CustomEvent<AnalysisErrorData>).detail
+      setAiErrorSnack(
+        `AI 分析失败：${d.error}（已连续 ${d.consecutive_failures} 次），请检查 AI 接口配置与额度`,
+      )
+    }
+    window.addEventListener('kefu-analysis-error', handler)
+    return () => window.removeEventListener('kefu-analysis-error', handler)
+  }, [])
+
+  // 点击 toast：回到商机列表页并打开对应详情抽屉（OpportunityList 监听该事件）。
+  // 列表页未挂载时事件会丢失：用模块级 pending 暂存，挂载后消费打开抽屉。
+  const openOpportunity = (id: number) => {
+    setOppToast(null)
+    setPendingOpportunity(id)
+    navigate('/')
+    window.dispatchEvent(new CustomEvent('kefu-open-opportunity', { detail: { id } }))
+  }
 
   const banner = buildBanner(status)
 
@@ -122,6 +187,47 @@ export default function App() {
           <Route path="*" element={<OpportunityList />} />
         </Routes>
       </Box>
+
+      {/* 新商机到达提醒（右上角，6 秒自动消失，可手动关闭，点击跳详情） */}
+      <Snackbar
+        open={oppToast !== null}
+        autoHideDuration={6000}
+        onClose={() => setOppToast(null)}
+        anchorOrigin={{ vertical: 'top', horizontal: 'right' }}
+      >
+        <Alert
+          severity="success"
+          onClose={() => setOppToast(null)}
+          sx={{
+            width: '100%',
+            minWidth: 300,
+            cursor: 'pointer',
+            alignItems: 'flex-start',
+          }}
+          onClick={() => oppToast && openOpportunity(oppToast.id)}
+        >
+          <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
+            发现新商机
+          </Typography>
+          <Typography variant="body2">{oppToast?.content}</Typography>
+        </Alert>
+      </Snackbar>
+
+      {/* AI 分析失败警告（右上角，8 秒自动消失；连续失败 ≥3 次由顶部横幅常驻提示） */}
+      <Snackbar
+        open={aiErrorSnack !== null}
+        autoHideDuration={8000}
+        onClose={() => setAiErrorSnack(null)}
+        anchorOrigin={{ vertical: 'top', horizontal: 'right' }}
+      >
+        <Alert
+          severity="warning"
+          onClose={() => setAiErrorSnack(null)}
+          sx={{ width: '100%', maxWidth: 420 }}
+        >
+          {aiErrorSnack}
+        </Alert>
+      </Snackbar>
     </Box>
   )
 }
@@ -145,6 +251,15 @@ function NavItem(props: {
 
 function buildBanner(status?: StatusOut) {
   if (!status) return null
+  // AI 分析连续失败 ≥3 次：常驻横幅（恢复成功后 analysis_health 归零自动消失）
+  const failures = status.analysis_health?.consecutive_failures ?? 0
+  if (failures >= 3) {
+    const lastError = status.analysis_health?.last_error ?? ''
+    return {
+      severity: 'error' as const,
+      text: `AI 分析连续失败 ${failures} 次${lastError ? `：${lastError}` : ''}，请检查 AI 接口配置与额度`,
+    }
+  }
   if (status.degraded_reason) {
     return { severity: 'warning' as const, text: `微信接入降级：${status.degraded_reason}` }
   }

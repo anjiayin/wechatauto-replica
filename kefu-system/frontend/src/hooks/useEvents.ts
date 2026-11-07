@@ -6,11 +6,26 @@ import type { WsEvent } from '../api/types'
  * WS 事件订阅（/ws/events）：断线自动重连 + react-query 失效联动。
  *
  * 事件处理：
- * - opportunity_new / opportunity_update / unread_cleared → 失效商机相关查询
+ * - opportunity_new → 失效商机相关查询 + 派发 kefu-opportunity-new-sound（提示音）
+ *   + 派发 kefu-opportunity-toast（App 全局右上角 toast，任何页面可见）
+ * - opportunity_update / unread_cleared → 仅刷新商机列表（合并更新不弹提醒）
+ * - analysis_error → 派发 kefu-analysis-error（AI 分析失败警告 toast）
+ *   + 失效状态查询（连续失败 ≥3 次时顶部常驻横幅由 /api/status 驱动）
  * - status_change → 失效状态查询（顶部横幅）
  * - send_result → 经 window CustomEvent("kefu-send-result") 分发给详情页
  * WS 不可用时页面自动退化为轮询刷新（react-query refetchInterval）。
  */
+interface OpportunityNewData {
+  id?: number
+  session_name?: string
+  summary?: string
+}
+
+interface AnalysisErrorData {
+  error?: string
+  consecutive_failures?: number
+}
+
 export function useEvents(): boolean {
   const queryClient = useQueryClient()
   const [connected, setConnected] = useState(false)
@@ -43,11 +58,37 @@ export function useEvents(): boolean {
           return
         }
         switch (msg.event) {
-          case 'opportunity_new':
+          case 'opportunity_new': {
+            const d = (msg.data ?? {}) as OpportunityNewData
+            if (typeof d.id === 'number') {
+              window.dispatchEvent(
+                new CustomEvent('kefu-opportunity-toast', {
+                  detail: {
+                    id: d.id,
+                    session_name: d.session_name ?? '',
+                    summary: d.summary ?? '',
+                  },
+                }),
+              )
+            }
             window.dispatchEvent(new CustomEvent('kefu-opportunity-new-sound'))
             void queryClient.invalidateQueries({ queryKey: ['opportunities'] })
             void queryClient.invalidateQueries({ queryKey: ['status'] })
             break
+          }
+          case 'analysis_error': {
+            const d = (msg.data ?? {}) as AnalysisErrorData
+            window.dispatchEvent(
+              new CustomEvent('kefu-analysis-error', {
+                detail: {
+                  error: d.error ?? '未知错误',
+                  consecutive_failures: d.consecutive_failures ?? 1,
+                },
+              }),
+            )
+            void queryClient.invalidateQueries({ queryKey: ['status'] })
+            break
+          }
           case 'opportunity_update':
           case 'unread_cleared':
             void queryClient.invalidateQueries({ queryKey: ['opportunities'] })

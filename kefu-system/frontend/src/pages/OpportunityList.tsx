@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Box,
@@ -21,6 +21,7 @@ import {
 import VisibilityOffIcon from '@mui/icons-material/VisibilityOff'
 import ReplyIcon from '@mui/icons-material/Reply'
 import { apiGet, apiPatch, qs } from '../api/client'
+import { consumePendingOpportunity } from '../hooks/pendingOpportunity'
 import type {
   OpportunityListOut,
   OpportunityType,
@@ -49,6 +50,22 @@ export default function OpportunityList() {
   const [page, setPage] = useState(0)
   const [pageSize, setPageSize] = useState(20)
   const [detailId, setDetailId] = useState<number | null>(null)
+
+  // 全局「新商机 toast 点击跳转」：App 派发 kefu-open-opportunity → 打开详情抽屉。
+  // 列表页未挂载时事件丢失的竞态由 pending 机制兜底：挂载时消费待打开 id。
+  useEffect(() => {
+    const handler = (ev: Event) => {
+      const d = (ev as CustomEvent<{ id: number }>).detail
+      if (typeof d?.id === 'number') {
+        consumePendingOpportunity() // 已挂载：事件直达，同步清空 pending 防陈旧
+        setDetailId(d.id)
+      }
+    }
+    const pending = consumePendingOpportunity()
+    if (pending !== null) setDetailId(pending)
+    window.addEventListener('kefu-open-opportunity', handler)
+    return () => window.removeEventListener('kefu-open-opportunity', handler)
+  }, [])
 
   const query = useMemo(
     () =>
@@ -138,6 +155,7 @@ export default function OpportunityList() {
       </Stack>
 
       <Paper variant="outlined">
+        <Box sx={{ overflowX: 'auto' }}>
         <Table size="small">
           <TableHead>
             <TableRow>
@@ -145,6 +163,7 @@ export default function OpportunityList() {
               <TableCell>来源</TableCell>
               <TableCell>发送人</TableCell>
               <TableCell>时间</TableCell>
+              <TableCell>消息原文</TableCell>
               <TableCell>AI 要点摘要</TableCell>
               <TableCell align="right">置信度</TableCell>
               <TableCell>状态</TableCell>
@@ -154,14 +173,14 @@ export default function OpportunityList() {
           <TableBody>
             {isLoading && (
               <TableRow>
-                <TableCell colSpan={8}>加载中…</TableCell>
+                <TableCell colSpan={9}>加载中…</TableCell>
               </TableRow>
             )}
             {!isLoading && items.length === 0 && (
               <TableRow>
-                <TableCell colSpan={8}>
+                <TableCell colSpan={9}>
                   <Typography color="text.secondary" align="center" sx={{ py: 4 }}>
-                    暂无商机。请确认：① 设置页已配置监控对象与商机类型；② AI 接口可用；③ 新消息在发送人停止发言（默认 60 秒）后即触发分析并产生商机。
+                    暂无商机。请确认：① 设置页已配置监控对象与商机类型；② AI 接口可用；③ 新消息在发送人停止发言（默认 15 秒）后即触发分析并产生商机。
                   </Typography>
                 </TableCell>
               </TableRow>
@@ -186,6 +205,25 @@ export default function OpportunityList() {
                   )}
                 </TableCell>
                 <TableCell sx={{ whiteSpace: 'nowrap' }}>{o.window_end.replace('T', ' ')}</TableCell>
+                <TableCell sx={{ maxWidth: 260, minWidth: 140 }}>
+                  {o.key_quote ? (
+                    <Tooltip title={o.key_quote} placement="top" arrow>
+                      <Typography
+                        variant="body2"
+                        sx={{
+                          display: '-webkit-box',
+                          WebkitBoxOrient: 'vertical',
+                          WebkitLineClamp: 2,
+                          overflow: 'hidden',
+                        }}
+                      >
+                        {o.key_quote}
+                      </Typography>
+                    </Tooltip>
+                  ) : (
+                    <Typography variant="body2" color="text.secondary">—</Typography>
+                  )}
+                </TableCell>
                 <TableCell sx={{ maxWidth: 360 }}>
                   <Typography variant="body2" sx={{ whiteSpace: 'pre-line' }}>
                     {o.summary.length > 120 ? `${o.summary.slice(0, 120)}…` : o.summary}
@@ -215,6 +253,7 @@ export default function OpportunityList() {
             ))}
           </TableBody>
         </Table>
+        </Box>
         <TablePagination
           component="div"
           count={data?.total ?? 0}

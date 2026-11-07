@@ -44,6 +44,23 @@ from app.notifier import Notifier
 logger = logging.getLogger(__name__)
 
 
+def friendly_ai_error(raw: str) -> str:
+    """把 AI 调用错误摘要映射为用户可读的中文提示（优化 10）。
+
+    规则：401/403 → Key 无效或无权限；429 → 额度不足或触发限流；
+    超时 → 接口超时；其余显示原始错误前 80 字。
+    """
+    text = str(raw or "").strip()
+    lowered = text.lower()
+    if "401" in text or "403" in text:
+        return "Key 无效或无权限"
+    if "429" in text:
+        return "额度不足或触发限流"
+    if "timeout" in lowered or "timed out" in lowered or "超时" in text:
+        return "接口超时"
+    return text[:80] if text else "未知错误"
+
+
 class Pipeline:
     """商机分析管线（应用生命周期内单例）。"""
 
@@ -67,6 +84,10 @@ class Pipeline:
         self._busy_lock = threading.Lock()
         self._workers: list[threading.Thread] = []
         self._stop = threading.Event()
+        # AI 分析健康度（内存态：/api/status.analysis_health 数据源）
+        self._health_lock = threading.Lock()
+        self._consecutive_failures = 0
+        self._last_error = ""
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -146,6 +167,41 @@ class Pipeline:
         return self._queue.qsize()
 
     # ------------------------------------------------------------------
+    # AI 分析健康度（优化 10）
+    # ------------------------------------------------------------------
+    @property
+    def analysis_health(self) -> dict:
+        """AI 分析健康度快照（/api/status 数据源）。"""
+        with self._health_lock:
+            return {"last_error": self._last_error,
+                    "consecutive_failures": self._consecutive_failures}
+
+    def _record_success(self) -> None:
+        """AI 调用成功：清零连续失败计数与错误摘要（横幅自动消失）。"""
+        with self._health_lock:
+            self._consecutive_failures = 0
+            self._last_error = ""
+
+    def _record_failure(self, session_username: str, raw_error: str) -> None:
+        """AI 分析最终失败：累计健康度并广播 analysis_error 事件。
+
+        任何异常不得影响管线线程（共享约定 4）。
+        """
+        friendly = friendly_ai_error(raw_error)
+        with self._health_lock:
+            self._consecutive_failures += 1
+            self._last_error = friendly
+            failures = self._consecutive_failures
+        try:
+            self._notifier.broadcast("analysis_error", {
+                "session_username": session_username,
+                "error": friendly,
+                "consecutive_failures": failures,
+            })
+        except Exception:
+            logger.exception("广播 analysis_error 事件失败（已忽略）")
+
+    # ------------------------------------------------------------------
     # 单元处理
     # ------------------------------------------------------------------
     def _process(self, unit: AnalysisUnit) -> None:
@@ -177,9 +233,10 @@ class Pipeline:
         ai_cfg = dbmod.read_ai_settings(self._db)
         api_key = decrypt_api_key(ai_cfg.get("api_key_enc", ""))
         if not ai_cfg.get("base_url") or not api_key or not ai_cfg.get("model"):
-            self._db.insert_analysis_log(status="error",
-                                         error="AI 接口未配置完整，请在设置页配置",
+            err = "AI 接口未配置完整，请在设置页配置"
+            self._db.insert_analysis_log(status="error", error=err,
                                          model="", **base_log)
+            self._record_failure(unit.session_username, err)
             return
         client = self._build_client(ai_cfg, api_key)
         # 调用 AI（失败指数退避重试 RETRY_TIMES 次）
@@ -194,6 +251,7 @@ class Pipeline:
                     unit.sender_name, unit.sender_wxid, unit.merged_count,
                     types, analysis_cfg.get("strictness", "balanced"),
                 )
+                self._record_success()
                 latency_ms = int((time.monotonic() - started) * 1000)
                 self._on_result(unit, result, latency_ms, base_log,
                                 ai_cfg.get("model", ""))
@@ -205,9 +263,10 @@ class Pipeline:
                                attempt + 1, exc, wait)
                 if attempt < RETRY_TIMES:
                     time.sleep(wait)
-        # 最终失败
+        # 最终失败：落库 + 健康度累计 + WS 广播（优化 10）
         self._db.insert_analysis_log(status="error", error=last_err,
                                      model=ai_cfg.get("model", ""), **base_log)
+        self._record_failure(unit.session_username, last_err)
 
     def _build_client(self, ai_cfg: dict, api_key: str):
         """按配置构建 AI 客户端。"""

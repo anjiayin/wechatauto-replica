@@ -5,6 +5,8 @@ import {
   Box,
   Button,
   Checkbox,
+  Chip,
+  CircularProgress,
   Dialog,
   DialogActions,
   DialogContent,
@@ -45,11 +47,17 @@ import type {
   AISettingsPayload,
   AITestResult,
   AnalysisSettings,
+  MonitorSettings,
   MonitorTarget,
   OpportunityType,
   SessionItem,
   StatusOut,
 } from '../api/types'
+import {
+  PRESCREEN_PRESETS,
+  mergePrescreen,
+  parsePrescreen,
+} from '../constants/prescreen'
 
 /** 设置页：监控对象 / 商机类型 / AI 接口（含分析判定与通知）三 tab。 */
 export default function SettingsPage() {
@@ -111,7 +119,7 @@ function TargetRow({
         sx={{ p: 0.5, mr: 1 }}
       />
       <ListItemText
-        primary={target.display_name}
+        primary={target.display_name || target.username}
         secondary={`${target.kind === 'group' ? '群聊' : '私聊'} · ${target.username}${
           target.enabled === 1 ? '' : '（已停用）'
         }`}
@@ -150,6 +158,35 @@ function TargetsTab() {
   const quotaWarning = quotaRatio >= 0.9
   const quotaFull = quota ? quota.used >= quota.max : false
 
+  // 监控上限配置（monitor.max_targets，10~2000；保存后配额提示即时更新）
+  const { data: monitorSettings } = useQuery({
+    queryKey: ['monitor-settings'],
+    queryFn: () => apiGet<MonitorSettings>('/api/settings/monitor'),
+  })
+  const [maxTargetsInput, setMaxTargetsInput] = useState('')
+  const [maxTargetsLoaded, setMaxTargetsLoaded] = useState(false)
+  if (monitorSettings && !maxTargetsLoaded) {
+    setMaxTargetsInput(String(monitorSettings.max_targets))
+    setMaxTargetsLoaded(true)
+  }
+  const maxTargetsValue = Number(maxTargetsInput)
+  const maxTargetsValid =
+    Number.isInteger(maxTargetsValue) &&
+    maxTargetsValue >= 10 &&
+    maxTargetsValue <= 2000
+  const saveMaxTargetsMutation = useMutation({
+    mutationFn: () =>
+      apiPut<MonitorSettings>('/api/settings/monitor', {
+        max_targets: maxTargetsValue,
+      }),
+    onSuccess: () => {
+      setSnack({ msg: '监控上限已保存', severity: 'success' })
+      void queryClient.invalidateQueries({ queryKey: ['monitor-settings'] })
+      void queryClient.invalidateQueries({ queryKey: ['status'] })
+    },
+    onError: (err: Error) => setSnack({ msg: err.message, severity: 'error' }),
+  })
+
   const { data: targets } = useQuery({
     queryKey: ['monitor-targets'],
     queryFn: () => apiGet<MonitorTarget[]>('/api/monitor-targets'),
@@ -183,13 +220,20 @@ function TargetsTab() {
     })
   }
 
-  // 批量添加：逐个 POST；后端超限 400 的中文 detail 原样进 Snackbar
+  // 批量添加：逐个 POST（携带候选显示名快照，后端免二次查询，响应更快）；
+  // 后端超限 400 的中文 detail 原样进 Snackbar
   const addMutation = useMutation({
     mutationFn: async (usernames: string[]) => {
+      const nameMap = new Map(
+        (candidates ?? []).map((s) => [s.username, s.display_name] as const),
+      )
       const errors: string[] = []
       for (const u of usernames) {
         try {
-          await apiPost<MonitorTarget>('/api/monitor-targets', { username: u })
+          await apiPost<MonitorTarget>('/api/monitor-targets', {
+            username: u,
+            display_name: nameMap.get(u) ?? '',
+          })
         } catch (err) {
           errors.push(`${u}：${(err as Error).message}`)
         }
@@ -278,17 +322,42 @@ function TargetsTab() {
 
   return (
     <Box>
-      {/* 配额提示：接近上限（≥90%）用警告色 */}
-      {quota && (
-        <Alert
-          severity={quotaWarning ? 'warning' : 'info'}
+      {/* 配额提示：接近上限（≥90%）用警告色；右侧为监控上限配置项 */}
+      <Stack
+        direction="row"
+        spacing={1.5}
+        alignItems="center"
+        sx={{ mb: 1.5, flexWrap: 'wrap' }}
+        useFlexGap
+      >
+        {quota && (
+          <Alert
+            severity={quotaWarning ? 'warning' : 'info'}
+            variant="outlined"
+            sx={{ flex: 1, minWidth: 260 }}
+          >
+            已监控 {quota.used}/{quota.max}，还可添加 {quota.max - quota.used} 个
+            {quotaWarning && '（已接近上限，建议清理不再需要的监控对象）'}
+          </Alert>
+        )}
+        <TextField
+          size="small"
+          type="number"
+          label="监控上限"
+          sx={{ width: 120 }}
+          value={maxTargetsInput}
+          onChange={(e) => setMaxTargetsInput(e.target.value)}
+          inputProps={{ min: 10, max: 2000 }}
+        />
+        <Button
+          size="small"
           variant="outlined"
-          sx={{ mb: 1.5 }}
+          disabled={!maxTargetsValid || saveMaxTargetsMutation.isPending}
+          onClick={() => saveMaxTargetsMutation.mutate()}
         >
-          已监控 {quota.used}/{quota.max}，还可添加 {quota.max - quota.used} 个
-          {quotaWarning && '（已接近上限，建议清理不再需要的监控对象）'}
-        </Alert>
-      )}
+          保存上限
+        </Button>
+      </Stack>
 
       <Stack direction="row" spacing={2} alignItems="stretch">
         {/* 左栏：通讯录候选 */}
@@ -395,14 +464,22 @@ function TargetsTab() {
           </List>
           <Button
             variant="contained"
-            startIcon={<AddIcon />}
+            startIcon={
+              addMutation.isPending ? (
+                <CircularProgress size={16} color="inherit" />
+              ) : (
+                <AddIcon />
+              )
+            }
             disabled={
               checkedCandidates.size === 0 || addMutation.isPending || quotaFull
             }
             onClick={() => addMutation.mutate([...checkedCandidates])}
             sx={{ mt: 1 }}
           >
-            添加 →{checkedCandidates.size > 0 ? `（${checkedCandidates.size}）` : ''}
+            {addMutation.isPending
+              ? '添加中…'
+              : `添加 →${checkedCandidates.size > 0 ? `（${checkedCandidates.size}）` : ''}`}
           </Button>
         </Box>
 
@@ -530,14 +607,25 @@ function TypesTab() {
           {error}
         </Alert>
       )}
-      <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-        <Typography variant="body2" color="text.secondary">
+      <Stack
+        direction="row"
+        justifyContent="space-between"
+        alignItems="center"
+        spacing={2}
+        sx={{ mb: 1 }}
+      >
+        <Typography
+          variant="body2"
+          color="text.secondary"
+          sx={{ flex: 1, minWidth: 0 }}
+        >
           用自然语言描述你的商机口径，描述修改后立即对后续消息生效。
           示例：「寻找机械加工订单的采购需求——客户明确提到需要 CNC/车铣/钣金加工、数量、交期等」
         </Typography>
         <Button
           variant="contained"
           startIcon={<AddIcon />}
+          sx={{ flexShrink: 0, whiteSpace: 'nowrap' }}
           onClick={() => {
             setForm(EMPTY_TYPE_FORM)
             setDialogOpen(true)
@@ -550,6 +638,7 @@ function TypesTab() {
         {(types ?? []).map((t) => (
           <ListItem
             key={t.id}
+            sx={{ pr: 17 }} // 给右侧「开关 + 编辑 + 删除」按钮留固定空间，避免描述文字被覆盖
             secondaryAction={
               <Stack direction="row" spacing={1} alignItems="center">
                 <Switch
@@ -673,8 +762,10 @@ function AiTab() {
   const [minConfidence, setMinConfidence] = useState(60)
   const [prescreenEnabled, setPrescreenEnabled] = useState(false)
   const [keywords, setKeywords] = useState('')
-  const [regex, setRegex] = useState('')
-  const [mergeWindow, setMergeWindow] = useState(60)
+  // 预筛正则 = 勾选的内置预设 + 自定义正则（保存时以 | 合并，存储格式不变）
+  const [selectedPresets, setSelectedPresets] = useState<string[]>([])
+  const [customRegex, setCustomRegex] = useState('')
+  const [mergeWindow, setMergeWindow] = useState(15)
   const [oppMergeWindow, setOppMergeWindow] = useState(180)
   const [analysisLoaded, setAnalysisLoaded] = useState(false)
   if (analysis && !analysisLoaded) {
@@ -682,10 +773,18 @@ function AiTab() {
     setMinConfidence(analysis.min_confidence)
     setPrescreenEnabled(analysis.prescreen_enabled)
     setKeywords(analysis.prescreen_keywords)
-    setRegex(analysis.prescreen_regex)
+    const parsed = parsePrescreen(analysis.prescreen_regex)
+    setSelectedPresets(parsed.selectedPresets)
+    setCustomRegex(parsed.customRegex)
     setMergeWindow(analysis.merge_window_sec)
     setOppMergeWindow(analysis.opp_merge_window_sec)
     setAnalysisLoaded(true)
+  }
+
+  const togglePreset = (regex: string) => {
+    setSelectedPresets((prev) =>
+      prev.includes(regex) ? prev.filter((r) => r !== regex) : [...prev, regex],
+    )
   }
 
   const saveAiMutation = useMutation({
@@ -715,7 +814,7 @@ function AiTab() {
         min_confidence: minConfidence,
         prescreen_enabled: prescreenEnabled,
         prescreen_keywords: keywords,
-        prescreen_regex: regex,
+        prescreen_regex: mergePrescreen(selectedPresets, customRegex),
         merge_window_sec: mergeWindow,
         opp_merge_window_sec: oppMergeWindow,
       }),
@@ -732,6 +831,12 @@ function AiTab() {
       apiPut<{ ok: boolean }>('/api/settings/notify', { sound_enabled: enabled }),
     onSuccess: (_resp, enabled) => {
       window.localStorage.setItem('kefu.sound_enabled', enabled ? '1' : '0')
+      // 同页 storage 事件不触发：派发自定义事件让 App 实时感知开关变化
+      window.dispatchEvent(
+        new CustomEvent('kefu-sound-settings-changed', {
+          detail: { enabled },
+        }),
+      )
     },
     onError: (err: Error) => setError(err.message),
   })
@@ -877,24 +982,51 @@ function AiTab() {
                 onChange={(e) => setKeywords(e.target.value)}
                 sx={{ width: 420 }}
               />
+              <Box>
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  sx={{ display: 'block', mb: 0.5 }}
+                >
+                  内置预设（可多选）
+                </Typography>
+                <Stack direction="row" spacing={1} sx={{ flexWrap: 'wrap' }} useFlexGap>
+                  {PRESCREEN_PRESETS.map((p) => {
+                    const selected = selectedPresets.includes(p.regex)
+                    return (
+                      <Chip
+                        key={p.key}
+                        size="small"
+                        label={p.label}
+                        color={selected ? 'primary' : 'default'}
+                        variant={selected ? 'filled' : 'outlined'}
+                        onClick={() => togglePreset(p.regex)}
+                      />
+                    )
+                  })}
+                </Stack>
+              </Box>
               <TextField
-                label="预筛正则（可选）"
-                value={regex}
-                onChange={(e) => setRegex(e.target.value)}
+                label="自定义正则（可选）"
+                value={customRegex}
+                onChange={(e) => setCustomRegex(e.target.value)}
                 sx={{ width: 420 }}
               />
+              <Typography variant="caption" color="text.secondary">
+                勾选预设或填写自定义正则，命中任一即送 AI 分析
+              </Typography>
             </Stack>
           )}
         </Box>
         <Box>
           <Typography variant="body2" gutterBottom>
-            消息合并窗口：{mergeWindow} 秒（发送人停止发言 {mergeWindow} 秒后立即分析，默认 60 秒）
+            消息合并窗口：{mergeWindow} 秒（发送人停止发言 {mergeWindow} 秒后立即分析，默认 15 秒）
           </Typography>
           <Slider
             value={mergeWindow}
-            min={10}
+            min={5}
             max={600}
-            step={10}
+            step={5}
             marks
             valueLabelDisplay="auto"
             onChange={(_, v) => setMergeWindow(v as number)}

@@ -15,6 +15,10 @@ from typing import Any, Iterable, Optional
 from app.config import (
     DB_PATH,
     DEFAULT_SETTINGS,
+    MERGE_WINDOW_SEC_DEFAULT,
+    MAX_MONITOR_TARGETS,
+    MONITOR_MAX_TARGETS_MIN,
+    MONITOR_MAX_TARGETS_MAX,
     KEY_AI_BASE_URL,
     KEY_AI_MODEL,
     KEY_ANALYSIS_MERGE_WINDOW,
@@ -27,7 +31,9 @@ from app.config import (
     KEY_AI_TIMEOUT_SEC,
     KEY_AI_TEMPERATURE,
     KEY_COMPLIANCE_CONFIRMED,
+    KEY_MONITOR_MAX_TARGETS,
     KEY_NOTIFY_SOUND,
+    KEY_RUNTIME_MW_MIGRATED,
 )
 
 logger = logging.getLogger(__name__)
@@ -155,6 +161,7 @@ class Database:
                 self._conn.execute(ddl)
             self._conn.commit()
         self._init_default_settings()
+        self._migrate_merge_window_default()
         logger.info("业务数据库已初始化：%s", self.path)
 
     # ------------------------------------------------------------------
@@ -178,6 +185,21 @@ class Database:
                     (key, value),
                 )
             self._conn.commit()
+
+    def _migrate_merge_window_default(self) -> None:
+        """一次性迁移（优化 7）：旧版本默认微窗口 60s → 15s。
+
+        仅当用户从未显式修改过该键（仍是出厂值 60）时才改写；
+        迁移后打标记，避免用户日后主动改回 60 又被复位。
+        """
+        if self.get_setting(KEY_RUNTIME_MW_MIGRATED, "0") == "1":
+            return
+        if self.get_setting(KEY_ANALYSIS_MERGE_WINDOW, "") == "60":
+            self.set_setting(KEY_ANALYSIS_MERGE_WINDOW,
+                             str(MERGE_WINDOW_SEC_DEFAULT))
+            logger.info("分析微窗口已从旧默认 60s 迁移为 %ds",
+                        MERGE_WINDOW_SEC_DEFAULT)
+        self.set_setting(KEY_RUNTIME_MW_MIGRATED, "1")
 
     # ------------------------------------------------------------------
     # settings DAO
@@ -294,6 +316,16 @@ class Database:
             self._conn.execute(
                 "UPDATE monitor_targets SET enabled=? WHERE id=?",
                 (1 if enabled else 0, target_id),
+            )
+            self._conn.commit()
+
+    def update_target_display_name(self, target_id: int,
+                                   display_name: str) -> None:
+        """刷新监控对象显示名快照（列表读取时补齐陈旧快照用）。"""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE monitor_targets SET display_name=? WHERE id=?",
+                (display_name, target_id),
             )
             self._conn.commit()
 
@@ -454,7 +486,7 @@ class Database:
             rows = self._conn.execute(
                 "SELECT id, session_username, session_name, sender_wxid, "
                 "sender_name, window_end, type_id, type_name, summary, "
-                "confidence, status, created_at FROM opportunities "
+                "key_quote, confidence, status, created_at FROM opportunities "
                 f"WHERE {where_sql} ORDER BY created_at DESC, id DESC "
                 "LIMIT ? OFFSET ?",
                 [*params, page_size, (max(page, 1) - 1) * page_size],
@@ -635,10 +667,21 @@ def read_analysis_settings(db: Database) -> dict[str, Any]:
         "prescreen_enabled": db.get_bool(KEY_ANALYSIS_PRESCREEN_ENABLED),
         "prescreen_keywords": db.get_setting(KEY_ANALYSIS_PRESCREEN_KEYWORDS, ""),
         "prescreen_regex": db.get_setting(KEY_ANALYSIS_PRESCREEN_REGEX, ""),
-        "merge_window_sec": db.get_int(KEY_ANALYSIS_MERGE_WINDOW, 60),
+        "merge_window_sec": db.get_int(KEY_ANALYSIS_MERGE_WINDOW,
+                                       MERGE_WINDOW_SEC_DEFAULT),
         "opp_merge_window_sec": db.get_int(KEY_ANALYSIS_OPP_MERGE_WINDOW, 180),
         "compliance_confirmed": db.get_bool(KEY_COMPLIANCE_CONFIRMED),
     }
+
+
+def read_monitor_max_targets(db: Database) -> int:
+    """读取监控对象数量上限（monitor.max_targets，越界值钳制到 10~2000）。"""
+    raw = db.get_setting(KEY_MONITOR_MAX_TARGETS, str(MAX_MONITOR_TARGETS))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return MAX_MONITOR_TARGETS
+    return max(MONITOR_MAX_TARGETS_MIN, min(MONITOR_MAX_TARGETS_MAX, value))
 
 
 def read_notify_settings(db: Database) -> dict[str, bool]:

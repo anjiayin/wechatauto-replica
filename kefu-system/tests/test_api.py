@@ -112,10 +112,15 @@ class FakePipeline:
     queue_max = 500
     dropped_total = 0
     busy = 0
+    health: dict = {"last_error": "", "consecutive_failures": 0}
 
     @property
     def queue_size(self) -> int:
         return 0
+
+    @property
+    def analysis_health(self) -> dict:
+        return dict(self.health)
 
 
 class FakeSender:
@@ -176,9 +181,19 @@ def insert_opp(db: Database, *, type_id: Optional[int] = None,
         key_quote="有谁能做铝合金CNC", confidence=confidence)
 
 
+def wait_until(predicate, timeout: float = 3.0) -> bool:
+    """轮询等待（后台线程注册监听为异步，测试需等待其生效）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return bool(predicate())
+
+
 LIST_ITEM_KEYS = {"id", "session_username", "session_name", "sender_wxid",
                   "sender_name", "window_end", "type_id", "type_name",
-                  "summary", "confidence", "status", "created_at"}
+                  "summary", "key_quote", "confidence", "status", "created_at"}
 DETAIL_EXTRA_KEYS = {"window_start", "merged_count", "raw_text", "key_quote",
                      "reply_content", "replied_at", "context"}
 
@@ -193,7 +208,8 @@ class TestSystemContract:
         assert resp.status_code == 200
         body = resp.json()
         for key in ("listener_running", "monitored_count", "wechat", "queue",
-                    "worker", "ai_configured", "watermark_saved_at"):
+                    "worker", "ai_configured", "watermark_saved_at",
+                    "analysis_health"):
             assert key in body, f"缺少字段 {key}"
         assert set(body["wechat"]) == {"alive", "visible"}
         assert set(body["queue"]) == {"size", "max", "dropped_total"}
@@ -202,9 +218,22 @@ class TestSystemContract:
         assert set(body["monitor_quota"]) == {"used", "max"}
         assert body["monitor_quota"]["used"] == 0
         assert body["monitor_quota"]["max"] == 200
+        # AI 分析健康度（优化 10：/api/status 新增 analysis_health）
+        assert set(body["analysis_health"]) == {"last_error",
+                                                "consecutive_failures"}
+        assert body["analysis_health"]["last_error"] == ""
+        assert body["analysis_health"]["consecutive_failures"] == 0
         assert body["queue"]["max"] == 500
         assert body["listener_running"] is True
         assert body["monitored_count"] == 2
+
+    def test_status_analysis_health_from_pipeline(self, env):
+        """优化 10：analysis_health 取自 pipeline 快照（页面刷新后仍可见）。"""
+        env.pipeline.health = {"last_error": "额度不足或触发限流",
+                               "consecutive_failures": 3}
+        body = env.client.get("/api/status").json()
+        assert body["analysis_health"]["last_error"] == "额度不足或触发限流"
+        assert body["analysis_health"]["consecutive_failures"] == 3
 
     def test_sessions_search(self, env):
         resp = env.client.get("/api/sessions/search", params={"keyword": "外协"})
@@ -279,7 +308,7 @@ class TestSystemContract:
 # ---------------------------------------------------------------------------
 class TestMonitorTargetsContract:
     def test_full_crud_flow(self, env):
-        # POST → 201 + 即时注册监听
+        # POST → 201 + 后台异步注册监听（优化 1：接口立即返回）
         resp = env.client.post("/api/monitor-targets",
                                json={"username": "111@chatroom"})
         assert resp.status_code == 201
@@ -287,7 +316,7 @@ class TestMonitorTargetsContract:
         assert body["username"] == "111@chatroom"
         assert body["kind"] == "group"
         assert body["enabled"] == 1
-        assert env.svc.registered == ["111@chatroom"]
+        assert wait_until(lambda: env.svc.registered == ["111@chatroom"])
         target_id = body["id"]
 
         # GET 列表
@@ -350,6 +379,46 @@ class TestMonitorTargetsContract:
         # 配额随 used 变化
         body = env.client.get("/api/status").json()
         assert body["monitor_quota"]["used"] == MAX_MONITOR_TARGETS
+
+
+class TestMonitorSettingsContract:
+    """优化 3：监控上限配置化（monitor.max_targets，10~2000）。"""
+
+    def test_monitor_settings_roundtrip(self, env):
+        # 默认 200
+        resp = env.client.get("/api/settings/monitor")
+        assert resp.status_code == 200
+        assert resp.json() == {"max_targets": 200}
+        # 保存 500 → 回读 + 配额即时生效
+        resp = env.client.put("/api/settings/monitor", json={"max_targets": 500})
+        assert resp.status_code == 200
+        assert resp.json()["max_targets"] == 500
+        assert env.db.get_setting("monitor.max_targets") == "500"
+        body = env.client.get("/api/status").json()
+        assert body["monitor_quota"]["max"] == 500
+        # 越界 → 422
+        assert env.client.put("/api/settings/monitor",
+                              json={"max_targets": 9}).status_code == 422
+        assert env.client.put("/api/settings/monitor",
+                              json={"max_targets": 2001}).status_code == 422
+
+    def test_quota_cap_uses_settings_value(self, env):
+        """配额校验使用 settings 里的上限值（非硬编码常量）。"""
+        env.db.set_setting("monitor.max_targets", "12")
+        for i in range(12):
+            env.db.insert_target(f"wxid_m12_{i}", f"联系人{i}", "friend")
+        resp = env.client.post("/api/monitor-targets",
+                               json={"username": "wxid_m12_over"})
+        assert resp.status_code == 400
+        assert "监控对象已达上限 12 个" in resp.json()["detail"]
+        body = env.client.get("/api/status").json()
+        assert body["monitor_quota"] == {"used": 12, "max": 12}
+
+    def test_quota_invalid_settings_falls_back(self, env):
+        """settings 里是非法值时回退常量 200（防御性）。"""
+        env.db.set_setting("monitor.max_targets", "not-a-number")
+        body = env.client.get("/api/status").json()
+        assert body["monitor_quota"]["max"] == 200
 
 
 # ---------------------------------------------------------------------------
@@ -512,8 +581,8 @@ class TestSettingsContract:
         resp = env.client.get("/api/settings/analysis")
         assert resp.status_code == 200
         assert resp.json()["strictness"] == "balanced"
-        # 优化 1：微窗口默认 60s，商机合并窗口默认 180s
-        assert resp.json()["merge_window_sec"] == 60
+        # 优化 1/7：微窗口默认 15s（5~600），商机合并窗口默认 180s
+        assert resp.json()["merge_window_sec"] == 15
         assert resp.json()["opp_merge_window_sec"] == 180
 
         resp = env.client.put("/api/settings/analysis", json={
@@ -530,12 +599,12 @@ class TestSettingsContract:
         assert body["opp_merge_window_sec"] == 600
         assert env.db.get_setting("analysis.opp_merge_window_sec") == "600"
 
-        # 部分更新：缺省时回退 schemas 默认（微窗口 60 / 商机合并窗口 180）
+        # 部分更新：缺省时回退 schemas 默认（微窗口 15 / 商机合并窗口 180）
         resp = env.client.put("/api/settings/analysis", json={
             "strictness": "balanced", "min_confidence": 60,
             "prescreen_enabled": False})
         assert resp.status_code == 200
-        assert resp.json()["merge_window_sec"] == 60
+        assert resp.json()["merge_window_sec"] == 15
         assert resp.json()["opp_merge_window_sec"] == 180
 
         # 非法档位 / 越界门槛 / 越界窗口 / 缺必填 → 422
@@ -545,7 +614,7 @@ class TestSettingsContract:
             {"strictness": "strict", "min_confidence": 101,
              "prescreen_enabled": False},
             {"strictness": "strict", "min_confidence": 60,
-             "prescreen_enabled": False, "merge_window_sec": 5},
+             "prescreen_enabled": False, "merge_window_sec": 4},
             {"strictness": "strict", "min_confidence": 60,
              "prescreen_enabled": False, "merge_window_sec": 601},
             {"strictness": "strict", "min_confidence": 60,
@@ -557,6 +626,34 @@ class TestSettingsContract:
         for bad in bad_bodies:
             resp = env.client.put("/api/settings/analysis", json=bad)
             assert resp.status_code == 422, f"应 422：{bad}"
+
+    def test_merge_window_min_boundary_5(self, env):
+        """优化 7：微窗口下限放宽到 5 秒（边界值合法）。"""
+        resp = env.client.put("/api/settings/analysis", json={
+            "strictness": "balanced", "min_confidence": 60,
+            "prescreen_enabled": False, "merge_window_sec": 5})
+        assert resp.status_code == 200
+        assert resp.json()["merge_window_sec"] == 5
+        assert env.db.get_setting("analysis.merge_window_sec") == "5"
+
+    def test_merge_window_legacy_default_migrated(self, tmp_path):
+        """优化 7：旧库存的出厂默认 60s 一次性迁移为 15s；用户自定义值不动。"""
+        db1 = Database(str(tmp_path / "migrate_legacy.sqlite3"))
+        # 模拟旧库：值为出厂默认 60，且尚无迁移标记
+        db1.set_setting("analysis.merge_window_sec", "60")
+        db1._conn.execute(
+            "DELETE FROM settings WHERE key='runtime.merge_window_migrated'")
+        db1._conn.commit()
+        db1.close()
+        # 重新打开：迁移生效
+        db2 = Database(str(tmp_path / "migrate_legacy.sqlite3"))
+        assert db2.get_setting("analysis.merge_window_sec") == "15"
+        # 再次打开（已迁移）：不会被二次改写；用户显式改回 60 也保留
+        db2.set_setting("analysis.merge_window_sec", "60")
+        db2.close()
+        db3 = Database(str(tmp_path / "migrate_legacy.sqlite3"))
+        assert db3.get_setting("analysis.merge_window_sec") == "60"
+        db3.close()
 
     def test_notify_roundtrip(self, env):
         resp = env.client.put("/api/settings/notify",

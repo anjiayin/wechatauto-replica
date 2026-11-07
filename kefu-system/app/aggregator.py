@@ -4,7 +4,7 @@
 设计要点（技术方案 1.1，优化后为两级窗口的第一级）：
 - Listener 回调线程调用 :meth:`Aggregator.add`，仅入缓冲即返回；
 - 独立调度线程每 1 秒检查一次，某缓冲区自最后一条消息起静默超过
-  分析微窗口（settings 可覆盖，默认 60 秒）即合并为一条 AnalysisUnit
+  分析微窗口（settings 可覆盖，默认 15 秒）即合并为一条 AnalysisUnit
   交给回调——商机最快可见延迟 ≈ 微窗口 + 1 秒（不再等 5 分钟）；
 - O-2 强制 flush 安全阀：缓冲区首条消息年龄超过 微窗口 ×
   ``AGGREGATOR_FORCE_FLUSH_FACTOR`` 时无条件 flush，杜绝持续发言

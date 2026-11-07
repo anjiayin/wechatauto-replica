@@ -377,6 +377,17 @@ class TestPipeline:
         pipeline._process(make_unit())
         assert client.calls == 0
 
+    def test_not_configured_records_health_failure(self):
+        """优化 10：AI 未配置也计入健康度失败（用户可感知）。"""
+        db, notifier = self._prepare()
+        db.set_setting("ai.base_url", "")
+        pipeline = Pipeline(db, notifier,
+                            client_factory=lambda cfg: FakeChatClient())
+        pipeline._process(make_unit())
+        health = pipeline.analysis_health
+        assert health["consecutive_failures"] == 1
+        assert "未配置" in health["last_error"]
+
     def test_compliance_gate(self):
         db, notifier = self._prepare()
         db.set_setting("compliance.confirmed", "0")
@@ -393,6 +404,122 @@ class TestPipeline:
         assert pipeline.enqueue(make_unit()) is True
         assert pipeline.enqueue(make_unit()) is False
         assert pipeline.dropped_total == 1
+
+
+# ---------------------------------------------------------------------------
+# AI 分析健康度 + analysis_error 广播（优化 10）
+# ---------------------------------------------------------------------------
+class TestAnalysisHealth:
+    def _prepare(self):
+        db = Database(":memory:")
+        notifier = Notifier()
+        db.insert_type("机械加工订单", "desc")
+        db.set_setting("ai.base_url", "https://mock.local/v1")
+        db.set_setting("ai.api_key_enc", encrypt_api_key("sk-test-12345678"))
+        db.set_setting("ai.model", "mock-model")
+        db.set_setting("compliance.confirmed", "1")
+        return db, notifier
+
+    def test_final_failure_records_health_and_broadcasts(self):
+        """重试耗尽后：健康度累计 + 广播 analysis_error（payload 含会话/摘要/次数）。"""
+        from app.config import RETRY_TIMES
+        db, notifier = self._prepare()
+        events: List[tuple] = []
+        notifier.broadcast = lambda event, data: events.append((event, data))
+        client = FakeChatClient(fail_times=10)
+        pipeline = Pipeline(db, notifier, client_factory=lambda cfg: client)
+        pipeline._process(make_unit())
+        assert client.calls == 1 + RETRY_TIMES  # 首调 + 重试 2 次
+        health = pipeline.analysis_health
+        assert health["consecutive_failures"] == 1
+        assert "模拟调用失败" in health["last_error"]
+        err_events = [e for e in events if e[0] == "analysis_error"]
+        assert len(err_events) == 1
+        payload = err_events[0][1]
+        assert payload["session_username"] == "12345@chatroom"
+        assert payload["consecutive_failures"] == 1
+        assert "模拟调用失败" in payload["error"]
+
+    def test_success_resets_health(self):
+        """AI 恢复成功：健康度清零（前端常驻横幅随之消失）。"""
+        db, notifier = self._prepare()
+        notifier.broadcast = lambda event, data: None
+        client = FakeChatClient(fail_times=10)
+        pipeline = Pipeline(db, notifier, client_factory=lambda cfg: client)
+        pipeline._process(make_unit())
+        assert pipeline.analysis_health["consecutive_failures"] == 1
+        client.fail_times = 0  # 恢复
+        pipeline._process(make_unit())
+        assert pipeline.analysis_health == {"last_error": "",
+                                            "consecutive_failures": 0}
+        total, _ = db.list_opportunities()
+        assert total == 1
+
+    def test_consecutive_failures_accumulate(self):
+        """连续多批失败：计数累加，广播 payload 携带累计次数。"""
+        db, notifier = self._prepare()
+        payloads: List[dict] = []
+        notifier.broadcast = lambda event, data: (
+            payloads.append(data) if event == "analysis_error" else None)
+        client = FakeChatClient(fail_times=99)
+        pipeline = Pipeline(db, notifier, client_factory=lambda cfg: client)
+        pipeline._process(make_unit())
+        pipeline._process(make_unit())
+        assert pipeline.analysis_health["consecutive_failures"] == 2
+        assert payloads[-1]["consecutive_failures"] == 2
+
+    def test_friendly_error_mapping(self):
+        """错误摘要友好映射：401/403 → Key 问题；429 → 额度；超时；其余前 80 字。"""
+        from app.pipeline import friendly_ai_error
+        assert friendly_ai_error(
+            "AI 接口调用失败：Error code: 401 - Invalid API key") == "Key 无效或无权限"
+        assert friendly_ai_error(
+            "AI 接口调用失败：Error code: 403 - permission denied") == "Key 无效或无权限"
+        assert friendly_ai_error(
+            "AI 接口调用失败：Error code: 429 - rate limit exceeded") == "额度不足或触发限流"
+        assert friendly_ai_error("Request timed out.") == "接口超时"
+        assert friendly_ai_error("连接超时（60 秒）") == "接口超时"
+        raw = "AI 接口调用失败：" + "x" * 200
+        assert friendly_ai_error(raw) == ("AI 接口调用失败：" + "x" * 200)[:80]
+        assert friendly_ai_error("") == "未知错误"
+
+
+# ---------------------------------------------------------------------------
+# 预筛内置预设正则（优化 4：前端 constants/prescreen.ts 的两串预设
+# 在后端 re 引擎必须可用且可命中，此处逐字复制防止漂移）
+# ---------------------------------------------------------------------------
+OE_PRESET = (r"(?<![A-Za-z0-9])(?:\d{4,5}-[A-Z0-9]{3,7}(?:-[A-Z0-9]{2,4})?"
+             r"|[A-Z0-9]{4}-\d{7}-[A-Za-z]"
+             r"|[A-Z]{1,3}[- ]?\d{2,3}[- ]?\d{3}[- ]?\d{1,3}(?:[- ]?\d{1,3})?"
+             r"|\d{10,13}|(?i:(?=[A-Z0-9]*[A-Z])[A-Z0-9]{8,15}))"
+             r"(?![A-Za-z0-9])")
+VIN_PRESET = r"(?<![A-Za-z0-9])[A-HJ-NPR-Z0-9]{17}(?![A-Za-z0-9])"
+
+
+class TestPrescreenRegexPresets:
+    def test_oe_preset_matches(self):
+        import re
+        assert re.search(OE_PRESET, "求丰田42431-0K090原厂件")
+        assert re.search(OE_PRESET, "本田04465-SZA-A020到货了吗")
+        assert re.search(OE_PRESET, "_digits 13800138000")  # 纯数字 10~13 位
+        assert re.search(OE_PRESET, "A12345678 报价")  # 字母开头 8~15 位（OE 预设范围）
+        assert not re.search(OE_PRESET, "LFV3A23C8K3123456")  # 17 位归 VIN 预设
+
+    def test_oe_preset_no_false_positive(self):
+        import re
+        assert not re.search(OE_PRESET, "今天天气不错聊聊家常")
+
+    def test_vin_preset_matches_and_excludes_ioq(self):
+        import re
+        assert re.search(VIN_PRESET, "VIN码LFV3A23C8K3123456出售")
+        assert not re.search(VIN_PRESET, "VIN码LFV3A23C8K31234I6")  # 含 I 不合法
+
+    def test_merged_regex_still_works_in_prescreen(self):
+        """前端 `|` 合并后的存储串可直接用于后端预筛（命中任一通过）。"""
+        merged = f"{OE_PRESET}|{VIN_PRESET}"
+        assert analyzer.prescreen("求42431-0K090", "", merged) is True
+        assert analyzer.prescreen("车架号LFV3A23C8K3123456", "", merged) is True
+        assert analyzer.prescreen("随便聊聊", "", merged) is False
 
 
 # ---------------------------------------------------------------------------

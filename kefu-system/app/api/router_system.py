@@ -20,9 +20,9 @@ from app.api.deps import (
     get_pipeline,
     get_wechat_service,
 )
-from app.config import MAX_MONITOR_TARGETS
-from app.db import Database
+from app.db import Database, read_monitor_max_targets
 from app.schemas import (
+    AnalysisHealth,
     MessageOut,
     MonitorQuota,
     QueueStatus,
@@ -52,6 +52,11 @@ def get_status(db: Database = Depends(get_db),
     ai_cfg_model = db.get_setting("ai.model", "")
     ai_key_enc = db.get_setting("ai.api_key_enc", "")
     ai_configured = bool(ai_cfg_base and ai_cfg_model and ai_key_enc)
+    try:
+        health = dict(pipeline.analysis_health)
+    except Exception:  # 防御：健康度读取失败不阻塞状态接口
+        logger.exception("读取分析健康度失败（按空值处理）")
+        health = {}
     return StatusOut(
         listener_running=svc.listener_running,
         monitored_count=svc.monitored_count,
@@ -61,7 +66,11 @@ def get_status(db: Database = Depends(get_db),
                           dropped_total=pipeline.dropped_total),
         worker=WorkerStatus(busy=pipeline.busy, max=2),
         monitor_quota=MonitorQuota(used=db.count_targets(),
-                                   max=MAX_MONITOR_TARGETS),
+                                   max=read_monitor_max_targets(db)),
+        analysis_health=AnalysisHealth(
+            last_error=str(health.get("last_error") or ""),
+            consecutive_failures=int(health.get("consecutive_failures") or 0),
+        ),
         ai_configured=ai_configured,
         watermark_saved_at=svc.watermark_saved_at,
         degraded_reason=svc.degraded_reason,

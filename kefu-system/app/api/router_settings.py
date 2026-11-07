@@ -5,6 +5,7 @@
 - GET/PUT /api/settings/ai
 - POST    /api/settings/ai/test
 - GET/PUT /api/settings/analysis
+- GET/PUT /api/settings/monitor
 - PUT     /api/settings/notify
 """
 from __future__ import annotations
@@ -29,16 +30,20 @@ from app.config import (
     KEY_ANALYSIS_PRESCREEN_REGEX,
     KEY_ANALYSIS_STRICTNESS,
     KEY_COMPLIANCE_CONFIRMED,
+    KEY_MONITOR_MAX_TARGETS,
     KEY_NOTIFY_SOUND,
+    MERGE_WINDOW_SEC_DEFAULT,
 )
 from app.crypto import encrypt_api_key, mask_key
-from app.db import Database
+from app.db import Database, read_monitor_max_targets
 from app.schemas import (
     AISettingsOut,
     AISettingsUpdate,
     AITestResult,
     AnalysisSettingsOut,
     AnalysisSettingsUpdate,
+    MonitorSettingsOut,
+    MonitorSettingsUpdate,
     NotifyUpdate,
 )
 
@@ -120,7 +125,8 @@ def _analysis_out(db: Database) -> AnalysisSettingsOut:
         prescreen_enabled=db.get_bool(KEY_ANALYSIS_PRESCREEN_ENABLED),
         prescreen_keywords=db.get_setting(KEY_ANALYSIS_PRESCREEN_KEYWORDS, ""),
         prescreen_regex=db.get_setting(KEY_ANALYSIS_PRESCREEN_REGEX, ""),
-        merge_window_sec=db.get_int(KEY_ANALYSIS_MERGE_WINDOW, 60),
+        merge_window_sec=db.get_int(KEY_ANALYSIS_MERGE_WINDOW,
+                                    MERGE_WINDOW_SEC_DEFAULT),
         opp_merge_window_sec=db.get_int(KEY_ANALYSIS_OPP_MERGE_WINDOW, 180),
     )
 
@@ -150,6 +156,26 @@ def update_analysis_settings(body: AnalysisSettingsUpdate,
     logger.info("分析设置已保存（strictness=%s, min_confidence=%d）",
                 body.strictness, body.min_confidence)
     return _analysis_out(db)
+
+
+# ---------------------------------------------------------------------------
+# 监控设置（监控对象数量上限）
+# ---------------------------------------------------------------------------
+@router.get("/monitor", response_model=MonitorSettingsOut)
+def get_monitor_settings(db: Database = Depends(get_db)
+                         ) -> MonitorSettingsOut:
+    """监控设置读取（当前仅 max_targets，越界值已钳制）。"""
+    return MonitorSettingsOut(max_targets=read_monitor_max_targets(db))
+
+
+@router.put("/monitor", response_model=MonitorSettingsOut)
+def update_monitor_settings(body: MonitorSettingsUpdate,
+                            db: Database = Depends(get_db)
+                            ) -> MonitorSettingsOut:
+    """保存监控对象数量上限（10~2000，即时生效）。"""
+    db.set_setting(KEY_MONITOR_MAX_TARGETS, str(body.max_targets))
+    logger.info("监控设置已保存（max_targets=%d）", body.max_targets)
+    return get_monitor_settings(db)
 
 
 # ---------------------------------------------------------------------------

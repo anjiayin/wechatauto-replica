@@ -94,8 +94,8 @@ def create_app() -> FastAPI:
         aggregator = Aggregator(
             flush_callback=lambda unit: _pipeline.enqueue(unit),
             window_sec_provider=lambda: max(
-                10, int(read_analysis_settings(_db).get("merge_window_sec",
-                                                        MERGE_WINDOW_SEC_DEFAULT))),
+                5, int(read_analysis_settings(_db).get("merge_window_sec",
+                                                       MERGE_WINDOW_SEC_DEFAULT))),
         )
         pipeline = Pipeline(db, notifier, worker_count=WORKER_COUNT,
                             queue_max=QUEUE_MAX)
@@ -106,6 +106,7 @@ def create_app() -> FastAPI:
         # 全局引用（供闭包/查找使用）
         globals()["_db"] = db
         globals()["_pipeline"] = pipeline
+        globals()["_aggregator"] = aggregator
         # 注入引用消息查询（避免 sender ↔ wechat_service 循环导入）
         sender.set_message_lookup(wechat.get_message_by_local_id)
         # 启动后台组件
@@ -127,10 +128,18 @@ def create_app() -> FastAPI:
         pipeline = deps.get_pipeline()
         sender = deps.get_sender()
         db = deps.get_db()
+        aggregator = globals().get("_aggregator")
         # 等待微信初始化线程结束（避免与 stop 并发竞争）
         wx_start = globals().get("_wx_start_thread")
         if wx_start is not None:
             wx_start.join(timeout=60)
+        # 先停合并窗口（flush 出的单元进入管线队列后由 worker 消化），
+        # 避免调度线程在 db 关闭后仍读库报错
+        if aggregator is not None:
+            try:
+                aggregator.stop(flush_all=False)
+            except Exception:
+                logger.exception("停止合并窗口异常（已忽略）")
         for stop in (wechat.stop, pipeline.stop, sender.stop, db.close):
             try:
                 stop()

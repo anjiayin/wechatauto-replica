@@ -33,6 +33,12 @@ class MonitorQuota(BaseModel):
     max: int = 0
 
 
+class AnalysisHealth(BaseModel):
+    """AI 分析健康度（内存态，pipeline 维护；页面刷新后仍可展示异常）。"""
+    last_error: str = ""               # 最近一次失败的友好错误摘要（成功后清空）
+    consecutive_failures: int = 0      # 连续失败次数（成功后归零）
+
+
 class StatusOut(BaseModel):
     listener_running: bool = False
     monitored_count: int = 0
@@ -40,6 +46,7 @@ class StatusOut(BaseModel):
     queue: QueueStatus = Field(default_factory=QueueStatus)
     worker: WorkerStatus = Field(default_factory=WorkerStatus)
     monitor_quota: MonitorQuota = Field(default_factory=MonitorQuota)
+    analysis_health: AnalysisHealth = Field(default_factory=AnalysisHealth)
     ai_configured: bool = False
     watermark_saved_at: str = ""
     degraded_reason: str = ""          # 微信接入降级原因（空 = 正常）
@@ -79,6 +86,7 @@ class MonitorTargetOut(BaseModel):
 
 class MonitorTargetCreate(BaseModel):
     username: str = Field(min_length=1)
+    display_name: str = ""             # 前端候选列表已知的显示名快照；空则由后端解析
 
 
 class MonitorTargetUpdate(BaseModel):
@@ -141,7 +149,7 @@ class AnalysisSettingsOut(BaseModel):
     prescreen_enabled: bool = False
     prescreen_keywords: str = ""
     prescreen_regex: str = ""
-    merge_window_sec: int = 60         # 分析微窗口：发送人静默 N 秒即触发 AI 分析
+    merge_window_sec: int = 15         # 分析微窗口：发送人静默 N 秒即触发 AI 分析
     opp_merge_window_sec: int = 180    # 商机合并窗口：同一人 N 秒内再次命中合并为一条
 
 
@@ -151,12 +159,21 @@ class AnalysisSettingsUpdate(BaseModel):
     prescreen_enabled: bool
     prescreen_keywords: str = ""
     prescreen_regex: str = ""
-    merge_window_sec: int = Field(default=60, ge=10, le=600)
+    merge_window_sec: int = Field(default=15, ge=5, le=600)
     opp_merge_window_sec: int = Field(default=180, ge=30, le=1800)
 
 
 class NotifyUpdate(BaseModel):
     sound_enabled: bool
+
+
+class MonitorSettingsOut(BaseModel):
+    """监控设置（当前仅暴露监控对象数量上限）。"""
+    max_targets: int = Field(default=200, ge=10, le=2000)
+
+
+class MonitorSettingsUpdate(BaseModel):
+    max_targets: int = Field(ge=10, le=2000)
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +189,7 @@ class OpportunityListItem(BaseModel):
     type_id: Optional[int] = None
     type_name: str = ""
     summary: str = ""
+    key_quote: str = ""                # 关键原文摘录（列表页「消息原文」列）
     confidence: int = 0
     status: str = "pending"
     created_at: str = ""

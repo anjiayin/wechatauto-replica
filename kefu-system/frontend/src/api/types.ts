@@ -25,6 +25,17 @@ export interface MonitorQuota {
   max: number
 }
 
+/** AI 分析健康度（/api/status.analysis_health） */
+export interface AnalysisHealth {
+  last_error: string
+  consecutive_failures: number
+}
+
+/** /api/settings/monitor */
+export interface MonitorSettings {
+  max_targets: number
+}
+
 export interface StatusOut {
   listener_running: boolean
   monitored_count: number
@@ -32,6 +43,7 @@ export interface StatusOut {
   queue: QueueStatus
   worker: WorkerStatus
   monitor_quota: MonitorQuota
+  analysis_health: AnalysisHealth
   ai_configured: boolean
   watermark_saved_at: string
   degraded_reason: string
@@ -107,7 +119,7 @@ export interface AnalysisSettings {
   prescreen_enabled: boolean
   prescreen_keywords: string
   prescreen_regex: string
-  /** 分析微窗口：发送人静默 N 秒即触发 AI 分析（10–600，默认 60） */
+  /** 分析微窗口：发送人静默 N 秒即触发 AI 分析（5–600，默认 15） */
   merge_window_sec: number
   /** 商机合并窗口：同一人 N 秒内再次命中合并为一条（30–1800，默认 180） */
   opp_merge_window_sec: number
@@ -124,6 +136,8 @@ export interface OpportunityListItem {
   type_id: number | null
   type_name: string
   summary: string
+  /** 关键原文摘录（列表页「消息原文」列） */
+  key_quote: string
   confidence: number
   status: 'pending' | 'replied' | 'ignored'
   created_at: string
