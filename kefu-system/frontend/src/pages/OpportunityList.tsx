@@ -161,7 +161,7 @@ export default function OpportunityList() {
               <TableRow>
                 <TableCell colSpan={8}>
                   <Typography color="text.secondary" align="center" sx={{ py: 4 }}>
-                    暂无商机。请确认：① 设置页已配置监控对象与商机类型；② AI 接口可用；③ 新消息需经过合并窗口（默认 5 分钟）后才会产生商机。
+                    暂无商机。请确认：① 设置页已配置监控对象与商机类型；② AI 接口可用；③ 新消息在发送人停止发言（默认 60 秒）后即触发分析并产生商机。
                   </Typography>
                 </TableCell>
               </TableRow>

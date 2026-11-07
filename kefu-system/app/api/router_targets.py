@@ -15,6 +15,7 @@ import sqlite3
 from fastapi import APIRouter, Depends, HTTPException, Response
 
 from app.api.deps import get_db, get_wechat_service
+from app.config import MAX_MONITOR_TARGETS
 from app.db import Database
 from app.schemas import MonitorTargetCreate, MonitorTargetOut, MonitorTargetUpdate
 from app.wechat_service import WeChatService
@@ -46,10 +47,17 @@ def create_target(body: MonitorTargetCreate,
         raise HTTPException(status_code=400, detail="该会话已在监控列表中")
     kind = "group" if username.endswith("@chatroom") else "friend"
     display_name = svc.get_display_name(username) or username
+    # 原子「配额校验 + 插入」（BUG-3 修复：check-then-insert 并发越界）
     try:
-        target = db.insert_target(username, display_name, kind)
+        target = db.insert_target_within_limit(username, display_name, kind,
+                                               MAX_MONITOR_TARGETS)
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=400, detail="该会话已在监控列表中")
+    if target is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"监控对象已达上限 {MAX_MONITOR_TARGETS} 个，"
+                   "请先移除部分再添加")
     if target["enabled"]:
         svc.register_target(username)
     logger.info("新增监控对象：%s（%s）", display_name, username)

@@ -221,16 +221,26 @@ class WeChatService:
         return name
 
     def search_sessions(self, keyword: str = "",
-                        limit: int = SESSION_SEARCH_LIMIT_DEFAULT) -> list[dict]:
+                        limit: int = SESSION_SEARCH_LIMIT_DEFAULT,
+                        kind: str = "all") -> list[dict]:
         """会话搜索（群 + 好友）：复用 get_sessions / search_contact / get_contacts。
+
+        Args:
+            kind: `all` / `group` / `friend`，按类型过滤返回结果
+               （设置页监控对象双栏左栏按类型拉取候选列表用）。
 
         Returns:
             [{username, display_name, kind}]
         """
+        kind = kind if kind in ("group", "friend", "all") else "all"
         limit = max(1, min(limit, 100))
         out: dict[str, dict] = {}
         if self._wxdb is None:
             return []
+
+        def _accept(item_kind: str) -> bool:
+            return kind == "all" or item_kind == kind
+
         try:
             # 会话列表（最近活跃优先）
             for s in self._wxdb.get_sessions(limit=100):
@@ -238,31 +248,39 @@ class WeChatService:
                 if not username or username in out:
                     continue
                 if username.endswith("@chatroom"):
-                    kind, name = "group", self.get_display_name(username)
+                    item_kind, name = "group", self.get_display_name(username)
                 elif username.startswith("gh_"):
                     continue  # 公众号不参与监控
                 else:
-                    kind, name = "friend", self.get_display_name(username)
+                    item_kind, name = "friend", self.get_display_name(username)
+                if not _accept(item_kind):
+                    continue
                 if keyword and keyword not in name and keyword not in username:
                     continue
                 out[username] = {"username": username,
-                                 "display_name": name, "kind": kind}
+                                 "display_name": name, "kind": item_kind}
                 if len(out) >= limit:
                     return list(out.values())
             # 联系人搜索（覆盖不在最近会话里的好友/群）
             contacts = []
             if keyword:
                 contacts = self._wxdb.search_contact(keyword)
+            elif kind == "group":
+                # wechatauto.get_contacts 的群聊取值为 "chatroom"（不是 "group"）
+                contacts = self._wxdb.get_contacts(kind="chatroom", limit=limit)
             else:
                 contacts = self._wxdb.get_contacts(kind="friend", limit=limit)
             for c in contacts:
                 username = str(c.get("username") or "")
                 if not username or username in out or username.startswith("gh_"):
                     continue
-                kind = ("group" if username.endswith("@chatroom") else "friend")
+                item_kind = ("group" if username.endswith("@chatroom")
+                             else "friend")
+                if not _accept(item_kind):
+                    continue
                 name = c.get("remark") or c.get("nick_name") or username
                 out[username] = {"username": username,
-                                 "display_name": name, "kind": kind}
+                                 "display_name": name, "kind": item_kind}
                 if len(out) >= limit:
                     break
         except Exception as exc:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timedelta
 from typing import List
 
 import pytest
@@ -219,6 +220,48 @@ class TestAggregator:
         agg.stop(flush_all=False)
         assert len(flushed) == 1
 
+    def test_micro_window_flush_timing(self):
+        """优化 1：微窗口到期即 flush，最大延迟 ≈ 窗口 + 1s 扫描间隔（不再等 5 分钟）。
+
+        注：_flush_expired 内有 max(5, window) 安全下限，测试用 5s 窗口验证时序。
+        """
+        flushed: List[AnalysisUnit] = []
+        agg = Aggregator(flush_callback=flushed.append,
+                         window_sec_provider=lambda: 5)
+        started = time.time()
+        agg.start()
+        agg.add(make_msg("微窗口消息", 1), "群", "group")
+        deadline = time.time() + 12  # 窗口 5s + 调度 1s，留足余量
+        while not flushed and time.time() < deadline:
+            time.sleep(0.05)
+        elapsed = time.time() - started
+        agg.stop(flush_all=False)
+        assert len(flushed) == 1
+        # 静默窗口 5s + 扫描间隔 1s 内完成（远小于原 5 分钟）
+        assert elapsed < 8.0
+
+    def test_force_flush_safety_valve(self):
+        """O-2 安全阀：首条消息年龄超过 微窗口×10 时无条件 flush，
+        杜绝持续发言导致的分析延迟无上界与缓冲无上限。"""
+        flushed: List[AnalysisUnit] = []
+        agg = Aggregator(flush_callback=flushed.append,
+                         window_sec_provider=lambda: 5)
+        now = time.time()
+        # 首条 60s 前入缓冲（年龄 60 > 5×10=50），最后一条 1s 前（静默 < 窗口）
+        agg.add(make_msg("开头", 1, create_time=now - 60), "群", "group")
+        agg.add(make_msg("最近", 2, create_time=now - 1), "群", "group")
+        agg._flush_expired()
+        assert len(flushed) == 1  # 静默不足但首条年龄超限 → 强制 flush
+        assert "开头" in flushed[0].merged_text()
+        # 对照：首条年龄未超限时，持续发言不触发强制 flush
+        flushed2: List[AnalysisUnit] = []
+        agg2 = Aggregator(flush_callback=flushed2.append,
+                          window_sec_provider=lambda: 5)
+        agg2.add(make_msg("a", 1, create_time=now - 3), "群", "group")
+        agg2.add(make_msg("b", 2, create_time=now - 1), "群", "group")
+        agg2._flush_expired()
+        assert flushed2 == []
+
 
 # ---------------------------------------------------------------------------
 # analyzer
@@ -350,6 +393,246 @@ class TestPipeline:
         assert pipeline.enqueue(make_unit()) is True
         assert pipeline.enqueue(make_unit()) is False
         assert pipeline.dropped_total == 1
+
+
+# ---------------------------------------------------------------------------
+# 商机合并窗口（优化 1 第二级：默认 180 秒）
+# ---------------------------------------------------------------------------
+def recent_unit(lines: List[tuple] | None = None,
+                window_end_offset_sec: float = 0.0,
+                session: str = "12345@chatroom",
+                sender_wxid: str = "wxid_zhang",
+                sender_name: str = "张三") -> AnalysisUnit:
+    """构造 window_end 为「现在 + offset」的分析单元（时间可自由控制）。"""
+    end_epoch = time.time() + window_end_offset_sec
+    start_epoch = end_epoch - 60
+    fmt = lambda e: datetime.fromtimestamp(e).isoformat(timespec="seconds")
+    hm = lambda e: datetime.fromtimestamp(e).strftime("%H:%M")
+    ls = lines or [(hm(start_epoch), "有谁能做铝合金CNC")]
+    return AnalysisUnit(
+        session_username=session,
+        session_name="加工外协群",
+        session_kind="group",
+        sender_wxid=sender_wxid,
+        sender_name=sender_name,
+        window_start=fmt(start_epoch),
+        window_end=fmt(end_epoch),
+        merged_count=len(ls),
+        lines=ls,
+    )
+
+
+class TestOpportunityMerge:
+    """同发送人商机合并 / 超时新建 / 已回复与已忽略新建。"""
+
+    def _prepare(self):
+        db = Database(":memory:")
+        notifier = Notifier()
+        db.insert_type("机械加工订单", "desc")
+        db.set_setting("ai.base_url", "https://mock.local/v1")
+        db.set_setting("ai.api_key_enc", encrypt_api_key("sk-test-12345678"))
+        db.set_setting("ai.model", "mock-model")
+        db.set_setting("compliance.confirmed", "1")
+        db.set_setting("analysis.min_confidence", "60")
+        return db, notifier
+
+    def _events(self, notifier) -> List[str]:
+        events: List[str] = []
+        notifier.broadcast = lambda event, data: events.append(event)
+        return events
+
+    def test_second_hit_merges_into_existing(self):
+        """180s 内同发送人再次命中 → 合并为一条 + opportunity_update。"""
+        db, notifier = self._prepare()
+        events = self._events(notifier)
+        client = FakeChatClient(result={
+            "hit": True, "type": "机械加工订单",
+            "points": ["追加要点：交期两周"], "confidence": 90,
+            "quote": "急，两周内要"})
+        pipeline = Pipeline(db, notifier, client_factory=lambda cfg: client)
+        pipeline._process(recent_unit([("14:02", "有谁能做铝合金CNC")],
+                                      window_end_offset_sec=-120))
+        total, rows = db.list_opportunities()
+        assert total == 1
+        first_id = rows[0]["id"]
+        assert events == ["opportunity_new"]
+        # 第二批命中（window_end 距今 10 秒，在 180s 合并窗口内）
+        pipeline._process(recent_unit([("14:05", "急，两周内要")],
+                                      window_end_offset_sec=-10))
+        total, rows = db.list_opportunities()
+        assert total == 1  # 未新建
+        opp = db.get_opportunity(first_id)
+        assert opp["merged_count"] == 2
+        assert "有谁能做铝合金CNC" in opp["raw_text"]
+        assert "急，两周内要" in opp["raw_text"]  # raw_text 追加
+        assert "[14:05]" in opp["raw_text"]       # 保持 [HH:MM] 行格式
+        # summary 要点并集去重（旧 + 新）
+        assert "铝合金CNC 500件" not in opp["summary"]  # 第一批 client 未用此 result
+        assert "追加要点：交期两周" in opp["summary"]
+        # confidence 取较大值（90 > 85）
+        assert opp["confidence"] == 90
+        # key_quote 取最新
+        assert opp["key_quote"] == "急，两周内要"
+        assert opp["status"] == "pending"
+        # analysis_logs 关联到被合并商机
+        assert events[-1] == "opportunity_update"
+        log = db._conn.execute(
+            "SELECT opportunity_id FROM analysis_logs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert log["opportunity_id"] == first_id
+
+    def test_merge_points_dedup_union(self):
+        """要点并集去重：旧要点与新要点重复项只保留一份。"""
+        db, notifier = self._prepare()
+        self._events(notifier)
+        client = FakeChatClient(result={
+            "hit": True, "type": "机械加工订单",
+            "points": ["需要加工铝合金件", "数量约500件"], "confidence": 85,
+            "quote": "q1"})
+        pipeline = Pipeline(db, notifier, client_factory=lambda cfg: client)
+        pipeline._process(recent_unit([("14:02", "铝合金500件")],
+                                      window_end_offset_sec=-60))
+        # 第二批：其中一条要点重复
+        client.result = {"hit": True, "type": "机械加工订单",
+                         "points": ["数量约500件", "交期两周"], "confidence": 80,
+                         "quote": "q2"}
+        pipeline._process(recent_unit([("14:05", "两周内交货")],
+                                      window_end_offset_sec=-10))
+        total, rows = db.list_opportunities()
+        assert total == 1
+        summary_lines = rows[0]["summary"].split("\n")
+        assert sorted(summary_lines) == sorted(
+            ["需要加工铝合金件", "数量约500件", "交期两周"])
+
+    def test_merge_window_timeout_creates_new(self):
+        """超过商机合并窗口（180s）→ 不合并，新建商机。"""
+        db, notifier = self._prepare()
+        events = self._events(notifier)
+        client = FakeChatClient()
+        pipeline = Pipeline(db, notifier, client_factory=lambda cfg: client)
+        # 第一批 window_end 距今 10 分钟（远超 180s 窗口）
+        pipeline._process(recent_unit([("13:00", "第一批")],
+                                      window_end_offset_sec=-600))
+        pipeline._process(recent_unit([("14:05", "第二批")]))
+        total, rows = db.list_opportunities()
+        assert total == 2
+        assert events.count("opportunity_new") == 2
+        assert "opportunity_update" not in events
+
+    def test_replied_opportunity_creates_new(self):
+        """商机合并窗口内的商机若已回复 → 不合并，新建。"""
+        db, notifier = self._prepare()
+        self._events(notifier)
+        client = FakeChatClient()
+        pipeline = Pipeline(db, notifier, client_factory=lambda cfg: client)
+        pipeline._process(recent_unit([("14:02", "第一批")],
+                                      window_end_offset_sec=-30))
+        total, rows = db.list_opportunities()
+        db.set_opportunity_replied(rows[0]["id"], "已回复")
+        pipeline._process(recent_unit([("14:05", "第二批")]))
+        total, rows = db.list_opportunities()
+        assert total == 2
+        assert all(o["status"] in ("pending", "replied") for o in rows)
+
+    def test_ignored_opportunity_creates_new(self):
+        """商机合并窗口内的商机若已忽略 → 不合并，新建。"""
+        db, notifier = self._prepare()
+        self._events(notifier)
+        client = FakeChatClient()
+        pipeline = Pipeline(db, notifier, client_factory=lambda cfg: client)
+        pipeline._process(recent_unit([("14:02", "第一批")],
+                                      window_end_offset_sec=-30))
+        _, rows = db.list_opportunities()
+        db.update_opportunity_status(rows[0]["id"], "ignored")
+        pipeline._process(recent_unit([("14:05", "第二批")]))
+        total, _ = db.list_opportunities()
+        assert total == 1  # ignored 默认不在列表；新建 1 条 pending
+        assert db.list_opportunities(status="ignored")[0] == 1
+
+    def test_different_sender_no_merge(self):
+        """同会话但不同发送人 → 不合并，各自新建。"""
+        db, notifier = self._prepare()
+        self._events(notifier)
+        client = FakeChatClient()
+        pipeline = Pipeline(db, notifier, client_factory=lambda cfg: client)
+        pipeline._process(recent_unit([("14:02", "张三的话")],
+                                      window_end_offset_sec=-30))
+        pipeline._process(recent_unit([("14:05", "李四的话")],
+                                      window_end_offset_sec=-20,
+                                      sender_wxid="wxid_li",
+                                      sender_name="李四"))
+        total, _ = db.list_opportunities()
+        assert total == 2
+
+    def test_sender_wxid_empty_falls_back_to_name(self):
+        """wxid 缺失时按昵称匹配合并（共享约定 9.2）。"""
+        db, notifier = self._prepare()
+        self._events(notifier)
+        client = FakeChatClient()
+        pipeline = Pipeline(db, notifier, client_factory=lambda cfg: client)
+        pipeline._process(recent_unit([("14:02", "第一批")],
+                                      window_end_offset_sec=-30,
+                                      sender_wxid=""))
+        pipeline._process(recent_unit([("14:05", "第二批")],
+                                      window_end_offset_sec=-10,
+                                      sender_wxid=""))
+        total, rows = db.list_opportunities()
+        assert total == 1
+        assert db.get_opportunity(rows[0]["id"])["merged_count"] == 2
+
+    def test_opp_merge_window_setting_respected(self):
+        """analysis.opp_merge_window_sec 可覆盖默认 180s。"""
+        db, notifier = self._prepare()
+        self._events(notifier)
+        db.set_setting("analysis.opp_merge_window_sec", "10")
+        client = FakeChatClient()
+        pipeline = Pipeline(db, notifier, client_factory=lambda cfg: client)
+        # window_end 距今 30s：默认 180s 会合并，但窗口缩到 10s 后应新建
+        pipeline._process(recent_unit([("14:02", "第一批")],
+                                      window_end_offset_sec=-30))
+        pipeline._process(recent_unit([("14:05", "第二批")]))
+        total, _ = db.list_opportunities()
+        assert total == 2
+
+    def test_merge_span_cap_creates_new(self):
+        """O-1：商机 window_start 距今超过 30 分钟跨度上限 → 不再续命，新建。"""
+        from app.config import MAX_OPPORTUNITY_SPAN_SEC
+        db, notifier = self._prepare()
+        self._events(notifier)
+        client = FakeChatClient()
+        pipeline = Pipeline(db, notifier, client_factory=lambda cfg: client)
+        # 直接构造一条长期滚动合并的商机：起点远超跨度上限、window_end 近期
+        start_iso = (datetime.now() - timedelta(
+            seconds=MAX_OPPORTUNITY_SPAN_SEC + 200)).isoformat(timespec="seconds")
+        end_iso = (datetime.now() - timedelta(seconds=5)).isoformat(
+            timespec="seconds")
+        db.insert_opportunity(
+            session_username="12345@chatroom", session_name="加工外协群",
+            sender_wxid="wxid_zhang", sender_name="张三",
+            window_start=start_iso, window_end=end_iso, merged_count=5,
+            raw_text="[09:00] 历史文本", type_id=None,
+            type_name="机械加工订单", summary="旧要点", key_quote="",
+            confidence=85)
+        # 新批次 window_end 距今 1s（在 180s 合并窗口内），但起点超限 → 新建
+        pipeline._process(recent_unit([("14:05", "新一批")],
+                                      window_end_offset_sec=-1))
+        total, rows = db.list_opportunities()
+        assert total == 2
+        new_opp = db.get_opportunity(max(rows, key=lambda r: r["id"])["id"])
+        assert new_opp["merged_count"] == 1  # 新建而非并入 merged_count=5 的旧条
+
+    def test_merge_within_span_cap_still_merges(self):
+        """O-1 对照：起点在跨度上限内的商机照常合并。"""
+        db, notifier = self._prepare()
+        self._events(notifier)
+        client = FakeChatClient()
+        pipeline = Pipeline(db, notifier, client_factory=lambda cfg: client)
+        pipeline._process(recent_unit([("14:02", "第一批")],
+                                      window_end_offset_sec=-30))
+        pipeline._process(recent_unit([("14:05", "第二批")],
+                                      window_end_offset_sec=-10))
+        total, _ = db.list_opportunities()
+        assert total == 1
 
 
 # ---------------------------------------------------------------------------

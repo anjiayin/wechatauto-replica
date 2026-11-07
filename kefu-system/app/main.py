@@ -94,7 +94,7 @@ def create_app() -> FastAPI:
         aggregator = Aggregator(
             flush_callback=lambda unit: _pipeline.enqueue(unit),
             window_sec_provider=lambda: max(
-                30, int(read_analysis_settings(_db).get("merge_window_sec",
+                10, int(read_analysis_settings(_db).get("merge_window_sec",
                                                         MERGE_WINDOW_SEC_DEFAULT))),
         )
         pipeline = Pipeline(db, notifier, worker_count=WORKER_COUNT,

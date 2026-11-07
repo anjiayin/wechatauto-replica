@@ -19,12 +19,19 @@ export interface WorkerStatus {
   max: number
 }
 
+/** 监控对象配额（/api/status.monitor_quota） */
+export interface MonitorQuota {
+  used: number
+  max: number
+}
+
 export interface StatusOut {
   listener_running: boolean
   monitored_count: number
   wechat: WechatStatus
   queue: QueueStatus
   worker: WorkerStatus
+  monitor_quota: MonitorQuota
   ai_configured: boolean
   watermark_saved_at: string
   degraded_reason: string
@@ -100,7 +107,10 @@ export interface AnalysisSettings {
   prescreen_enabled: boolean
   prescreen_keywords: string
   prescreen_regex: string
+  /** 分析微窗口：发送人静默 N 秒即触发 AI 分析（10–600，默认 60） */
   merge_window_sec: number
+  /** 商机合并窗口：同一人 N 秒内再次命中合并为一条（30–1800，默认 180） */
+  opp_merge_window_sec: number
 }
 
 /** /api/opportunities */

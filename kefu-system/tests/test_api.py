@@ -78,11 +78,15 @@ class FakeWechatService:
         return True
 
     # --- 查询能力 ---
-    def search_sessions(self, keyword: str = "", limit: int = 20) -> list[dict]:
+    def search_sessions(self, keyword: str = "", limit: int = 20,
+                        kind: str = "all") -> list[dict]:
+        items = self.sessions
+        if kind in ("group", "friend"):
+            items = [s for s in items if s["kind"] == kind]
         if keyword:
-            return [s for s in self.sessions
-                    if keyword in s["display_name"] or keyword in s["username"]]
-        return self.sessions[:limit]
+            items = [s for s in items
+                     if keyword in s["display_name"] or keyword in s["username"]]
+        return items[:limit]
 
     def get_messages(self, username: str, limit: int = 50,
                      before_seq: int = 0) -> list[dict]:
@@ -194,6 +198,10 @@ class TestSystemContract:
         assert set(body["wechat"]) == {"alive", "visible"}
         assert set(body["queue"]) == {"size", "max", "dropped_total"}
         assert set(body["worker"]) == {"busy", "max"}
+        # 监控配额（优化 2：/api/status 新增 monitor_quota）
+        assert set(body["monitor_quota"]) == {"used", "max"}
+        assert body["monitor_quota"]["used"] == 0
+        assert body["monitor_quota"]["max"] == 200
         assert body["queue"]["max"] == 500
         assert body["listener_running"] is True
         assert body["monitored_count"] == 2
@@ -205,6 +213,47 @@ class TestSystemContract:
         assert len(items) == 1
         assert set(items[0]) == {"username", "display_name", "kind"}
         assert items[0]["kind"] == "group"
+
+    def test_sessions_search_kind_filter(self, env):
+        """优化 2：kind 查询参数按类型过滤（all/group/friend）。"""
+        # 默认 all：群+好友都返回
+        resp = env.client.get("/api/sessions/search")
+        assert resp.status_code == 200
+        assert {i["kind"] for i in resp.json()} == {"group", "friend"}
+        # kind=group：只回群聊
+        resp = env.client.get("/api/sessions/search", params={"kind": "group"})
+        items = resp.json()
+        assert len(items) == 1
+        assert items[0]["username"] == "111@chatroom"
+        # kind=friend：只回私聊
+        resp = env.client.get("/api/sessions/search", params={"kind": "friend"})
+        items = resp.json()
+        assert len(items) == 1
+        assert items[0]["username"] == "wxid_b"
+        # kind 与 keyword 组合
+        resp = env.client.get("/api/sessions/search",
+                              params={"kind": "friend", "keyword": "李四"})
+        assert [i["username"] for i in resp.json()] == ["wxid_b"]
+        # 非法 kind → 422
+        assert env.client.get(
+            "/api/sessions/search", params={"kind": "bogus"}).status_code == 422
+
+    def test_sessions_search_kind_edge_cases(self, env):
+        """QA 补充：kind 参数边界（大小写 / 空串 / 空结果集）。
+
+        契约定性：kind 校验为大小写敏感的正则（GROUP/Group/"" → 422），
+        前端只发小写 group/friend，不受影响；合法 kind + 无匹配 → 200 []。
+        """
+        # 大写非法 → 422（契约：pattern 大小写敏感）
+        for bad in ("GROUP", "Group", "Friend", ""):
+            assert env.client.get(
+                "/api/sessions/search", params={"kind": bad}
+            ).status_code == 422, f"kind={bad!r} 应 422"
+        # 合法 kind 但无匹配 → 200 + 空数组
+        resp = env.client.get("/api/sessions/search",
+                              params={"kind": "group", "keyword": "不存在的关键词"})
+        assert resp.status_code == 200
+        assert resp.json() == []
 
     def test_sessions_search_limit_validation(self, env):
         # limit 越界（>100）→ 422；边界 100 → 200
@@ -281,6 +330,26 @@ class TestMonitorTargetsContract:
                                json={"username": "wxid_b"})
         assert resp.status_code == 201
         assert resp.json()["kind"] == "friend"
+
+    def test_monitor_quota_cap_400(self, env):
+        """优化 2：监控数量达上限后 POST 返回 400 + 中文 detail。"""
+        from app.config import MAX_MONITOR_TARGETS
+        for i in range(MAX_MONITOR_TARGETS):
+            env.db.insert_target(f"wxid_cap_{i}", f"联系人{i}", "friend")
+        resp = env.client.post("/api/monitor-targets",
+                               json={"username": "wxid_overflow"})
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert f"监控对象已达上限 {MAX_MONITOR_TARGETS} 个" in detail
+        assert "请先移除部分再添加" in detail
+        # 移除一个后恢复可添加
+        assert env.client.delete("/api/monitor-targets/1").status_code == 204
+        resp = env.client.post("/api/monitor-targets",
+                               json={"username": "wxid_overflow"})
+        assert resp.status_code == 201
+        # 配额随 used 变化
+        body = env.client.get("/api/status").json()
+        assert body["monitor_quota"]["used"] == MAX_MONITOR_TARGETS
 
 
 # ---------------------------------------------------------------------------
@@ -443,25 +512,31 @@ class TestSettingsContract:
         resp = env.client.get("/api/settings/analysis")
         assert resp.status_code == 200
         assert resp.json()["strictness"] == "balanced"
-        assert resp.json()["merge_window_sec"] == 300
+        # 优化 1：微窗口默认 60s，商机合并窗口默认 180s
+        assert resp.json()["merge_window_sec"] == 60
+        assert resp.json()["opp_merge_window_sec"] == 180
 
         resp = env.client.put("/api/settings/analysis", json={
             "strictness": "strict", "min_confidence": 75,
             "prescreen_enabled": True, "prescreen_keywords": "采购,求购",
-            "prescreen_regex": "", "merge_window_sec": 120})
+            "prescreen_regex": "", "merge_window_sec": 120,
+            "opp_merge_window_sec": 600})
         assert resp.status_code == 200
         body = resp.json()
         assert body["strictness"] == "strict"
         assert body["min_confidence"] == 75
         assert body["prescreen_enabled"] is True
         assert body["merge_window_sec"] == 120
+        assert body["opp_merge_window_sec"] == 600
+        assert env.db.get_setting("analysis.opp_merge_window_sec") == "600"
 
-        # 部分更新：merge_window_sec 缺省时回退默认 300（schemas default=300）
+        # 部分更新：缺省时回退 schemas 默认（微窗口 60 / 商机合并窗口 180）
         resp = env.client.put("/api/settings/analysis", json={
             "strictness": "balanced", "min_confidence": 60,
             "prescreen_enabled": False})
         assert resp.status_code == 200
-        assert resp.json()["merge_window_sec"] == 300
+        assert resp.json()["merge_window_sec"] == 60
+        assert resp.json()["opp_merge_window_sec"] == 180
 
         # 非法档位 / 越界门槛 / 越界窗口 / 缺必填 → 422
         bad_bodies = [
@@ -470,7 +545,13 @@ class TestSettingsContract:
             {"strictness": "strict", "min_confidence": 101,
              "prescreen_enabled": False},
             {"strictness": "strict", "min_confidence": 60,
-             "prescreen_enabled": False, "merge_window_sec": 10},
+             "prescreen_enabled": False, "merge_window_sec": 5},
+            {"strictness": "strict", "min_confidence": 60,
+             "prescreen_enabled": False, "merge_window_sec": 601},
+            {"strictness": "strict", "min_confidence": 60,
+             "prescreen_enabled": False, "opp_merge_window_sec": 20},
+            {"strictness": "strict", "min_confidence": 60,
+             "prescreen_enabled": False, "opp_merge_window_sec": 1801},
             {"strictness": "strict", "min_confidence": 60},  # 缺 prescreen_enabled
         ]
         for bad in bad_bodies:

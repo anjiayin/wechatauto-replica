@@ -1,9 +1,10 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Alert,
   Box,
   Button,
+  Checkbox,
   Dialog,
   DialogActions,
   DialogContent,
@@ -31,7 +32,6 @@ import SearchIcon from '@mui/icons-material/Search'
 import AddIcon from '@mui/icons-material/Add'
 import EditIcon from '@mui/icons-material/Edit'
 import DeleteIcon from '@mui/icons-material/Delete'
-import PersonAddIcon from '@mui/icons-material/PersonAdd'
 import {
   apiDelete,
   apiGet,
@@ -48,6 +48,7 @@ import type {
   MonitorTarget,
   OpportunityType,
   SessionItem,
+  StatusOut,
 } from '../api/types'
 
 /** 设置页：监控对象 / 商机类型 / AI 接口（含分析判定与通知）三 tab。 */
@@ -68,160 +69,399 @@ export default function SettingsPage() {
 }
 
 // ---------------------------------------------------------------------------
-// Tab 1：监控对象
+// Tab 1：监控对象（通讯录双栏多选）
 // ---------------------------------------------------------------------------
+type SnackState = { msg: string; severity: 'success' | 'warning' | 'error' }
+
+function TargetRow({
+  target,
+  checked,
+  onToggleCheck,
+  onToggleEnabled,
+  onRemove,
+}: {
+  target: MonitorTarget
+  checked: boolean
+  onToggleCheck: () => void
+  onToggleEnabled: () => void
+  onRemove: () => void
+}) {
+  return (
+    <ListItem
+      dense
+      secondaryAction={
+        <Stack direction="row" spacing={0.5} alignItems="center">
+          <Tooltip title={target.enabled === 1 ? '停用（暂停分析该会话）' : '启用'}>
+            <Switch
+              checked={target.enabled === 1}
+              onChange={onToggleEnabled}
+              size="small"
+            />
+          </Tooltip>
+          <IconButton size="small" onClick={onRemove}>
+            <DeleteIcon fontSize="small" />
+          </IconButton>
+        </Stack>
+      }
+    >
+      <Checkbox
+        size="small"
+        checked={checked}
+        onChange={onToggleCheck}
+        sx={{ p: 0.5, mr: 1 }}
+      />
+      <ListItemText
+        primary={target.display_name}
+        secondary={`${target.kind === 'group' ? '群聊' : '私聊'} · ${target.username}${
+          target.enabled === 1 ? '' : '（已停用）'
+        }`}
+      />
+    </ListItem>
+  )
+}
+
 function TargetsTab() {
   const queryClient = useQueryClient()
+  // 左栏：通讯录候选（群聊/私聊子页签 + 搜索）
+  const [candidateKind, setCandidateKind] = useState<'group' | 'friend'>('group')
+  const [keywordInput, setKeywordInput] = useState('')
   const [keyword, setKeyword] = useState('')
-  const [searched, setSearched] = useState<SessionItem[]>([])
-  const [error, setError] = useState('')
+  const [checkedCandidates, setCheckedCandidates] = useState<Set<string>>(
+    () => new Set(),
+  )
+  // 右栏：已选监控（可勾选批量移除）
+  const [checkedTargets, setCheckedTargets] = useState<Set<number>>(
+    () => new Set(),
+  )
+  const [snack, setSnack] = useState<SnackState | null>(null)
+
+  // 搜索关键词 300ms 防抖（输入即过滤，不打爆接口）
+  useEffect(() => {
+    const t = window.setTimeout(() => setKeyword(keywordInput.trim()), 300)
+    return () => window.clearTimeout(t)
+  }, [keywordInput])
+
+  const { data: statusData } = useQuery({
+    queryKey: ['status'],
+    queryFn: () => apiGet<StatusOut>('/api/status'),
+  })
+  const quota = statusData?.monitor_quota
+  const quotaRatio = quota && quota.max > 0 ? quota.used / quota.max : 0
+  const quotaWarning = quotaRatio >= 0.9
+  const quotaFull = quota ? quota.used >= quota.max : false
 
   const { data: targets } = useQuery({
     queryKey: ['monitor-targets'],
     queryFn: () => apiGet<MonitorTarget[]>('/api/monitor-targets'),
   })
 
-  const searchMutation = useMutation({
-    mutationFn: () => apiGet<SessionItem[]>(`/api/sessions/search${qs({ keyword, limit: 20 })}`),
-    onSuccess: (items) => setSearched(items),
-    onError: (err: Error) => setError(err.message),
+  const { data: candidates, isFetching: searching } = useQuery({
+    queryKey: ['session-candidates', candidateKind, keyword],
+    queryFn: () =>
+      apiGet<SessionItem[]>(
+        `/api/sessions/search${qs({ kind: candidateKind, keyword, limit: 50 })}`,
+      ),
   })
 
+  const targetUsernames = new Set((targets ?? []).map((t) => t.username))
+
+  const toggleCandidate = (username: string) => {
+    setCheckedCandidates((prev) => {
+      const next = new Set(prev)
+      if (next.has(username)) next.delete(username)
+      else next.add(username)
+      return next
+    })
+  }
+
+  const toggleTarget = (id: number) => {
+    setCheckedTargets((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  // 批量添加：逐个 POST；后端超限 400 的中文 detail 原样进 Snackbar
   const addMutation = useMutation({
-    mutationFn: (username: string) =>
-      apiPost<MonitorTarget>('/api/monitor-targets', { username }),
-    onSuccess: () => {
+    mutationFn: async (usernames: string[]) => {
+      const errors: string[] = []
+      for (const u of usernames) {
+        try {
+          await apiPost<MonitorTarget>('/api/monitor-targets', { username: u })
+        } catch (err) {
+          errors.push(`${u}：${(err as Error).message}`)
+        }
+      }
+      return errors
+    },
+    onSuccess: (errors) => {
+      if (errors.length > 0) {
+        setSnack({ msg: errors.join('；'), severity: 'error' })
+      } else {
+        setSnack({
+          msg: `已添加 ${checkedCandidates.size} 个监控对象`,
+          severity: 'success',
+        })
+      }
+      setCheckedCandidates(new Set())
       void queryClient.invalidateQueries({ queryKey: ['monitor-targets'] })
       void queryClient.invalidateQueries({ queryKey: ['status'] })
+      void queryClient.invalidateQueries({ queryKey: ['session-candidates'] })
     },
-    onError: (err: Error) => setError(err.message),
   })
 
-  const toggleMutation = useMutation({
+  // 批量移除：逐个 DELETE
+  const removeMutation = useMutation({
+    mutationFn: async (ids: number[]) => {
+      const errors: string[] = []
+      for (const id of ids) {
+        try {
+          await apiDelete(`/api/monitor-targets/${id}`)
+        } catch (err) {
+          errors.push(`#${id}：${(err as Error).message}`)
+        }
+      }
+      return errors
+    },
+    onSuccess: (errors) => {
+      if (errors.length > 0) {
+        setSnack({ msg: errors.join('；'), severity: 'error' })
+      } else {
+        setSnack({ msg: '已移除所选监控对象', severity: 'success' })
+      }
+      setCheckedTargets(new Set())
+      void queryClient.invalidateQueries({ queryKey: ['monitor-targets'] })
+      void queryClient.invalidateQueries({ queryKey: ['status'] })
+      void queryClient.invalidateQueries({ queryKey: ['session-candidates'] })
+    },
+  })
+
+  const toggleEnabledMutation = useMutation({
     mutationFn: (t: MonitorTarget) =>
       apiPatch<MonitorTarget>(`/api/monitor-targets/${t.id}`, {
         enabled: t.enabled === 0,
       }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['monitor-targets'] })
-    },
-    onError: (err: Error) => setError(err.message),
-  })
-
-  const deleteMutation = useMutation({
-    mutationFn: (t: MonitorTarget) => apiDelete(`/api/monitor-targets/${t.id}`),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['monitor-targets'] })
       void queryClient.invalidateQueries({ queryKey: ['status'] })
     },
-    onError: (err: Error) => setError(err.message),
+    onError: (err: Error) => setSnack({ msg: err.message, severity: 'error' }),
   })
 
-  const targetUsernames = new Set((targets ?? []).map((t) => t.username))
+  const groupTargets = (targets ?? []).filter((t) => t.kind === 'group')
+  const friendTargets = (targets ?? []).filter((t) => t.kind === 'friend')
+
+  const renderTargetGroup = (title: string, items: MonitorTarget[]) => (
+    <>
+      <Typography variant="caption" color="text.secondary" sx={{ pl: 1 }}>
+        {title}（{items.length}）
+      </Typography>
+      {items.map((t) => (
+        <TargetRow
+          key={t.id}
+          target={t}
+          checked={checkedTargets.has(t.id)}
+          onToggleCheck={() => toggleTarget(t.id)}
+          onToggleEnabled={() => toggleEnabledMutation.mutate(t)}
+          onRemove={() => removeMutation.mutate([t.id])}
+        />
+      ))}
+      {items.length === 0 && (
+        <Typography variant="body2" color="text.secondary" sx={{ pl: 2, py: 1 }}>
+          暂无
+        </Typography>
+      )}
+    </>
+  )
 
   return (
     <Box>
-      {error && (
-        <Alert severity="error" sx={{ mb: 1 }} onClose={() => setError('')}>
-          {error}
+      {/* 配额提示：接近上限（≥90%）用警告色 */}
+      {quota && (
+        <Alert
+          severity={quotaWarning ? 'warning' : 'info'}
+          variant="outlined"
+          sx={{ mb: 1.5 }}
+        >
+          已监控 {quota.used}/{quota.max}，还可添加 {quota.max - quota.used} 个
+          {quotaWarning && '（已接近上限，建议清理不再需要的监控对象）'}
         </Alert>
       )}
-      <Stack direction="row" spacing={1} sx={{ mb: 1 }}>
-        <TextField
-          label="按昵称/群名搜索会话"
-          sx={{ width: 320 }}
-          value={keyword}
-          onChange={(e) => setKeyword(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') searchMutation.mutate()
-          }}
-          InputProps={{
-            endAdornment: (
-              <InputAdornment position="end">
-                <IconButton size="small" onClick={() => searchMutation.mutate()}>
-                  <SearchIcon />
-                </IconButton>
-              </InputAdornment>
-            ),
-          }}
-        />
-        <Button
-          variant="contained"
-          onClick={() => searchMutation.mutate()}
-          disabled={searchMutation.isPending}
-        >
-          搜索
-        </Button>
-      </Stack>
 
-      {searched.length > 0 && (
-        <>
-          <Typography variant="subtitle2" sx={{ mt: 1 }}>候选会话（点击加入监控）</Typography>
-          <List dense sx={{ maxHeight: 220, overflow: 'auto', border: '1px solid #eee', borderRadius: 1, mb: 2 }}>
-            {searched.map((s) => (
-              <ListItem
-                key={s.username}
-                secondaryAction={
-                  targetUsernames.has(s.username) ? (
-                    <Typography variant="caption" color="text.secondary">已监控</Typography>
-                  ) : (
-                    <Tooltip title="加入监控">
-                      <IconButton size="small" onClick={() => addMutation.mutate(s.username)}>
-                        <PersonAddIcon fontSize="small" />
-                      </IconButton>
-                    </Tooltip>
-                  )
-                }
+      <Stack direction="row" spacing={2} alignItems="stretch">
+        {/* 左栏：通讯录候选 */}
+        <Box
+          sx={{
+            flex: 1,
+            border: '1px solid',
+            borderColor: 'divider',
+            borderRadius: 1,
+            p: 1.5,
+            display: 'flex',
+            flexDirection: 'column',
+            minWidth: 0,
+          }}
+        >
+          <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1 }}>
+            <Typography variant="subtitle2">通讯录候选</Typography>
+            <Stack
+              direction="row"
+              spacing={0.5}
+              sx={{ ml: 'auto' }}
+              alignItems="center"
+            >
+              <Button
+                size="small"
+                variant={candidateKind === 'group' ? 'contained' : 'text'}
+                onClick={() => setCandidateKind('group')}
               >
+                群聊
+              </Button>
+              <Button
+                size="small"
+                variant={candidateKind === 'friend' ? 'contained' : 'text'}
+                onClick={() => setCandidateKind('friend')}
+              >
+                私聊
+              </Button>
+            </Stack>
+          </Stack>
+          <TextField
+            size="small"
+            label="按昵称/群名搜索"
+            value={keywordInput}
+            onChange={(e) => setKeywordInput(e.target.value)}
+            fullWidth
+            sx={{ mb: 1 }}
+            InputProps={{
+              endAdornment: (
+                <InputAdornment position="end">
+                  {searching ? (
+                    <SearchIcon fontSize="small" color="primary" />
+                  ) : (
+                    <SearchIcon fontSize="small" />
+                  )}
+                </InputAdornment>
+              ),
+            }}
+          />
+          <List
+            dense
+            sx={{
+              flex: 1,
+              minHeight: 220,
+              maxHeight: 340,
+              overflow: 'auto',
+            }}
+          >
+            {(candidates ?? []).map((s) => {
+              const monitored = targetUsernames.has(s.username)
+              return (
+                <ListItem
+                  key={s.username}
+                  dense
+                  sx={monitored ? { opacity: 0.45 } : undefined}
+                  secondaryAction={
+                    monitored ? (
+                      <Typography variant="caption" color="text.secondary">
+                        已监控
+                      </Typography>
+                    ) : undefined
+                  }
+                >
+                  <Checkbox
+                    size="small"
+                    disabled={monitored}
+                    checked={checkedCandidates.has(s.username)}
+                    onChange={() => toggleCandidate(s.username)}
+                    sx={{ p: 0.5, mr: 1 }}
+                  />
+                  <ListItemText
+                    primary={s.display_name}
+                    secondary={s.username}
+                  />
+                </ListItem>
+              )
+            })}
+            {(candidates ?? []).length === 0 && (
+              <ListItem dense>
                 <ListItemText
-                  primary={s.display_name}
-                  secondary={`${s.kind === 'group' ? '群聊' : '好友'} · ${s.username}`}
+                  primary={searching ? '搜索中…' : '未找到匹配的会话'}
                 />
               </ListItem>
-            ))}
-            {searched.length === 0 && (
-              <ListItem><ListItemText primary="未找到匹配的会话" /></ListItem>
             )}
           </List>
-        </>
-      )}
-
-      <Divider sx={{ my: 1 }} />
-      <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
-        已配置监控对象（{targets?.length ?? 0}）
-      </Typography>
-      <List dense>
-        {(targets ?? []).map((t) => (
-          <ListItem
-            key={t.id}
-            secondaryAction={
-              <Stack direction="row" spacing={1} alignItems="center">
-                <Switch
-                  checked={t.enabled === 1}
-                  onChange={() => toggleMutation.mutate(t)}
-                  size="small"
-                />
-                <IconButton size="small" onClick={() => deleteMutation.mutate(t)}>
-                  <DeleteIcon fontSize="small" />
-                </IconButton>
-              </Stack>
+          <Button
+            variant="contained"
+            startIcon={<AddIcon />}
+            disabled={
+              checkedCandidates.size === 0 || addMutation.isPending || quotaFull
             }
+            onClick={() => addMutation.mutate([...checkedCandidates])}
+            sx={{ mt: 1 }}
           >
-            <ListItemText
-              primary={t.display_name}
-              secondary={`${t.kind === 'group' ? '群聊' : '好友'} · ${t.username}${t.enabled === 1 ? '' : '（已停用）'}`}
-            />
-          </ListItem>
-        ))}
-        {(targets ?? []).length === 0 && (
-          <ListItem>
-            <ListItemText
-              primary="暂无监控对象"
-              secondary="搜索并加入群/好友后，系统将实时分析其新消息"
-            />
-          </ListItem>
-        )}
-      </List>
+            添加 →{checkedCandidates.size > 0 ? `（${checkedCandidates.size}）` : ''}
+          </Button>
+        </Box>
+
+        {/* 右栏：已选监控 */}
+        <Box
+          sx={{
+            flex: 1,
+            border: '1px solid',
+            borderColor: 'divider',
+            borderRadius: 1,
+            p: 1.5,
+            display: 'flex',
+            flexDirection: 'column',
+            minWidth: 0,
+          }}
+        >
+          <Typography variant="subtitle2" sx={{ mb: 1 }}>
+            已选监控（{targets?.length ?? 0}）
+          </Typography>
+          <List dense sx={{ flex: 1, minHeight: 220, maxHeight: 340, overflow: 'auto' }}>
+            {renderTargetGroup('群聊', groupTargets)}
+            {renderTargetGroup('私聊', friendTargets)}
+            {(targets ?? []).length === 0 && (
+              <ListItem dense>
+                <ListItemText
+                  primary="暂无监控对象"
+                  secondary="从左侧通讯录勾选群/好友后批量添加，系统将实时分析其新消息"
+                />
+              </ListItem>
+            )}
+          </List>
+          <Button
+            variant="outlined"
+            color="error"
+            disabled={
+              checkedTargets.size === 0 || removeMutation.isPending
+            }
+            onClick={() => removeMutation.mutate([...checkedTargets])}
+            sx={{ mt: 1 }}
+          >
+            ← 移除{checkedTargets.size > 0 ? `（${checkedTargets.size}）` : ''}
+          </Button>
+        </Box>
+      </Stack>
+
+      <Snackbar
+        open={snack !== null}
+        autoHideDuration={4500}
+        onClose={() => setSnack(null)}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+      >
+        <Alert
+          severity={snack?.severity ?? 'info'}
+          onClose={() => setSnack(null)}
+          sx={{ width: '100%' }}
+        >
+          {snack?.msg}
+        </Alert>
+      </Snackbar>
     </Box>
   )
 }
@@ -434,7 +674,8 @@ function AiTab() {
   const [prescreenEnabled, setPrescreenEnabled] = useState(false)
   const [keywords, setKeywords] = useState('')
   const [regex, setRegex] = useState('')
-  const [mergeWindow, setMergeWindow] = useState(300)
+  const [mergeWindow, setMergeWindow] = useState(60)
+  const [oppMergeWindow, setOppMergeWindow] = useState(180)
   const [analysisLoaded, setAnalysisLoaded] = useState(false)
   if (analysis && !analysisLoaded) {
     setStrictness(analysis.strictness)
@@ -443,6 +684,7 @@ function AiTab() {
     setKeywords(analysis.prescreen_keywords)
     setRegex(analysis.prescreen_regex)
     setMergeWindow(analysis.merge_window_sec)
+    setOppMergeWindow(analysis.opp_merge_window_sec)
     setAnalysisLoaded(true)
   }
 
@@ -475,6 +717,7 @@ function AiTab() {
         prescreen_keywords: keywords,
         prescreen_regex: regex,
         merge_window_sec: mergeWindow,
+        opp_merge_window_sec: oppMergeWindow,
       }),
     onSuccess: () => {
       setError('')
@@ -645,16 +888,31 @@ function AiTab() {
         </Box>
         <Box>
           <Typography variant="body2" gutterBottom>
-            合并窗口：{mergeWindow} 秒（同一人连续发言静默该时长后合并为一条分析单元，商机最快在该时延后可见）
+            消息合并窗口：{mergeWindow} 秒（发送人停止发言 {mergeWindow} 秒后立即分析，默认 60 秒）
           </Typography>
           <Slider
             value={mergeWindow}
+            min={10}
+            max={600}
+            step={10}
+            marks
+            valueLabelDisplay="auto"
+            onChange={(_, v) => setMergeWindow(v as number)}
+            sx={{ width: 320 }}
+          />
+        </Box>
+        <Box>
+          <Typography variant="body2" gutterBottom>
+            商机合并窗口：{oppMergeWindow} 秒（同一人 {oppMergeWindow} 秒内再次命中的商机合并为一条，默认 180 秒；单条商机最长跨度 30 分钟）
+          </Typography>
+          <Slider
+            value={oppMergeWindow}
             min={30}
             max={1800}
             step={30}
             marks
             valueLabelDisplay="auto"
-            onChange={(_, v) => setMergeWindow(v as number)}
+            onChange={(_, v) => setOppMergeWindow(v as number)}
             sx={{ width: 320 }}
           />
         </Box>

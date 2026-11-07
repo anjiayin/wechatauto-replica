@@ -27,12 +27,19 @@ class WorkerStatus(BaseModel):
     max: int = 0
 
 
+class MonitorQuota(BaseModel):
+    """监控对象配额（used/max，设置页双栏顶部提示用）。"""
+    used: int = 0
+    max: int = 0
+
+
 class StatusOut(BaseModel):
     listener_running: bool = False
     monitored_count: int = 0
     wechat: WechatStatus = Field(default_factory=WechatStatus)
     queue: QueueStatus = Field(default_factory=QueueStatus)
     worker: WorkerStatus = Field(default_factory=WorkerStatus)
+    monitor_quota: MonitorQuota = Field(default_factory=MonitorQuota)
     ai_configured: bool = False
     watermark_saved_at: str = ""
     degraded_reason: str = ""          # 微信接入降级原因（空 = 正常）
@@ -134,7 +141,8 @@ class AnalysisSettingsOut(BaseModel):
     prescreen_enabled: bool = False
     prescreen_keywords: str = ""
     prescreen_regex: str = ""
-    merge_window_sec: int = 300
+    merge_window_sec: int = 60         # 分析微窗口：发送人静默 N 秒即触发 AI 分析
+    opp_merge_window_sec: int = 180    # 商机合并窗口：同一人 N 秒内再次命中合并为一条
 
 
 class AnalysisSettingsUpdate(BaseModel):
@@ -143,7 +151,8 @@ class AnalysisSettingsUpdate(BaseModel):
     prescreen_enabled: bool
     prescreen_keywords: str = ""
     prescreen_regex: str = ""
-    merge_window_sec: int = Field(default=300, ge=30, le=3600)
+    merge_window_sec: int = Field(default=60, ge=10, le=600)
+    opp_merge_window_sec: int = Field(default=180, ge=30, le=1800)
 
 
 class NotifyUpdate(BaseModel):

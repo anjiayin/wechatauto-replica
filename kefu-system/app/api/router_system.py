@@ -3,14 +3,14 @@
 
 路由（设计文档 3.2）：
 - GET /api/status
-- GET /api/sessions/search?keyword=&limit=20
+- GET /api/sessions/search?keyword=&limit=20&kind=all
 - GET /api/messages/{username}?before_seq=&limit=50
 - WS  /ws/events
 """
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import List
 
 from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
 
@@ -20,9 +20,11 @@ from app.api.deps import (
     get_pipeline,
     get_wechat_service,
 )
+from app.config import MAX_MONITOR_TARGETS
 from app.db import Database
 from app.schemas import (
     MessageOut,
+    MonitorQuota,
     QueueStatus,
     SessionItemOut,
     StatusOut,
@@ -58,6 +60,8 @@ def get_status(db: Database = Depends(get_db),
         queue=QueueStatus(size=pipeline.queue_size, max=pipeline.queue_max,
                           dropped_total=pipeline.dropped_total),
         worker=WorkerStatus(busy=pipeline.busy, max=2),
+        monitor_quota=MonitorQuota(used=db.count_targets(),
+                                   max=MAX_MONITOR_TARGETS),
         ai_configured=ai_configured,
         watermark_saved_at=svc.watermark_saved_at,
         degraded_reason=svc.degraded_reason,
@@ -72,10 +76,11 @@ def get_status(db: Database = Depends(get_db),
 def search_sessions(
     keyword: str = "",
     limit: int = Query(default=20, ge=1, le=100),
+    kind: str = Query(default="all", pattern="^(all|group|friend)$"),
     svc: WeChatService = Depends(get_wechat_service),
 ) -> List[SessionItemOut]:
-    """会话搜索（群 + 好友，复用 search_contact/get_sessions）。"""
-    items = svc.search_sessions(keyword=keyword, limit=limit)
+    """会话搜索（群 + 好友，复用 search_contact/get_sessions；kind 过滤类型）。"""
+    items = svc.search_sessions(keyword=keyword, limit=limit, kind=kind)
     return [SessionItemOut(**item) for item in items]
 
 

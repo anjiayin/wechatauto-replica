@@ -15,9 +15,12 @@ LOG_PATH = DATA_DIR / "kefu.log"                           # 滚动日志
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"             # 前端构建产物
 
 # ---------------------------------------------------------------------------
-# 管线常量（合并窗口允许 settings 覆盖：analysis.merge_window_sec）
+# 管线常量（窗口允许 settings 覆盖：analysis.merge_window_sec / analysis.opp_merge_window_sec）
 # ---------------------------------------------------------------------------
-MERGE_WINDOW_SEC_DEFAULT = 300     # 合并窗口默认 5 分钟
+MERGE_WINDOW_SEC_DEFAULT = 60      # 分析微窗口默认 60 秒（发送人静默该时长即触发 AI 分析）
+OPP_MERGE_WINDOW_SEC_DEFAULT = 180  # 商机合并窗口默认 180 秒（同一人再次命中合并为一条）
+MAX_OPPORTUNITY_SPAN_SEC = 1800    # 单条商机最长时间跨度（window_start 距今超过则不再合并，防无限续命）
+AGGREGATOR_FORCE_FLUSH_FACTOR = 10  # 缓冲区首条消息年龄超过 微窗口×该倍数 时强制 flush（安全阀）
 QUEUE_MAX = 500                    # 有界分析队列长度（满则丢弃并计数告警）
 WORKER_COUNT = 2                   # 分析 worker 线程数
 CONTEXT_COUNT = 5                  # 商机详情上下文条数（前后各 N 条）
@@ -25,6 +28,7 @@ WATERMARK_FLUSH_SEC = 30           # watermark 定期刷回间隔（秒）
 RETRY_TIMES = 2                    # AI 调用失败重试次数
 RETRY_BACKOFF_BASE = 1.0           # 重试退避基数（秒），第 n 次重试退避 base*2^(n-1)
 SESSION_SEARCH_LIMIT_DEFAULT = 20  # 会话搜索默认条数
+MAX_MONITOR_TARGETS = 200          # 监控对象数量上限（超出返回 400）
 
 # ---------------------------------------------------------------------------
 # settings 表配置键（共享约定，前端与后端共同遵守）
@@ -40,6 +44,7 @@ KEY_ANALYSIS_PRESCREEN_ENABLED = "analysis.prescreen_enabled"
 KEY_ANALYSIS_PRESCREEN_KEYWORDS = "analysis.prescreen_keywords"
 KEY_ANALYSIS_PRESCREEN_REGEX = "analysis.prescreen_regex"
 KEY_ANALYSIS_MERGE_WINDOW = "analysis.merge_window_sec"
+KEY_ANALYSIS_OPP_MERGE_WINDOW = "analysis.opp_merge_window_sec"
 KEY_NOTIFY_SOUND = "notify.sound_enabled"
 KEY_COMPLIANCE_CONFIRMED = "compliance.confirmed"
 KEY_RUNTIME_WM_SAVED_AT = "runtime.watermark_saved_at"  # 内部键：最近 watermark 刷回时间
@@ -58,6 +63,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     KEY_ANALYSIS_PRESCREEN_KEYWORDS: "采购,求购,报价,加工",
     KEY_ANALYSIS_PRESCREEN_REGEX: "",
     KEY_ANALYSIS_MERGE_WINDOW: str(MERGE_WINDOW_SEC_DEFAULT),
+    KEY_ANALYSIS_OPP_MERGE_WINDOW: str(OPP_MERGE_WINDOW_SEC_DEFAULT),
     KEY_NOTIFY_SOUND: "0",
     KEY_COMPLIANCE_CONFIRMED: "0",
 }

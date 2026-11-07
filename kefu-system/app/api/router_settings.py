@@ -22,6 +22,7 @@ from app.config import (
     KEY_AI_TEMPERATURE,
     KEY_AI_TIMEOUT_SEC,
     KEY_ANALYSIS_MERGE_WINDOW,
+    KEY_ANALYSIS_OPP_MERGE_WINDOW,
     KEY_ANALYSIS_MIN_CONFIDENCE,
     KEY_ANALYSIS_PRESCREEN_ENABLED,
     KEY_ANALYSIS_PRESCREEN_KEYWORDS,
@@ -119,7 +120,8 @@ def _analysis_out(db: Database) -> AnalysisSettingsOut:
         prescreen_enabled=db.get_bool(KEY_ANALYSIS_PRESCREEN_ENABLED),
         prescreen_keywords=db.get_setting(KEY_ANALYSIS_PRESCREEN_KEYWORDS, ""),
         prescreen_regex=db.get_setting(KEY_ANALYSIS_PRESCREEN_REGEX, ""),
-        merge_window_sec=db.get_int(KEY_ANALYSIS_MERGE_WINDOW, 300),
+        merge_window_sec=db.get_int(KEY_ANALYSIS_MERGE_WINDOW, 60),
+        opp_merge_window_sec=db.get_int(KEY_ANALYSIS_OPP_MERGE_WINDOW, 180),
     )
 
 
@@ -134,7 +136,7 @@ def get_analysis_settings(db: Database = Depends(get_db)
 def update_analysis_settings(body: AnalysisSettingsUpdate,
                              db: Database = Depends(get_db)
                              ) -> AnalysisSettingsOut:
-    """保存判定档位/门槛/预筛/合并窗口（即时生效）。"""
+    """保存判定档位/门槛/预筛/两级窗口（即时生效）。"""
     db.set_setting(KEY_ANALYSIS_STRICTNESS, body.strictness)
     db.set_setting(KEY_ANALYSIS_MIN_CONFIDENCE, str(body.min_confidence))
     db.set_setting(KEY_ANALYSIS_PRESCREEN_ENABLED,
@@ -143,6 +145,8 @@ def update_analysis_settings(body: AnalysisSettingsUpdate,
                    body.prescreen_keywords.strip())
     db.set_setting(KEY_ANALYSIS_PRESCREEN_REGEX, body.prescreen_regex.strip())
     db.set_setting(KEY_ANALYSIS_MERGE_WINDOW, str(body.merge_window_sec))
+    db.set_setting(KEY_ANALYSIS_OPP_MERGE_WINDOW,
+                   str(body.opp_merge_window_sec))
     logger.info("分析设置已保存（strictness=%s, min_confidence=%d）",
                 body.strictness, body.min_confidence)
     return _analysis_out(db)

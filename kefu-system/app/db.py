@@ -18,6 +18,7 @@ from app.config import (
     KEY_AI_BASE_URL,
     KEY_AI_MODEL,
     KEY_ANALYSIS_MERGE_WINDOW,
+    KEY_ANALYSIS_OPP_MERGE_WINDOW,
     KEY_ANALYSIS_MIN_CONFIDENCE,
     KEY_ANALYSIS_PRESCREEN_ENABLED,
     KEY_ANALYSIS_PRESCREEN_KEYWORDS,
@@ -262,6 +263,31 @@ class Database:
             self._conn.commit()
             return self.get_target(cur.lastrowid)  # type: ignore[return-value]
 
+    def insert_target_within_limit(self, username: str, display_name: str,
+                                   kind: str, max_targets: int,
+                                   enabled: int = 1) -> Optional[dict]:
+        """原子「配额校验 + 插入」（修复 BUG-3 并发越界）。
+
+        计数与 INSERT 在同一把写锁内完成，并发添加最后 1 个名额时
+        恰好达到上限、不会越过。
+
+        Returns:
+            新建对象；达到/超过上限时返回 None（调用方转 400）。
+            username 重复抛 sqlite3.IntegrityError。
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM monitor_targets").fetchone()
+            if int(row[0]) >= max_targets:
+                return None
+            cur = self._conn.execute(
+                "INSERT INTO monitor_targets (username, display_name, kind, "
+                "enabled) VALUES (?, ?, ?, ?)",
+                (username, display_name, kind, enabled),
+            )
+            self._conn.commit()
+            return self.get_target(cur.lastrowid)  # type: ignore[return-value]
+
     def update_target_enabled(self, target_id: int, enabled: bool) -> None:
         """启用/停用监控对象。"""
         with self._lock:
@@ -279,6 +305,13 @@ class Database:
             )
             self._conn.commit()
             return cur.rowcount
+
+    def count_targets(self) -> int:
+        """监控对象总数（配额展示用）。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM monitor_targets").fetchone()
+        return int(row[0])
 
     def list_enabled_target_usernames(self) -> list[str]:
         """全部启用中的监控会话 username（Listener 启动注册用）。"""
@@ -436,6 +469,72 @@ class Database:
             ).fetchone()
         return self._opp_row_to_dict(row) if row else None
 
+    def find_mergeable_opportunity(self, *, session_username: str,
+                                   sender_wxid: str, sender_name: str,
+                                   min_window_end_iso: str) -> Optional[dict]:
+        """查找可合并商机（商机合并窗口内，pipeline 用）。
+
+        条件：同会话 + 同发送人（wxid 为空时退化为昵称匹配）+ status='pending'
+        + window_end 距今不超过商机合并窗口（ISO 字符串同格式可直接比较）。
+
+        Args:
+            min_window_end_iso: 窗口下限（now - opp_merge_window_sec 的 ISO 串）。
+        """
+        sender_cond = "sender_wxid=?" if sender_wxid else "sender_name=?"
+        sender_val = sender_wxid or sender_name
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM opportunities WHERE session_username=? AND "
+                f"{sender_cond} AND status='pending' AND window_end>=? "
+                "ORDER BY window_end DESC, id DESC LIMIT 1",
+                (session_username, sender_val, min_window_end_iso),
+            ).fetchone()
+        return self._opp_row_to_dict(row) if row else None
+
+    def merge_opportunity(self, opp_id: int, *, raw_text_append: str,
+                          summary_append: str, window_end: str,
+                          merged_count_delta: int, key_quote: str,
+                          confidence: int, type_id: Optional[int],
+                          type_name: str) -> Optional[dict]:
+        """原子合并新批次进既有商机，返回合并后的完整记录。
+
+        修复 BUG-1/BUG-2（丢失更新竞态）：合并动作在单条 SQL 内完成——
+        raw_text/summary 由 SQL 端拼接（不基于 Python 快照回写）、
+        merged_count 在 SQL 端累加、confidence 取 SQL 端较大值，并以
+        ``WHERE id=? AND status='pending'`` 复检状态。find 返回快照后
+        商机被回复/删除/并发合并时 UPDATE 不生效，rowcount=0 返回 None，
+        由调用方走新建兜底（新命中内容不被吞）。
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE opportunities SET "
+                "raw_text = CASE WHEN :raw_append = '' THEN raw_text "
+                "  WHEN raw_text IS NULL OR raw_text = '' THEN :raw_append "
+                "  ELSE raw_text || char(10) || :raw_append END, "
+                "summary = CASE WHEN :summary_append = '' THEN summary "
+                "  WHEN summary IS NULL OR summary = '' THEN :summary_append "
+                "  ELSE summary || char(10) || :summary_append END, "
+                "window_end = :window_end, "
+                "merged_count = merged_count + :count_delta, "
+                "key_quote = :key_quote, "
+                "confidence = MAX(confidence, :confidence), "
+                "type_id = :type_id, type_name = :type_name "
+                "WHERE id = :opp_id AND status = 'pending'",
+                {"raw_append": raw_text_append,
+                 "summary_append": summary_append,
+                 "window_end": window_end,
+                 "count_delta": merged_count_delta,
+                 "key_quote": key_quote,
+                 "confidence": confidence,
+                 "type_id": type_id,
+                 "type_name": type_name,
+                 "opp_id": opp_id},
+            )
+            self._conn.commit()
+            if cur.rowcount == 0:
+                return None
+            return self.get_opportunity(opp_id)
+
     def update_opportunity_status(self, opp_id: int, status: str) -> int:
         """更新商机状态，返回受影响行数。"""
         with self._lock:
@@ -529,14 +628,15 @@ def read_ai_settings(db: Database) -> dict[str, str]:
 
 
 def read_analysis_settings(db: Database) -> dict[str, Any]:
-    """读取分析判定配置（合并窗口允许 settings 覆盖）。"""
+    """读取分析判定配置（分析微窗口 / 商机合并窗口允许 settings 覆盖）。"""
     return {
         "strictness": db.get_setting(KEY_ANALYSIS_STRICTNESS, "balanced"),
         "min_confidence": db.get_int(KEY_ANALYSIS_MIN_CONFIDENCE, 60),
         "prescreen_enabled": db.get_bool(KEY_ANALYSIS_PRESCREEN_ENABLED),
         "prescreen_keywords": db.get_setting(KEY_ANALYSIS_PRESCREEN_KEYWORDS, ""),
         "prescreen_regex": db.get_setting(KEY_ANALYSIS_PRESCREEN_REGEX, ""),
-        "merge_window_sec": db.get_int(KEY_ANALYSIS_MERGE_WINDOW, 300),
+        "merge_window_sec": db.get_int(KEY_ANALYSIS_MERGE_WINDOW, 60),
+        "opp_merge_window_sec": db.get_int(KEY_ANALYSIS_OPP_MERGE_WINDOW, 180),
         "compliance_confirmed": db.get_bool(KEY_COMPLIANCE_CONFIRMED),
     }
 

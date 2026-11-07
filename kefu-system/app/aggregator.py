@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
-"""5 分钟合并窗口：按 (会话, 发送人) 缓冲，窗口静默期满后 flush 出"分析单元"。
+"""分析微窗口：按 (会话, 发送人) 缓冲，静默期满后 flush 出"分析单元"。
 
-设计要点（技术方案 1.1）：
+设计要点（技术方案 1.1，优化后为两级窗口的第一级）：
 - Listener 回调线程调用 :meth:`Aggregator.add`，仅入缓冲即返回；
-- 独立调度线程每 2 秒检查一次，某缓冲区自最后一条消息起静默超过
-  合并窗口（settings 可覆盖）即合并为一条 AnalysisUnit 交给回调；
+- 独立调度线程每 1 秒检查一次，某缓冲区自最后一条消息起静默超过
+  分析微窗口（settings 可覆盖，默认 60 秒）即合并为一条 AnalysisUnit
+  交给回调——商机最快可见延迟 ≈ 微窗口 + 1 秒（不再等 5 分钟）；
+- O-2 强制 flush 安全阀：缓冲区首条消息年龄超过 微窗口 ×
+  ``AGGREGATOR_FORCE_FLUSH_FACTOR`` 时无条件 flush，杜绝持续发言
+  （相邻消息间隔始终小于微窗口）导致的分析延迟无上界与缓冲无上限；
+- 命中后的商机级合并（180 秒窗口）由 pipeline 负责；
 - 非文本消息不进入缓冲（由 wechat_service 记 skipped 日志）。
 """
 from __future__ import annotations
@@ -15,10 +20,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
+from app.config import AGGREGATOR_FORCE_FLUSH_FACTOR
+
 logger = logging.getLogger(__name__)
 
-# 调度检查间隔（秒）
-_SCHED_INTERVAL = 2.0
+# 调度检查间隔（秒）：到期即 flush 的最大额外延迟
+_SCHED_INTERVAL = 1.0
 
 
 @dataclass
@@ -65,7 +72,7 @@ class Aggregator:
     def __init__(self, flush_callback: Callable[[AnalysisUnit], None],
                  window_sec_provider: Optional[Callable[[], int]] = None) -> None:
         self._flush_callback = flush_callback
-        self._window_sec_provider = window_sec_provider or (lambda: 300)
+        self._window_sec_provider = window_sec_provider or (lambda: 60)
         self._buffers: Dict[Tuple[str, str], _Buffer] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -143,13 +150,22 @@ class Aggregator:
             self._stop.wait(_SCHED_INTERVAL)
 
     def _flush_expired(self, force: bool = False) -> None:
-        """把静默超期（或 force 时全部）的缓冲 flush 为分析单元。"""
-        window = max(5, int(self._window_sec_provider() or 300))
+        """把静默超期（或 force 时全部）的缓冲 flush 为分析单元。
+
+        flush 条件（满足其一）：
+        - force=True（退出路径）；
+        - 最后一条消息静默超过微窗口（正常路径）；
+        - O-2 安全阀：首条消息年龄超过 微窗口 × FORCE_FLUSH_FACTOR
+          （持续发言导致静默期一直不满足时兜底，保证分析延迟有上界）。
+        """
+        window = max(5, int(self._window_sec_provider() or 60))
+        force_flush_age = window * AGGREGATOR_FORCE_FLUSH_FACTOR
         now = datetime.now().timestamp()
         ready: List[Tuple[Tuple[str, str], _Buffer]] = []
         with self._lock:
             for key, buf in list(self._buffers.items()):
-                if force or (now - buf.last_epoch) >= window:
+                if force or (now - buf.last_epoch) >= window or (
+                        now - buf.window_start_epoch) >= force_flush_age:
                     ready.append((key, self._buffers.pop(key)))
         for key, buf in ready:
             if not buf.lines:
