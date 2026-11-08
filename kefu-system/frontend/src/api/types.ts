@@ -123,7 +123,11 @@ export interface AnalysisSettings {
   merge_window_sec: number
   /** 商机合并窗口：同一人 N 秒内再次命中合并为一条（30–1800，默认 180） */
   opp_merge_window_sec: number
+  /** 漏判修正：用户确认过的真实商机消息示例（最多 20 条） */
+  correction_examples: string[]
 }
+
+export interface AnalysisSettingsPayload extends AnalysisSettings {}
 
 /** /api/opportunities */
 export interface OpportunityListItem {
@@ -139,7 +143,7 @@ export interface OpportunityListItem {
   /** 关键原文摘录（列表页「消息原文」列） */
   key_quote: string
   confidence: number
-  status: 'pending' | 'replied' | 'ignored'
+  status: 'pending' | 'replied' | 'ignored' | 'handled'
   created_at: string
 }
 
@@ -155,7 +159,38 @@ export interface OpportunityDetail extends OpportunityListItem {
   key_quote: string
   reply_content: string | null
   replied_at: string | null
-  context: MessageItem[]
+  // 上下文已拆分为独立接口 GET /api/opportunities/{id}/context
+}
+
+/** GET /api/opportunities/{id}/context（error 非空 = 微信库读取失败原因） */
+export interface OpportunityContextOut {
+  items: MessageItem[]
+  error: string
+}
+
+/** /api/analysis-logs 单条分析日志 */
+export interface AnalysisLogItem {
+  id: number
+  created_at: string
+  session_username: string
+  /** 来源会话显示名（备注/昵称优先，解析失败回退 session_username） */
+  session_display: string
+  sender_wxid: string
+  msg_count: number
+  input_text: string
+  /** 消息内容展示版（群消息发送者前缀已解析为显示名） */
+  input_text_display: string
+  result: string
+  status: 'ok' | 'error' | 'skipped' | 'below_threshold'
+  error: string
+  model: string
+  latency_ms: number | null
+}
+
+/** /api/analysis-logs 分页响应 */
+export interface AnalysisLogListOut {
+  total: number
+  items: AnalysisLogItem[]
 }
 
 export interface ReplyPayload {

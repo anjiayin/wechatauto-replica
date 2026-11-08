@@ -151,6 +151,7 @@ class AnalysisSettingsOut(BaseModel):
     prescreen_regex: str = ""
     merge_window_sec: int = 15         # 分析微窗口：发送人静默 N 秒即触发 AI 分析
     opp_merge_window_sec: int = 180    # 商机合并窗口：同一人 N 秒内再次命中合并为一条
+    correction_examples: List[str] = Field(default_factory=list)  # 漏判修正示例（最多 20 条）
 
 
 class AnalysisSettingsUpdate(BaseModel):
@@ -161,6 +162,8 @@ class AnalysisSettingsUpdate(BaseModel):
     prescreen_regex: str = ""
     merge_window_sec: int = Field(default=15, ge=5, le=600)
     opp_merge_window_sec: int = Field(default=180, ge=30, le=1800)
+    # None = 不变更（防止部分更新的旧调用把已有示例意外清空）；[] = 显式清空
+    correction_examples: Optional[List[str]] = None
 
 
 class NotifyUpdate(BaseModel):
@@ -208,11 +211,18 @@ class OpportunityDetailOut(OpportunityListItem):
     key_quote: str = ""
     reply_content: Optional[str] = None
     replied_at: Optional[str] = None
-    context: List[MessageOut] = Field(default_factory=list)
+    # 上下文已拆分为独立接口 GET /api/opportunities/{id}/context
+    # （详情接口不查微信库，秒开；上下文区域独立加载态）
+
+
+class OpportunityContextOut(BaseModel):
+    """商机上下文（独立异步接口；error 非空 = 微信库读取失败的用户可读原因）。"""
+    items: List[MessageOut] = Field(default_factory=list)
+    error: str = ""
 
 
 class OpportunityStatusUpdate(BaseModel):
-    status: str = Field(pattern="^(pending|replied|ignored)$")
+    status: str = Field(pattern="^(pending|replied|ignored|handled)$")
 
 
 class QuoteRef(BaseModel):
@@ -228,3 +238,27 @@ class ReplyRequest(BaseModel):
 class ReplyAccepted(BaseModel):
     ok: bool
     message: str
+
+
+# ---------------------------------------------------------------------------
+# 分析日志
+# ---------------------------------------------------------------------------
+class AnalysisLogOut(BaseModel):
+    id: int
+    created_at: str = ""
+    session_username: str = ""
+    session_display: str = ""          # 来源会话显示名（备注/昵称优先，失败回退原值）
+    sender_wxid: str = ""
+    msg_count: int = 0
+    input_text: str = ""
+    input_text_display: str = ""       # 消息内容展示版（群消息发送者前缀已解析为显示名）
+    result: str = ""                   # AI 结果原始 JSON（ok/below_threshold 时有值）
+    status: str = ""                   # ok / error / skipped / below_threshold
+    error: str = ""                    # skipped/error 原因
+    model: str = ""
+    latency_ms: Optional[int] = None
+
+
+class AnalysisLogListOut(BaseModel):
+    total: int
+    items: List[AnalysisLogOut]

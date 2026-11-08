@@ -8,6 +8,7 @@ import type { WsEvent } from '../api/types'
  * 事件处理：
  * - opportunity_new → 失效商机相关查询 + 派发 kefu-opportunity-new-sound（提示音）
  *   + 派发 kefu-opportunity-toast（App 全局右上角 toast，任何页面可见）
+ *   + 页面不可见且已授权系统通知时发 Web Notification（点击回焦并打开详情抽屉）
  * - opportunity_update / unread_cleared → 仅刷新商机列表（合并更新不弹提醒）
  * - analysis_error → 派发 kefu-analysis-error（AI 分析失败警告 toast）
  *   + 失效状态查询（连续失败 ≥3 次时顶部常驻横幅由 /api/status 驱动）
@@ -24,6 +25,55 @@ interface OpportunityNewData {
 interface AnalysisErrorData {
   error?: string
   consecutive_failures?: number
+}
+
+/** 提取摘要首行非空文本（系统通知正文用） */
+function firstLine(text: string | undefined): string {
+  return (
+    String(text ?? '')
+      .split('\n')
+      .map((l) => l.trim())
+      .find(Boolean) ?? ''
+  )
+}
+
+/** 系统通知应用级开关 localStorage 键（设置页 Switch 写入，"1"=开） */
+export const SYSTEM_NOTIFY_KEY = 'kefu.system_notify_enabled'
+
+/** 系统通知是否开启（应用级开关；需与浏览器授权同时满足才发通知） */
+function isSystemNotifyEnabled(): boolean {
+  try {
+    return window.localStorage.getItem(SYSTEM_NOTIFY_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+/** 系统通知（应用开关开启 + 已授权 + 页面不可见时）：点击 → 回焦并打开详情。 */
+function showSystemNotification(id: number, body: string): void {
+  try {
+    if (
+      typeof Notification === 'undefined' ||
+      !isSystemNotifyEnabled() ||
+      Notification.permission !== 'granted'
+    ) {
+      return
+    }
+    const notification = new Notification('发现新商机', {
+      body,
+      tag: `kefu-opp-${id}`, // 同一商机只弹一个通知
+    })
+    notification.onclick = () => {
+      window.focus()
+      notification.close()
+      // App 监听该事件：导航回商机列表页并打开详情抽屉（pending 兜底）
+      window.dispatchEvent(
+        new CustomEvent('kefu-notification-click', { detail: { id } }),
+      )
+    }
+  } catch {
+    // 通知失败静默降级（应用内 toast 已有兜底）
+  }
 }
 
 export function useEvents(): boolean {
@@ -72,6 +122,15 @@ export function useEvents(): boolean {
               )
             }
             window.dispatchEvent(new CustomEvent('kefu-opportunity-new-sound'))
+            // 系统通知：仅页面不可见时发送，避免与应用内 toast 重复打扰
+            if (document.hidden && typeof d.id === 'number') {
+              showSystemNotification(
+                d.id,
+                [d.session_name ?? '', firstLine(d.summary)]
+                  .filter(Boolean)
+                  .join('：'),
+              )
+            }
             void queryClient.invalidateQueries({ queryKey: ['opportunities'] })
             void queryClient.invalidateQueries({ queryKey: ['status'] })
             break

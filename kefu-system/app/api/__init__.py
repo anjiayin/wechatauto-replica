@@ -2,6 +2,7 @@
 """API 路由汇总：main.py 一次性 include 全部子路由。"""
 from __future__ import annotations
 
+from app.api.router_analysis import router as analysis_router
 from app.api.router_opportunities import router as opportunities_router
 from app.api.router_settings import router as settings_router
 from app.api.router_system import router as system_router
@@ -14,6 +15,7 @@ ALL_ROUTERS = (
     types_router,
     settings_router,
     opportunities_router,
+    analysis_router,
 )
 
 __all__ = ["ALL_ROUTERS"]

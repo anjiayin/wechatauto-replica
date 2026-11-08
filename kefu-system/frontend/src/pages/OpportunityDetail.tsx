@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  Alert,
   Box,
   Button,
   Checkbox,
@@ -10,6 +11,7 @@ import {
   FormControlLabel,
   IconButton,
   LinearProgress,
+  Skeleton,
   Snackbar,
   Stack,
   TextField,
@@ -17,11 +19,17 @@ import {
   Typography,
 } from '@mui/material'
 import CloseIcon from '@mui/icons-material/Close'
+import RefreshIcon from '@mui/icons-material/Refresh'
 import VisibilityOffIcon from '@mui/icons-material/VisibilityOff'
+import TaskAltIcon from '@mui/icons-material/TaskAlt'
 import UndoIcon from '@mui/icons-material/Undo'
 import SendIcon from '@mui/icons-material/Send'
 import { apiGet, apiPatch, apiPost } from '../api/client'
-import type { OpportunityDetail, ReplyPayload } from '../api/types'
+import type {
+  OpportunityContextOut,
+  OpportunityDetail,
+  ReplyPayload,
+} from '../api/types'
 
 interface SendResultData {
   opportunity_id: number
@@ -29,7 +37,7 @@ interface SendResultData {
   message: string
 }
 
-/** 商机详情抽屉：原文/要点/上下文/回复框（@成员、引用）/操作。 */
+/** 商机详情抽屉：原文/要点/上下文（独立加载）/回复框（@成员、引用）/操作。 */
 export default function OpportunityDetail(props: {
   id: number | null
   onClose: () => void
@@ -41,11 +49,30 @@ export default function OpportunityDetail(props: {
   const [quoteLast, setQuoteLast] = useState(false)
   const [snack, setSnack] = useState<{ ok: boolean; message: string } | null>(null)
 
+  // 详情：只读业务库（不查微信库），秒开
   const { data: opp, isLoading } = useQuery({
     queryKey: ['opportunity', id],
     queryFn: () => apiGet<OpportunityDetail>(`/api/opportunities/${id}`),
     enabled: id !== null,
   })
+
+  // 上下文：独立异步接口（微信库查询 + 后端瞬时故障重试；失败可重新加载）
+  const contextQuery = useQuery({
+    queryKey: ['opportunity-context', id],
+    queryFn: () => apiGet<OpportunityContextOut>(`/api/opportunities/${id}/context`),
+    enabled: id !== null,
+  })
+  const contextError = contextQuery.error
+    ? (contextQuery.error as Error).message
+    : contextQuery.data?.error ?? ''
+  // 时间正序渲染（最新在最下）：后端返回时间倒序，按 sort_seq 升序排列
+  const contextItems = useMemo(
+    () =>
+      [...(contextQuery.data?.items ?? [])].sort(
+        (a, b) => a.sort_seq - b.sort_seq,
+      ),
+    [contextQuery.data],
+  )
 
   // 发送结果经 WS → CustomEvent 送达（202 受理后异步反馈）
   useEffect(() => {
@@ -94,9 +121,9 @@ export default function OpportunityDetail(props: {
         .map((s) => s.trim())
         .filter(Boolean),
     }
-    // 引用回复：引用上下文里最新一条消息（与详情页所见一致）
-    if (quoteLast && opp && opp.context.length > 0) {
-      payload.quote = { local_id: opp.context[0].local_id }
+    // 引用回复：引用上下文里最新一条消息（上下文 items 已按时间正序，取末条）
+    if (quoteLast && contextItems.length > 0) {
+      payload.quote = { local_id: contextItems[contextItems.length - 1].local_id }
     }
     replyMutation.mutate(payload)
   }
@@ -143,9 +170,39 @@ export default function OpportunityDetail(props: {
               </Typography>
             </Box>
 
-            <Typography variant="subtitle2">上下文消息（最近 11 条）</Typography>
+            <Typography variant="subtitle2">上下文消息（最近 11 条，时间正序）</Typography>
             <Box sx={{ maxHeight: 200, overflow: 'auto', border: '1px solid #eee', borderRadius: 1, mb: 1.5 }}>
-              {[...opp.context].reverse().map((m) => (
+              {/* 上下文独立加载态：Skeleton 骨架屏（详情本身秒开，不互相阻塞） */}
+              {contextQuery.isLoading && (
+                <Box sx={{ p: 1.5 }}>
+                  {[0, 1, 2].map((i) => (
+                    <Box key={i} sx={{ mb: 1.5 }}>
+                      <Skeleton variant="text" width="45%" height={18} />
+                      <Skeleton variant="text" width="85%" height={18} />
+                    </Box>
+                  ))}
+                </Box>
+              )}
+              {/* 读取失败：明确中文原因 + 重新加载按钮 */}
+              {contextError && (
+                <Alert
+                  severity="warning"
+                  sx={{ m: 1.5 }}
+                  action={
+                    <Button
+                      color="inherit"
+                      size="small"
+                      startIcon={<RefreshIcon />}
+                      onClick={() => contextQuery.refetch()}
+                    >
+                      重新加载
+                    </Button>
+                  }
+                >
+                  {contextError}
+                </Alert>
+              )}
+              {!contextQuery.isLoading && !contextError && contextItems.map((m) => (
                 <Box key={`${m.sort_seq}-${m.local_id}`} sx={{ px: 1.5, py: 0.5, borderBottom: '1px dashed #eee' }}>
                   <Typography variant="caption" color="text.secondary">
                     {m.create_time.replace('T', ' ')} · {m.sender_name} · {m.type_name}
@@ -155,9 +212,12 @@ export default function OpportunityDetail(props: {
                   </Typography>
                 </Box>
               ))}
-              {opp.context.length === 0 && (
-                <Typography variant="caption" color="text.secondary" sx={{ p: 1.5 }}>
-                  无法读取历史消息（微信数据库不可用）
+              {!contextQuery.isLoading && !contextError && contextItems.length === 0 && (
+                <Typography variant="caption" color="text.secondary" sx={{ p: 1.5, display: 'block' }}>
+                  暂无上下文消息
+                  <Button size="small" startIcon={<RefreshIcon />} onClick={() => contextQuery.refetch()}>
+                    重新加载
+                  </Button>
                 </Typography>
               )}
             </Box>
@@ -221,6 +281,23 @@ export default function OpportunityDetail(props: {
                   标记非商机
                 </Button>
               ) : (
+                <Tooltip title="恢复为待处理">
+                  <Button startIcon={<UndoIcon />} onClick={() => statusMutation.mutate('pending')}>
+                    恢复待处理
+                  </Button>
+                </Tooltip>
+              )}
+              {opp.status !== 'handled' && (
+                <Tooltip title="已在微信里自行处理完，无需系统跟进">
+                  <Button
+                    startIcon={<TaskAltIcon />}
+                    onClick={() => statusMutation.mutate('handled')}
+                  >
+                    已自行处理
+                  </Button>
+                </Tooltip>
+              )}
+              {opp.status === 'handled' && (
                 <Tooltip title="恢复为待处理">
                   <Button startIcon={<UndoIcon />} onClick={() => statusMutation.mutate('pending')}>
                     恢复待处理

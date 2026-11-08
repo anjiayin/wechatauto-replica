@@ -23,6 +23,7 @@ from app.config import (
     KEY_AI_MODEL,
     KEY_ANALYSIS_MERGE_WINDOW,
     KEY_ANALYSIS_OPP_MERGE_WINDOW,
+    KEY_ANALYSIS_CORRECTION_EXAMPLES,
     KEY_ANALYSIS_MIN_CONFIDENCE,
     KEY_ANALYSIS_PRESCREEN_ENABLED,
     KEY_ANALYSIS_PRESCREEN_KEYWORDS,
@@ -57,6 +58,31 @@ def epoch_to_iso(epoch: Optional[int | float]) -> str:
 # ---------------------------------------------------------------------------
 # DDL（严格遵循设计文档 3.1 节，不得改动）
 # ---------------------------------------------------------------------------
+# opportunities 列定义抽出为常量：DDL 与旧库迁移共用同一份定义（防漂移）。
+# 状态含 handled（用户已自行处理）——status 是 TEXT，但 CHECK 约束需要
+# 对旧库做一次表重建迁移（见 _migrate_opportunity_status_handled）。
+_OPPORTUNITIES_COLUMNS = """
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_username TEXT NOT NULL,
+      session_name     TEXT NOT NULL,
+      sender_wxid      TEXT NOT NULL DEFAULT '',
+      sender_name      TEXT NOT NULL,
+      window_start     TEXT NOT NULL,
+      window_end       TEXT NOT NULL,
+      merged_count     INTEGER NOT NULL DEFAULT 1,
+      raw_text         TEXT NOT NULL,
+      type_id          INTEGER REFERENCES opportunity_types(id) ON DELETE SET NULL,
+      type_name        TEXT NOT NULL,
+      summary          TEXT NOT NULL,
+      key_quote        TEXT NOT NULL DEFAULT '',
+      confidence       INTEGER NOT NULL DEFAULT 0,
+      status           TEXT NOT NULL DEFAULT 'pending'
+                       CHECK (status IN ('pending','replied','ignored','handled')),
+      reply_content    TEXT,
+      replied_at       TEXT,
+      created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+    """
+
 DDL_STATEMENTS: tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS settings (
@@ -85,29 +111,7 @@ DDL_STATEMENTS: tuple[str, ...] = (
       updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
     )
     """,
-    """
-    CREATE TABLE IF NOT EXISTS opportunities (
-      id               INTEGER PRIMARY KEY AUTOINCREMENT,
-      session_username TEXT NOT NULL,
-      session_name     TEXT NOT NULL,
-      sender_wxid      TEXT NOT NULL DEFAULT '',
-      sender_name      TEXT NOT NULL,
-      window_start     TEXT NOT NULL,
-      window_end       TEXT NOT NULL,
-      merged_count     INTEGER NOT NULL DEFAULT 1,
-      raw_text         TEXT NOT NULL,
-      type_id          INTEGER REFERENCES opportunity_types(id) ON DELETE SET NULL,
-      type_name        TEXT NOT NULL,
-      summary          TEXT NOT NULL,
-      key_quote        TEXT NOT NULL DEFAULT '',
-      confidence       INTEGER NOT NULL DEFAULT 0,
-      status           TEXT NOT NULL DEFAULT 'pending'
-                       CHECK (status IN ('pending','replied','ignored')),
-      reply_content    TEXT,
-      replied_at       TEXT,
-      created_at       TEXT NOT NULL DEFAULT (datetime('now'))
-    )
-    """,
+    "CREATE TABLE IF NOT EXISTS opportunities (%s)" % _OPPORTUNITIES_COLUMNS,
     "CREATE INDEX IF NOT EXISTS idx_opp_created ON opportunities (created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_opp_status  ON opportunities (status)",
     "CREATE INDEX IF NOT EXISTS idx_opp_session ON opportunities (session_username)",
@@ -162,6 +166,7 @@ class Database:
             self._conn.commit()
         self._init_default_settings()
         self._migrate_merge_window_default()
+        self._migrate_opportunity_status_handled()
         logger.info("业务数据库已初始化：%s", self.path)
 
     # ------------------------------------------------------------------
@@ -200,6 +205,54 @@ class Database:
             logger.info("分析微窗口已从旧默认 60s 迁移为 %ds",
                         MERGE_WINDOW_SEC_DEFAULT)
         self.set_setting(KEY_RUNTIME_MW_MIGRATED, "1")
+
+    def _migrate_opportunity_status_handled(self) -> None:
+        """一次性迁移：旧库 opportunities 的 CHECK 约束不含 handled 时重建表。
+
+        status 是 TEXT，但旧 DDL 的 CHECK (status IN ('pending','replied',
+        'ignored')) 会拒绝新状态值。重建步骤（foreign_keys 临时关闭）：
+        建 opportunities_new（新 CHECK）→ 复制数据 → 删旧表 → 改名。
+        已含 handled 的库直接跳过（幂等）。
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='opportunities'").fetchone()
+            if not row or "handled" in str(row["sql"] or ""):
+                return
+            logger.info("检测到旧版 opportunities 表（status 无 handled），"
+                        "开始重建以支持「已自行处理」状态")
+            self._conn.commit()
+            self._conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                # 清理上次迁移中断的残留（DDL 自提交，残留的
+                # opportunities_new 必然是建表后、复制完成前的空表，
+                # 无已提交数据，可直接删除——否则重启将抛
+                # "table already exists" 导致应用无法自愈，BUG-2）
+                self._conn.execute(
+                    "DROP TABLE IF EXISTS opportunities_new")
+                self._conn.execute(
+                    "CREATE TABLE opportunities_new (%s)" % _OPPORTUNITIES_COLUMNS)
+                self._conn.execute(
+                    "INSERT INTO opportunities_new "
+                    "SELECT * FROM opportunities")
+                self._conn.execute("DROP TABLE opportunities")
+                self._conn.execute(
+                    "ALTER TABLE opportunities_new RENAME TO opportunities")
+                # 表随 DROP 一并消失的索引按现有 DDL 重建
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_opp_created "
+                    "ON opportunities (created_at DESC)")
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_opp_status "
+                    "ON opportunities (status)")
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_opp_session "
+                    "ON opportunities (session_username)")
+                self._conn.commit()
+            finally:
+                self._conn.execute("PRAGMA foreign_keys=ON")
+            logger.info("opportunities 表迁移完成（status 支持 handled）")
 
     # ------------------------------------------------------------------
     # settings DAO
@@ -453,14 +506,15 @@ class Database:
         """商机列表（时间倒序）。
 
         Args:
-            status: pending/replied/ignored；空串 = 排除 ignored。
+            status: pending/replied/ignored/handled；空串 = 排除 ignored
+                （handled 与 pending/replied 一样默认展示在列表中）。
 
         Returns:
             (total, items)
         """
         where: list[str] = []
         params: list[Any] = []
-        if status in ("pending", "replied", "ignored"):
+        if status in ("pending", "replied", "ignored", "handled"):
             where.append("status=?")
             params.append(status)
         else:
@@ -608,6 +662,44 @@ class Database:
             self._conn.commit()
             return int(cur.lastrowid or 0)
 
+    def list_analysis_logs(self, *, page: int = 1, page_size: int = 20,
+                           status: str = "", session: str = "",
+                           keyword: str = "") -> tuple[int, list[dict]]:
+        """分析日志分页列表（id 倒序 = 时间倒序）。
+
+        Args:
+            status: ok/error/skipped/below_threshold；空串 = 全部。
+            session: 会话筛选（session_username 模糊匹配）。
+            keyword: 关键词筛选（input_text 模糊匹配）。
+
+        Returns:
+            (total, items)
+        """
+        where: list[str] = []
+        params: list[Any] = []
+        if status in ("ok", "error", "skipped", "below_threshold"):
+            where.append("status=?")
+            params.append(status)
+        if session:
+            where.append("session_username LIKE ?")
+            params.append(f"%{session}%")
+        if keyword:
+            where.append("input_text LIKE ?")
+            params.append(f"%{keyword}%")
+        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+        with self._lock:
+            total = self._conn.execute(
+                f"SELECT COUNT(*) FROM analysis_logs{where_sql}", params
+            ).fetchone()[0]
+            rows = self._conn.execute(
+                "SELECT id, created_at, session_username, sender_wxid, "
+                "msg_count, input_text, result, status, error, model, "
+                "latency_ms FROM analysis_logs"
+                f"{where_sql} ORDER BY id DESC LIMIT ? OFFSET ?",
+                [*params, page_size, (max(page, 1) - 1) * page_size],
+            ).fetchall()
+        return int(total), [dict(r) for r in rows]
+
     # ------------------------------------------------------------------
     # watermarks DAO
     # ------------------------------------------------------------------
@@ -659,6 +751,23 @@ def read_ai_settings(db: Database) -> dict[str, str]:
     }
 
 
+def read_correction_examples(db: Database) -> list[str]:
+    """读取分析修正示例（analysis.correction_examples，JSON 数组字符串）。
+
+    脏数据防御：解析失败/类型异常一律回退空列表，不崩管线。
+    """
+    import json as _json
+
+    raw = db.get_setting(KEY_ANALYSIS_CORRECTION_EXAMPLES, "[]")
+    try:
+        data = _json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [str(e) for e in data if str(e).strip()]
+
+
 def read_analysis_settings(db: Database) -> dict[str, Any]:
     """读取分析判定配置（分析微窗口 / 商机合并窗口允许 settings 覆盖）。"""
     return {
@@ -670,6 +779,7 @@ def read_analysis_settings(db: Database) -> dict[str, Any]:
         "merge_window_sec": db.get_int(KEY_ANALYSIS_MERGE_WINDOW,
                                        MERGE_WINDOW_SEC_DEFAULT),
         "opp_merge_window_sec": db.get_int(KEY_ANALYSIS_OPP_MERGE_WINDOW, 180),
+        "correction_examples": read_correction_examples(db),
         "compliance_confirmed": db.get_bool(KEY_COMPLIANCE_CONFIRMED),
     }
 

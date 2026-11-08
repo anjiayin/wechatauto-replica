@@ -17,6 +17,7 @@ import {
 } from '@mui/material'
 import Inventory2Icon from '@mui/icons-material/Inventory2'
 import ChatIcon from '@mui/icons-material/Chat'
+import ReceiptLongIcon from '@mui/icons-material/ReceiptLong'
 import SettingsIcon from '@mui/icons-material/Settings'
 import { apiGet } from './api/client'
 import type { StatusOut } from './api/types'
@@ -25,6 +26,7 @@ import { armAudioUnlock, playOpportunitySound } from './hooks/sound'
 import { setPendingOpportunity } from './hooks/pendingOpportunity'
 import OpportunityList from './pages/OpportunityList'
 import MessageBrowse from './pages/MessageBrowse'
+import AnalysisLogs from './pages/AnalysisLogs'
 import SettingsPage from './pages/SettingsPage'
 
 const DRAWER_WIDTH = 200
@@ -129,6 +131,17 @@ export default function App() {
     window.dispatchEvent(new CustomEvent('kefu-open-opportunity', { detail: { id } }))
   }
 
+  // 系统通知点击（页面不可见时收到新商机 → 点击通知回焦并打开详情抽屉）
+  useEffect(() => {
+    const handler = (ev: Event) => {
+      const d = (ev as CustomEvent<{ id: number }>).detail
+      if (typeof d?.id === 'number') openOpportunity(d.id)
+    }
+    window.addEventListener('kefu-notification-click', handler)
+    return () => window.removeEventListener('kefu-notification-click', handler)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   const banner = buildBanner(status)
 
   return (
@@ -170,6 +183,7 @@ export default function App() {
             badge={status?.unread_count ?? 0}
           />
           <NavItem to="/messages" icon={<ChatIcon />} label="消息浏览" />
+          <NavItem to="/analysis-logs" icon={<ReceiptLongIcon />} label="分析日志" />
           <NavItem to="/settings" icon={<SettingsIcon />} label="设置" />
         </List>
       </Drawer>
@@ -183,6 +197,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<OpportunityList />} />
           <Route path="/messages" element={<MessageBrowse />} />
+          <Route path="/analysis-logs" element={<AnalysisLogs />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<OpportunityList />} />
         </Routes>

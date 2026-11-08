@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import re
 import sys
 import threading
 import time
@@ -24,6 +25,10 @@ from app import db as dbmod
 from app.aggregator import Aggregator
 from app.config import (
     CONTEXT_COUNT,
+    GROUP_MEMBER_CACHE_TTL_SEC,
+    MSG_QUERY_RETRY_INTERVAL_SEC,
+    MSG_QUERY_RETRY_TIMES,
+    SESSION_CACHE_TTL_SEC,
     SESSION_SEARCH_LIMIT_DEFAULT,
     WATERMARK_FLUSH_SEC,
     KEY_RUNTIME_WM_SAVED_AT,
@@ -31,6 +36,24 @@ from app.config import (
 from app.db import Database, epoch_to_iso
 
 logger = logging.getLogger(__name__)
+
+# 微信库读取失败的用户可读提示（前端展示 + 重新加载按钮）
+MSG_DB_BUSY_ERROR = "微信数据库正忙（微信客户端正在写入），请稍后点击重新加载"
+# 微信服务未接入时的提示
+MSG_DB_UNAVAILABLE_ERROR = "微信数据库不可用，请确认微信已登录"
+
+# 微信 4.x 群消息正文自带的发送者前缀（wxid_xxx: / 自定义微信号:），
+# 原生格式为 "发送者ID:\n正文"；sender_id 映射不可靠，此前缀为权威发送者。
+# 显示渲染侧用（逐行处理，行内无换行，$ 锚点安全）：
+_SENDER_PREFIX_RE = re.compile(r"^([^\s:：]{2,64})\s*:\s*(.*)$")
+# 发送者提取侧用（严格版）：
+# - ID 字符集排除 "/"（URL 路径字符）；
+# - 冒号后紧跟 "//" 视为 URL scheme（如 http://...），不提取（BUG-3）；
+# - 提取时先按换行切分仅取首行，避免多行正文匹配失败回退到不可靠
+#   sender_username 映射（BUG-1，见 extract_content_sender）。
+_SENDER_ID_STRICT_RE = re.compile(r"^([^\s:：/]{2,64})\s*:(?!//)\s*")
+# 合并文本行首的 "[HH:MM] " 时间前缀（Aggregator.merged_text 系统加的）
+_TIME_PREFIX_RE = re.compile(r"^\[\d{1,2}:\d{2}\]\s*")
 
 # 仓库根目录（wechatauto-replica/）加入 sys.path，保证从 kefu-system 目录
 # 启动时也能 import wechatauto（只 import 调用，不做任何修改）
@@ -57,6 +80,18 @@ class WeChatService:
         self._stop = threading.Event()
         self._name_cache: dict[str, str] = {}   # username → display name 缓存
         self._name_cache_lock = threading.Lock()
+        # 全量联系人/会话列表缓存（TTL 60s；会话搜索改为缓存 + 内存过滤，
+        # 避免每次搜索都撞微信库冷分片/解密导致的秒级等待）
+        self._contact_cache: list[dict] = []
+        self._contact_cache_ts: float = 0.0
+        self._contact_cache_lock = threading.Lock()
+        # single-flight 并发构建锁：缓存未命中时仅首个线程持锁构建
+        # （真实构建可达 ~20s），其余线程等待后复用，避免并发首请求
+        # 重复撞微信库冷分片（前端设置页本身就会并行发两个搜索请求）
+        self._contact_cache_build_lock = threading.Lock()
+        # 群成员显示名缓存（chatroom → (timestamp, {username: 显示名})，TTL 600s）
+        self._group_members_cache: dict[str, tuple[float, dict[str, str]]] = {}
+        self._group_members_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # 启停
@@ -153,26 +188,181 @@ class WeChatService:
         try:
             username = str(msg.get("username") or "")
             mtype = str(msg.get("type") or "")
+            kind = "group" if username.endswith("@chatroom") else "friend"
+            sender_wxid, sender_name = self._resolve_sender(username, kind, msg)
             if mtype != "文本":
                 self._db.insert_analysis_log(
                     session_username=username,
-                    sender_wxid=str(msg.get("sender_username") or ""),
+                    sender_wxid=sender_wxid,
                     msg_count=1,
                     input_text=str(msg.get("content") or "")[:200],
                     status="skipped",
                     error=f"非文本消息（{mtype or '未知类型'}），不分析",
                 )
                 return
-            kind = "group" if username.endswith("@chatroom") else "friend"
             session_name = self.get_display_name(username)
-            # 群内昵称解析（有 wxid 时尽力解析显示名，解析失败回退 wxid）
-            sender_wxid = str(msg.get("sender_username") or "")
-            display = self.get_display_name(sender_wxid) if sender_wxid else ""
-            if display and display != sender_wxid:
-                msg["sender_display_name"] = display
+            # 发送人已用可靠数据源解析（群=正文前缀 / 私聊=会话对方），
+            # 覆盖 msg 中不可靠的 sender_username 供 Aggregator/管线透传
+            msg["sender_username"] = sender_wxid
+            msg["sender_display_name"] = sender_name
             self._aggregator.add(msg, session_name, kind)
         except Exception:
             logger.exception("处理新消息回调异常（已忽略）")
+
+    # ------------------------------------------------------------------
+    # 发送人权威解析（修复：SenderName2Id rowid 映射不可靠导致的显示错误）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def extract_content_sender(content: str) -> str:
+        """从群消息正文提取行首发送者 ID（wxid_xxx: / 自定义微信号:）。
+
+        微信 4.x 原生把发送者写入正文首部（``ID:\\n正文``），该前缀是
+        权威数据源；无前缀返回空串（由调用方回退 sender_username）。
+
+        实现细节：
+        - 先按换行切分仅取首行再匹配（不用 ``$`` 锚点直接匹配全文，
+          否则 ``ID:\\n多行正文`` 会匹配失败——BUG-1）；
+        - ID 字符集排除 "/"，且冒号后紧跟 "//"（URL scheme，如
+          ``http://...`` 开头的无前缀正文）不提取——BUG-3。
+        """
+        first_line = str(content or "").lstrip().split("\n", 1)[0]
+        match = _SENDER_ID_STRICT_RE.match(first_line)
+        return match.group(1) if match else ""
+
+    def _get_group_member_names(self, chatroom: str) -> dict[str, str]:
+        """群成员 username → 显示名映射（群内昵称优先，缓存 TTL 600s）。
+
+        wechatauto.get_group_members 返回字段：username / nick_name /
+        remark / is_owner；群内显示名取 nick_name（群昵称），缺失回退
+        remark。读取失败回退空映射（调用方再回退联系人/原值）。
+        """
+        with self._group_members_lock:
+            cached = self._group_members_cache.get(chatroom)
+            if cached and \
+                    time.monotonic() - cached[0] < GROUP_MEMBER_CACHE_TTL_SEC:
+                return cached[1]
+        names: dict[str, str] = {}
+        if self._wxdb is not None:
+            try:
+                for member in self._wxdb.get_group_members(chatroom):
+                    uid = str(member.get("username") or "")
+                    if uid:
+                        names[uid] = str(member.get("nick_name")
+                                         or member.get("remark") or uid)
+            except Exception as exc:
+                logger.warning("读取群成员列表失败（%s）：%s", chatroom, exc)
+        with self._group_members_lock:
+            self._group_members_cache[chatroom] = (time.monotonic(), names)
+        return names
+
+    def resolve_group_member_display(self, chatroom: str,
+                                     member_id: str) -> str:
+        """群成员 ID → 群内显示名。
+
+        优先级：chatroom member 表群昵称 → 联系人备注/昵称（get_nickname）
+        → 原 ID（解析失败回退原值，不崩管线）。
+        """
+        if not member_id:
+            return ""
+        if chatroom.endswith("@chatroom"):
+            names = self._get_group_member_names(chatroom)
+            if member_id in names:
+                return names[member_id]
+        if self._wxdb is not None:
+            try:
+                nick = self._wxdb.get_nickname(member_id) or ""
+            except Exception:
+                nick = ""
+            if nick:
+                return nick
+        return member_id
+
+    def _resolve_sender(self, username: str, kind: str,
+                        msg: dict) -> tuple[str, str]:
+        """解析消息发送人的权威 (wxid, 显示名)。
+
+        背景：msg["sender_username"] 来自 message_resource.db 的
+        SenderName2Id 表 rowid→user_name 映射，该映射不可靠（私聊可能
+        解析成无关好友、群内非好友可能解析成好友昵称）。改用可靠数据源：
+
+        - 群聊：正文自带发送者前缀（``ID:\\n正文``）为权威，仅当无前缀时
+          回退 sender_username；显示名 = 群成员表群昵称 → 联系人备注/昵称
+          → 原 ID；
+        - 私聊：发送人就是会话对方，与 sender_username 映射无关；
+          sender_id ∈ (2, "2") 为自己发送（显示「我」，后续管线正常处理）。
+        """
+        if kind != "group":
+            if msg.get("sender_id") in (2, "2"):
+                return "", "我"
+            return username, self.get_display_name(username)
+        # 群聊：正文前缀优先，sender_username 映射仅作回退
+        sender_id = self.extract_content_sender(msg.get("content") or "") \
+            or str(msg.get("sender_username") or "")
+        if not sender_id:
+            return "", ""
+        return sender_id, self.resolve_group_member_display(username, sender_id)
+
+    # ------------------------------------------------------------------
+    # 分析日志展示字段（来源会话/消息内容的显示名渲染）
+    # ------------------------------------------------------------------
+    def build_log_displays(self, session_username: str,
+                           input_text: str) -> tuple[str, str]:
+        """分析日志的展示字段：(session_display, input_text_display)。
+
+        - session_display：会话显示名（备注/昵称优先，失败回退原 ID）；
+        - input_text_display：群消息每行的发送者前缀解析为显示名
+          （私聊无前缀行，原样返回）；前缀解析失败保留原值。
+        """
+        session_username = str(session_username or "")
+        input_text = str(input_text or "")
+        session_display = self.get_display_name(session_username) \
+            or session_username
+        if not session_username.endswith("@chatroom"):
+            return session_display, input_text
+        return session_display, self._render_input_text_display(
+            session_username, input_text)
+
+    def _render_input_text_display(self, chatroom: str,
+                                   text: str) -> str:
+        """把合并文本中每行的发送者 ID 前缀替换为显示名。
+
+        行格式兼容 ``[HH:MM] wxid_xxx:`` / ``[HH:MM] wxid_xxx: 正文`` /
+        无时间前缀的 ``wxid_xxx:`` 行；前缀若解析不出显示名（既不在群
+        成员表也不是已知联系人）则整行保留原值，避免误伤正文。
+        """
+        out_lines: list[str] = []
+        for line in text.split("\n"):
+            time_match = _TIME_PREFIX_RE.match(line)
+            time_prefix = line[:time_match.end()] if time_match else ""
+            body = line[time_match.end():] if time_match else line
+            match = _SENDER_PREFIX_RE.match(body)
+            if not match:
+                out_lines.append(line)
+                continue
+            prefix_id, rest = match.group(1), match.group(2)
+            display = self._try_resolve_chat_id(chatroom, prefix_id)
+            if display and display != prefix_id:
+                out_lines.append(f"{time_prefix}{display}: {rest}".rstrip())
+            else:
+                out_lines.append(line)
+        return "\n".join(out_lines)
+
+    def _try_resolve_chat_id(self, chatroom: str, uid: str) -> str:
+        """会话内 ID → 显示名；解析失败返回空串（调用方保留原值）。"""
+        if not uid:
+            return ""
+        if chatroom.endswith("@chatroom"):
+            names = self._get_group_member_names(chatroom)
+            if uid in names:
+                return names[uid]
+        if self._wxdb is not None:
+            try:
+                nick = self._wxdb.get_nickname(uid) or ""
+            except Exception:
+                nick = ""
+            if nick:
+                return nick
+        return ""
 
     # ------------------------------------------------------------------
     # 监控对象联动（API 增删改时调用）
@@ -220,72 +410,107 @@ class WeChatService:
             self._name_cache[username] = name
         return name
 
+    def _build_contact_list(self) -> list[dict]:
+        """构建全量联系人/会话列表（群+好友，含显示名）。
+
+        会话（≤100 条，最近活跃优先）逐个解析显示名；联系人用
+        wechatauto 自带的 remark/nick_name 快照，免逐个解析（快）。
+        公众号（gh_ 前缀）不参与监控，直接跳过。
+        """
+        items: list[dict] = []
+        seen: set[str] = set()
+        for s in self._wxdb.get_sessions(limit=100):
+            username = str(s.get("username") or "")
+            if not username or username in seen or username.startswith("gh_"):
+                continue
+            kind = "group" if username.endswith("@chatroom") else "friend"
+            items.append({"username": username,
+                          "display_name": self.get_display_name(username),
+                          "kind": kind})
+            seen.add(username)
+        # wechatauto.get_contacts 的群聊取值为 "chatroom"（不是 "group"）
+        for c_kind, item_kind in (("chatroom", "group"), ("friend", "friend")):
+            try:
+                contacts = self._wxdb.get_contacts(kind=c_kind, limit=2000)
+            except Exception as exc:
+                logger.warning("读取联系人（%s）失败：%s", c_kind, exc)
+                contacts = []
+            for c in contacts:
+                username = str(c.get("username") or "")
+                if not username or username in seen or username.startswith("gh_"):
+                    continue
+                name = c.get("remark") or c.get("nick_name") or username
+                items.append({"username": username,
+                              "display_name": name, "kind": item_kind})
+                seen.add(username)
+        return items
+
+    def _get_cached_contact_list(self) -> list[dict]:
+        """全量联系人/会话列表（TTL 60s 内存缓存 + single-flight 构建）。
+
+        流程：锁内快查 → 未命中则竞争构建锁 → 持锁线程构建并写缓存，
+        其余线程等待后二次检查直接复用（不重复构建）；构建失败回退
+        过期缓存且不更新时间戳（下次请求会再尝试重建）。
+        """
+        with self._contact_cache_lock:
+            if self._contact_cache and \
+                    time.monotonic() - self._contact_cache_ts < SESSION_CACHE_TTL_SEC:
+                return self._contact_cache
+        with self._contact_cache_build_lock:
+            # 拿到构建锁后二次检查：等待期间可能已有线程完成构建
+            with self._contact_cache_lock:
+                if self._contact_cache and \
+                        time.monotonic() - self._contact_cache_ts \
+                        < SESSION_CACHE_TTL_SEC:
+                    return self._contact_cache
+            try:
+                fresh = self._build_contact_list()
+            except Exception as exc:
+                # 构建失败：回退过期缓存（聊胜于无），不更新时间戳，
+                # 下次请求再重试构建
+                logger.warning("构建联系人列表缓存失败：%s", exc)
+                with self._contact_cache_lock:
+                    return list(self._contact_cache)
+            with self._contact_cache_lock:
+                self._contact_cache = fresh
+                self._contact_cache_ts = time.monotonic()
+                return self._contact_cache
+
+    # 说明：未提供 invalidate_contact_cache 之类的手动失效方法——
+    # 监控对象的增删只改本系统 monitor_targets 表，不影响微信联系人库
+    # 的内容，联系人列表缓存（TTL 60s）无需随之失效；微信侧新出现的
+    # 会话最长 60 秒后即可被搜到，属可接受的缓存延迟。
+
     def search_sessions(self, keyword: str = "",
                         limit: int = SESSION_SEARCH_LIMIT_DEFAULT,
                         kind: str = "all") -> list[dict]:
-        """会话搜索（群 + 好友）：复用 get_sessions / search_contact / get_contacts。
+        """会话搜索（群 + 好友）：TTL 缓存的全量列表 + 内存过滤。
+
+        首次调用构建缓存（可能较慢，微信库冷启动解密分片）；
+        之后 60 秒内的搜索/翻页/类型切换全部内存过滤（毫秒级）。
 
         Args:
-            kind: `all` / `group` / `friend`，按类型过滤返回结果
-               （设置页监控对象双栏左栏按类型拉取候选列表用）。
+            keyword: 显示名/username 子串匹配，空串返回全部。
+            kind: `all` / `group` / `friend`，按类型过滤返回结果。
 
         Returns:
             [{username, display_name, kind}]
         """
         kind = kind if kind in ("group", "friend", "all") else "all"
         limit = max(1, min(limit, 100))
-        out: dict[str, dict] = {}
         if self._wxdb is None:
             return []
-
-        def _accept(item_kind: str) -> bool:
-            return kind == "all" or item_kind == kind
-
-        try:
-            # 会话列表（最近活跃优先）
-            for s in self._wxdb.get_sessions(limit=100):
-                username = str(s.get("username") or "")
-                if not username or username in out:
-                    continue
-                if username.endswith("@chatroom"):
-                    item_kind, name = "group", self.get_display_name(username)
-                elif username.startswith("gh_"):
-                    continue  # 公众号不参与监控
-                else:
-                    item_kind, name = "friend", self.get_display_name(username)
-                if not _accept(item_kind):
-                    continue
-                if keyword and keyword not in name and keyword not in username:
-                    continue
-                out[username] = {"username": username,
-                                 "display_name": name, "kind": item_kind}
-                if len(out) >= limit:
-                    return list(out.values())
-            # 联系人搜索（覆盖不在最近会话里的好友/群）
-            contacts = []
-            if keyword:
-                contacts = self._wxdb.search_contact(keyword)
-            elif kind == "group":
-                # wechatauto.get_contacts 的群聊取值为 "chatroom"（不是 "group"）
-                contacts = self._wxdb.get_contacts(kind="chatroom", limit=limit)
-            else:
-                contacts = self._wxdb.get_contacts(kind="friend", limit=limit)
-            for c in contacts:
-                username = str(c.get("username") or "")
-                if not username or username in out or username.startswith("gh_"):
-                    continue
-                item_kind = ("group" if username.endswith("@chatroom")
-                             else "friend")
-                if not _accept(item_kind):
-                    continue
-                name = c.get("remark") or c.get("nick_name") or username
-                out[username] = {"username": username,
-                                 "display_name": name, "kind": item_kind}
-                if len(out) >= limit:
-                    break
-        except Exception as exc:
-            logger.warning("会话搜索失败：%s", exc)
-        return list(out.values())[:limit]
+        out: list[dict] = []
+        for item in self._get_cached_contact_list():
+            if kind != "all" and item["kind"] != kind:
+                continue
+            if keyword and keyword not in item["display_name"] \
+                    and keyword not in item["username"]:
+                continue
+            out.append(dict(item))
+            if len(out) >= limit:
+                break
+        return out
 
     def get_messages(self, username: str, limit: int = 50,
                      before_seq: int = 0) -> list[dict]:
@@ -293,16 +518,58 @@ class WeChatService:
 
         字段对齐 API 约定：local_id/type/type_name/sender_id/sender_name/
         create_time(ISO8601)/content/sort_seq。
+        持久失败时返回空列表（与「会话确实无消息」同形，调用方按需区分）。
+        """
+        msgs, _error = self.get_messages_with_error(username, limit=limit,
+                                                    before_seq=before_seq)
+        return msgs
+
+    def get_messages_with_error(self, username: str, limit: int = 50,
+                                before_seq: int = 0,
+                                retry_on_empty: bool = False
+                                ) -> tuple[list[dict], str]:
+        """会话历史消息查询（含瞬时故障重试），返回 (msgs, error)。
+
+        优化：微信客户端写库期间分片瞬时 malformed → 查询抛异常或返回空，
+        此处间隔 MSG_QUERY_RETRY_INTERVAL_SEC 重试最多 MSG_QUERY_RETRY_TIMES 次
+        （上下文场景足够等到重建完成）。
+
+        Args:
+            retry_on_empty: 空结果也参与重试（上下文场景：商机存在 ⇒ 会话应有消息）。
+
+        Returns:
+            (msgs, error)：error 为空串 = 成功；
+            非空 = 用户可读中文原因（异常重试耗尽 → 微信数据库正忙）；
+            「重试后仍为空」视为会话确实无消息，error 返回空串。
         """
         if self._wxdb is None:
-            return []
+            return [], MSG_DB_UNAVAILABLE_ERROR
         limit = max(1, min(limit, 200))
+        attempt = 0
+        while True:
+            msgs, failed = self._fetch_messages_once(username, limit, before_seq)
+            if not failed and (msgs or not retry_on_empty):
+                return msgs, ""
+            # 查询异常，或（空结果且要求重试）：间隔后重试
+            if attempt >= MSG_QUERY_RETRY_TIMES:
+                if failed:
+                    return [], MSG_DB_BUSY_ERROR
+                return [], ""  # 空结果重试耗尽：按「会话确实无消息」处理
+            attempt += 1
+            logger.warning("读取会话消息%s（第 %d 次尝试，%s），%.1fs 后重试",
+                           "异常" if failed else "为空", attempt, username,
+                           MSG_QUERY_RETRY_INTERVAL_SEC)
+            time.sleep(MSG_QUERY_RETRY_INTERVAL_SEC)
+
+    def _fetch_messages_once(self, username: str, limit: int,
+                             before_seq: int) -> tuple[list[dict], bool]:
+        """单次消息查询；返回 (msgs, failed)，异常不外抛。"""
         try:
             fetch = limit if not before_seq else min(200, limit + 100)
             msgs = self._wxdb.get_messages(username, limit=fetch)
         except Exception as exc:
-            logger.warning("读取会话消息失败：%s", exc)
-            return []
+            logger.warning("读取会话消息失败（%s）：%s", username, exc)
+            return [], True
         out: list[dict] = []
         for m in msgs:
             if before_seq and int(m.get("sort_seq") or 0) >= before_seq:
@@ -321,7 +588,7 @@ class WeChatService:
             })
             if len(out) >= limit:
                 break
-        return out
+        return out, False
 
     def get_message_by_local_id(self, username: str,
                                 local_id: int) -> Optional[dict]:

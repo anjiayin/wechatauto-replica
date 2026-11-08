@@ -250,6 +250,7 @@ class Pipeline:
                     client, unit_text, unit.session_name, unit.session_kind,
                     unit.sender_name, unit.sender_wxid, unit.merged_count,
                     types, analysis_cfg.get("strictness", "balanced"),
+                    examples=analysis_cfg.get("correction_examples") or [],
                 )
                 self._record_success()
                 latency_ms = int((time.monotonic() - started) * 1000)

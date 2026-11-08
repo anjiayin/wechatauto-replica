@@ -5,9 +5,11 @@ import {
   IconButton,
   InputAdornment,
   List,
+  ListItem,
   ListItemButton,
   ListItemText,
   Paper,
+  Skeleton,
   TextField,
   Typography,
 } from '@mui/material'
@@ -60,6 +62,16 @@ export default function MessageBrowse() {
           />
         </Box>
         <List dense sx={{ overflow: 'auto', flexGrow: 1 }}>
+          {/* 首次加载骨架屏（替代空白） */}
+          {isFetching && (sessions ?? []).length === 0 &&
+            [0, 1, 2, 3, 4].map((i) => (
+              <ListItem key={i} dense>
+                <ListItemText
+                  primary={<Skeleton variant="text" width="60%" height={22} />}
+                  secondary={<Skeleton variant="text" width="40%" height={16} />}
+                />
+              </ListItem>
+            ))}
           {(sessions ?? []).map((s) => (
             <ListItemButton
               key={s.username}

@@ -14,6 +14,8 @@ import re
 import time
 from typing import Any, List, Optional
 
+from app.config import CORRECTION_EXAMPLES_MAX
+
 logger = logging.getLogger(__name__)
 
 
@@ -38,9 +40,17 @@ _SYSTEM_PROMPT_TEMPLATE = """你是微信群聊/私聊消息的销售商机分�
 3. points 提取发送人表达的具体需求要素（标的/数量/时间/价格/地点等），原文没有的不要编造。
 4. quote 必须是原文的逐字摘录。
 5. 只输出一个 JSON 对象，不要输出任何其他文字或 Markdown 代码块标记。
+{examples_block}
 
 ## 输出 JSON 格式
 {{"hit": <bool>, "type": <string|null>, "points": <string[]>, "confidence": <0-100>, "quote": <string>}}"""
+
+# 修正示例段落头部（漏判修正：用户确认过的真实商机消息示例注入 Prompt）
+_EXAMPLES_HEADER = (
+    "## 商机示例（用户确认）\n"
+    "以下是用户确认过的真实商机消息示例，与此相似的消息"
+    "（尤其包含配件 OE 号、车型、配件名称、价格、数量等交易要素的）应判定为商机："
+)
 
 _STRICTNESS_LABELS = {
     "lenient": "宽松（lenient）",
@@ -59,12 +69,24 @@ _STRICTNESS_RULES = {
 }
 
 
-def build_system_prompt(types: List[dict], strictness: str = "balanced") -> str:
+def format_examples_block(examples: Optional[List[str]]) -> str:
+    """构造修正示例段落（最多 20 条，每条截断 100 字；空列表返回空串）。"""
+    items = [str(e or "").strip()[:100] for e in (examples or [])]
+    items = [e for e in items if e][:CORRECTION_EXAMPLES_MAX]
+    if not items:
+        return ""
+    lines = [f"{i}. {e}" for i, e in enumerate(items, start=1)]
+    return "\n" + _EXAMPLES_HEADER + "\n" + "\n".join(lines)
+
+
+def build_system_prompt(types: List[dict], strictness: str = "balanced",
+                        examples: Optional[List[str]] = None) -> str:
     """构造系统提示词。
 
     Args:
         types: 启用的商机类型 dict 列表（name/description）。
         strictness: lenient / balanced / strict。
+        examples: 用户确认过的真实商机消息示例（漏判修正，最多注入 20 条）。
     """
     strictness = strictness if strictness in _STRICTNESS_LABELS else "balanced"
     if types:
@@ -79,6 +101,7 @@ def build_system_prompt(types: List[dict], strictness: str = "balanced") -> str:
         types_block=types_block,
         strictness_label=_STRICTNESS_LABELS[strictness],
         strictness_rules=_STRICTNESS_RULES[strictness],
+        examples_block=format_examples_block(examples),
     )
 
 
@@ -156,12 +179,12 @@ def _normalize_result(data: dict) -> dict:
 # 预筛
 # ---------------------------------------------------------------------------
 def prescreen(text: str, keywords: str, regex: str) -> bool:
-    """轻量预筛：关键词（逗号分隔）或正则任一命中即通过。
+    """轻量预筛：关键词（逗号分隔，中英文逗号均可）或正则任一命中即通过。
 
     关键词与正则均为空时视为全部通过（预筛不误伤）。
     """
     text = text or ""
-    kws = [k.strip() for k in (keywords or "").split(",") if k.strip()]
+    kws = [k.strip() for k in re.split(r"[,，]", keywords or "") if k.strip()]
     if kws and any(k in text for k in kws):
         return True
     if regex:
@@ -261,13 +284,17 @@ class AIClient:
 def analyze_unit(client: AIClient, unit_text: str, session_name: str,
                  session_kind: str, sender_name: str, sender_wxid: str,
                  msg_count: int, types: List[dict],
-                 strictness: str) -> dict:
+                 strictness: str,
+                 examples: Optional[List[str]] = None) -> dict:
     """对一个分析单元执行完整 AI 判定，返回规整后的结果 dict。
+
+    Args:
+        examples: 用户确认过的真实商机消息示例（注入 Prompt，漏判修正）。
 
     Raises:
         AIError: 调用或解析失败。
     """
-    system_prompt = build_system_prompt(types, strictness)
+    system_prompt = build_system_prompt(types, strictness, examples=examples)
     user_message = build_user_message(
         unit_text, session_name, session_kind, sender_name, sender_wxid, msg_count
     )

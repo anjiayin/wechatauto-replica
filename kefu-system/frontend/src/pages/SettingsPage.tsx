@@ -20,6 +20,7 @@ import {
   ListItemText,
   MenuItem,
   Paper,
+  Skeleton,
   Slider,
   Snackbar,
   Stack,
@@ -192,13 +193,24 @@ function TargetsTab() {
     queryFn: () => apiGet<MonitorTarget[]>('/api/monitor-targets'),
   })
 
-  const { data: candidates, isFetching: searching } = useQuery({
-    queryKey: ['session-candidates', candidateKind, keyword],
-    queryFn: () =>
-      apiGet<SessionItem[]>(
-        `/api/sessions/search${qs({ kind: candidateKind, keyword, limit: 50 })}`,
-      ),
+  // 群聊/私聊两个列表并行请求（Promise.all）：一次请求双端缓存，
+  // 子页签切换零等待；后端另有 60s 联系人缓存，重复搜索毫秒级返回。
+  const { data: candidateLists, isFetching: searching } = useQuery({
+    queryKey: ['session-candidates', keyword],
+    queryFn: async () => {
+      const [groups, friends] = await Promise.all([
+        apiGet<SessionItem[]>(
+          `/api/sessions/search${qs({ kind: 'group', keyword, limit: 50 })}`,
+        ),
+        apiGet<SessionItem[]>(
+          `/api/sessions/search${qs({ kind: 'friend', keyword, limit: 50 })}`,
+        ),
+      ])
+      return { group: groups, friend: friends }
+    },
   })
+  const candidates =
+    candidateKind === 'group' ? (candidateLists?.group ?? []) : (candidateLists?.friend ?? [])
 
   const targetUsernames = new Set((targets ?? []).map((t) => t.username))
 
@@ -425,7 +437,17 @@ function TargetsTab() {
               overflow: 'auto',
             }}
           >
-            {(candidates ?? []).map((s) => {
+            {/* 首次加载骨架屏（替代空白） */}
+            {searching && candidates.length === 0 &&
+              [0, 1, 2, 3, 4, 5].map((i) => (
+                <ListItem key={i} dense>
+                  <ListItemText
+                    primary={<Skeleton variant="text" width="60%" height={22} />}
+                    secondary={<Skeleton variant="text" width="40%" height={16} />}
+                  />
+                </ListItem>
+              ))}
+            {candidates.map((s) => {
               const monitored = targetUsernames.has(s.username)
               return (
                 <ListItem
@@ -454,10 +476,10 @@ function TargetsTab() {
                 </ListItem>
               )
             })}
-            {(candidates ?? []).length === 0 && (
+            {candidates.length === 0 && !searching && (
               <ListItem dense>
                 <ListItemText
-                  primary={searching ? '搜索中…' : '未找到匹配的会话'}
+                  primary="未找到匹配的会话"
                 />
               </ListItem>
             )}
@@ -817,6 +839,7 @@ function AiTab() {
         prescreen_regex: mergePrescreen(selectedPresets, customRegex),
         merge_window_sec: mergeWindow,
         opp_merge_window_sec: oppMergeWindow,
+        correction_examples: analysis?.correction_examples ?? [],
       }),
     onSuccess: () => {
       setError('')
@@ -840,6 +863,86 @@ function AiTab() {
     },
     onError: (err: Error) => setError(err.message),
   })
+
+  // 提示音音量（0~100，默认 60；localStorage 与提示音开关同级）
+  // 注意：键不存在时 getItem 返回 null 而 Number(null)===0——必须先判
+  // null 再转数字，否则存量用户（从未设置过音量）会被静音
+  const [volume, setVolume] = useState(() => {
+    const raw = window.localStorage.getItem('kefu.sound_volume')
+    if (raw === null || raw.trim() === '') return 60
+    const n = Number(raw)
+    return Number.isFinite(n) ? Math.min(100, Math.max(0, Math.round(n))) : 60
+  })
+  const changeVolume = (v: number) => {
+    setVolume(v)
+    window.localStorage.setItem('kefu.sound_volume', String(v))
+    window.dispatchEvent(new CustomEvent('kefu-sound-settings-changed'))
+  }
+
+  // 系统通知授权状态（granted / default / denied / unsupported）
+  const [notifPermission, setNotifPermission] = useState<string>(() =>
+    typeof Notification === 'undefined' ? 'unsupported' : Notification.permission,
+  )
+  // 应用级系统通知开关（默认关；localStorage 与提示音开关同级）
+  const [systemNotifyEnabled, setSystemNotifyEnabled] = useState(() => {
+    try {
+      return window.localStorage.getItem('kefu.system_notify_enabled') === '1'
+    } catch {
+      return false
+    }
+  })
+  const toggleSystemNotify = (enabled: boolean) => {
+    setSystemNotifyEnabled(enabled)
+    try {
+      window.localStorage.setItem(
+        'kefu.system_notify_enabled',
+        enabled ? '1' : '0',
+      )
+    } catch {
+      // localStorage 不可用（隐私模式等）：仅内存态生效
+    }
+    // 打开开关且尚未授权时，引导用户完成浏览器授权
+    if (enabled && notifPermission === 'default') {
+      void requestNotification()
+    }
+  }
+  const requestNotification = async () => {
+    if (typeof Notification === 'undefined') return
+    try {
+      const result = await Notification.requestPermission()
+      setNotifPermission(result)
+      if (result === 'granted') {
+        // 授权成功后立即弹一条测试通知，用户可直观确认效果
+        try {
+          const n = new Notification('系统通知已开启', {
+            body: '页面不在前台时收到新商机，将通过系统通知提醒',
+          })
+          n.onclick = () => {
+            window.focus()
+            n.close()
+          }
+        } catch {
+          // 测试通知失败不影响授权结果
+        }
+      }
+    } catch {
+      // 部分浏览器在非安全上下文拒绝授权请求：状态保持不变
+    }
+  }
+  const notifPermissionLabel =
+    notifPermission === 'granted'
+      ? '已授权'
+      : notifPermission === 'denied'
+        ? '已被浏览器拒绝，需在浏览器站点设置中恢复授权'
+        : notifPermission === 'unsupported'
+          ? '当前浏览器不支持系统通知'
+          : '未授权（打开开关后可授权）'
+  // 授权按钮显示时机：
+  // ① 开关打开且未授权（default）→ 引导授权；
+  // ② 已授权但开关关闭 → 保持可再次授权状态
+  const showAuthButton =
+    (systemNotifyEnabled && notifPermission === 'default') ||
+    (notifPermission === 'granted' && !systemNotifyEnabled)
 
   return (
     <Box sx={{ maxWidth: 640 }}>
@@ -977,7 +1080,8 @@ function AiTab() {
           {prescreenEnabled && (
             <Stack spacing={1} sx={{ mt: 1 }}>
               <TextField
-                label="预筛关键词（逗号分隔）"
+                label="预筛关键词"
+                helperText="多个关键词用逗号（中英文均可）分隔"
                 value={keywords}
                 onChange={(e) => setKeywords(e.target.value)}
                 sx={{ width: 420 }}
@@ -1059,15 +1163,55 @@ function AiTab() {
 
       <Divider sx={{ my: 2 }} />
       <Typography variant="subtitle2" sx={{ mb: 1 }}>通知</Typography>
-      <FormControlLabel
-        control={
-          <Switch
-            checked={soundEnabled}
-            onChange={(e) => saveNotifyMutation.mutate(e.target.checked)}
+      <Stack spacing={2}>
+        <FormControlLabel
+          control={
+            <Switch
+              checked={soundEnabled}
+              onChange={(e) => saveNotifyMutation.mutate(e.target.checked)}
+            />
+          }
+          label="新商机提示音"
+        />
+        <Box>
+          <Typography variant="body2" gutterBottom>
+            提示音音量：{volume}（默认 60）
+          </Typography>
+          <Slider
+            value={volume}
+            min={0}
+            max={100}
+            step={5}
+            marks
+            valueLabelDisplay="auto"
+            onChange={(_, v) => changeVolume(v as number)}
+            sx={{ width: 320 }}
           />
-        }
-        label="新商机提示音"
-      />
+        </Box>
+        <Box>
+          <FormControlLabel
+            control={
+              <Switch
+                checked={systemNotifyEnabled}
+                onChange={(e) => toggleSystemNotify(e.target.checked)}
+              />
+            }
+            label="系统通知（页面不在前台时收到新商机，系统弹窗提醒）"
+          />
+          {showAuthButton && (
+            <Button
+              variant="outlined"
+              sx={{ mt: 1 }}
+              onClick={() => void requestNotification()}
+            >
+              授权系统通知
+            </Button>
+          )}
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
+            {notifPermissionLabel}；系统通知在页面切换到后台时才会发出，可在浏览器设置中撤销授权
+          </Typography>
+        </Box>
+      </Stack>
     </Box>
   )
 }

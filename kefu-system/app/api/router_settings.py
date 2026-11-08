@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 
 from fastapi import APIRouter, Depends
@@ -17,11 +18,13 @@ from fastapi import APIRouter, Depends
 from app import analyzer
 from app.api.deps import get_db
 from app.config import (
+    CORRECTION_EXAMPLES_MAX,
     KEY_AI_API_KEY_ENC,
     KEY_AI_BASE_URL,
     KEY_AI_MODEL,
     KEY_AI_TEMPERATURE,
     KEY_AI_TIMEOUT_SEC,
+    KEY_ANALYSIS_CORRECTION_EXAMPLES,
     KEY_ANALYSIS_MERGE_WINDOW,
     KEY_ANALYSIS_OPP_MERGE_WINDOW,
     KEY_ANALYSIS_MIN_CONFIDENCE,
@@ -119,6 +122,7 @@ def test_ai_connection(db: Database = Depends(get_db)) -> AITestResult:
 # 分析判定配置
 # ---------------------------------------------------------------------------
 def _analysis_out(db: Database) -> AnalysisSettingsOut:
+    from app.db import read_correction_examples
     return AnalysisSettingsOut(
         strictness=db.get_setting(KEY_ANALYSIS_STRICTNESS, "balanced"),
         min_confidence=db.get_int(KEY_ANALYSIS_MIN_CONFIDENCE, 60),
@@ -128,6 +132,7 @@ def _analysis_out(db: Database) -> AnalysisSettingsOut:
         merge_window_sec=db.get_int(KEY_ANALYSIS_MERGE_WINDOW,
                                     MERGE_WINDOW_SEC_DEFAULT),
         opp_merge_window_sec=db.get_int(KEY_ANALYSIS_OPP_MERGE_WINDOW, 180),
+        correction_examples=read_correction_examples(db),
     )
 
 
@@ -153,6 +158,14 @@ def update_analysis_settings(body: AnalysisSettingsUpdate,
     db.set_setting(KEY_ANALYSIS_MERGE_WINDOW, str(body.merge_window_sec))
     db.set_setting(KEY_ANALYSIS_OPP_MERGE_WINDOW,
                    str(body.opp_merge_window_sec))
+    # 漏判修正示例：None = 不变更（防部分更新误清空）；列表 = 全量替换
+    #（服务端钳制：去空 + 截断 200 字/条 + 最多 20 条 FIFO 淘汰最旧）
+    if body.correction_examples is not None:
+        examples = [str(e).strip()[:200] for e in body.correction_examples
+                    if str(e).strip()]
+        examples = examples[-CORRECTION_EXAMPLES_MAX:]
+        db.set_setting(KEY_ANALYSIS_CORRECTION_EXAMPLES,
+                       json.dumps(examples, ensure_ascii=False))
     logger.info("分析设置已保存（strictness=%s, min_confidence=%d）",
                 body.strictness, body.min_confidence)
     return _analysis_out(db)

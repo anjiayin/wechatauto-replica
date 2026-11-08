@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from datetime import datetime, timedelta
 from typing import List
@@ -301,6 +302,42 @@ class TestAnalyzer:
         assert analyzer.prescreen("找加工厂", "", "加[工工]") is True
         assert analyzer.prescreen("随便聊聊", "", "") is True  # 空 = 全通过
 
+    def test_prescreen_chinese_comma(self):
+        """体验优化 2：中文逗号（，）可正确分隔关键词，不再并入单个关键词。"""
+        assert analyzer.prescreen("有采购需求", "采购，求购", "") is True
+        assert analyzer.prescreen("今天天气不错", "采购，求购", "") is False
+        # 混合中英文逗号
+        assert analyzer.prescreen("求购铝锭", "采购,求购，报价", "") is True
+        assert analyzer.prescreen("随便聊聊", "采购,求购，报价", "") is False
+        # 中文逗号分隔的每个关键词独立生效（修复前 "采购，求购" 整串匹配）
+        assert analyzer.prescreen("有求购需求", "采购，求购", "") is True
+
+    def test_system_prompt_correction_examples(self):
+        """体验优化 6：修正示例注入 Prompt（段落 + 逐条 + 100 字截断 + 上限 20）。"""
+        types = [{"name": "配件采购", "description": "寻找配件采购需求"}]
+        examples = ["求丰田42431-0K090原厂件，要50个"]
+        prompt = analyzer.build_system_prompt(types, "balanced",
+                                              examples=examples)
+        assert "用户确认过的真实商机消息示例" in prompt
+        assert "42431-0K090" in prompt
+        # 无示例：不注入段落
+        prompt2 = analyzer.build_system_prompt(types, "balanced")
+        assert "商机消息示例" not in prompt2
+        # 每条截断 100 字
+        long_ex = "长" * 150
+        prompt3 = analyzer.build_system_prompt(types, "balanced",
+                                               examples=[long_ex])
+        assert "长" * 100 in prompt3
+        assert "长" * 101 not in prompt3
+        # 上限 20 条
+        prompt4 = analyzer.build_system_prompt(
+            types, "balanced", examples=[f"示例{i}" for i in range(30)])
+        assert "示例19" in prompt4 and "示例20" not in prompt4
+        # 空白条目被过滤
+        prompt5 = analyzer.build_system_prompt(types, "balanced",
+                                               examples=["  ", "有效示例"])
+        assert "有效示例" in prompt5
+
     def test_summarize_points(self):
         assert analyzer.summarize_points(["a", "b"]) == "a\nb"
         assert analyzer.summarize_points([]) == ""
@@ -367,6 +404,26 @@ class TestPipeline:
         pipeline._process(make_unit())
         assert client.calls == 0
         assert db.list_opportunities() == (0, [])
+
+    def test_correction_examples_injected_into_prompt(self):
+        """体验优化 6：管线把 analysis.correction_examples 注入系统提示词。"""
+        captured: dict = {}
+
+        class CaptureClient:
+            def chat(self, system_prompt: str, user_message: str) -> str:
+                captured["prompt"] = system_prompt
+                return json.dumps({"hit": False, "type": None, "points": [],
+                                   "confidence": 10, "quote": ""})
+
+        db, notifier = self._prepare()
+        db.set_setting("analysis.correction_examples",
+                       json.dumps(["求丰田42431-0K090原厂件"],
+                                  ensure_ascii=False))
+        pipeline = Pipeline(db, notifier,
+                            client_factory=lambda cfg: CaptureClient())
+        pipeline._process(make_unit())
+        assert "用户确认过的真实商机消息示例" in captured["prompt"]
+        assert "42431-0K090" in captured["prompt"]
 
     def test_not_configured(self):
         db, notifier = self._prepare()
@@ -909,3 +966,165 @@ class TestMiniPipeline:
             time.sleep(0.1)
         assert db.count_pending_opportunities() == 1
         assert "opportunity_new" in events
+
+
+# ---------------------------------------------------------------------------
+# 体验优化 1：会话搜索 TTL 缓存（全量列表 + 内存过滤）
+# ---------------------------------------------------------------------------
+class FakeWxDb:
+    """WeChatDB 替身：记录调用次数，模拟冷启动慢查询与瞬时故障。"""
+
+    def __init__(self) -> None:
+        self.sessions_calls = 0
+        self.contacts_calls = 0
+        self.msg_calls = 0
+        self.msg_fail_times = 0
+        self.sessions = [{"username": "111@chatroom"},
+                         {"username": "gh_official"},
+                         {"username": "wxid_b"}]
+        self.contacts = {
+            "chatroom": [{"username": "222@chatroom", "nick_name": "群二"}],
+            "friend": [{"username": "wxid_c", "remark": "王五"},
+                       {"username": "wxid_b", "nick_name": "李四"}],
+        }
+        self.msgs = [{"local_id": 1, "type": "文本",
+                      "sender_username": "wxid_a",
+                      "create_time": 1700000000, "content": "hello",
+                      "sort_seq": 10}]
+
+    def get_sessions(self, limit: int = 100) -> list[dict]:
+        self.sessions_calls += 1
+        return self.sessions
+
+    def get_contacts(self, kind: str = "friend",
+                     limit: int = 100) -> list[dict]:
+        self.contacts_calls += 1
+        return self.contacts.get(kind, [])
+
+    def get_nickname(self, username: str) -> str:
+        return {"111@chatroom": "加工群"}.get(username, "")
+
+    def get_messages(self, username: str, limit: int = 50) -> list[dict]:
+        self.msg_calls += 1
+        if self.msg_calls <= self.msg_fail_times:
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        return list(self.msgs)
+
+
+def make_svc() -> WeChatService:
+    db = Database(":memory:")
+    svc = WeChatService(db, Aggregator(lambda u: None))
+    svc._wxdb = FakeWxDb()  # 注入替身（不触碰真实微信）
+    return svc
+
+
+class TestSessionCache:
+    def test_second_search_hits_cache(self):
+        """首次构建缓存后，60 秒内的搜索不再触碰微信库（第二次进入 <1s）。"""
+        svc = make_svc()
+        assert svc.search_sessions(keyword="") != []
+        first = svc._wxdb
+        assert first.sessions_calls == 1
+        # 第二次搜索（换关键词/类型）→ 全部走缓存
+        svc.search_sessions(keyword="王五")
+        svc.search_sessions(kind="group")
+        assert first.sessions_calls == 1
+        assert first.contacts_calls == 2  # chatroom + friend 各一次
+
+    def test_kind_and_keyword_filter_on_cached_list(self):
+        svc = make_svc()
+        groups = svc.search_sessions(kind="group")
+        assert [i["username"] for i in groups] == ["111@chatroom", "222@chatroom"]
+        friends = svc.search_sessions(kind="friend")
+        assert [i["username"] for i in friends] == ["wxid_b", "wxid_c"]
+        # 关键词命中显示名（remark 快照）
+        hits = svc.search_sessions(keyword="王五")
+        assert [i["username"] for i in hits] == ["wxid_c"]
+        # 关键词命中 username
+        hits = svc.search_sessions(keyword="222@")
+        assert [i["username"] for i in hits] == ["222@chatroom"]
+        # 公众号 gh_ 不出现在结果里
+        all_names = [i["username"] for i in svc.search_sessions()]
+        assert not any(u.startswith("gh_") for u in all_names)
+
+    def test_ttl_expiry_rebuilds(self):
+        svc = make_svc()
+        svc.search_sessions()
+        first = svc._wxdb
+        # 未过期：走缓存
+        svc.search_sessions()
+        assert first.sessions_calls == 1
+        # 手动把缓存时间戳拨回 61 秒前 → 过期重建
+        svc._contact_cache_ts -= 61
+        svc.search_sessions()
+        assert first.sessions_calls == 2
+
+    def test_build_failure_falls_back_to_stale_cache(self):
+        svc = make_svc()
+        svc.search_sessions()
+        stale = list(svc._contact_cache)
+        # 构建抛异常 → 回退过期缓存，不抛错
+        def boom() -> list[dict]:
+            raise RuntimeError("微信库忙")
+        svc._build_contact_list = boom  # type: ignore[method-assign]
+        svc._contact_cache_ts -= 61
+        result = svc.search_sessions()
+        assert result == stale
+
+
+# ---------------------------------------------------------------------------
+# 体验优化 5：微信消息查询瞬时故障重试
+# ---------------------------------------------------------------------------
+class TestMessageRetry:
+    def test_retry_on_exception_then_success(self, monkeypatch):
+        """malformed 瞬时失败 → 1.5s 后重试成功（上下文场景）。"""
+        monkeypatch.setattr("app.wechat_service.time.sleep", lambda s: None)
+        svc = make_svc()
+        svc._wxdb.msg_fail_times = 1
+        msgs, error = svc.get_messages_with_error("111@chatroom",
+                                                  retry_on_empty=True)
+        assert error == ""
+        assert len(msgs) == 1
+        assert svc._wxdb.msg_calls == 2  # 首次失败 + 1 次重试
+
+    def test_retry_exhausted_returns_busy_error(self, monkeypatch):
+        """持续异常 → 重试 2 次后返回用户可读中文 + 空列表。"""
+        monkeypatch.setattr("app.wechat_service.time.sleep", lambda s: None)
+        svc = make_svc()
+        svc._wxdb.msg_fail_times = 99
+        msgs, error = svc.get_messages_with_error("111@chatroom",
+                                                  retry_on_empty=True)
+        assert msgs == []
+        assert "微信数据库正忙" in error
+        assert "重新加载" in error
+        assert svc._wxdb.msg_calls == 3  # 1 + MSG_QUERY_RETRY_TIMES
+
+    def test_empty_with_retry_then_empty_is_genuinely_empty(self, monkeypatch):
+        """空结果重试耗尽仍为空 → 按「会话确实无消息」处理（error 为空）。"""
+        monkeypatch.setattr("app.wechat_service.time.sleep", lambda s: None)
+        svc = make_svc()
+        svc._wxdb.msgs = []  # 会话真的没消息
+        msgs, error = svc.get_messages_with_error("empty@chatroom",
+                                                  retry_on_empty=True)
+        assert msgs == [] and error == ""
+        assert svc._wxdb.msg_calls == 3  # 空结果也重试了 2 次
+
+    def test_empty_without_retry_no_delay(self, monkeypatch):
+        """默认路径（消息浏览页）：空结果不重试，立即返回。"""
+        monkeypatch.setattr("app.wechat_service.time.sleep", lambda s: None)
+        svc = make_svc()
+        svc._wxdb.msgs = []
+        msgs, error = svc.get_messages_with_error("empty@chatroom")
+        assert msgs == [] and error == ""
+        assert svc._wxdb.msg_calls == 1
+
+    def test_get_messages_delegates_and_swallows_error(self, monkeypatch):
+        """旧接口 get_messages：失败重试耗尽后返回空列表（不抛异常）。"""
+        monkeypatch.setattr("app.wechat_service.time.sleep", lambda s: None)
+        svc = make_svc()
+        svc._wxdb.msg_fail_times = 99
+        assert svc.get_messages("111@chatroom") == []
+        # 正常路径返回消息
+        svc._wxdb.msg_fail_times = 0
+        svc._wxdb.msg_calls = 0
+        assert len(svc.get_messages("111@chatroom")) == 1

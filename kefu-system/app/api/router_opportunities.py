@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-"""商机路由：列表 / 详情（含上下文、清除未读）/ 状态 / 回复。
+"""商机路由：列表 / 详情（快速，不查微信库）/ 上下文（独立接口）/ 状态 / 回复。
 
 路由（设计文档 3.2）：
 - GET   /api/opportunities?page=&page_size=20&session=&type_id=&status=&keyword=
-- GET   /api/opportunities/{id}          详情（并清除该条未读）
-- PATCH /api/opportunities/{id}          {status}
-- POST  /api/opportunities/{id}/reply    {text, at?, quote?} → 202 受理
+- GET   /api/opportunities/{id}                详情（并清除该条未读；不查微信库，秒开）
+- GET   /api/opportunities/{id}/context        上下文消息（独立异步，失败可重试）
+- PATCH /api/opportunities/{id}                {status}
+- POST  /api/opportunities/{id}/reply          {text, at?, quote?} → 202 受理
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ from app.config import CONTEXT_COUNT
 from app.db import Database
 from app.schemas import (
     MessageOut,
+    OpportunityContextOut,
     OpportunityDetailOut,
     OpportunityListOut,
     OpportunityListItem,
@@ -43,7 +45,8 @@ def list_opportunities(
     page_size: int = Query(default=20, ge=1, le=100),
     session: str = "",
     type_id: Optional[int] = Query(default=None, ge=1),
-    status: str = Query(default="", pattern="^(|pending|replied|ignored)$"),
+    status: str = Query(default="",
+                        pattern="^(|pending|replied|ignored|handled)$"),
     keyword: str = "",
     db: Database = Depends(get_db),
 ) -> OpportunityListOut:
@@ -56,50 +59,44 @@ def list_opportunities(
 
 
 # ---------------------------------------------------------------------------
-# 详情
+# 详情（快速：只读业务库，不查微信库；上下文走独立接口）
 # ---------------------------------------------------------------------------
-def _load_detail(opp_id: int, db: Database, svc: WeChatService
-                 ) -> OpportunityDetailOut:
-    """读取商机详情 + 上下文（前后各 N 条，复用历史消息查询）。"""
+@router.get("/{opp_id}", response_model=OpportunityDetailOut)
+def get_opportunity(opp_id: int, db: Database = Depends(get_db),
+                    ) -> OpportunityDetailOut:
+    """商机详情（并清除该条未读，广播 unread_cleared）。
+
+    体验优化：详情与上下文拆分——本接口只读业务 SQLite（毫秒级），
+    上下文消息由 GET /{opp_id}/context 异步加载，微信库繁忙时详情照常秒开。
+    """
     opp = db.get_opportunity(opp_id)
     if not opp:
         raise HTTPException(status_code=404, detail="商机不存在")
-    context: List[MessageOut] = []
-    msgs = svc.get_messages(opp["session_username"],
-                            limit=CONTEXT_COUNT * 2 + 1)
-    for m in msgs:
-        context.append(MessageOut(**m))
-    return OpportunityDetailOut(
-        id=opp["id"],
-        session_username=opp["session_username"],
-        session_name=opp["session_name"],
-        sender_wxid=opp["sender_wxid"],
-        sender_name=opp["sender_name"],
-        window_start=opp["window_start"],
-        window_end=opp["window_end"],
-        merged_count=opp["merged_count"],
-        raw_text=opp["raw_text"],
-        type_id=opp["type_id"],
-        type_name=opp["type_name"],
-        summary=opp["summary"],
-        key_quote=opp["key_quote"],
-        confidence=opp["confidence"],
-        status=opp["status"],
-        reply_content=opp["reply_content"],
-        replied_at=opp["replied_at"],
-        created_at=opp["created_at"],
-        context=context,
-    )
-
-
-@router.get("/{opp_id}", response_model=OpportunityDetailOut)
-def get_opportunity(opp_id: int, db: Database = Depends(get_db),
-                    svc: WeChatService = Depends(get_wechat_service),
-                    ) -> OpportunityDetailOut:
-    """商机详情（并清除该条未读，广播 unread_cleared）。"""
-    detail = _load_detail(opp_id, db, svc)
     get_notifier().clear_unread(opp_id)
-    return detail
+    return OpportunityDetailOut(**opp)
+
+
+# ---------------------------------------------------------------------------
+# 上下文（独立接口：微信库查询 + 瞬时故障重试，见 WeChatService）
+# ---------------------------------------------------------------------------
+@router.get("/{opp_id}/context", response_model=OpportunityContextOut)
+def get_opportunity_context(opp_id: int,
+                            db: Database = Depends(get_db),
+                            svc: WeChatService = Depends(get_wechat_service),
+                            ) -> OpportunityContextOut:
+    """商机上下文消息（前后各 N 条，时间倒序返回，前端转正序渲染）。
+
+    微信客户端写库期间的瞬时 malformed/空结果由服务层自动重试（最多 2 次）；
+    仍失败时 error 返回用户可读的中文原因，前端展示 + 重新加载按钮。
+    """
+    opp = db.get_opportunity(opp_id)
+    if not opp:
+        raise HTTPException(status_code=404, detail="商机不存在")
+    msgs, error = svc.get_messages_with_error(
+        opp["session_username"], limit=CONTEXT_COUNT * 2 + 1,
+        retry_on_empty=True)
+    return OpportunityContextOut(
+        items=[MessageOut(**m) for m in msgs], error=error)
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +106,7 @@ def get_opportunity(opp_id: int, db: Database = Depends(get_db),
 def update_opportunity_status(opp_id: int, body: OpportunityStatusUpdate,
                               db: Database = Depends(get_db),
                               ) -> OpportunityListItem:
-    """标记商机状态（待处理/已回复/已忽略，误报处理 P0-9）。"""
+    """标记商机状态（待处理/已回复/已忽略/已自行处理，误报处理 P0-9）。"""
     opp = db.get_opportunity(opp_id)
     if not opp:
         raise HTTPException(status_code=404, detail="商机不存在")

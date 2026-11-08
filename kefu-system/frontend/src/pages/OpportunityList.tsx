@@ -20,6 +20,7 @@ import {
 } from '@mui/material'
 import VisibilityOffIcon from '@mui/icons-material/VisibilityOff'
 import ReplyIcon from '@mui/icons-material/Reply'
+import TaskAltIcon from '@mui/icons-material/TaskAlt'
 import { apiGet, apiPatch, qs } from '../api/client'
 import { consumePendingOpportunity } from '../hooks/pendingOpportunity'
 import type {
@@ -33,12 +34,17 @@ const STATUS_LABELS: Record<string, string> = {
   pending: '待处理',
   replied: '已回复',
   ignored: '已忽略',
+  handled: '已自行处理',
 }
 
-const STATUS_COLORS: Record<string, 'warning' | 'success' | 'default'> = {
+const STATUS_COLORS: Record<
+  string,
+  'warning' | 'success' | 'default' | 'info'
+> = {
   pending: 'warning',
   replied: 'success',
   ignored: 'default',
+  handled: 'info',
 }
 
 /** 商机列表页：筛选栏、未读角标联动、行内快捷操作、详情抽屉。 */
@@ -103,6 +109,15 @@ export default function OpportunityList() {
     },
   })
 
+  // 标记「已自行处理」：用户已在微信里自己处理完的商机
+  const handleMutation = useMutation({
+    mutationFn: (id: number) => apiPatch(`/api/opportunities/${id}`, { status: 'handled' }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['opportunities'] })
+      void queryClient.invalidateQueries({ queryKey: ['status'] })
+    },
+  })
+
   const items = data?.items ?? []
 
   return (
@@ -122,6 +137,7 @@ export default function OpportunityList() {
           <MenuItem value="pending">待处理</MenuItem>
           <MenuItem value="replied">已回复</MenuItem>
           <MenuItem value="ignored">已忽略</MenuItem>
+          <MenuItem value="handled">已自行处理</MenuItem>
         </TextField>
         <TextField
           select
@@ -246,6 +262,15 @@ export default function OpportunityList() {
                       onClick={() => ignoreMutation.mutate(o.id)}
                     >
                       <VisibilityOffIcon fontSize="small" />
+                    </IconButton>
+                  </Tooltip>
+                  <Tooltip title="标记已自行处理（已在微信里处理完）">
+                    <IconButton
+                      size="small"
+                      disabled={o.status === 'handled'}
+                      onClick={() => handleMutation.mutate(o.id)}
+                    >
+                      <TaskAltIcon fontSize="small" />
                     </IconButton>
                   </Tooltip>
                 </TableCell>

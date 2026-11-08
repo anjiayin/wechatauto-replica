@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import re
 import time
 from types import SimpleNamespace
@@ -52,6 +53,8 @@ class FakeWechatService:
              "content": f"上下文消息{i}", "sort_seq": i}
             for i in range(1, 12)
         ]
+        # 上下文接口故障注入（体验优化 4/5：拆分接口 + 失败重试）
+        self.context_fail = False
 
     # --- 状态（/api/status） ---
     @property
@@ -92,8 +95,23 @@ class FakeWechatService:
                      before_seq: int = 0) -> list[dict]:
         return self.messages[:limit]
 
+    def get_messages_with_error(self, username: str, limit: int = 50,
+                                before_seq: int = 0,
+                                retry_on_empty: bool = False
+                                ) -> tuple[list[dict], str]:
+        """上下文接口用的查询（替身：故障开关可控，重试逻辑由真实服务层测试覆盖）。"""
+        if self.context_fail:
+            return [], "微信数据库正忙（微信客户端正在写入），请稍后点击重新加载"
+        return self.get_messages(username, limit=limit,
+                                 before_seq=before_seq), ""
+
     def get_display_name(self, username: str) -> str:
         return username
+
+    def build_log_displays(self, session_username: str,
+                           input_text: str) -> tuple[str, str]:
+        """分析日志展示字段（替身：原值返回，解析逻辑由服务层测试覆盖）。"""
+        return session_username, input_text
 
     def session_exists(self, username: str) -> bool:
         return self.exists_map.get(username, True)
@@ -194,8 +212,10 @@ def wait_until(predicate, timeout: float = 3.0) -> bool:
 LIST_ITEM_KEYS = {"id", "session_username", "session_name", "sender_wxid",
                   "sender_name", "window_end", "type_id", "type_name",
                   "summary", "key_quote", "confidence", "status", "created_at"}
+# 契约变更（体验优化 4）：详情与上下文拆分 —— 详情接口不再返回 context 字段，
+# 上下文由独立接口 GET /api/opportunities/{id}/context 提供（items + error）
 DETAIL_EXTRA_KEYS = {"window_start", "merged_count", "raw_text", "key_quote",
-                     "reply_content", "replied_at", "context"}
+                     "reply_content", "replied_at"}
 
 
 # ---------------------------------------------------------------------------
@@ -745,7 +765,8 @@ class TestOpportunityLifecycle:
         assert env.client.get(
             "/api/opportunities", params={"page_size": 999}).status_code == 422
 
-    def test_detail_with_context_and_unread_clear(self, env):
+    def test_detail_and_context_split(self, env):
+        """体验优化 4：详情与上下文拆分——详情不查微信库、无 context 字段。"""
         opp = insert_opp(env.db, type_id=None)
         env.notifier.mark_new_opportunity(opp["id"])
         assert env.notifier.unread_count == 1
@@ -754,18 +775,48 @@ class TestOpportunityLifecycle:
         assert resp.status_code == 200
         body = resp.json()
         assert set(body) == LIST_ITEM_KEYS | DETAIL_EXTRA_KEYS
+        assert "context" not in body  # 契约：上下文已拆分到独立接口
         assert body["raw_text"].startswith("[14:02]")
         assert body["merged_count"] == 2
         assert body["key_quote"] == "有谁能做铝合金CNC"
         assert body["reply_content"] is None
-        assert len(body["context"]) == 11  # 前后各 5 条 + 命中消息位
-        assert body["context"][0]["content"] == "上下文消息1"
         # 详情打开即清除未读（设计文档 3.2）
         assert env.notifier.unread_count == 0
 
         # 再次打开：未读本已清零，不重复广播
         env.client.get(f"/api/opportunities/{opp['id']}")
         assert env.notifier.unread_count == 0
+
+    def test_context_endpoint_success(self, env):
+        """体验优化 4：独立上下文接口正常返回（items + 空 error）。"""
+        opp = insert_opp(env.db)
+        resp = env.client.get(f"/api/opportunities/{opp['id']}/context")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert set(body) == {"items", "error"}
+        assert body["error"] == ""
+        assert len(body["items"]) == 11
+        for m in body["items"]:
+            assert set(m) == {"local_id", "type", "type_name", "sender_id",
+                              "sender_name", "create_time", "content",
+                              "sort_seq"}
+
+    def test_context_endpoint_busy_error(self, env):
+        """体验优化 5：微信库忙 → error 返回明确中文，前端展示 + 重新加载。"""
+        opp = insert_opp(env.db)
+        env.svc.context_fail = True
+        resp = env.client.get(f"/api/opportunities/{opp['id']}/context")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["items"] == []
+        assert "微信数据库正忙" in body["error"]
+        assert "重新加载" in body["error"]
+        env.svc.context_fail = False
+
+    def test_context_endpoint_404(self, env):
+        resp = env.client.get("/api/opportunities/99999/context")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "商机不存在"
 
     def test_detail_404(self, env):
         resp = env.client.get("/api/opportunities/99999")
@@ -774,7 +825,7 @@ class TestOpportunityLifecycle:
 
     def test_patch_status_flow(self, env):
         opp = insert_opp(env.db)
-        for status in ("replied", "ignored", "pending"):
+        for status in ("replied", "ignored", "pending", "handled"):
             resp = env.client.patch(f"/api/opportunities/{opp['id']}",
                                     json={"status": status})
             assert resp.status_code == 200
@@ -876,6 +927,140 @@ class TestReplyEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# 契约测试：分析日志（体验优化 6：分页 + 筛选）
+# ---------------------------------------------------------------------------
+class TestAnalysisLogsContract:
+    def _insert_logs(self, db: Database) -> list[int]:
+        ids = []
+        for i, (status, session, text) in enumerate([
+            ("ok", "111@chatroom", "求丰田42431-0K090原厂件"),
+            ("skipped", "222@chatroom", "今天天气不错聊聊家常"),
+            ("error", "111@chatroom", "要加工一批铝合金件"),
+            ("below_threshold", "333@chatroom", "求购铝锭100吨"),
+        ]):
+            result = (json.dumps({"hit": True, "type": "配件采购",
+                                  "confidence": 85}, ensure_ascii=False)
+                      if status == "ok" else "")
+            ids.append(db.insert_analysis_log(
+                session_username=session, sender_wxid=f"wxid_{i}",
+                msg_count=i + 1, input_text=text, result=result,
+                status=status,
+                error="预筛未命中" if status == "skipped"
+                else ("AI 接口调用失败" if status == "error" else ""),
+                model="mock-model" if status in ("ok", "below_threshold") else "",
+                latency_ms=800 if status in ("ok", "below_threshold") else None,
+            ))
+        return ids
+
+    def test_list_pagination_and_fields(self, env):
+        self._insert_logs(env.db)
+        resp = env.client.get("/api/analysis-logs", params={"page_size": 2})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total"] == 4
+        assert len(body["items"]) == 2
+        # id 倒序（最新在前）
+        assert body["items"][0]["id"] > body["items"][1]["id"]
+        for item in body["items"]:
+            assert set(item) == {"id", "created_at", "session_username",
+                                 "session_display", "sender_wxid",
+                                 "msg_count", "input_text",
+                                 "input_text_display", "result", "status",
+                                 "error", "model", "latency_ms"}
+
+    def test_list_filters(self, env):
+        self._insert_logs(env.db)
+        # status 筛选
+        body = env.client.get(
+            "/api/analysis-logs", params={"status": "skipped"}).json()
+        assert body["total"] == 1
+        assert body["items"][0]["status"] == "skipped"
+        assert "预筛未命中" in body["items"][0]["error"]
+        # session 筛选（模糊）
+        body = env.client.get(
+            "/api/analysis-logs", params={"session": "111"}).json()
+        assert body["total"] == 2
+        assert all(i["session_username"] == "111@chatroom"
+                   for i in body["items"])
+        # keyword 筛选（input_text 模糊）
+        body = env.client.get(
+            "/api/analysis-logs", params={"keyword": "42431"}).json()
+        assert body["total"] == 1
+        assert "42431" in body["items"][0]["input_text"]
+        # 组合筛选
+        body = env.client.get("/api/analysis-logs", params={
+            "session": "111", "keyword": "铝合金", "status": "error"}).json()
+        assert body["total"] == 1
+
+    def test_list_invalid_status_422(self, env):
+        assert env.client.get("/api/analysis-logs",
+                              params={"status": "bogus"}).status_code == 422
+        assert env.client.get("/api/analysis-logs",
+                              params={"page": 0}).status_code == 422
+        assert env.client.get("/api/analysis-logs",
+                              params={"page_size": 999}).status_code == 422
+
+    def test_empty_list(self, env):
+        body = env.client.get("/api/analysis-logs").json()
+        assert body == {"total": 0, "items": []}
+
+
+# ---------------------------------------------------------------------------
+# 契约测试：漏判修正示例 analysis.correction_examples（体验优化 6）
+# ---------------------------------------------------------------------------
+class TestCorrectionExamplesContract:
+    def test_default_empty_and_roundtrip(self, env):
+        body = env.client.get("/api/settings/analysis").json()
+        assert body["correction_examples"] == []
+        resp = env.client.put("/api/settings/analysis", json={
+            "strictness": "balanced", "min_confidence": 60,
+            "prescreen_enabled": False,
+            "correction_examples": ["求丰田42431-0K090原厂件，要50个"]})
+        assert resp.status_code == 200
+        assert resp.json()["correction_examples"] == \
+            ["求丰田42431-0K090原厂件，要50个"]
+        assert json.loads(env.db.get_setting("analysis.correction_examples")
+                          ) == ["求丰田42431-0K090原厂件，要50个"]
+
+    def test_fifo_cap_20(self, env):
+        """上限淘汰：一次 PUT 25 条 → 保留最新 20 条（FIFO 淘汰最旧）。"""
+        examples = [f"示例消息{i}" for i in range(25)]
+        resp = env.client.put("/api/settings/analysis", json={
+            "strictness": "balanced", "min_confidence": 60,
+            "prescreen_enabled": False,
+            "correction_examples": examples})
+        assert resp.status_code == 200
+        kept = resp.json()["correction_examples"]
+        assert len(kept) == 20
+        assert kept[0] == "示例消息5"   # 最旧 5 条被淘汰
+        assert kept[-1] == "示例消息24"
+
+    def test_empty_and_whitespace_filtered(self, env):
+        resp = env.client.put("/api/settings/analysis", json={
+            "strictness": "balanced", "min_confidence": 60,
+            "prescreen_enabled": False,
+            "correction_examples": ["  ", "有效示例", ""]})
+        assert resp.json()["correction_examples"] == ["有效示例"]
+
+    def test_partial_update_keeps_examples(self, env):
+        """契约：PUT 缺省 correction_examples（None）= 不变更，不误清空。"""
+        env.client.put("/api/settings/analysis", json={
+            "strictness": "balanced", "min_confidence": 60,
+            "prescreen_enabled": False,
+            "correction_examples": ["示例A"]})
+        resp = env.client.put("/api/settings/analysis", json={
+            "strictness": "strict", "min_confidence": 70,
+            "prescreen_enabled": True})
+        assert resp.status_code == 200
+        assert resp.json()["correction_examples"] == ["示例A"]
+        # 显式 [] = 清空
+        resp = env.client.put("/api/settings/analysis", json={
+            "strictness": "strict", "min_confidence": 70,
+            "prescreen_enabled": True, "correction_examples": []})
+        assert resp.json()["correction_examples"] == []
+
+
+# ---------------------------------------------------------------------------
 # WebSocket 握手（TestClient 层；真实环境另有握手检查）
 # ---------------------------------------------------------------------------
 class TestWebsocketHandshake:
@@ -950,9 +1135,10 @@ class TestConcurrency:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             futures = [pool.submit(worker, i) for i in range(8)]
-            done, not_done = concurrent.futures.wait(
-                futures, timeout=60)
-        # 死锁检测：60 秒内必须全部完成
+            # 时限 300s：仅容忍慢 I/O 环境（沙箱实测单次 WAL 提交 ~360ms，
+            # 本测试 ~4300 次提交）；真死锁在任何时限内都不会完成，语义不变
+            done, not_done = concurrent.futures.wait(futures, timeout=300)
+        # 死锁检测：时限内必须全部完成
         assert not not_done, f"疑似死锁：{len(not_done)} 个线程未在时限内完成"
         assert errors == []
 

@@ -6,9 +6,30 @@
  * - 开启提示音后立即挂载 pointerdown（once）解锁监听，首次交互恢复播放能力；
  * - 播放时若仍被挂起，resume 成功后补播；resume 失败则只保留解锁监听；
  * - 任何异常静默降级，绝不向外抛错。
+ *
+ * 音量（0~100，默认 60）：存 localStorage 'kefu.sound_volume'，
+ * 播放时经 GainNode 应用（基础峰值 0.15 × volume/100）。
  */
 let sharedCtx: AudioContext | null = null
 let unlockArmed = false
+
+/** 提示音音量 localStorage 键（与提示音开关 'kefu.sound_enabled' 同级） */
+export const SOUND_VOLUME_KEY = 'kefu.sound_volume'
+export const DEFAULT_SOUND_VOLUME = 60
+
+/** 读取提示音音量（0~100，默认 60）。
+ *
+ * 注意：键不存在时 localStorage.getItem 返回 null，而 Number(null)===0
+ * 且 isFinite——直接 Number 会把「从未设置过」误判为 0（完全静音）。
+ * 必须先判 null 再转数字，非法值统一回退默认值。
+ */
+export function getSoundVolume(): number {
+  const raw = window.localStorage.getItem(SOUND_VOLUME_KEY)
+  if (raw === null || raw.trim() === '') return DEFAULT_SOUND_VOLUME
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return DEFAULT_SOUND_VOLUME
+  return Math.min(100, Math.max(0, Math.round(n)))
+}
 
 function getAudioContext(): AudioContext | null {
   try {
@@ -46,7 +67,9 @@ function playTone(ctx: AudioContext): void {
   osc.connect(gain)
   gain.connect(ctx.destination)
   osc.frequency.value = 880
-  gain.gain.setValueAtTime(0.15, ctx.currentTime)
+  // 音量应用：gain = volume/100（基础峰值 0.15；volume=0 时静音）
+  const volume = getSoundVolume() / 100
+  gain.gain.setValueAtTime(0.15 * volume, ctx.currentTime)
   gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.5)
   osc.start()
   osc.stop(ctx.currentTime + 0.5)

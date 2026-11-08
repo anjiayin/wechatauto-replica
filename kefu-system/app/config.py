@@ -28,6 +28,11 @@ WATERMARK_FLUSH_SEC = 30           # watermark 定期刷回间隔（秒）
 RETRY_TIMES = 2                    # AI 调用失败重试次数
 RETRY_BACKOFF_BASE = 1.0           # 重试退避基数（秒），第 n 次重试退避 base*2^(n-1)
 SESSION_SEARCH_LIMIT_DEFAULT = 20  # 会话搜索默认条数
+SESSION_CACHE_TTL_SEC = 60         # 全量联系人/会话列表内存缓存 TTL（秒）
+MSG_QUERY_RETRY_TIMES = 2          # 微信消息查询瞬时失败重试次数
+MSG_QUERY_RETRY_INTERVAL_SEC = 1.5 # 消息查询重试间隔（秒）
+CORRECTION_EXAMPLES_MAX = 20       # 分析修正示例上限（FIFO 淘汰最旧）
+GROUP_MEMBER_CACHE_TTL_SEC = 600   # 群成员列表缓存 TTL（秒，发送人显示名解析用）
 MAX_MONITOR_TARGETS = 200          # 监控对象数量上限兜底值（settings 无 monitor.max_targets 时使用）
 MONITOR_MAX_TARGETS_MIN = 10       # monitor.max_targets 允许下限
 MONITOR_MAX_TARGETS_MAX = 2000     # monitor.max_targets 允许上限
@@ -47,6 +52,7 @@ KEY_ANALYSIS_PRESCREEN_KEYWORDS = "analysis.prescreen_keywords"
 KEY_ANALYSIS_PRESCREEN_REGEX = "analysis.prescreen_regex"
 KEY_ANALYSIS_MERGE_WINDOW = "analysis.merge_window_sec"
 KEY_ANALYSIS_OPP_MERGE_WINDOW = "analysis.opp_merge_window_sec"
+KEY_ANALYSIS_CORRECTION_EXAMPLES = "analysis.correction_examples"  # JSON 数组字符串
 KEY_NOTIFY_SOUND = "notify.sound_enabled"
 KEY_MONITOR_MAX_TARGETS = "monitor.max_targets"  # 监控对象数量上限（10~2000，默认 200）
 KEY_COMPLIANCE_CONFIRMED = "compliance.confirmed"
@@ -68,6 +74,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     KEY_ANALYSIS_PRESCREEN_REGEX: "",
     KEY_ANALYSIS_MERGE_WINDOW: str(MERGE_WINDOW_SEC_DEFAULT),
     KEY_ANALYSIS_OPP_MERGE_WINDOW: str(OPP_MERGE_WINDOW_SEC_DEFAULT),
+    KEY_ANALYSIS_CORRECTION_EXAMPLES: "[]",
     KEY_NOTIFY_SOUND: "0",
     KEY_MONITOR_MAX_TARGETS: str(MAX_MONITOR_TARGETS),
     KEY_COMPLIANCE_CONFIRMED: "0",
@@ -75,8 +82,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
 
 # 判定严格度取值
 STRICTNESS_VALUES = ("lenient", "balanced", "strict")
-# 商机状态取值
-OPPORTUNITY_STATUS_VALUES = ("pending", "replied", "ignored")
+# 商机状态取值（handled = 用户已在微信里自行处理）
+OPPORTUNITY_STATUS_VALUES = ("pending", "replied", "ignored", "handled")
 
 # 日志配置
 LOG_MAX_BYTES = 2 * 1024 * 1024
