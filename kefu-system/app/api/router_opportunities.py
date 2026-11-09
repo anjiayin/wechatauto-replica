@@ -48,14 +48,27 @@ def list_opportunities(
     status: str = Query(default="",
                         pattern="^(|pending|replied|ignored|handled)$"),
     keyword: str = "",
+    direction: str = Query(default="", pattern="^(|buy|sell)$"),
     db: Database = Depends(get_db),
 ) -> OpportunityListOut:
-    """商机列表（时间倒序；status 为空时排除已忽略项）。"""
+    """商机列表（时间倒序；status 为空时排除已忽略项；direction 买卖货筛选）。"""
     total, rows = db.list_opportunities(
         page=page, page_size=page_size, session=session,
-        type_id=type_id, status=status, keyword=keyword)
+        type_id=type_id, status=status, keyword=keyword, direction=direction)
     items = [OpportunityListItem(**r) for r in rows]
     return OpportunityListOut(total=total, items=items)
+
+
+# ---------------------------------------------------------------------------
+# 全部已读（反馈 12：一键清零未读角标）
+# ---------------------------------------------------------------------------
+@router.post("/read-all")
+def read_all_opportunities(
+    notifier=Depends(get_notifier),
+) -> dict:
+    """全部已读：清空未读角标并广播（不影响商机状态本身）。"""
+    cleared = notifier.clear_all_unread()
+    return {"cleared": cleared}
 
 
 # ---------------------------------------------------------------------------

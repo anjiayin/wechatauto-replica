@@ -21,7 +21,9 @@ import {
 import VisibilityOffIcon from '@mui/icons-material/VisibilityOff'
 import ReplyIcon from '@mui/icons-material/Reply'
 import TaskAltIcon from '@mui/icons-material/TaskAlt'
-import { apiGet, apiPatch, qs } from '../api/client'
+import ContentCopyIcon from '@mui/icons-material/ContentCopy'
+import CheckIcon from '@mui/icons-material/Check'
+import { apiGet, apiPatch, apiPost, qs } from '../api/client'
 import { consumePendingOpportunity } from '../hooks/pendingOpportunity'
 import type {
   OpportunityListOut,
@@ -37,6 +39,12 @@ const STATUS_LABELS: Record<string, string> = {
   handled: '已自行处理',
 }
 
+/** 买/卖货方向标签（反馈 4）：买=蓝、卖=橙、不明不显示 */
+const DIRECTION_LABELS: Record<string, string> = {
+  buy: '买货',
+  sell: '卖货',
+}
+
 const STATUS_COLORS: Record<
   string,
   'warning' | 'success' | 'default' | 'info'
@@ -47,11 +55,56 @@ const STATUS_COLORS: Record<
   handled: 'info',
 }
 
+/** 行内一键复制图标：点击复制文本并短暂显示 ✓ 表示成功。 */
+function CopyButton(props: { text: string; label: string }) {
+  const [copied, setCopied] = useState(false)
+  return (
+    <Tooltip title={copied ? '已复制' : `复制${props.label}`} arrow>
+      <IconButton
+        size="small"
+        aria-label={`复制${props.label}`}
+        sx={{ ml: 0.25, py: 0.25 }}
+        onClick={(e) => {
+          e.stopPropagation() // 不触发行点击（打开详情）
+          navigator.clipboard.writeText(props.text).then(() => {
+            setCopied(true)
+            window.setTimeout(() => setCopied(false), 1500)
+          })
+        }}
+      >
+        {copied ? (
+          <CheckIcon sx={{ fontSize: 14, color: 'success.main' }} />
+        ) : (
+          <ContentCopyIcon sx={{ fontSize: 14 }} />
+        )}
+      </IconButton>
+    </Tooltip>
+  )
+}
+
+/** 超长原文 tooltip：支持换行与滚动，完整展示不截断。 */
+const QUOTE_TOOLTIP_PROPS = {
+  slotProps: {
+    popper: {
+      sx: {
+        '& .MuiTooltip-tooltip': {
+          maxWidth: 480,
+          maxHeight: 320,
+          overflowY: 'auto',
+          whiteSpace: 'pre-wrap',
+          fontSize: 13,
+        },
+      },
+    },
+  },
+} as const
+
 /** 商机列表页：筛选栏、未读角标联动、行内快捷操作、详情抽屉。 */
 export default function OpportunityList() {
   const queryClient = useQueryClient()
   const [status, setStatus] = useState('')
   const [typeId, setTypeId] = useState('')
+  const [direction, setDirection] = useState('')
   const [keyword, setKeyword] = useState('')
   const [page, setPage] = useState(0)
   const [pageSize, setPageSize] = useState(20)
@@ -80,9 +133,10 @@ export default function OpportunityList() {
         page_size: pageSize,
         status,
         type_id: typeId,
+        direction,
         keyword,
       })}`,
-    [page, pageSize, status, typeId, keyword],
+    [page, pageSize, status, typeId, direction, keyword],
   )
 
   const { data, isLoading } = useQuery({
@@ -114,6 +168,14 @@ export default function OpportunityList() {
     mutationFn: (id: number) => apiPatch(`/api/opportunities/${id}`, { status: 'handled' }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['opportunities'] })
+      void queryClient.invalidateQueries({ queryKey: ['status'] })
+    },
+  })
+
+  // 全部已读（反馈 12）：一键清零未读角标
+  const readAllMutation = useMutation({
+    mutationFn: () => apiPost<{ cleared: number }>('/api/opportunities/read-all'),
+    onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['status'] })
     },
   })
@@ -157,6 +219,20 @@ export default function OpportunityList() {
           ))}
         </TextField>
         <TextField
+          select
+          label="方向"
+          sx={{ width: 110 }}
+          value={direction}
+          onChange={(e) => {
+            setPage(0)
+            setDirection(e.target.value)
+          }}
+        >
+          <MenuItem value="">全部方向</MenuItem>
+          <MenuItem value="buy">买货（求购）</MenuItem>
+          <MenuItem value="sell">卖货（供货）</MenuItem>
+        </TextField>
+        <TextField
           label="关键词（要点/原文/发送人）"
           sx={{ width: 260 }}
           value={keyword}
@@ -166,7 +242,17 @@ export default function OpportunityList() {
           }}
         />
         {statusInfo && statusInfo.unread_count > 0 && (
-          <Chip color="error" size="small" label={`${statusInfo.unread_count} 条未读商机`} />
+          <>
+            <Chip color="error" size="small" label={`${statusInfo.unread_count} 条未读商机`} />
+            <Button
+              size="small"
+              variant="outlined"
+              disabled={readAllMutation.isPending}
+              onClick={() => readAllMutation.mutate()}
+            >
+              全部已读
+            </Button>
+          </>
         )}
       </Stack>
 
@@ -209,11 +295,28 @@ export default function OpportunityList() {
                 onClick={() => setDetailId(o.id)}
               >
                 <TableCell>
-                  <Chip size="small" color="primary" variant="outlined" label={o.type_name} />
+                  <Stack direction="row" spacing={0.5} alignItems="center">
+                    <Chip size="small" color="primary" variant="outlined" label={o.type_name} />
+                    {o.direction && (
+                      <Chip
+                        size="small"
+                        color={o.direction === 'buy' ? 'info' : 'warning'}
+                        label={DIRECTION_LABELS[o.direction] ?? o.direction}
+                      />
+                    )}
+                  </Stack>
                 </TableCell>
-                <TableCell>{o.session_name}</TableCell>
                 <TableCell>
-                  {o.sender_name}
+                  <Box sx={{ display: 'flex', alignItems: 'center' }}>
+                    <span>{o.session_name}</span>
+                    <CopyButton text={o.session_name} label="群名/会话名" />
+                  </Box>
+                </TableCell>
+                <TableCell>
+                  <Box sx={{ display: 'flex', alignItems: 'center' }}>
+                    <span>{o.sender_name}</span>
+                    <CopyButton text={o.sender_name} label="发送人" />
+                  </Box>
                   {o.sender_wxid && (
                     <Typography variant="caption" display="block" color="text.secondary">
                       {o.sender_wxid}
@@ -223,14 +326,18 @@ export default function OpportunityList() {
                 <TableCell sx={{ whiteSpace: 'nowrap' }}>{o.window_end.replace('T', ' ')}</TableCell>
                 <TableCell sx={{ maxWidth: 260, minWidth: 140 }}>
                   {o.key_quote ? (
-                    <Tooltip title={o.key_quote} placement="top" arrow>
+                    <Tooltip
+                      title={o.key_quote}
+                      placement="top"
+                      arrow
+                      {...QUOTE_TOOLTIP_PROPS}
+                    >
                       <Typography
                         variant="body2"
                         sx={{
-                          display: '-webkit-box',
-                          WebkitBoxOrient: 'vertical',
-                          WebkitLineClamp: 2,
                           overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
                         }}
                       >
                         {o.key_quote}

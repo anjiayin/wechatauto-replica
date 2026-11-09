@@ -48,6 +48,8 @@ export interface StatusOut {
   watermark_saved_at: string
   degraded_reason: string
   unread_count: number
+  /** 今日 AI 估算费用（元，反馈 13） */
+  today_cost: number
 }
 
 /** /api/sessions/search */
@@ -143,6 +145,8 @@ export interface OpportunityListItem {
   /** 关键原文摘录（列表页「消息原文」列） */
   key_quote: string
   confidence: number
+  /** 买/卖货方向（反馈 4）：buy=买货 sell=卖货 ''=不明 */
+  direction: '' | 'buy' | 'sell'
   status: 'pending' | 'replied' | 'ignored' | 'handled'
   created_at: string
 }
@@ -197,6 +201,30 @@ export interface ReplyPayload {
   text: string
   at: string[]
   quote?: { local_id: number }
+}
+
+/** /api/system/retention（反馈 7：历史数据保留配置，天） */
+export interface RetentionSettings {
+  logs_days: number
+  opportunities_days: number
+}
+
+/** /api/system/billing 单日用量与费用（元） */
+export interface BillingDay {
+  date: string
+  calls: number
+  prompt_tokens: number
+  completion_tokens: number
+  cost: number
+}
+
+/** /api/system/billing（反馈 13：AI 账单估算） */
+export interface BillingOut {
+  unit: 'per_k' | 'per_m'
+  input_price: number
+  output_price: number
+  today: BillingDay
+  series: BillingDay[]
 }
 
 /** WS 事件（{event, data}） */

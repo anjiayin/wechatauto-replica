@@ -51,6 +51,7 @@ class StatusOut(BaseModel):
     watermark_saved_at: str = ""
     degraded_reason: str = ""          # 微信接入降级原因（空 = 正常）
     unread_count: int = 0
+    today_cost: float = 0.0            # 今日 AI 估算费用（元，反馈 13）
 
 
 class SessionItemOut(BaseModel):
@@ -180,6 +181,48 @@ class MonitorSettingsUpdate(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 历史数据管理（反馈 7）/ AI 账单（反馈 13）
+# ---------------------------------------------------------------------------
+class RetentionOut(BaseModel):
+    """历史数据保留配置（两表分开管理）。"""
+    logs_days: int = Field(default=90, ge=1, le=3650)    # analysis_logs 保留天数
+    opportunities_days: int = Field(default=365, ge=1, le=3650)
+
+
+class RetentionUpdate(BaseModel):
+    logs_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    opportunities_days: Optional[int] = Field(default=None, ge=1, le=3650)
+
+
+class PurgeRequest(BaseModel):
+    """立即清理请求。"""
+    table: str = Field(pattern="^(analysis_logs|opportunities)$")
+    keep_days: int = Field(ge=1, le=3650)
+
+
+class PurgeResult(BaseModel):
+    table: str
+    deleted: int
+
+
+class BillingDayOut(BaseModel):
+    date: str
+    calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost: float = 0.0
+
+
+class BillingOut(BaseModel):
+    """AI 账单估算（按设置的输入/输出单价计算，元）。"""
+    unit: str = "per_k"                       # per_k=元/千tokens per_m=元/百万tokens
+    input_price: float = 0.0
+    output_price: float = 0.0
+    today: BillingDayOut = Field(default_factory=lambda: BillingDayOut(date=""))
+    series: List[BillingDayOut] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
 # 商机
 # ---------------------------------------------------------------------------
 class OpportunityListItem(BaseModel):
@@ -194,6 +237,7 @@ class OpportunityListItem(BaseModel):
     summary: str = ""
     key_quote: str = ""                # 关键原文摘录（列表页「消息原文」列）
     confidence: int = 0
+    direction: str = ""                # 买/卖货方向（反馈 4）：buy/sell/''=不明
     status: str = "pending"
     created_at: str = ""
 

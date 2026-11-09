@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -39,6 +40,52 @@ from app.sender import Sender
 from app.wechat_service import WeChatService
 
 logger = logging.getLogger("kefu")
+
+# 每日定时清理时间（反馈 7）
+PURGE_HOUR, PURGE_MINUTE = 3, 30
+
+
+def _run_scheduled_purge(db: Database) -> None:
+    """按保留配置清理两表并记录当日已执行标记（自动/补跑共用）。"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    for table, key in (("analysis_logs", "retention.logs_days"),
+                       ("opportunities", "retention.opportunities_days")):
+        days = db.get_int(key, 90 if table == "analysis_logs" else 365)
+        try:
+            deleted = db.delete_older_than(table, days)
+            if deleted:
+                logger.info("定时清理：%s 删除 %d 条（保留 %d 天）",
+                            table, deleted, days)
+        except Exception:
+            logger.exception("定时清理失败（%s，已跳过）", table)
+    db.set_setting("purge.last_run_date", today)
+
+
+async def _purge_scheduler() -> None:
+    """每日 03:30 定时清理协程；启动时若已过当日清理点则立即补跑一次。"""
+    db = globals().get("_db")
+    if db is None:
+        return
+    # 启动补跑：已过 03:30 且当日未执行（主理人决策 ③）
+    now = datetime.now()
+    run_at = now.replace(hour=PURGE_HOUR, minute=PURGE_MINUTE,
+                         second=0, microsecond=0)
+    if now >= run_at and \
+            db.get_setting("purge.last_run_date", "") != now.strftime("%Y-%m-%d"):
+        logger.info("启动补跑当日定时清理（%02d:%02d 已过）",
+                    PURGE_HOUR, PURGE_MINUTE)
+        _run_scheduled_purge(db)
+    while True:
+        now = datetime.now()
+        run_at = now.replace(hour=PURGE_HOUR, minute=PURGE_MINUTE,
+                             second=0, microsecond=0)
+        if now >= run_at:
+            run_at += timedelta(days=1)
+        await asyncio.sleep(max(60.0, (run_at - now).total_seconds()))
+        db = globals().get("_db")
+        if db is None:
+            return
+        _run_scheduled_purge(db)
 
 
 def setup_logging() -> None:
@@ -118,6 +165,8 @@ def create_app() -> FastAPI:
                                     name="kefu-wx-start", daemon=True)
         wx_start.start()
         globals()["_wx_start_thread"] = wx_start
+        # 历史数据每日定时清理（反馈 7）：03:30 执行，启动时补跑当日未执行的
+        globals()["_purge_task"] = asyncio.create_task(_purge_scheduler())
         logger.info("kefu-system 启动完成（前端 dist：%s）",
                     "已托管" if (FRONTEND_DIST / "index.html").exists()
                     else "未构建")
@@ -129,6 +178,10 @@ def create_app() -> FastAPI:
         sender = deps.get_sender()
         db = deps.get_db()
         aggregator = globals().get("_aggregator")
+        # 停止定时清理协程
+        purge_task = globals().get("_purge_task")
+        if purge_task is not None:
+            purge_task.cancel()
         # 等待微信初始化线程结束（避免与 stop 并发竞争）
         wx_start = globals().get("_wx_start_thread")
         if wx_start is not None:

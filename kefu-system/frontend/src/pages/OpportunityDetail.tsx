@@ -37,6 +37,35 @@ interface SendResultData {
   message: string
 }
 
+/** 上下文中的图片消息：尝试展示解密真图，加载失败回退占位文本（反馈 2）。 */
+function ContextImage(props: { username: string; localId: number; fallback: string }) {
+  const [failed, setFailed] = useState(false)
+  if (failed) {
+    return (
+      <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
+        {props.fallback || '[图片]'}
+      </Typography>
+    )
+  }
+  return (
+    <Box
+      component="img"
+      src={`/api/messages/${encodeURIComponent(props.username)}/images/${props.localId}`}
+      alt="图片消息"
+      loading="lazy"
+      onError={() => setFailed(true)}
+      sx={{
+        maxWidth: 240,
+        maxHeight: 180,
+        display: 'block',
+        borderRadius: 1,
+        border: '1px solid #e0e0e0',
+        mt: 0.5,
+      }}
+    />
+  )
+}
+
 /** 商机详情抽屉：原文/要点/上下文（独立加载）/回复框（@成员、引用）/操作。 */
 export default function OpportunityDetail(props: {
   id: number | null
@@ -207,9 +236,17 @@ export default function OpportunityDetail(props: {
                   <Typography variant="caption" color="text.secondary">
                     {m.create_time.replace('T', ' ')} · {m.sender_name} · {m.type_name}
                   </Typography>
-                  <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
-                    {m.content}
-                  </Typography>
+                  {m.type === '图片' && opp ? (
+                    <ContextImage
+                      username={opp.session_username}
+                      localId={m.local_id}
+                      fallback={m.content}
+                    />
+                  ) : (
+                    <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
+                      {m.content}
+                    </Typography>
+                  )}
                 </Box>
               ))}
               {!contextQuery.isLoading && !contextError && contextItems.length === 0 && (

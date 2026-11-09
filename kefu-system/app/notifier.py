@@ -82,6 +82,16 @@ class Notifier:
             return True
         return False
 
+    def clear_all_unread(self) -> int:
+        """全部已读（反馈 12）：清空未读集合并广播，返回清除条数。"""
+        if not self._unread:
+            return 0
+        count = len(self._unread)
+        self._unread.clear()
+        self.broadcast("unread_cleared", {"opportunity_id": None,
+                                          "all": True})
+        return count
+
     @property
     def unread_count(self) -> int:
         """当前未读商机数。"""

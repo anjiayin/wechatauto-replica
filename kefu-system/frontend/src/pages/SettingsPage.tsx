@@ -48,9 +48,11 @@ import type {
   AISettingsPayload,
   AITestResult,
   AnalysisSettings,
+  BillingOut,
   MonitorSettings,
   MonitorTarget,
   OpportunityType,
+  RetentionSettings,
   SessionItem,
   StatusOut,
 } from '../api/types'
@@ -60,7 +62,7 @@ import {
   parsePrescreen,
 } from '../constants/prescreen'
 
-/** 设置页：监控对象 / 商机类型 / AI 接口（含分析判定与通知）三 tab。 */
+/** 设置页：监控对象 / 商机类型 / AI 接口 / 数据与账单 四 tab。 */
 export default function SettingsPage() {
   const [tab, setTab] = useState(0)
   return (
@@ -69,10 +71,12 @@ export default function SettingsPage() {
         <Tab label="监控对象" />
         <Tab label="商机类型" />
         <Tab label="AI 接口" />
+        <Tab label="数据与账单" />
       </Tabs>
       {tab === 0 && <TargetsTab />}
       {tab === 1 && <TypesTab />}
       {tab === 2 && <AiTab />}
+      {tab === 3 && <DataBillingTab />}
     </Paper>
   )
 }
@@ -1212,6 +1216,229 @@ function AiTab() {
           </Typography>
         </Box>
       </Stack>
+    </Box>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Tab 4：数据与账单（反馈 7 历史数据管理 / 反馈 13 AI 账单估算）
+// ---------------------------------------------------------------------------
+const RETENTION_PRESETS = [
+  { label: '1 个月', days: 30 },
+  { label: '半年', days: 182 },
+  { label: '1 年', days: 365 },
+]
+
+function DataBillingTab() {
+  const queryClient = useQueryClient()
+  const [snack, setSnack] = useState<string | null>(null)
+
+  // 保留时长配置
+  const { data: retention } = useQuery({
+    queryKey: ['retention'],
+    queryFn: () => apiGet<RetentionSettings>('/api/system/retention'),
+  })
+  const [logsDays, setLogsDays] = useState('')
+  const [oppsDays, setOppsDays] = useState('')
+  const [loaded, setLoaded] = useState(false)
+  useEffect(() => {
+    if (retention && !loaded) {
+      setLogsDays(String(retention.logs_days))
+      setOppsDays(String(retention.opportunities_days))
+      setLoaded(true)
+    }
+  }, [retention, loaded])
+
+  const saveRetentionMutation = useMutation({
+    mutationFn: () =>
+      apiPut<RetentionSettings>('/api/system/retention', {
+        logs_days: Number(logsDays),
+        opportunities_days: Number(oppsDays),
+      }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['retention'] })
+      setSnack('保留时长已保存')
+    },
+    onError: (e: Error) => setSnack(`保存失败：${e.message}`),
+  })
+
+  const purgeMutation = useMutation({
+    mutationFn: (p: { table: string; keep_days: number }) =>
+      apiPost<{ table: string; deleted: number }>('/api/system/purge', p),
+    onSuccess: (r) =>
+      setSnack(`已清理 ${r.table === 'analysis_logs' ? '分析日志' : '商机'} ${r.deleted} 条`),
+    onError: (e: Error) => setSnack(`清理失败：${e.message}`),
+  })
+
+  // AI 账单
+  const { data: billing } = useQuery({
+    queryKey: ['billing'],
+    queryFn: () => apiGet<BillingOut>('/api/system/billing'),
+  })
+  const [inputPrice, setInputPrice] = useState('')
+  const [outputPrice, setOutputPrice] = useState('')
+  const [priceUnit, setPriceUnit] = useState<'per_k' | 'per_m'>('per_k')
+  const [billingLoaded, setBillingLoaded] = useState(false)
+  useEffect(() => {
+    if (billing && !billingLoaded) {
+      setInputPrice(billing.input_price ? String(billing.input_price) : '')
+      setOutputPrice(billing.output_price ? String(billing.output_price) : '')
+      setPriceUnit(billing.unit)
+      setBillingLoaded(true)
+    }
+  }, [billing, billingLoaded])
+
+  const saveBillingMutation = useMutation({
+    mutationFn: () =>
+      apiPost<{ ok: boolean }>('/api/settings/billing', {
+        input_price: Number(inputPrice) || 0,
+        output_price: Number(outputPrice) || 0,
+        unit: priceUnit,
+      }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['billing'] })
+      setSnack('AI 单价已保存，费用估算已更新')
+    },
+    onError: (e: Error) => setSnack(`保存失败：${e.message}`),
+  })
+
+  const unitLabel = priceUnit === 'per_k' ? '元 / 千 tokens' : '元 / 百万 tokens'
+
+  return (
+    <Box>
+      <Typography variant="subtitle2" sx={{ mb: 1 }}>历史数据管理</Typography>
+      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
+        分别配置分析日志与商机的保留时长（每天 03:30 自动清理，也可手动立即清理）；删除不可恢复，请谨慎设置。
+      </Typography>
+      <Stack spacing={2} sx={{ mb: 2 }}>
+        <Stack direction="row" spacing={1} alignItems="center" useFlexGap>
+          <Typography variant="body2" sx={{ width: 90 }}>分析日志保留</Typography>
+          <TextField
+            size="small"
+            sx={{ width: 110 }}
+            value={logsDays}
+            onChange={(e) => setLogsDays(e.target.value.replace(/[^0-9]/g, ''))}
+            InputProps={{ endAdornment: <InputAdornment position="end">天</InputAdornment> }}
+          />
+          {RETENTION_PRESETS.map((p) => (
+            <Button
+              key={p.days}
+              size="small"
+              variant={Number(logsDays) === p.days ? 'contained' : 'outlined'}
+              onClick={() => setLogsDays(String(p.days))}
+            >
+              {p.label}
+            </Button>
+          ))}
+          <Button
+            size="small"
+            color="warning"
+            disabled={purgeMutation.isPending || !Number(logsDays)}
+            onClick={() => purgeMutation.mutate({ table: 'analysis_logs', keep_days: Number(logsDays) })}
+          >
+            立即清理
+          </Button>
+        </Stack>
+        <Stack direction="row" spacing={1} alignItems="center" useFlexGap>
+          <Typography variant="body2" sx={{ width: 90 }}>商机保留</Typography>
+          <TextField
+            size="small"
+            sx={{ width: 110 }}
+            value={oppsDays}
+            onChange={(e) => setOppsDays(e.target.value.replace(/[^0-9]/g, ''))}
+            InputProps={{ endAdornment: <InputAdornment position="end">天</InputAdornment> }}
+          />
+          {RETENTION_PRESETS.map((p) => (
+            <Button
+              key={p.days}
+              size="small"
+              variant={Number(oppsDays) === p.days ? 'contained' : 'outlined'}
+              onClick={() => setOppsDays(String(p.days))}
+            >
+              {p.label}
+            </Button>
+          ))}
+          <Button
+            size="small"
+            color="warning"
+            disabled={purgeMutation.isPending || !Number(oppsDays)}
+            onClick={() => purgeMutation.mutate({ table: 'opportunities', keep_days: Number(oppsDays) })}
+          >
+            立即清理
+          </Button>
+        </Stack>
+        <Button
+          variant="contained"
+          sx={{ alignSelf: 'flex-start' }}
+          disabled={saveRetentionMutation.isPending}
+          onClick={() => saveRetentionMutation.mutate()}
+        >
+          保存保留时长
+        </Button>
+      </Stack>
+
+      <Divider sx={{ my: 2 }} />
+      <Typography variant="subtitle2" sx={{ mb: 1 }}>AI 账单估算</Typography>
+      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
+        填写所用 AI 接口的输入/输出单价，系统按每次调用的实际 token 用量自动累计每日估算费用（仅本机估算，非官方账单）。
+      </Typography>
+      <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1.5 }} useFlexGap>
+        <TextField
+          label="输入单价"
+          size="small"
+          sx={{ width: 120 }}
+          value={inputPrice}
+          onChange={(e) => setInputPrice(e.target.value.replace(/[^0-9.]/g, ''))}
+        />
+        <TextField
+          label="输出单价"
+          size="small"
+          sx={{ width: 120 }}
+          value={outputPrice}
+          onChange={(e) => setOutputPrice(e.target.value.replace(/[^0-9.]/g, ''))}
+        />
+        <TextField
+          select
+          label="单位"
+          size="small"
+          sx={{ width: 160 }}
+          value={priceUnit}
+          onChange={(e) => setPriceUnit(e.target.value as 'per_k' | 'per_m')}
+        >
+          <MenuItem value="per_k">元 / 千 tokens</MenuItem>
+          <MenuItem value="per_m">元 / 百万 tokens</MenuItem>
+        </TextField>
+        <Button
+          variant="contained"
+          disabled={saveBillingMutation.isPending}
+          onClick={() => saveBillingMutation.mutate()}
+        >
+          保存单价
+        </Button>
+      </Stack>
+      {billing && (
+        <Box sx={{ bgcolor: '#f7f7f7', borderRadius: 1, p: 1.5 }}>
+          <Typography variant="body2" sx={{ mb: 0.5 }}>
+            今日：{billing.today.calls} 次调用 ·
+            输入 {billing.today.prompt_tokens.toLocaleString()} tokens ·
+            输出 {billing.today.completion_tokens.toLocaleString()} tokens ·
+            估算费用 <b>¥{billing.today.cost.toFixed(4)}</b>（{unitLabel}）
+          </Typography>
+          {billing.series.length > 0 && (
+            <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+              近 7 日：{billing.series.map((d) => `${d.date.slice(5)} ¥${d.cost.toFixed(2)}`).join(' · ')}
+            </Typography>
+          )}
+        </Box>
+      )}
+
+      <Snackbar
+        open={snack !== null}
+        autoHideDuration={4000}
+        onClose={() => setSnack(null)}
+        message={snack}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+      />
     </Box>
   )
 }

@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Iterable, Optional
 
 from app.config import (
@@ -76,6 +76,7 @@ _OPPORTUNITIES_COLUMNS = """
       summary          TEXT NOT NULL,
       key_quote        TEXT NOT NULL DEFAULT '',
       confidence       INTEGER NOT NULL DEFAULT 0,
+      direction        TEXT NOT NULL DEFAULT '',   -- 买/卖货方向（反馈 4）：buy/sell/''=不明
       status           TEXT NOT NULL DEFAULT 'pending'
                        CHECK (status IN ('pending','replied','ignored','handled')),
       reply_content    TEXT,
@@ -132,6 +133,8 @@ DDL_STATEMENTS: tuple[str, ...] = (
       created_at       TEXT NOT NULL DEFAULT (datetime('now'))
     )
     """,
+    "CREATE INDEX IF NOT EXISTS idx_logs_created ON analysis_logs (created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_logs_session ON analysis_logs (session_username, created_at DESC)",
     """
     CREATE TABLE IF NOT EXISTS watermarks (
       username   TEXT PRIMARY KEY,
@@ -167,7 +170,30 @@ class Database:
         self._init_default_settings()
         self._migrate_merge_window_default()
         self._migrate_opportunity_status_handled()
+        self._migrate_add_columns()
         logger.info("业务数据库已初始化：%s", self.path)
+
+    def _migrate_add_columns(self) -> None:
+        """幂等加列迁移（反馈 4/13）：老库补 direction 与 token 用量列。
+
+        新建库由 DDL 直接带全列；老库按 PRAGMA table_info 检查后
+        ALTER TABLE ADD COLUMN，已存在则跳过（可重复执行）。
+        """
+        plans = (
+            ("opportunities", "direction", "TEXT NOT NULL DEFAULT ''"),
+            ("analysis_logs", "prompt_tokens", "INTEGER"),
+            ("analysis_logs", "completion_tokens", "INTEGER"),
+        )
+        with self._lock:
+            for table, column, col_type in plans:
+                cols = {r["name"] for r in self._conn.execute(
+                    f"PRAGMA table_info({table})").fetchall()}
+                if not cols or column in cols:
+                    continue
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+                logger.info("已迁移：%s 增加 %s 列", table, column)
+            self._conn.commit()
 
     # ------------------------------------------------------------------
     # 基础
@@ -481,17 +507,20 @@ class Database:
                            merged_count: int, raw_text: str,
                            type_id: Optional[int], type_name: str,
                            summary: str, key_quote: str,
-                           confidence: int) -> dict:
+                           confidence: int,
+                           direction: str = "") -> dict:
         """插入一条商机并返回完整记录。"""
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO opportunities (session_username, session_name, "
                 "sender_wxid, sender_name, window_start, window_end, merged_count, "
-                "raw_text, type_id, type_name, summary, key_quote, confidence) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "raw_text, type_id, type_name, summary, key_quote, confidence, "
+                "direction) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (session_username, session_name, sender_wxid, sender_name,
                  window_start, window_end, merged_count, raw_text, type_id,
-                 type_name, summary, key_quote, confidence),
+                 type_name, summary, key_quote, confidence,
+                 direction if direction in ("buy", "sell") else ""),
             )
             self._conn.commit()
             return self.get_opportunity(cur.lastrowid)  # type: ignore[return-value]
@@ -502,12 +531,14 @@ class Database:
 
     def list_opportunities(self, *, page: int = 1, page_size: int = 20,
                            session: str = "", type_id: Optional[int] = None,
-                           status: str = "", keyword: str = "") -> tuple[int, list[dict]]:
+                           status: str = "", keyword: str = "",
+                           direction: str = "") -> tuple[int, list[dict]]:
         """商机列表（时间倒序）。
 
         Args:
             status: pending/replied/ignored/handled；空串 = 排除 ignored
                 （handled 与 pending/replied 一样默认展示在列表中）。
+            direction: buy/sell；空串 = 全部方向（反馈 4）。
 
         Returns:
             (total, items)
@@ -525,6 +556,9 @@ class Database:
         if type_id:
             where.append("type_id=?")
             params.append(type_id)
+        if direction in ("buy", "sell"):
+            where.append("direction=?")
+            params.append(direction)
         if keyword:
             where.append(
                 "(summary LIKE ? OR raw_text LIKE ? OR type_name LIKE ? "
@@ -540,8 +574,9 @@ class Database:
             rows = self._conn.execute(
                 "SELECT id, session_username, session_name, sender_wxid, "
                 "sender_name, window_end, type_id, type_name, summary, "
-                "key_quote, confidence, status, created_at FROM opportunities "
-                f"WHERE {where_sql} ORDER BY created_at DESC, id DESC "
+                "key_quote, confidence, direction, status, created_at "
+                f"FROM opportunities WHERE {where_sql} "
+                "ORDER BY created_at DESC, id DESC "
                 "LIMIT ? OFFSET ?",
                 [*params, page_size, (max(page, 1) - 1) * page_size],
             ).fetchall()
@@ -649,15 +684,23 @@ class Database:
                             input_text: str = "", result: str = "",
                             status: str, error: str = "", model: str = "",
                             latency_ms: Optional[int] = None,
-                            opportunity_id: Optional[int] = None) -> int:
-        """写入一条分析日志（ok/error/skipped/below_threshold）。"""
+                            opportunity_id: Optional[int] = None,
+                            prompt_tokens: Optional[int] = None,
+                            completion_tokens: Optional[int] = None) -> int:
+        """写入一条分析日志（ok/error/skipped/below_threshold）。
+
+        prompt_tokens/completion_tokens：AI 调用 token 用量（反馈 13
+        账单估算数据源）；skipped 等未调用 AI 的场景为 None。
+        """
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO analysis_logs (session_username, sender_wxid, "
                 "msg_count, input_text, result, status, error, model, "
-                "latency_ms, opportunity_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "latency_ms, opportunity_id, prompt_tokens, completion_tokens) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (session_username, sender_wxid, msg_count, input_text, result,
-                 status, error, model, latency_ms, opportunity_id),
+                 status, error, model, latency_ms, opportunity_id,
+                 prompt_tokens, completion_tokens),
             )
             self._conn.commit()
             return int(cur.lastrowid or 0)
@@ -699,6 +742,71 @@ class Database:
                 [*params, page_size, (max(page, 1) - 1) * page_size],
             ).fetchall()
         return int(total), [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # 历史数据管理（反馈 7）
+    # ------------------------------------------------------------------
+    _PURGE_TABLES = ("analysis_logs", "opportunities")
+
+    def delete_older_than(self, table: str, days: int) -> int:
+        """删除指定表创建时间早于 N 天前的记录，返回删除行数。
+
+        Args:
+            table: 仅允许 analysis_logs / opportunities（白名单防注入）。
+            days: 保留天数（≥1；删除 created_at < now - days 的记录）。
+
+        opportunities 删除前先把 analysis_logs.opportunity_id 引用置空，
+        避免外键约束阻止删除（日志保留完整，仅断开关联）。
+        """
+        if table not in self._PURGE_TABLES:
+            raise ValueError(f"不允许清理的表：{table}")
+        if days < 1:
+            raise ValueError("保留天数必须 ≥ 1")
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat(
+            timespec="seconds")
+        with self._lock:
+            if table == "opportunities":
+                self._conn.execute(
+                    "UPDATE analysis_logs SET opportunity_id=NULL "
+                    "WHERE opportunity_id IN ("
+                    "SELECT id FROM opportunities WHERE created_at < ?)",
+                    (cutoff,),
+                )
+            cur = self._conn.execute(
+                f"DELETE FROM {table} WHERE created_at < ?", (cutoff,))
+            self._conn.commit()
+            return cur.rowcount
+
+    # ------------------------------------------------------------------
+    # AI 账单估算（反馈 13）
+    # ------------------------------------------------------------------
+    def usage_by_date(self, date_str: str) -> dict:
+        """某日（YYYY-MM-DD）的 AI token 用量与调用次数汇总。
+
+        Returns:
+            {calls, prompt_tokens, completion_tokens}（无数据为 0）。
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS calls, "
+                "COALESCE(SUM(prompt_tokens), 0) AS pt, "
+                "COALESCE(SUM(completion_tokens), 0) AS ct "
+                "FROM analysis_logs WHERE status='ok' "
+                "AND prompt_tokens IS NOT NULL "
+                "AND substr(created_at, 1, 10) = ?",
+                (date_str,),
+            ).fetchone()
+        return {"calls": int(row["calls"]), "prompt_tokens": int(row["pt"]),
+                "completion_tokens": int(row["ct"])}
+
+    def usage_series(self, days: int = 7) -> list[dict]:
+        """近 N 日（含今日）逐日 token 用量序列（账单卡片展示）。"""
+        out: list[dict] = []
+        for i in range(days - 1, -1, -1):
+            day = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+            usage = self.usage_by_date(day)
+            out.append({"date": day, **usage})
+        return out
 
     # ------------------------------------------------------------------
     # watermarks DAO

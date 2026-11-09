@@ -302,19 +302,26 @@ class Pipeline:
     # ------------------------------------------------------------------
     def _on_result(self, unit: AnalysisUnit, result: dict, latency_ms: int,
                    base_log: dict, model: str) -> None:
-        """按命中/门槛/未命中分流落库与广播；命中先尝试商机级合并。"""
+        """按命中/门槛/未命中分流落库与广播；命中先尝试商机级合并。
+
+        token 用量（反馈 13）随日志落库；direction（反馈 4）随商机落库。
+        """
         result_json = json.dumps(result, ensure_ascii=False)
+        usage = {
+            "prompt_tokens": result.get("prompt_tokens"),
+            "completion_tokens": result.get("completion_tokens"),
+        }
         if not result.get("hit"):
             self._db.insert_analysis_log(
                 status="ok", result=result_json, model=model,
-                latency_ms=latency_ms, **base_log)
+                latency_ms=latency_ms, **base_log, **usage)
             return
         analysis_cfg = dbmod.read_analysis_settings(self._db)
         min_conf = int(analysis_cfg.get("min_confidence", 60))
         if result["confidence"] < min_conf:
             self._db.insert_analysis_log(
                 status="below_threshold", result=result_json, model=model,
-                latency_ms=latency_ms, **base_log)
+                latency_ms=latency_ms, **base_log, **usage)
             return
         # 命中类型：AI 返回类型名 → 匹配已启用类型拿 type_id（找不到则存快照）
         type_name = result.get("type") or "未知类型"
@@ -343,10 +350,14 @@ class Pipeline:
             summary=analyzer.summarize_points(result.get("points", [])),
             key_quote=result.get("quote", ""),
             confidence=result["confidence"],
+            direction=str(result.get("direction") or ""),
         )
         self._db.insert_analysis_log(
             status="ok", result=result_json, model=model,
-            latency_ms=latency_ms, opportunity_id=opp["id"], **base_log)
+            latency_ms=latency_ms, opportunity_id=opp["id"],
+            prompt_tokens=result.get("prompt_tokens"),
+            completion_tokens=result.get("completion_tokens"),
+            **base_log)
         self._notifier.mark_new_opportunity(opp["id"])
         self._notifier.broadcast("opportunity_new", opp)
         logger.info("新商机 #%d：%s/%s（%s，置信度 %d）",
@@ -439,6 +450,8 @@ class Pipeline:
             status="ok", result=json.dumps(result, ensure_ascii=False),
             model=model, latency_ms=latency_ms,
             opportunity_id=opp["id"],
+            prompt_tokens=result.get("prompt_tokens"),
+            completion_tokens=result.get("completion_tokens"),
             **self._base_log_with_defaults(unit, base_log))
         self._notifier.broadcast("opportunity_update", opp)
         logger.info("商机 #%d 已合并新批次：%s/%s（累计 %d 条，置信度 %d）",
@@ -477,11 +490,14 @@ class Pipeline:
             summary=analyzer.summarize_points(result.get("points", [])),
             key_quote=result.get("quote", ""),
             confidence=result["confidence"],
+            direction=str(result.get("direction") or ""),
         )
         self._db.insert_analysis_log(
             status="ok", result=json.dumps(result, ensure_ascii=False),
             model=model, latency_ms=latency_ms,
             opportunity_id=opp["id"],
+            prompt_tokens=result.get("prompt_tokens"),
+            completion_tokens=result.get("completion_tokens"),
             **self._base_log_with_defaults(unit, base_log))
         self._notifier.mark_new_opportunity(opp["id"])
         self._notifier.broadcast("opportunity_new", opp)

@@ -5,14 +5,18 @@
 - GET /api/status
 - GET /api/sessions/search?keyword=&limit=20&kind=all
 - GET /api/messages/{username}?before_seq=&limit=50
+- GET /api/messages/{username}/images/{local_id}   图片解密（反馈 2）
+- GET /api/system/retention | POST /api/system/purge          历史数据（反馈 7）
+- GET /api/system/billing                                     AI 账单（反馈 13）
 - WS  /ws/events
 """
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import List
 
-from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 
 from app.api.deps import (
     get_db,
@@ -23,9 +27,15 @@ from app.api.deps import (
 from app.db import Database, read_monitor_max_targets
 from app.schemas import (
     AnalysisHealth,
+    BillingDayOut,
+    BillingOut,
     MessageOut,
     MonitorQuota,
+    PurgeRequest,
+    PurgeResult,
     QueueStatus,
+    RetentionOut,
+    RetentionUpdate,
     SessionItemOut,
     StatusOut,
     WechatStatus,
@@ -37,6 +47,30 @@ from app.wechat_service import WeChatService
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _billing_settings(db: Database) -> dict:
+    """读取账单单价配置：input_price/output_price/unit（per_k|per_m）。"""
+    unit = db.get_setting("billing.unit", "per_k")
+    if unit not in ("per_k", "per_m"):
+        unit = "per_k"
+    return {
+        "unit": unit,
+        "input_price": db.get_float("billing.input_price", 0.0),
+        "output_price": db.get_float("billing.output_price", 0.0),
+    }
+
+
+def _usage_cost(usage: dict, billing: dict) -> float:
+    """按单价与单位换算一次调用/一日的费用（元）。
+
+    per_k：元/千 tokens；per_m：元/百万 tokens。未配置单价时为 0。
+    """
+    divisor = 1000.0 if billing["unit"] == "per_k" else 1_000_000.0
+    pt = int(usage.get("prompt_tokens") or 0)
+    ct = int(usage.get("completion_tokens") or 0)
+    return (pt / divisor * billing["input_price"]
+            + ct / divisor * billing["output_price"])
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +109,9 @@ def get_status(db: Database = Depends(get_db),
         watermark_saved_at=svc.watermark_saved_at,
         degraded_reason=svc.degraded_reason,
         unread_count=notifier.unread_count,
+        today_cost=round(_usage_cost(
+            db.usage_by_date(datetime.now().strftime("%Y-%m-%d")),
+            _billing_settings(db)), 4),
     )
 
 
@@ -105,6 +142,92 @@ def get_messages(username: str,
     """会话历史消息（详情上下文 / 消息浏览页复用）。"""
     msgs = svc.get_messages(username, limit=limit, before_seq=before_seq)
     return [MessageOut(**m) for m in msgs]
+
+
+# ---------------------------------------------------------------------------
+# GET /api/messages/{username}/images/{local_id}   图片解密（反馈 2）
+# ---------------------------------------------------------------------------
+@router.get("/api/messages/{username}/images/{local_id}",
+            response_class=Response)
+def get_message_image(username: str, local_id: int,
+                      svc: WeChatService = Depends(get_wechat_service),
+                      ) -> Response:
+    """解密并返回会话中指定图片消息（image/jpeg|png|gif）。
+
+    - 数据源：本地 .dat 缓存解密（群聊原图未点开时自动回退缩略图）；
+    - 不做网络拉取（主理人决策）；无缓存/解密失败回 404，前端显示占位卡片。
+    """
+    data = svc.get_image_bytes(username, local_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="图片本地缓存不存在或解密失败")
+    media_type = "image/png" if data[:4] == b"\x89PNG" else \
+        "image/gif" if data[:3] == b"GIF" else "image/jpeg"
+    return Response(content=data, media_type=media_type)
+
+
+# ---------------------------------------------------------------------------
+# 历史数据管理（反馈 7）
+# ---------------------------------------------------------------------------
+@router.get("/api/system/retention", response_model=RetentionOut)
+def get_retention(db: Database = Depends(get_db)) -> RetentionOut:
+    """读取两表保留时长配置（天）。"""
+    return RetentionOut(
+        logs_days=db.get_int("retention.logs_days", 90),
+        opportunities_days=db.get_int("retention.opportunities_days", 365),
+    )
+
+
+@router.put("/api/system/retention", response_model=RetentionOut)
+def update_retention(body: RetentionUpdate,
+                     db: Database = Depends(get_db)) -> RetentionOut:
+    """更新保留时长配置（None = 不变更）。"""
+    if body.logs_days is not None:
+        db.set_setting("retention.logs_days", str(int(body.logs_days)))
+    if body.opportunities_days is not None:
+        db.set_setting("retention.opportunities_days",
+                       str(int(body.opportunities_days)))
+    return get_retention(db)
+
+
+@router.post("/api/system/purge", response_model=PurgeResult)
+def purge_history(body: PurgeRequest,
+                  db: Database = Depends(get_db)) -> PurgeResult:
+    """立即清理指定表中超过保留时长的历史数据。"""
+    try:
+        deleted = db.delete_older_than(body.table, body.keep_days)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    logger.info("手动清理：%s 删除 %d 条（保留 %d 天）",
+                body.table, deleted, body.keep_days)
+    return PurgeResult(table=body.table, deleted=deleted)
+
+
+# ---------------------------------------------------------------------------
+# AI 账单估算（反馈 13）
+# ---------------------------------------------------------------------------
+@router.get("/api/system/billing", response_model=BillingOut)
+def get_billing(db: Database = Depends(get_db)) -> BillingOut:
+    """AI 账单：今日与近 7 日 token 用量及按单价估算的费用（元）。"""
+    billing = _billing_settings(db)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_usage = db.usage_by_date(today_str)
+    series = [
+        BillingDayOut(date=d["date"], calls=d["calls"],
+                      prompt_tokens=d["prompt_tokens"],
+                      completion_tokens=d["completion_tokens"],
+                      cost=round(_usage_cost(d, billing), 4))
+        for d in db.usage_series(7)
+    ]
+    return BillingOut(
+        unit=billing["unit"],
+        input_price=billing["input_price"],
+        output_price=billing["output_price"],
+        today=BillingDayOut(date=today_str, calls=today_usage["calls"],
+                            prompt_tokens=today_usage["prompt_tokens"],
+                            completion_tokens=today_usage["completion_tokens"],
+                            cost=round(_usage_cost(today_usage, billing), 4)),
+        series=series,
+    )
 
 
 # ---------------------------------------------------------------------------

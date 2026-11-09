@@ -37,10 +37,10 @@ class SenderFakeWxDb:
         self.group_members_calls.append(chatroom)
         if chatroom == "111@chatroom":
             return [
-                # 群昵称优先（nick_name），缺失回退 remark
+                # 备注优先（反馈 5：好友显示我给他的备注，而非其群昵称）
                 {"username": "wxid_zhang", "nick_name": "张三(群昵称)",
                  "remark": "zhang的备注", "is_owner": True},
-                # 自定义微信号、无群昵称 → 用 remark
+                # 自定义微信号、无备注 → 用群显示名/昵称
                 {"username": "andyyu", "nick_name": "", "remark": "余老板",
                  "is_owner": False},
             ]
@@ -80,7 +80,7 @@ class TestGroupSenderResolution:
         msg = make_group_msg("wxid_zhang:\n有谁能做铝合金CNC")
         svc._on_message(msg)
         assert msg["sender_username"] == "wxid_zhang"
-        assert msg["sender_display_name"] == "张三(群昵称)"  # 群成员表群昵称优先
+        assert msg["sender_display_name"] == "zhang的备注"  # 好友备注优先（反馈 5）
 
     def test_custom_weixin_id_prefix(self):
         """自定义微信号前缀（非 wxid_ 开头）同样解析；无群昵称回退 remark。"""
@@ -113,10 +113,10 @@ class TestGroupSenderResolution:
         svc._on_message(make_group_msg("wxid_zhang:\n第一条"))
         svc._on_message(make_group_msg("andyyu:\n第二条"))
         assert svc._wxdb.group_members_calls == ["111@chatroom"]
-        # 过期后重新读取
+        # 过期后重新读取（缓存条目为 (ts, names, ok) 三元组）
         cached = svc._group_members_cache["111@chatroom"]
         svc._group_members_cache["111@chatroom"] = (
-            cached[0] - 601, cached[1])
+            cached[0] - 601, cached[1], cached[2])
         svc._on_message(make_group_msg("wxid_zhang:\n第三条"))
         assert svc._wxdb.group_members_calls == ["111@chatroom"] * 2
 
@@ -263,7 +263,7 @@ class TestLogDisplays:
         svc = make_sender_svc()
         text = "[14:02] wxid_zhang:\n[14:02] 有谁能做铝合金CNC"
         _, display_text = svc.build_log_displays("111@chatroom", text)
-        assert "[14:02] 张三(群昵称):" in display_text
+        assert "[14:02] zhang的备注:" in display_text  # 好友备注优先（反馈 5）
         assert "有谁能做铝合金CNC" in display_text
 
     def test_group_input_text_inline_prefix(self):

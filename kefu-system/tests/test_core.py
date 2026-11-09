@@ -283,7 +283,7 @@ class TestAnalyzer:
             '{"hit": true, "type": "加工", "points": ["a"], '
             '"confidence": 85, "quote": "原文"}')
         assert ok == {"hit": True, "type": "加工", "points": ["a"],
-                      "confidence": 85, "quote": "原文"}
+                      "confidence": 85, "quote": "原文", "direction": ""}
         # markdown 包裹 + 正则兜底
         ok2 = analyzer.parse_ai_json('```json\n{"hit": false, "type": null, '
                                      '"points": [], "confidence": 10}\n```')

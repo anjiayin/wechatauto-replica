@@ -39,11 +39,12 @@ _SYSTEM_PROMPT_TEMPLATE = """你是微信群聊/私聊消息的销售商机分�
 2. 广告、闲聊、表情、纯问候一律 hit=false。
 3. points 提取发送人表达的具体需求要素（标的/数量/时间/价格/地点等），原文没有的不要编造。
 4. quote 必须是原文的逐字摘录。
-5. 只输出一个 JSON 对象，不要输出任何其他文字或 Markdown 代码块标记。
+5. direction 判断商机方向：发送人表达"求购/找货/收货/谁有"等买入意向为 "buy"；表达"出售/供货/有货/低价处理"等卖出意向为 "sell"；无法判断或非商机时为 ""。
+6. 只输出一个 JSON 对象，不要输出任何其他文字或 Markdown 代码块标记。
 {examples_block}
 
 ## 输出 JSON 格式
-{{"hit": <bool>, "type": <string|null>, "points": <string[]>, "confidence": <0-100>, "quote": <string>}}"""
+{{"hit": <bool>, "type": <string|null>, "points": <string[]>, "confidence": <0-100>, "quote": <string>, "direction": <"buy"|"sell"|"">}}"""
 
 # 修正示例段落头部（漏判修正：用户确认过的真实商机消息示例注入 Prompt）
 _EXAMPLES_HEADER = (
@@ -163,6 +164,10 @@ def _normalize_result(data: dict) -> dict:
         confidence = 0
     confidence = max(0, min(100, confidence))
     quote = str(data.get("quote") or "").strip()
+    # 买卖货方向（反馈 4）：buy/sell 之外的值一律归 ""（不明，历史不回溯）
+    direction = str(data.get("direction") or "").strip().lower()
+    if direction not in ("buy", "sell"):
+        direction = ""
     if hit and (not type_name):
         # 命中但无类型名视为无效结果
         raise AIError("AI 返回 hit=true 但缺少命中类型名")
@@ -172,6 +177,7 @@ def _normalize_result(data: dict) -> dict:
         "points": points,
         "confidence": confidence,
         "quote": quote,
+        "direction": direction,
     }
 
 
@@ -239,7 +245,12 @@ class AIClient:
         return self._client
 
     def chat(self, system_prompt: str, user_message: str) -> str:
-        """执行一次 chat.completions（json_object 模式），返回原始文本。"""
+        """执行一次 chat.completions（json_object 模式），返回原始文本。
+
+        副作用：把本次调用的 token 用量写入 ``self.last_usage``
+        （反馈 13 账单估算数据源；usage 缺失或调用失败时为 None）。
+        """
+        self.last_usage: Optional[dict] = None
         client = self._ensure_client()
         started = time.monotonic()
         try:
@@ -255,6 +266,13 @@ class AIClient:
         except Exception as exc:
             raise AIError(f"AI 接口调用失败：{exc}") from exc
         logger.debug("AI 调用耗时 %.0f ms", (time.monotonic() - started) * 1000)
+        # 记录 token 用量（部分兼容网关不返回 usage，防御性读取）
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            self.last_usage = {
+                "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                "completion_tokens": getattr(usage, "completion_tokens", None),
+            }
         content = ""
         try:
             content = resp.choices[0].message.content or ""
@@ -299,7 +317,12 @@ def analyze_unit(client: AIClient, unit_text: str, session_name: str,
         unit_text, session_name, session_kind, sender_name, sender_wxid, msg_count
     )
     raw = client.chat(system_prompt, user_message)
-    return parse_ai_json(raw)
+    result = parse_ai_json(raw)
+    # 附加本次调用 token 用量（反馈 13）；无 usage（兼容网关）时缺省 None
+    usage = getattr(client, "last_usage", None) or {}
+    result["prompt_tokens"] = usage.get("prompt_tokens")
+    result["completion_tokens"] = usage.get("completion_tokens")
+    return result
 
 
 def summarize_points(points: List[str]) -> str:

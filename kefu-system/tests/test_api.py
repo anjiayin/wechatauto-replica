@@ -211,7 +211,8 @@ def wait_until(predicate, timeout: float = 3.0) -> bool:
 
 LIST_ITEM_KEYS = {"id", "session_username", "session_name", "sender_wxid",
                   "sender_name", "window_end", "type_id", "type_name",
-                  "summary", "key_quote", "confidence", "status", "created_at"}
+                  "summary", "key_quote", "confidence", "direction",
+                  "status", "created_at"}
 # 契约变更（体验优化 4）：详情与上下文拆分 —— 详情接口不再返回 context 字段，
 # 上下文由独立接口 GET /api/opportunities/{id}/context 提供（items + error）
 DETAIL_EXTRA_KEYS = {"window_start", "merged_count", "raw_text", "key_quote",

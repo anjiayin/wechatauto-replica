@@ -22,10 +22,12 @@ from pathlib import Path
 from typing import Optional
 
 from app import db as dbmod
+from app import content_format
 from app.aggregator import Aggregator
 from app.config import (
     CONTEXT_COUNT,
     GROUP_MEMBER_CACHE_TTL_SEC,
+    IMG_CACHE_DIR,
     MSG_QUERY_RETRY_INTERVAL_SEC,
     MSG_QUERY_RETRY_TIMES,
     SESSION_CACHE_TTL_SEC,
@@ -90,7 +92,7 @@ class WeChatService:
         # 重复撞微信库冷分片（前端设置页本身就会并行发两个搜索请求）
         self._contact_cache_build_lock = threading.Lock()
         # 群成员显示名缓存（chatroom → (timestamp, {username: 显示名})，TTL 600s）
-        self._group_members_cache: dict[str, tuple[float, dict[str, str]]] = {}
+        self._group_members_cache: dict[str, tuple[float, dict[str, str], bool]] = {}
         self._group_members_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -195,7 +197,9 @@ class WeChatService:
                     session_username=username,
                     sender_wxid=sender_wxid,
                     msg_count=1,
-                    input_text=str(msg.get("content") or "")[:200],
+                    # 日志展示友好化：非文本消息存可读摘要而非原始 XML（反馈 3）
+                    input_text=content_format.format_content(
+                        mtype, str(msg.get("content") or ""))[:200],
                     status="skipped",
                     error=f"非文本消息（{mtype or '未知类型'}），不分析",
                 )
@@ -230,37 +234,59 @@ class WeChatService:
         return match.group(1) if match else ""
 
     def _get_group_member_names(self, chatroom: str) -> dict[str, str]:
-        """群成员 username → 显示名映射（群内昵称优先，缓存 TTL 600s）。
+        """群成员 username → 显示名映射（好友备注优先，缓存 TTL 600s）。
 
         wechatauto.get_group_members 返回字段：username / nick_name /
-        remark / is_owner；群内显示名取 nick_name（群昵称），缺失回退
-        remark。读取失败回退空映射（调用方再回退联系人/原值）。
+        remark / is_owner。显示名优先级（与产品口径一致）：
+
+        1. ``remark``：我对该成员的好友备注（好友场景，如群内昵称被对方
+           自定义为花名时仍显示备注）；
+        2. ``nick_name``：contact 表昵称——对群内非好友，微信会把其
+           群内显示名同步为 contact 昵称（实测 nickname 即群名片）；
+        3. 回退成员 username。
+
+        读取失败回退空映射，但失败结果只缓存 15 秒（避免微信写库期
+        读取抖动把空映射钉死 600 秒，导致整段时间内发送人显示错误）。
         """
         with self._group_members_lock:
             cached = self._group_members_cache.get(chatroom)
-            if cached and \
-                    time.monotonic() - cached[0] < GROUP_MEMBER_CACHE_TTL_SEC:
-                return cached[1]
+            if cached:
+                ts, names, ok = cached
+                ttl = GROUP_MEMBER_CACHE_TTL_SEC if ok else 15.0
+                if time.monotonic() - ts < ttl:
+                    return names
         names: dict[str, str] = {}
+        ok = False
         if self._wxdb is not None:
             try:
                 for member in self._wxdb.get_group_members(chatroom):
                     uid = str(member.get("username") or "")
                     if uid:
-                        names[uid] = str(member.get("nick_name")
-                                         or member.get("remark") or uid)
+                        names[uid] = (str(member.get("remark") or "")
+                                      or str(member.get("nick_name") or "")
+                                      or uid)
+                ok = True
             except Exception as exc:
                 logger.warning("读取群成员列表失败（%s）：%s", chatroom, exc)
         with self._group_members_lock:
-            self._group_members_cache[chatroom] = (time.monotonic(), names)
+            self._group_members_cache[chatroom] = (time.monotonic(), names, ok)
         return names
+
+    def _group_member_reverse_names(self, chatroom: str) -> dict[str, str]:
+        """群成员 显示名 → username 反查映射（同名取第一个，仅供参考）。"""
+        names = self._get_group_member_names(chatroom)
+        reverse: dict[str, str] = {}
+        for uid, display in names.items():
+            reverse.setdefault(display, uid)
+        return reverse
 
     def resolve_group_member_display(self, chatroom: str,
                                      member_id: str) -> str:
         """群成员 ID → 群内显示名。
 
-        优先级：chatroom member 表群昵称 → 联系人备注/昵称（get_nickname）
-        → 原 ID（解析失败回退原值，不崩管线）。
+        优先级：好友备注 → 群显示名（群成员映射，见
+        _get_group_member_names）→ 联系人备注/昵称（get_nickname）→
+        原 ID（解析失败回退原值，不崩管线）。
         """
         if not member_id:
             return ""
@@ -268,6 +294,11 @@ class WeChatService:
             names = self._get_group_member_names(chatroom)
             if member_id in names:
                 return names[member_id]
+            # 前缀解析出的可能是群显示名而非 wxid（微信 4.x 群消息正文
+            # 前缀两种格式都存在）：反查回规范 ID 对应的显示名。
+            uid = self._group_member_reverse_names(chatroom).get(member_id)
+            if uid:
+                return names[uid]
         if self._wxdb is not None:
             try:
                 nick = self._wxdb.get_nickname(member_id) or ""
@@ -285,9 +316,10 @@ class WeChatService:
         SenderName2Id 表 rowid→user_name 映射，该映射不可靠（私聊可能
         解析成无关好友、群内非好友可能解析成好友昵称）。改用可靠数据源：
 
-        - 群聊：正文自带发送者前缀（``ID:\\n正文``）为权威，仅当无前缀时
-          回退 sender_username；显示名 = 群成员表群昵称 → 联系人备注/昵称
-          → 原 ID；
+        - 群聊：正文自带发送者前缀（``ID:\\n正文`` 或 ``群显示名:\\n正文``）
+          为权威——先按 wxid 提取，提取不到（或提到的是显示名）时反查
+          群成员映射；仅当两者都失败时才回退 sender_username；
+          显示名 = 好友备注 → 群显示名 → 联系人备注/昵称 → 原 ID；
         - 私聊：发送人就是会话对方，与 sender_username 映射无关；
           sender_id ∈ (2, "2") 为自己发送（显示「我」，后续管线正常处理）。
         """
@@ -295,12 +327,46 @@ class WeChatService:
             if msg.get("sender_id") in (2, "2"):
                 return "", "我"
             return username, self.get_display_name(username)
-        # 群聊：正文前缀优先，sender_username 映射仅作回退
-        sender_id = self.extract_content_sender(msg.get("content") or "") \
-            or str(msg.get("sender_username") or "")
+        # 群聊：正文前缀优先，sender_username 映射仅作最终回退
+        content = str(msg.get("content") or "")
+        sender_id = self.extract_content_sender(content)
+        if sender_id and username.endswith("@chatroom"):
+            names = self._get_group_member_names(username)
+            if sender_id not in names:
+                # 提取到的可能是群显示名（非 wxid 前缀）：反查真实成员
+                uid = self._group_member_reverse_names(username).get(sender_id)
+                if uid:
+                    sender_id = uid
+        if not sender_id:
+            # 无前缀或前缀含空格等导致严格正则未命中：尝试「显示名:」
+            # 宽松前缀反查（如「长信 无欲无求:」→ 真实 wxid），避免掉进
+            # 不可靠的 SenderName2Id 映射
+            sender_id = self._sender_from_display_prefix(username, content)
+        if not sender_id:
+            sender_id = str(msg.get("sender_username") or "")
         if not sender_id:
             return "", ""
         return sender_id, self.resolve_group_member_display(username, sender_id)
+
+    def _sender_from_display_prefix(self, chatroom: str,
+                                    content: str) -> str:
+        """正文首行「显示名:」前缀 → 群成员 username（失败返回空串）。
+
+        兼容 ``[HH:MM] 显示名:`` / ``显示名: 正文`` 格式；显示名需与群
+        成员映射中的显示名精确相等才采纳，避免误伤正文。
+        """
+        if not chatroom.endswith("@chatroom"):
+            return ""
+        first_line = content.lstrip().split("\n", 1)[0]
+        # 去掉可选的时间前缀（如「[14:02] 」）
+        first_line = re.sub(r"^\[[^\]]*\]\s*", "", first_line)
+        match = re.match(r"^([^:：]{1,64}?)\s*[:：]", first_line)
+        if not match:
+            return ""
+        display = match.group(1).strip()
+        if not display:
+            return ""
+        return self._group_member_reverse_names(chatroom).get(display, "")
 
     # ------------------------------------------------------------------
     # 分析日志展示字段（来源会话/消息内容的显示名渲染）
@@ -575,15 +641,18 @@ class WeChatService:
             if before_seq and int(m.get("sort_seq") or 0) >= before_seq:
                 continue
             sender_wxid = str(m.get("sender_username") or "")
+            mtype = str(m.get("type") or "")
             out.append({
                 "local_id": int(m.get("local_id") or 0),
-                "type": str(m.get("type") or ""),
-                "type_name": str(m.get("type") or ""),
+                "type": mtype,
+                "type_name": mtype,
                 "sender_id": int(m.get("sender_id") or 0),
                 "sender_name": (self.get_display_name(sender_wxid)
                                 if sender_wxid else "我"),
                 "create_time": epoch_to_iso(m.get("create_time")),
-                "content": str(m.get("content") or ""),
+                # 展示层友好化：链接/小程序/图片等 XML 转人可读短文本（反馈 3）
+                "content": content_format.format_content(
+                    mtype, str(m.get("content") or "")),
                 "sort_seq": int(m.get("sort_seq") or 0),
             })
             if len(out) >= limit:
@@ -622,6 +691,44 @@ class WeChatService:
         except Exception:
             pass
         return False
+
+    # ------------------------------------------------------------------
+    # 图片消息解密（反馈 2：详情/上下文中的图片显示为真图）
+    # ------------------------------------------------------------------
+    def get_image_bytes(self, username: str, local_id: int) -> Optional[bytes]:
+        """解密会话中指定图片消息，返回图片字节；失败返回 None。
+
+        底层用 wechatauto.media.MediaDownloader 定位并解密 .dat
+        （群聊原图未点开时只有缩略图缓存，自动回退缩略图）。解密结果
+        由 MediaDownloader 落盘到 IMG_CACHE_DIR（持久缓存，避免重复
+        解密；目录在 data/ 下已被 git 忽略）。
+
+        仅接受可内嵌展示的格式（jpg/png/gif）；wxgf 转码失败等情况
+        返回 None，由前端回退占位卡片。
+        """
+        if self._wxdb is None:
+            return None
+        try:
+            from wechatauto.media import MediaDownloader
+        except Exception:
+            logger.warning("wechatauto.media 不可用，图片解密功能降级")
+            return None
+        try:
+            downloader = MediaDownloader(self._wxdb, save_dir=str(IMG_CACHE_DIR))
+            path = downloader.download_image(username, local_id)
+        except Exception as exc:
+            logger.warning("图片解密失败（%s local_id=%d）：%s",
+                           username, local_id, exc)
+            return None
+        if not path:
+            return None
+        if not str(path).lower().endswith((".jpg", ".jpeg", ".png", ".gif")):
+            return None  # wxgf 等无法内嵌展示的格式
+        try:
+            with open(path, "rb") as f:
+                return f.read()
+        except OSError:
+            return None
 
     # ------------------------------------------------------------------
     # 状态

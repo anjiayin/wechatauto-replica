@@ -6,6 +6,7 @@ import {
   AppBar,
   Badge,
   Box,
+  Chip,
   Drawer,
   List,
   ListItemButton,
@@ -13,6 +14,7 @@ import {
   ListItemText,
   Snackbar,
   Toolbar,
+  Tooltip,
   Typography,
 } from '@mui/material'
 import Inventory2Icon from '@mui/icons-material/Inventory2'
@@ -160,9 +162,21 @@ export default function App() {
               ? `监听运行中 · 监控 ${status.monitored_count} 个会话`
               : '监听未运行'}
           </Typography>
-          <Typography variant="caption" sx={{ color: status?.wechat.visible ? '#07c160' : '#e0a800' }}>
-            {status?.wechat.visible ? '微信窗口可用' : '微信窗口不可用'}
-          </Typography>
+          {/* 今日 AI 估算费用（反馈 13；未配置单价时为 0 不展示） */}
+          {(status?.today_cost ?? 0) > 0 && (
+            <Tooltip title="今日 AI 估算费用（按设置中的单价与实际 token 用量计算）">
+              <Typography variant="caption" sx={{ mr: 2 }}>
+                今日 AI 费用：¥{(status!.today_cost).toFixed(2)}
+              </Typography>
+            </Tooltip>
+          )}
+          {/* 微信窗口状态：实心 Chip 高对比（绿底白字可用 / 红底白字不可用） */}
+          <Chip
+            size="small"
+            color={status?.wechat.visible ? 'success' : 'error'}
+            label={status?.wechat.visible ? '微信窗口可用' : '微信窗口不可用'}
+            sx={{ mr: 1 }}
+          />
         </Toolbar>
       </AppBar>
 

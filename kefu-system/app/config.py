@@ -12,6 +12,7 @@ DATA_DIR = BASE_DIR / "data"                               # 运行数据目录
 DB_PATH = DATA_DIR / "kefu.sqlite3"                        # 业务 SQLite
 SECRET_KEY_PATH = DATA_DIR / "secret.key"                  # Fernet 密钥文件
 LOG_PATH = DATA_DIR / "kefu.log"                           # 滚动日志
+IMG_CACHE_DIR = DATA_DIR / "imgcache"                      # 图片解密缓存（反馈 2）
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"             # 前端构建产物
 
 # ---------------------------------------------------------------------------

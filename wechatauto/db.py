@@ -41,6 +41,9 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 PAGE_SZ = 4096
 RESERVE_SZ = 80  # IV(16) + HMAC(64)
 STAMP_VERSION = 2  # 解密缓存 stamp 格式版本，改合并逻辑时递增以强制重建
+# 后台重建节流：同一分片距上次重建完成不足该间隔时直接沿用旧缓存，
+# 避免微信活跃期无限重建（新消息最迟在下一次重建后可见）
+REBUILD_MIN_INTERVAL_SEC = 8.0
 CONFIG_CIPHER_NAME = b"com.Tencent.WCDB.Config.Cipher"
 CONFIG_XOR_MASK = bytes.fromhex(
     "d2c7442458020000004889442450488b"
@@ -489,6 +492,11 @@ class WeChatDB:
         self.cfg_dword: Optional[int] = None
         self._bad_shards: Dict[str, float] = {}  # rel -> marked-bad timestamp
         self._bad_shards_mtime: Dict[str, float] = {}  # rel -> source mtime when marked bad
+        # 后台重建解密缓存：rel -> 去重集合 / 全局守卫锁 / 分片互斥锁
+        self._rebuilding: set = set()
+        self._rebuild_guard = threading.Lock()
+        self._rebuild_locks: Dict[str, threading.Lock] = {}
+        self._rebuild_done_at: Dict[str, float] = {}  # rel -> 上次重建完成时刻
         self._load_or_extract_keys(master_key=master_key)
 
     # ------------------------------------------------------------------
@@ -934,12 +942,104 @@ class WeChatDB:
         print("[wechatauto] 密钥诊断完成，以上为自动检测结果。完整排查请运行 "
               "python -m wechatauto.diagnose_keys", file=sys.stderr)
 
+    @staticmethod
+    def _read_stamp(stamp: str) -> Optional[dict]:
+        """读取解密缓存 stamp（不存在/损坏返回 None）。"""
+        if not os.path.exists(stamp):
+            return None
+        try:
+            with open(stamp, "r") as f:
+                parts = f.read().split(",")
+            old = {
+                "ver": int(parts[0]),
+                "mtime": float(parts[1]),
+                "size": int(parts[2]),
+                "wal_mtime": float(parts[3]),
+                "wal_size": int(parts[4]),
+                "applied": int(parts[5]),
+            }
+            if old["ver"] != STAMP_VERSION:
+                return None
+            return old
+        except (ValueError, OSError, IndexError):
+            return None
+
+    @staticmethod
+    def _write_stamp(stamp: str, src_mtime: float, src_size: int,
+                     wal_mtime: float, wal_size: int, applied: int) -> None:
+        """写入解密缓存 stamp。"""
+        os.makedirs(os.path.dirname(stamp), exist_ok=True)
+        with open(stamp, "w") as f:
+            f.write("%d,%f,%d,%f,%d,%d"
+                    % (STAMP_VERSION, src_mtime, src_size, wal_mtime, wal_size, applied))
+
+    @staticmethod
+    def _connect_ro(dst: str) -> sqlite3.Connection:
+        conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.text_factory = _sqlite_text_factory
+        return conn
+
+    @staticmethod
+    def _cache_readable(dst: str) -> bool:
+        """旧缓存能否作为只读库打开（快速校验 schema 可读）。"""
+        try:
+            conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
+            try:
+                conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            finally:
+                conn.close()
+            return True
+        except sqlite3.Error:
+            return False
+
+    @staticmethod
+    def _promote_cache(tmp: str, dst: str) -> bool:
+        """把重建结果原子替换为正式缓存；目标被占用时短暂重试。
+
+        成功返回 True；彻底失败删除临时文件并返回 False（保留旧缓存，
+        stamp 不更新 → 下次打开自然再次触发重建）。
+        源页哈希边车（.pages）随缓存一并替换，供下次增量重建使用。
+        """
+        for _ in range(20):
+            try:
+                os.replace(tmp, dst)
+                if os.path.exists(tmp + ".pages"):
+                    try:
+                        os.replace(tmp + ".pages", dst + ".pages")
+                    except OSError:
+                        pass  # 边车替换失败：下次重建回退全量，不影响正确性
+                return True
+            except OSError:
+                time.sleep(0.5)
+        for p in (tmp, tmp + ".pages"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        return False
+
+    def _rel_lock(self, rel: str) -> threading.Lock:
+        """取指定分片的重建互斥锁（避免多线程同时写同一临时文件）。"""
+        with self._rebuild_guard:
+            lock = self._rebuild_locks.get(rel)
+            if lock is None:
+                lock = threading.Lock()
+                self._rebuild_locks[rel] = lock
+            return lock
+
     def _open(self, rel: str) -> sqlite3.Connection:
         """打开解密(并合并 -wal 增量)后的只读库。
 
         解密结果缓存到 workdir；主库或 WAL 有变化时：
         - 主库被 checkpoint 改写（mtime/size 变化）或 WAL 被重置 → 全量重建；
         - 仅 WAL 追加了新帧 → 增量合并新帧（秒级）。
+
+        全量重建较慢（大分片几十秒），为此做两层优化：
+        - 重建一律先写 .rebuild 临时文件、校验通过后原子替换正式缓存，
+          失败不破坏现有缓存（旧缓存仍可服务查询，也避免反复全量重建）；
+        - 旧缓存有效时「先用旧缓存响应 + 后台重建」：查询零阻塞，
+          新消息在后台重建完成后的下一轮轮询即可读到。
         """
         if rel not in self._keys:
             self._auto_diagnose_key_failure(rel)
@@ -958,90 +1058,161 @@ class WeChatDB:
         wal_mtime = os.path.getmtime(wal_path) if wal_path else 0.0
         wal_size = os.path.getsize(wal_path) if wal_path else 0
         stamp = dst + ".stamp"
-        old = None
-        if os.path.exists(stamp):
-            try:
-                with open(stamp, "r") as f:
-                    parts = f.read().split(",")
-                old = {
-                    "ver": int(parts[0]),
-                    "mtime": float(parts[1]),
-                    "size": int(parts[2]),
-                    "wal_mtime": float(parts[3]),
-                    "wal_size": int(parts[4]),
-                    "applied": int(parts[5]),
-                }
-                if old["ver"] != STAMP_VERSION:
-                    old = None
-            except (ValueError, OSError, IndexError):
-                old = None
+        old = self._read_stamp(stamp)
         build = (not old or old["mtime"] != src_mtime or old["size"] != src_size
                  or old["wal_mtime"] != wal_mtime or old["wal_size"] != wal_size)
-        attempt = 0
-        while build:
-            attempt += 1
-            full = (not old or old["mtime"] != src_mtime or old["size"] != src_size
-                    or wal_size < old["wal_size"] or wal_size == 0)
-            mtime_before = -1.0
-            if full:
-                mtime_before = os.path.getmtime(src)
-                self._decrypt_file(src, dst, key)
-                applied = 0
-            else:
-                applied = old["applied"] if old else 0
-            merged_pages = 0
-            if wal_path and wal_size > self.WAL_HEADER_SZ:
-                applied, merged_pages = self._merge_wal(dst, wal_path, key, applied)
-            else:
-                applied = 0
-            # 轮询场景下 quick_check 整库校验(大分片秒级)是延迟大头，
-            # 在可证明安全时跳过：
-            # - 增量合并未写入任何页 → 缓存与上次已验证状态完全一致；
-            # - 全量解密期间主库 mtime 未变（快照一致）且 WAL 无当前世代帧
-            #   → 解密是确定性的，结果必然有效。
-            # 其余情形（写入过帧/读取期间被写/重试）仍全库校验。
-            skip_check = (attempt == 1 and merged_pages == 0
-                          and (not full or os.path.getmtime(src) == mtime_before))
-            if skip_check or self._check_merged(dst):
-                build = False
-                os.makedirs(os.path.dirname(stamp), exist_ok=True)
-                with open(stamp, "w") as f:
-                    f.write("%d,%f,%d,%f,%d,%d"
-                            % (STAMP_VERSION, src_mtime, src_size, wal_mtime, wal_size, applied))
-            elif attempt >= 3:
-                # WAL 合并反复失败，尝试仅解密主库(不含 WAL 增量)作为兜底
-                sys.stderr.write(
-                    "[wechatauto] WAL 合并失败(%s)，尝试仅解密主库...\n" % rel
-                )
-                self._decrypt_file(src, dst, key)
-                if self._check_merged(dst):
+        if not build and not os.path.exists(dst):
+            build = True  # stamp 残留但缓存文件丢失：强制重建
+        if build and old and self._cache_readable(dst):
+            # 全量重建耗时长：立即返回旧缓存（稍旧数据），后台原子重建
+            self._kick_rebuild(rel, src, dst, key,
+                               src_mtime, src_size, wal_mtime, wal_size)
+            return self._connect_ro(dst)
+        tmp = dst + ".rebuild"
+        rel_lock = self._rel_lock(rel)
+        with rel_lock:
+            attempt = 0
+            while build:
+                attempt += 1
+                full = (not old or old["mtime"] != src_mtime or old["size"] != src_size
+                        or wal_size < old["wal_size"] or wal_size == 0)
+                if full:
+                    # 先构建到临时文件（页级增量优先）：校验通过才替换正式
+                    # 缓存，失败不影响旧缓存
+                    page_hashes, _how = self._build_cache(src, tmp, dst, key)
+                    with open(tmp + ".pages", "wb") as hf:
+                        hf.write(page_hashes)
                     applied = 0
-                    build = False
-                    os.makedirs(os.path.dirname(stamp), exist_ok=True)
-                    with open(stamp, "w") as f:
-                        f.write("%d,%f,%d,%f,%d,%d"
-                                % (STAMP_VERSION, src_mtime, src_size, 0, 0, 0))
-                    sys.stderr.write(
-                        "[wechatauto] 主库解密成功(WAL 增量已跳过，部分最新消息可能缺失): %s\n" % rel
-                    )
                 else:
-                    sys.stderr.write(
-                        "[wechatauto] 主库解密校验失败，返回降级连接(部分数据可能缺失): %s\n"
-                        % rel
-                    )
-                    # best-effort: return connection even though validation failed
+                    applied = old["applied"] if old else 0
+                merged_pages = 0
+                if wal_path and wal_size > self.WAL_HEADER_SZ:
+                    applied, merged_pages = self._merge_wal(
+                        tmp if full else dst, wal_path, key, applied)
+                else:
                     applied = 0
+                # 轮询场景下 quick_check 整库校验(大分片秒级)是延迟大头，
+                # 在可证明安全时跳过：仅限增量路径——合并未写入任何页，
+                # 缓存与上次已验证状态完全一致。
+                # 全量解密绝不跳过：微信 checkpoint 写库期间 mtime 可能不
+                # 更新，mtime 稳定不能证明源库页一致，实测会解出撕裂页
+                # （曾导致坏缓存被盖上有效戳，反复触发 40s+ 同步重建）。
+                skip_check = (attempt == 1 and merged_pages == 0 and not full)
+                if skip_check or self._check_merged(tmp if full else dst):
                     build = False
-                    os.makedirs(os.path.dirname(stamp), exist_ok=True)
-                    with open(stamp, "w") as f:
-                        f.write("%d,%f,%d,%f,%d,%d"
-                                % (STAMP_VERSION, src_mtime, src_size, 0, 0, 0))
-            else:
-                old = None  # 合并结果损坏 → 全量重建重试
-        conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
-        conn.text_factory = _sqlite_text_factory
-        return conn
+                    if full and not self._promote_cache(tmp, dst):
+                        old = None  # 替换失败（缓存被占用等）：重试
+                        continue
+                    self._write_stamp(stamp, src_mtime, src_size,
+                                      wal_mtime, wal_size, applied)
+                elif attempt >= 3:
+                    # WAL 合并反复失败，尝试仅解密主库(不含 WAL 增量)作为兜底
+                    sys.stderr.write(
+                        "[wechatauto] WAL 合并失败(%s)，尝试仅解密主库...\n" % rel
+                    )
+                    self._decrypt_file(src, tmp, key)
+                    if self._check_merged(tmp):
+                        # 校验通过才晋升；本次不含 WAL 增量，部分最新消息可能缺失
+                        self._promote_cache(tmp, dst)
+                        applied = 0
+                        build = False
+                        self._write_stamp(stamp, src_mtime, src_size, 0, 0, 0)
+                    else:
+                        # 源库正被微信写库、快照始终撕裂：不晋升未校验文件
+                        # （旧实现会降级晋升坏缓存并盖上有效戳，导致后续反复
+                        # 40s+ 同步重建）。直接返回临时文件的降级连接，
+                        # 缓存保持待重建状态，下轮打开再次尝试。
+                        sys.stderr.write(
+                            "[wechatauto] 主库解密校验失败，返回降级连接(部分数据可能缺失): %s\n"
+                            % rel
+                        )
+                        applied = 0
+                        build = False
+                        return self._connect_ro(tmp)
+                else:
+                    old = None  # 合并结果损坏 → 全量重建重试
+                    # 多为微信正在 checkpoint 写库导致快照撕裂：稍候再试，
+                    # 立即重试大概率再次读到写了一半的源库
+                    time.sleep(1.5)
+        return self._connect_ro(dst)
+
+    def _kick_rebuild(self, rel: str, src: str, dst: str, key: bytes,
+                      src_mtime: float, src_size: int,
+                      wal_mtime: float, wal_size: int) -> None:
+        """后台重建解密缓存（同一分片去重 + 完成间隔节流）。
+
+        微信活跃期源库几乎每秒都在变，若不加节流会无限重建。
+        距上次重建完成不足 REBUILD_MIN_INTERVAL_SEC 时仅返回旧缓存，
+        新消息最迟在下一次重建后即可读到（秒级延迟，不再阻塞）。
+        """
+        with self._rebuild_guard:
+            if rel in self._rebuilding:
+                return
+            last_done = self._rebuild_done_at.get(rel, 0.0)
+            if time.monotonic() - last_done < REBUILD_MIN_INTERVAL_SEC:
+                return
+            self._rebuilding.add(rel)
+        t = threading.Thread(
+            target=self._bg_rebuild, name="kefu-db-rebuild",
+            args=(rel, src, dst, key, src_mtime, src_size, wal_mtime, wal_size),
+            daemon=True,
+        )
+        t.start()
+
+    def _bg_rebuild(self, rel: str, src: str, dst: str, key: bytes,
+                    src_mtime: float, src_size: int,
+                    wal_mtime: float, wal_size: int) -> None:
+        """后台线程：增量重建解密缓存并原子替换（详见 _open 的旧缓存策略）。"""
+        tmp = dst + ".rebuild"
+        started = time.monotonic()
+        applied = 0
+        try:
+            with self._rel_lock(rel):
+                how = ""
+                for _attempt in range(3):
+                    try:
+                        page_hashes, how = self._build_cache(src, tmp, dst, key)
+                        with open(tmp + ".pages", "wb") as hf:
+                            hf.write(page_hashes)
+                        wal_path = self._wal_path(rel)
+                        applied = 0
+                        if wal_path and os.path.getsize(wal_path) > self.WAL_HEADER_SZ:
+                            applied, _merged = self._merge_wal(tmp, wal_path, key, 0)
+                        if self._check_merged(tmp):
+                            break
+                    except (OSError, sqlite3.Error):
+                        pass
+                    time.sleep(1.0)
+                else:
+                    # 三次尝试均失败：多为微信持续写库，保留下轮再试
+                    for p in (tmp, tmp + ".pages"):
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+                    return
+                # 源库在重建期间又被改写 → 不写 stamp（缓存内容与 stamp 描述
+                # 不一致会被误判为最新），下次 _open 会再次触发重建（自愈）。
+                # 页级增量重建成本已很低，连续重建不再是瓶颈。
+                try:
+                    snapshot_fresh = (os.path.getmtime(src) == src_mtime
+                                      and os.path.getsize(src) == src_size)
+                except OSError:
+                    snapshot_fresh = False
+                if not self._promote_cache(tmp, dst):
+                    return
+                if snapshot_fresh:
+                    self._write_stamp(stamp=dst + ".stamp", src_mtime=src_mtime,
+                                      src_size=src_size, wal_mtime=wal_mtime,
+                                      wal_size=wal_size, applied=applied)
+                sys.stderr.write(
+                    "[wechatauto] %s 缓存重建完成（%s，%.1fs%s）\n"
+                    % (rel, how, time.monotonic() - started,
+                       "" if snapshot_fresh else "，源库持续写入下轮继续"))
+        finally:
+            with self._rebuild_guard:
+                self._rebuilding.discard(rel)
+                self._rebuild_done_at[rel] = time.monotonic()
 
     @staticmethod
     def _check_merged(dst: str) -> bool:
@@ -1218,20 +1389,9 @@ class WeChatDB:
             out.close()
         return n, len(page_data)
 
-    def _decrypt_file(self, src: str, dst: str, key: bytes) -> None:
-        size = os.path.getsize(src)
-        pages = size // PAGE_SZ + (1 if size % PAGE_SZ else 0)
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        with open(src, "rb") as fin, open(dst, "wb") as fout:
-            for pgno in range(1, pages + 1):
-                page = fin.read(PAGE_SZ)
-                if not page:
-                    break
-                if len(page) < PAGE_SZ:
-                    page = page + b"\x00" * (PAGE_SZ - len(page))
-                fout.write(_decrypt_page(key, page, pgno))
-        # Truncate trailing unused pages: SQLCipher may preallocate beyond the
-        # logical database size, causing PRAGMA quick_check "never used" errors.
+    @staticmethod
+    def _truncate_preallocated(dst: str) -> None:
+        """按 page1 头部逻辑页数截断 SQLCipher 预分配的尾部空页。"""
         try:
             with open(dst, "r+b") as f:
                 page1 = f.read(PAGE_SZ)
@@ -1242,6 +1402,91 @@ class WeChatDB:
                         f.truncate(hdr_pages * PAGE_SZ)
         except OSError:
             pass
+
+    def _decrypt_file(self, src: str, dst: str, key: bytes,
+                      hashes_out: Optional[list] = None) -> None:
+        """全量解密源库到 dst；hashes_out 传入列表时逐页记录源页哈希。"""
+        size = os.path.getsize(src)
+        pages = size // PAGE_SZ + (1 if size % PAGE_SZ else 0)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(src, "rb") as fin, open(dst, "wb") as fout:
+            for pgno in range(1, pages + 1):
+                page = fin.read(PAGE_SZ)
+                if not page:
+                    break
+                if len(page) < PAGE_SZ:
+                    page = page + b"\x00" * (PAGE_SZ - len(page))
+                if hashes_out is not None:
+                    hashes_out.append(hashlib.blake2b(page, digest_size=8).digest())
+                fout.write(_decrypt_page(key, page, pgno))
+        self._truncate_preallocated(dst)
+
+    def _patch_cache(self, src: str, dst_old: str, tmp: str,
+                     key: bytes) -> Optional[Tuple[bytes, int]]:
+        """页级增量重建：以旧缓存为底，只解密源库中内容变化的页。
+
+        原理：上次构建时记录了源库每页的 blake2b-8 哈希（.pages 边车文件），
+        本次逐页比对，哈希相同的页直接沿用旧缓存中的解密结果，
+        仅对变化页执行 AES 解密。微信 checkpoint 后通常只有几十~几百页
+        变化，重建耗时从全量解密的几十秒降到约 1~2 秒（主要是顺序读盘）。
+
+        返回 (新源页哈希串, 实际解密页数)；缺少旧缓存/哈希或发生异常时
+        返回 None（调用方回退全量解密）。
+        """
+        hashes_path = dst_old + ".pages"
+        if not (os.path.exists(dst_old) and os.path.exists(hashes_path)):
+            return None
+        try:
+            with open(hashes_path, "rb") as f:
+                old_hashes = f.read()
+            shutil.copyfile(dst_old, tmp)
+            tmp_size = os.path.getsize(tmp)
+            size = os.path.getsize(src)
+            pages = size // PAGE_SZ + (1 if size % PAGE_SZ else 0)
+            new_hashes = bytearray()
+            patched = 0
+            with open(src, "rb") as fin, open(tmp, "r+b") as fout:
+                for pgno in range(1, pages + 1):
+                    page = fin.read(PAGE_SZ)
+                    if not page:
+                        break
+                    if len(page) < PAGE_SZ:
+                        page = page + b"\x00" * (PAGE_SZ - len(page))
+                    h = hashlib.blake2b(page, digest_size=8).digest()
+                    new_hashes += h
+                    idx = pgno - 1
+                    off = idx * 8
+                    old_h = (old_hashes[off:off + 8]
+                             if off + 8 <= len(old_hashes) else None)
+                    # 页内容未变且旧缓存中确实存在该页 → 沿用旧解密结果
+                    if old_h == h and idx * PAGE_SZ < tmp_size:
+                        continue
+                    fout.seek(idx * PAGE_SZ)
+                    fout.write(_decrypt_page(key, page, pgno))
+                    patched += 1
+            self._truncate_preallocated(tmp)
+            return bytes(new_hashes), patched
+        except (OSError, sqlite3.Error):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return None
+
+    def _build_cache(self, src: str, tmp: str, dst: str,
+                     key: bytes) -> Tuple[bytes, str]:
+        """构建解密缓存到 tmp：优先页级增量，无旧缓存/哈希时全量解密。
+
+        返回 (源页哈希串, 构建方式描述)——哈希随晋升写入 .pages 边车，
+        供下一次增量重建比对。
+        """
+        patched = self._patch_cache(src, dst, tmp, key)
+        if patched is not None:
+            hashes, n = patched
+            return hashes, "增量 %d 页" % n
+        hashes: list = []
+        self._decrypt_file(src, tmp, key, hashes_out=hashes)
+        return b"".join(hashes), "全量"
 
     def _message_dbs(self) -> List[str]:
         """返回当前所有消息分片库。微信运行中可能新建分片（如 message_5.db），
@@ -1318,7 +1563,7 @@ class WeChatDB:
             return
         removed = 0
         for n in names:
-            if n.endswith(".db") or n.endswith(".stamp"):
+            if n.endswith((".db", ".stamp", ".pages", ".rebuild")):
                 try:
                     os.remove(os.path.join(self.workdir, n))
                     removed += 1
@@ -1332,7 +1577,7 @@ class WeChatDB:
         """只删除指定消息库的解密缓存，不影响其他库。"""
         safe_name = rel.replace(os.sep, "__")
         workdir = self.workdir
-        for ext in (".db", ".stamp", ".db-shm", ".db-wal"):
+        for ext in (".db", ".stamp", ".db-shm", ".db-wal", ".pages", ".rebuild"):
             path = os.path.join(workdir, safe_name + ext)
             try:
                 if os.path.exists(path):

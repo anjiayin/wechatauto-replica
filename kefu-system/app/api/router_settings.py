@@ -14,6 +14,7 @@ import json
 import logging
 
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel, Field
 
 from app import analyzer
 from app.api.deps import get_db
@@ -201,3 +202,25 @@ def update_notify_settings(body: NotifyUpdate,
     db.set_setting(KEY_NOTIFY_SOUND, "1" if body.sound_enabled else "0")
     logger.info("通知设置已保存（sound_enabled=%s）", body.sound_enabled)
     return {"ok": True, "message": "通知设置已保存"}
+
+
+# ---------------------------------------------------------------------------
+# AI 账单单价（反馈 13）
+# ---------------------------------------------------------------------------
+class BillingSettingsUpdate(BaseModel):
+    """AI 账单单价配置：输入/输出单价 + 计价单位。"""
+    input_price: float = Field(ge=0, le=10000)
+    output_price: float = Field(ge=0, le=10000)
+    unit: str = Field(pattern="^(per_k|per_m)$")   # per_k=元/千tokens per_m=元/百万tokens
+
+
+@router.post("/billing")
+def update_billing_settings(body: BillingSettingsUpdate,
+                            db: Database = Depends(get_db)) -> dict:
+    """保存 AI 账单单价（估算当日/近 7 日费用用）。"""
+    db.set_setting("billing.input_price", repr(float(body.input_price)))
+    db.set_setting("billing.output_price", repr(float(body.output_price)))
+    db.set_setting("billing.unit", body.unit)
+    logger.info("AI 账单单价已保存（in=%s out=%s unit=%s）",
+                body.input_price, body.output_price, body.unit)
+    return {"ok": True, "message": "AI 单价已保存"}
