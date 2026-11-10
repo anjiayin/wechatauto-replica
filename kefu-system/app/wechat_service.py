@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from app import db as dbmod
 from app import content_format
@@ -727,6 +727,51 @@ class WeChatService:
         except Exception:
             pass
         return False
+
+    def get_latest_local_id(self, username: str) -> int:
+        """会话最新一条消息的 local_id（0 = 读不到）。
+
+        引用回复用它判断「用户要引用的就是最新一条」：是的话直接右键最新
+        消息即可，不必拿文本去消息列表里匹配（图片/小程序消息没有可识别
+        文字，匹配必然失败）。
+        """
+        if self._wxdb is None:
+            return 0
+        try:
+            rows = self._wxdb.get_messages(username, limit=1)
+        except Exception as exc:
+            logger.debug("读取最新消息 local_id 失败（%s）：%s", username, exc)
+            return 0
+        if not rows:
+            return 0
+        try:
+            return int(rows[0].get("local_id") or 0)
+        except Exception:
+            return 0
+
+    def list_group_members(self, chatroom: str) -> List[dict]:
+        """群成员列表（供前端「@群成员」下拉选择）。
+
+        返回 ``[{"name": 群内显示名, "wxid": 成员ID, "is_owner": bool}]``，
+        按显示名排序；非群会话返回空列表。显示名口径与消息发送人一致
+        （好友备注 → 群名片 → wxid），因为 @ 弹层里显示的就是这个名字。
+        """
+        if not chatroom.endswith("@chatroom") or self._wxdb is None:
+            return []
+        names = self._get_group_member_names(chatroom)
+        owner = ""
+        try:
+            for member in self._wxdb.get_group_members(chatroom):
+                if member.get("is_owner"):
+                    owner = str(member.get("username") or "")
+                    break
+        except Exception:
+            owner = ""
+        out = [{"name": display, "wxid": uid,
+                "is_owner": uid == owner and bool(owner)}
+               for uid, display in names.items() if uid and display]
+        out.sort(key=lambda m: (not m["is_owner"], m["name"]))
+        return out
 
     # ------------------------------------------------------------------
     # 图片消息解密（反馈 2：详情/上下文中的图片显示为真图）

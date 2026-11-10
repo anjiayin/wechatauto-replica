@@ -19,6 +19,8 @@ from app.api.deps import get_db, get_notifier, get_sender, get_wechat_service
 from app.config import CONTEXT_COUNT
 from app.db import Database
 from app.schemas import (
+    GroupMemberOut,
+    GroupMembersOut,
     MessageOut,
     OpportunityContextOut,
     OpportunityDetailOut,
@@ -115,6 +117,37 @@ def mark_opportunity_read(opp_id: int, db: Database = Depends(get_db)) -> dict:
         raise HTTPException(status_code=404, detail="商机不存在")
     cleared = get_notifier().clear_unread(opp_id)
     return {"ok": True, "cleared": cleared}
+
+
+# ---------------------------------------------------------------------------
+# @ 群成员候选（前端下拉选择，避免手输昵称 @ 不到人）
+# ---------------------------------------------------------------------------
+@router.get("/{opp_id}/members", response_model=GroupMembersOut)
+def list_group_members(opp_id: int,
+                       db: Database = Depends(get_db),
+                       svc: WeChatService = Depends(get_wechat_service),
+                       ) -> GroupMembersOut:
+    """该商机会话的群成员列表（非群会话 is_group=False）。
+
+    前端用群内显示名（= 微信 @ 弹层里显示的名字）作为 @ 值；读取失败
+    返回 error，前端降级为手输。
+    """
+    opp = db.get_opportunity(opp_id)
+    if not opp:
+        raise HTTPException(status_code=404, detail="商机不存在")
+    username = opp["session_username"] or ""
+    if not username.endswith("@chatroom"):
+        return GroupMembersOut(is_group=False)
+    try:
+        members = svc.list_group_members(username)
+    except Exception as exc:
+        logger.warning("读取群成员失败（%s）：%s", username, exc)
+        return GroupMembersOut(is_group=True,
+                               error=f"读取群成员失败：{exc}")
+    return GroupMembersOut(
+        is_group=True,
+        items=[GroupMemberOut(**m) for m in members],
+    )
 
 
 # ---------------------------------------------------------------------------

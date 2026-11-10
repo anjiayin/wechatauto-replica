@@ -113,6 +113,7 @@ def create_app() -> FastAPI:
         globals()["_aggregator"] = aggregator
         # 注入引用消息查询（避免 sender ↔ wechat_service 循环导入）
         sender.set_message_lookup(wechat.get_message_by_local_id)
+        sender.set_latest_lookup(wechat.get_latest_local_id)
         # 启动后台组件
         pipeline.start()
         sender.start()

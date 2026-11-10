@@ -852,7 +852,7 @@ class FakeGUI:
     def open_chat(self, name, exact=False):
         return self.open_ok
 
-    def send_msg(self, text, who=None, verify=False):
+    def send_msg(self, text, who=None, verify=False, assume_open=False):
         self.sent.append(text)
         return FakeWxResponse(self.send_ok,
                               "消息已发送并确认" if self.send_ok else "发送失败：模拟")

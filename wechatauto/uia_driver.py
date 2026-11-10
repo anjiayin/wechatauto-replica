@@ -34,6 +34,7 @@ import ctypes
 import os
 import re
 import struct
+import threading
 import time
 from ctypes import wintypes
 from functools import lru_cache
@@ -130,6 +131,30 @@ class UIATimeout(Exception):
 
 class UIANotAvailable(Exception):
     """UIA 树不可用（热激活失败 / 微信未运行等），调用方应降级到 OCR。"""
+
+
+# ---------------------------------------------------------------------------
+# 共享 WeChatDB（密钥提取/建连很慢，进程内只做一次）
+# ---------------------------------------------------------------------------
+_SHARED_DB = None
+_SHARED_DB_LOCK = threading.Lock()
+
+
+def _shared_db():
+    """惰性创建并复用 WeChatDB 单例。
+
+    背景：``WeChatDB()`` 首次构造要提取密钥并打开多个加密库，耗时可达数秒。
+    旧实现每次 ``_resolve_search_keyword`` 都新建一个，导致「微信已到前台，
+    但搜索框迟迟不出现文字」——发送链路上最大的一段空白等待。
+    """
+    global _SHARED_DB
+    if _SHARED_DB is not None:
+        return _SHARED_DB
+    with _SHARED_DB_LOCK:
+        if _SHARED_DB is None:
+            from wechatauto.db import WeChatDB
+            _SHARED_DB = WeChatDB()
+    return _SHARED_DB
 
 
 # ---------------------------------------------------------------------------
@@ -758,17 +783,30 @@ class WeChatUIA:
 
     # ------------------------------------------------------------------ 高层动作
     @staticmethod
+    def _is_system_id(text: str) -> bool:
+        """是否微信系统账号（wxid_/gh_/@chatroom）——这类不能直接用于搜索框。"""
+        t = (text or "").strip().lower()
+        return (t.startswith("wxid_") or t.startswith("gh_")
+                or t.endswith("@chatroom") or "@" in t)
+
+    @staticmethod
     def _resolve_search_keyword(keyword: str) -> List[str]:
         """把账号/username 解析成微信搜索框能命中的关键词列表。
 
-        微信搜索框不认 wxid（系统账号），只认昵称/备注/微信号(alias)。
-        优先返回直接命中词（原样），再尝试 DB 映射：username 精确 → 昵称/备注/微信号。
+        微信搜索框本身就能命中昵称/备注/微信号，只有传入 wxid 这类系统
+        账号时才需要查库映射。**查库是整条发送链路里最慢的一步**（要提取
+        密钥 + 打开加密库），而 99% 的调用传的都是会话显示名，因此显示名
+        直接原样搜索，不再碰数据库；wxid 场景复用进程内单例连接。
         """
-        candidates = [keyword]
+        kw = (keyword or "").strip()
+        if not kw:
+            return []
+        if not WeChatUIA._is_system_id(kw):
+            return [kw]
+        candidates = [kw]
         try:
-            from wechatauto.db import WeChatDB
-            db = WeChatDB()
-            for hit in db.search_contact(keyword):
+            db = _shared_db()
+            for hit in db.search_contact(kw):
                 for k in (hit.get("remark"), hit.get("nick_name")):
                     if k and k not in candidates:
                         candidates.append(k)
@@ -851,11 +889,283 @@ class WeChatUIA:
 
     def send_text_to(self, text: str, who: str) -> bool:
         """打开会话并发送文本（组合动作）。"""
-        if self.current_chat() == who:
+        if self.same_chat(self.current_chat(), who):
             return self.send_text(text)
         if not self.open_chat(who):
             return False
         return self.send_text(text)
+
+    # ------------------------------------------------------------------ 会话比较
+    @staticmethod
+    def same_chat(current: Optional[str], target: str) -> bool:
+        """判断当前输入框所属会话是否就是目标会话（容忍群名带人数后缀）。
+
+        微信群聊输入框 ``Name`` 可能带「(123)」成员数后缀或空格差异，
+        严格相等会导致每发一条都重新搜索打开会话（数秒级浪费）。
+        """
+        if not current or not target:
+            return False
+        a = re.sub(r"\s*[（(]\d+[)）]\s*$", "", str(current)).strip()
+        b = re.sub(r"\s*[（(]\d+[)）]\s*$", "", str(target)).strip()
+        if not a or not b:
+            return False
+        return a == b or a.startswith(b) or b.startswith(a)
+
+    # ------------------------------------------------------------------ 引用 / @
+    def _right_click_row(self, row) -> bool:
+        """在消息行内容重心处右键（self 靠右、好友靠左），弹操作菜单。"""
+        try:
+            r = row.BoundingRectangle
+            if r.right - r.left < 10 or r.bottom - r.top < 10:
+                return False
+            from PIL import ImageGrab as IG
+            import numpy as np
+            img = IG.grab(bbox=(r.left, r.top, r.right, r.bottom))
+            arr = np.array(img.convert("RGB"))
+            bg = (arr.max(axis=2) > 235) & ((arr.max(axis=2) - arr.min(axis=2)) < 22)
+            colc = (~bg).sum(axis=0)
+            total = int(colc.sum())
+            if total >= 20:
+                cx = int(r.left + sum(x * colc[x] for x in range(len(colc))) / total)
+            else:
+                cx = (r.left + r.right) // 2
+            cy = (r.top + r.bottom) // 2
+            self._set_cursor(cx, cy)
+            time.sleep(0.2)
+            self._right_click()
+            time.sleep(0.8)
+            return True
+        except Exception as exc:
+            wxlog.debug(f"右键消息行失败：{exc}")
+            return False
+
+    def _find_row_by_text(self, target_text: str):
+        """在消息列表中按文本查找消息行控件（先可视区，再滚向历史）。"""
+        text = (target_text or "").strip()
+        if not text:
+            return None
+        lst = self._message_list()
+        if lst is None:
+            return None
+        # 先只在可视区找：绝大多数引用目标就是最近几条
+        for ch in list(lst.GetChildren()):
+            try:
+                nm = (ch.Name or "")
+                if text in nm:
+                    return ch
+            except Exception:
+                continue
+        got = self.find_in_message_list(
+            lambda cn, nm: text in (nm or ""), max_scrolls=12)
+        return got[2] if got else None
+
+    def _menu_click(self, keywords: Tuple[str, ...]) -> bool:
+        """在当前弹出的右键菜单里点击名称含任一关键词的菜单项。"""
+        for kw in keywords:
+            item = self._uia_find_menu_item(kw)
+            if item is not None and self._uia_click_menu_item(item):
+                return True
+        return False
+
+    def _focus_input_end(self, ctrl) -> None:
+        """把光标放到输入框底部（避开表情/文件工具栏，且不选中既有内容）。"""
+        try:
+            r = ctrl.BoundingRectangle
+            self._set_cursor((r.left + r.right) // 2, r.bottom - 12)
+            time.sleep(0.15)
+            self._left_click()
+            time.sleep(0.15)
+        except Exception:
+            pass
+
+    def _paste_append(self, ctrl, text: str) -> bool:
+        """在现有草稿后追加文本（不 Ctrl+A/Delete，避免清掉引用卡片或 @ 提及）。"""
+        self._clip_set(text)
+        try:
+            ctrl.SendKeys("{Ctrl}v", waitTime=0.05)
+            return True
+        except Exception:
+            return False
+
+    def _clear_input(self, ctrl) -> None:
+        """清空输入框草稿（插入引用卡片/@ 提及之前调用）。"""
+        try:
+            self._focus_input_end(ctrl)
+            ctrl.SendKeys("{Ctrl}a{Delete}", waitTime=0.05)
+        except Exception:
+            pass
+
+    def quote_message(self, text: str, who: Optional[str] = None,
+                      target_text: Optional[str] = None) -> bool:
+        """引用消息后发送正文（UIA 路线：右键消息行 → 菜单「引用」）。
+
+        相比 OCR 方案（靠识别到的文字去匹配、再识别菜单文字点击），UIA
+        菜单项是真实控件，不受字号/生僻字/深色主题影响；图片、小程序等
+        「没有可识别文字」的消息也能正确引用。
+
+        Args:
+            text: 要发送的正文
+            who: 目标会话（None = 当前已打开会话）
+            target_text: 要引用的消息文本片段；None = 引用最新一条
+        """
+        if not self.ensure_window():
+            return False
+        if who and not self.same_chat(self.current_chat(), who):
+            if not self.open_chat(who):
+                return False
+            time.sleep(0.5)
+        # 先清掉旧草稿（此时还没有引用卡片，可以安全清空）
+        e0 = self._chat_input()
+        if e0 is not None:
+            self._clear_input(e0)
+        if target_text:
+            row = self._find_row_by_text(target_text)
+            if row is None:
+                wxlog.debug(f"引用目标未在消息列表中定位到：{target_text[:30]}")
+                return False
+            pos = self._right_click_row(row)
+        else:
+            pos = self._right_click_latest_row(None)
+        if not pos:
+            return False
+        if not self._menu_click(("引用", "Quote")):
+            # 菜单没弹出来时再右键一次，避免首击落在消息空白处
+            self._set_cursor(*pos)
+            time.sleep(0.2)
+            self._right_click()
+            time.sleep(0.8)
+            if not self._menu_click(("引用", "Quote")):
+                try:
+                    from wechatauto.ui.component import Menu
+                    Menu(self).close()
+                except Exception:
+                    pass
+                return False
+        time.sleep(0.5)
+        e = self._chat_input()
+        if e is None:
+            return False
+        # 点击菜单后焦点可能落在消息区：先把光标放回输入框末尾
+        self._focus_input_end(e)
+        # 注意：草稿里已经有「引用卡片」，这里绝不能再 Ctrl+A/Delete
+        # （那会把引用块一起清掉，变成普通消息）
+        if not self._paste_append(e, text):
+            return False
+        time.sleep(0.2)
+        try:
+            e.SendKeys("{Enter}", waitTime=0.05)
+        except Exception:
+            return False
+        return True
+
+    # -- @ 群成员 -------------------------------------------------------
+    def _mention_popup(self, timeout: float = 2.0):
+        """定位 @ 成员弹层（mmui::XPopover / AutomationId=MentionPopover）。"""
+        deadline = time.time() + timeout
+        variants = (
+            dict(ClassName="mmui::XPopover", AutomationId="MentionPopover"),
+            dict(AutomationId="MentionPopover"),
+            dict(ClassName="mmui::XPopover", Name="Weixin"),
+        )
+        while time.time() < deadline:
+            for kw in variants:
+                try:
+                    pop = self._win.WindowControl(searchDepth=0xFFFFFFFF, **kw)
+                    if pop.Exists(0.1, 0.1):
+                        return pop
+                except Exception:
+                    continue
+            time.sleep(0.2)
+        return None
+
+    def _pick_mention(self, member: str, timeout: float = 2.0) -> bool:
+        """在已弹出的 @ 成员列表里选中 member（精确名 → 前缀 → 唯一项）。"""
+        pop = self._mention_popup(timeout)
+        if pop is None:
+            return False
+        try:
+            lst = pop.ListControl()
+            if not lst.Exists(0.2, 0.1):
+                return False
+            items = [i for i in lst.GetChildren() if (i.Name or "").strip()]
+        except Exception as exc:
+            wxlog.debug(f"读取 @ 成员列表失败：{exc}")
+            return False
+        if not items:
+            return False
+        target = (member or "").strip()
+        hit = next((i for i in items if (i.Name or "").strip() == target), None)
+        if hit is None:
+            hit = next((i for i in items
+                        if target and target in (i.Name or "")), None)
+        if hit is None and len(items) == 1:
+            hit = items[0]
+        if hit is None:
+            return False
+        try:
+            auto.RollIntoView(pop, hit)
+        except Exception:
+            pass
+        try:
+            hit.Click()
+        except Exception:
+            return False
+        time.sleep(0.25)
+        return True
+
+    def at_members(self, members: List[str], text: str,
+                   who: Optional[str] = None) -> bool:
+        """群聊 @ 多个成员后一次性发送正文（同一条消息）。
+
+        旧实现是「每个成员各发一条消息」，@ 多个成员时会发出多条空正文
+        消息；这里改成：逐个 @ 进同一个草稿 → 追加正文 → 只回车一次。
+        """
+        names = [m.strip() for m in (members or []) if m and m.strip()]
+        if not names:
+            return self.send_text(text)
+        if not self.ensure_window():
+            return False
+        if who and not self.same_chat(self.current_chat(), who):
+            if not self.open_chat(who):
+                return False
+            time.sleep(0.5)
+        e = self._chat_input()
+        if e is None:
+            return False
+        # 清空草稿（可能有上次失败残留）
+        try:
+            e.Click()
+            e.SendKeys("{Ctrl}a{Delete}", waitTime=0.05)
+        except Exception:
+            pass
+        for name in names:
+            try:
+                e.SendKeys("@", waitTime=0.05)
+            except Exception:
+                return False
+            time.sleep(0.45)
+            if not self._pick_mention(name):
+                wxlog.debug(f"@ 成员未在弹层中选中：{name}")
+                # 退一步：输入名字过滤后再选（部分版本 @ 后不弹全量列表）
+                try:
+                    e.SendKeys(name, waitTime=0.05)
+                except Exception:
+                    return False
+                time.sleep(0.6)
+                if not self._pick_mention(name, timeout=1.5):
+                    return False
+            time.sleep(0.25)
+        if text:
+            # 直接用 Ctrl+V 追加：不点击输入框，避免光标落回已插入的 @ 提及之前
+            if not self._paste_append(e, text):
+                return False
+            time.sleep(0.2)
+        try:
+            e.SendKeys("{Enter}", waitTime=0.05)
+        except Exception:
+            return False
+        return True
+
 
     def voice_call(self, who: Optional[str] = None, video: bool = False) -> bool:
         """发起语音/视频通话（点击标题栏通话按钮 → 选择菜单项）。

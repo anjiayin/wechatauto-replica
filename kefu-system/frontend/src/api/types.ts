@@ -235,6 +235,19 @@ export interface ReplyPayload {
   quote?: { local_id: number }
 }
 
+/** /api/opportunities/{id}/members：@ 群成员候选（name 为群内显示名） */
+export interface GroupMember {
+  name: string
+  wxid: string
+  is_owner: boolean
+}
+
+export interface GroupMembers {
+  is_group: boolean
+  items: GroupMember[]
+  error: string
+}
+
 /** /api/system/retention（反馈 7：历史数据保留配置，天） */
 export interface RetentionSettings {
   logs_days: number

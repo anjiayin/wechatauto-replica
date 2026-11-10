@@ -1,14 +1,13 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Alert,
+  Autocomplete,
   Box,
   Button,
-  Checkbox,
   Chip,
   Divider,
   Drawer,
-  FormControlLabel,
   IconButton,
   LinearProgress,
   Skeleton,
@@ -24,8 +23,10 @@ import VisibilityOffIcon from '@mui/icons-material/VisibilityOff'
 import TaskAltIcon from '@mui/icons-material/TaskAlt'
 import UndoIcon from '@mui/icons-material/Undo'
 import SendIcon from '@mui/icons-material/Send'
+import FormatQuoteIcon from '@mui/icons-material/FormatQuote'
 import { apiGet, apiPatch, apiPost } from '../api/client'
 import type {
+  GroupMembers,
   OpportunityContextOut,
   OpportunityDetail,
   ReplyPayload,
@@ -35,6 +36,27 @@ interface SendResultData {
   opportunity_id: number
   ok: boolean
   message: string
+  /** 发送链路分段耗时（毫秒）：init/front/open/send */
+  stages?: Record<string, number>
+  total_ms?: number
+}
+
+const STAGE_LABELS: Record<string, string> = {
+  init: '组件初始化',
+  front: '前置窗口',
+  open: '打开会话',
+  send: '输入发送',
+  fail: '失败前',
+}
+
+/** 分段耗时摘要（让用户一眼看出慢在「打开会话」还是「输入/确认」）。 */
+function stageText(data: SendResultData): string {
+  const stages = data.stages || {}
+  const parts = Object.entries(stages)
+    .filter(([k]) => k !== 'fail')
+    .map(([k, v]) => `${STAGE_LABELS[k] ?? k} ${(v / 1000).toFixed(1)}s`)
+  if (parts.length === 0) return ''
+  return `${parts.join(' · ')} · 合计 ${(((data.total_ms ?? 0) / 1000)).toFixed(1)}s`
 }
 
 /** 上下文中的图片消息：尝试展示解密真图，加载失败回退占位文本（反馈 2）。 */
@@ -74,9 +96,13 @@ export default function OpportunityDetail(props: {
   const { id, onClose } = props
   const queryClient = useQueryClient()
   const [replyText, setReplyText] = useState('')
-  const [atText, setAtText] = useState('')
-  const [quoteLast, setQuoteLast] = useState(false)
+  const [atMembers, setAtMembers] = useState<string[]>([])
+  const [quoteLocalId, setQuoteLocalId] = useState<number | null>(null)
   const [snack, setSnack] = useState<{ ok: boolean; message: string } | null>(null)
+  // 发送中耗时（202 受理后要等微信 GUI 操作，必须让用户看到进度）
+  const [sendingSince, setSendingSince] = useState<number | null>(null)
+  const [sendingMs, setSendingMs] = useState(0)
+  const timerRef = useRef<number | null>(null)
 
   // 详情：只读业务库（不查微信库），秒开
   const { data: opp, isLoading } = useQuery({
@@ -103,18 +129,63 @@ export default function OpportunityDetail(props: {
     [contextQuery.data],
   )
 
+  // @ 群成员候选：群会话才有（后端按会话读微信库成员表，600s 缓存）
+  const isGroup = (opp?.session_username ?? '').endsWith('@chatroom')
+  const membersQuery = useQuery({
+    queryKey: ['opportunity-members', id],
+    queryFn: () => apiGet<GroupMembers>(`/api/opportunities/${id}/members`),
+    enabled: id !== null && isGroup,
+    staleTime: 5 * 60 * 1000,
+  })
+  const memberNames = useMemo(
+    () => (membersQuery.data?.items ?? []).map((m) => m.name),
+    [membersQuery.data],
+  )
+
   // 发送结果经 WS → CustomEvent 送达（202 受理后异步反馈）
   useEffect(() => {
     const handler = (ev: Event) => {
       const data = (ev as CustomEvent<SendResultData>).detail
       if (!id || data.opportunity_id !== id) return
-      setSnack({ ok: data.ok, message: data.message })
+      const detail = stageText(data)
+      setSnack({
+        ok: data.ok,
+        message: detail ? `${data.message}（${detail}）` : data.message,
+      })
+      setSendingSince(null)
+      if (data.ok) {
+        // 已发出：清空草稿，避免用户重复点发送
+        setReplyText('')
+        setAtMembers([])
+        setQuoteLocalId(null)
+      }
       void queryClient.invalidateQueries({ queryKey: ['opportunity', id] })
       void queryClient.invalidateQueries({ queryKey: ['opportunities'] })
     }
     window.addEventListener('kefu-send-result', handler)
     return () => window.removeEventListener('kefu-send-result', handler)
   }, [id, queryClient])
+
+  // 发送中计时（微信 GUI 操作要数秒，没有任何反馈会让人以为卡死）
+  useEffect(() => {
+    if (sendingSince === null) {
+      setSendingMs(0)
+      if (timerRef.current !== null) {
+        window.clearInterval(timerRef.current)
+        timerRef.current = null
+      }
+      return
+    }
+    timerRef.current = window.setInterval(() => {
+      setSendingMs(Date.now() - sendingSince)
+    }, 200)
+    return () => {
+      if (timerRef.current !== null) {
+        window.clearInterval(timerRef.current)
+        timerRef.current = null
+      }
+    }
+  }, [sendingSince])
 
   const statusMutation = useMutation({
     mutationFn: (status: string) =>
@@ -137,6 +208,7 @@ export default function OpportunityDetail(props: {
       setSnack({ ok: resp.ok, message: resp.message })
     },
     onError: (err: Error) => {
+      setSendingSince(null)
       setSnack({ ok: false, message: err.message })
     },
   })
@@ -145,17 +217,23 @@ export default function OpportunityDetail(props: {
     if (!replyText.trim()) return
     const payload: ReplyPayload = {
       text: replyText.trim(),
-      at: atText
-        .split(/[,，]/)
-        .map((s) => s.trim())
-        .filter(Boolean),
+      at: atMembers,
     }
-    // 引用回复：引用上下文里最新一条消息（上下文 items 已按时间正序，取末条）
-    if (quoteLast && contextItems.length > 0) {
-      payload.quote = { local_id: contextItems[contextItems.length - 1].local_id }
+    if (quoteLocalId !== null) {
+      payload.quote = { local_id: quoteLocalId }
     }
+    setSendingSince(Date.now())
     replyMutation.mutate(payload)
   }
+
+  /** 引用某条上下文消息（再点一次取消）。 */
+  const toggleQuote = (localId: number) => {
+    setQuoteLocalId((cur) => (cur === localId ? null : localId))
+  }
+
+  const quotedItem = quoteLocalId === null
+    ? null
+    : contextItems.find((m) => m.local_id === quoteLocalId) ?? null
 
   return (
     <Drawer anchor="right" open={id !== null} onClose={onClose}>
@@ -233,10 +311,29 @@ export default function OpportunityDetail(props: {
                 </Alert>
               )}
               {!contextQuery.isLoading && !contextError && contextItems.map((m) => (
-                <Box key={`${m.sort_seq}-${m.local_id}`} sx={{ px: 1.5, py: 0.5, borderBottom: '1px dashed #eee' }}>
-                  <Typography variant="caption" color="text.secondary">
-                    {m.create_time.replace('T', ' ')} · {m.sender_name} · {m.type_name}
-                  </Typography>
+                <Box
+                  key={`${m.sort_seq}-${m.local_id}`}
+                  sx={{
+                    px: 1.5,
+                    py: 0.5,
+                    borderBottom: '1px dashed #eee',
+                    bgcolor: quoteLocalId === m.local_id ? '#eef6ff' : 'transparent',
+                  }}
+                >
+                  <Stack direction="row" alignItems="center" spacing={0.5}>
+                    <Typography variant="caption" color="text.secondary" sx={{ flexGrow: 1 }}>
+                      {m.create_time.replace('T', ' ')} · {m.sender_name} · {m.type_name}
+                    </Typography>
+                    <Tooltip title={quoteLocalId === m.local_id ? '取消引用' : '引用这条消息'}>
+                      <IconButton
+                        size="small"
+                        color={quoteLocalId === m.local_id ? 'primary' : 'default'}
+                        onClick={() => toggleQuote(m.local_id)}
+                      >
+                        <FormatQuoteIcon fontSize="inherit" />
+                      </IconButton>
+                    </Tooltip>
+                  </Stack>
                   {m.type === '图片' && opp ? (
                     <ContextImage
                       username={opp.session_username}
@@ -285,31 +382,81 @@ export default function OpportunityDetail(props: {
               }}
               sx={{ mb: 1 }}
             />
-            <Stack direction="row" spacing={2} alignItems="center" sx={{ mb: 1.5, flexWrap: 'wrap' }} useFlexGap>
-              <TextField
-                label="@群成员（多个用逗号分隔，仅群聊有效）"
-                sx={{ width: 320 }}
-                value={atText}
-                onChange={(e) => setAtText(e.target.value)}
-              />
-              <FormControlLabel
-                control={
-                  <Checkbox
-                    checked={quoteLast}
-                    onChange={(e) => setQuoteLast(e.target.checked)}
-                  />
-                }
-                label="引用最新一条消息"
-              />
+            <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1, flexWrap: 'wrap' }} useFlexGap>
+              {isGroup && (
+                <Autocomplete
+                  multiple
+                  freeSolo
+                  size="small"
+                  options={memberNames}
+                  value={atMembers}
+                  onChange={(_e, value) => setAtMembers(value)}
+                  loading={membersQuery.isLoading}
+                  noOptionsText={membersQuery.data?.error
+                    ? '读取群成员失败，可直接输入群昵称后回车'
+                    : '没有匹配的群成员，可直接输入群昵称后回车'}
+                  filterSelectedOptions
+                  sx={{ width: 340 }}
+                  renderInput={(params) => (
+                    <TextField
+                      {...params}
+                      label="@群成员（从列表选择）"
+                      placeholder={atMembers.length ? '' : '选择要 @ 的人'}
+                      helperText={membersQuery.data?.error
+                        ? membersQuery.data.error
+                        : undefined}
+                      error={Boolean(membersQuery.data?.error)}
+                    />
+                  )}
+                />
+              )}
+              {quotedItem ? (
+                <Chip
+                  color="primary"
+                  variant="outlined"
+                  size="small"
+                  icon={<FormatQuoteIcon />}
+                  label={`引用：${(quotedItem.content || quotedItem.type_name).slice(0, 16)}`}
+                  onDelete={() => setQuoteLocalId(null)}
+                />
+              ) : (
+                contextItems.length > 0 && (
+                  <Button
+                    size="small"
+                    startIcon={<FormatQuoteIcon />}
+                    onClick={() => toggleQuote(contextItems[contextItems.length - 1].local_id)}
+                  >
+                    引用最新一条消息
+                  </Button>
+                )
+              )}
             </Stack>
+            {sendingSince !== null && (
+              <Alert
+                severity="info"
+                sx={{ mb: 1, py: 0 }}
+                action={
+                  <Button
+                    color="inherit"
+                    size="small"
+                    onClick={() => setSendingSince(null)}
+                  >
+                    不再等待
+                  </Button>
+                }
+              >
+                已受理，正在操作微信窗口（{(sendingMs / 1000).toFixed(1)}s）…
+                首次发送需初始化自动化组件，通常 3~8 秒；若超过 30 秒请检查微信窗口是否被遮挡。
+              </Alert>
+            )}
             <Stack direction="row" spacing={1}>
               <Button
                 variant="contained"
                 startIcon={<SendIcon />}
-                disabled={replyMutation.isPending || !replyText.trim()}
+                disabled={replyMutation.isPending || sendingSince !== null || !replyText.trim()}
                 onClick={handleSend}
               >
-                {replyMutation.isPending ? '发送中…' : '发送回复'}
+                {sendingSince !== null ? '发送中…' : '发送回复'}
               </Button>
               {opp.status !== 'ignored' ? (
                 <Button

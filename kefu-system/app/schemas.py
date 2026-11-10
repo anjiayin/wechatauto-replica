@@ -309,6 +309,19 @@ class ReplyAccepted(BaseModel):
     message: str
 
 
+class GroupMemberOut(BaseModel):
+    """群成员候选（@ 用）。name 为群内显示名，与微信 @ 弹层一致。"""
+    name: str = ""
+    wxid: str = ""
+    is_owner: bool = False
+
+
+class GroupMembersOut(BaseModel):
+    is_group: bool = False
+    items: List[GroupMemberOut] = Field(default_factory=list)
+    error: str = ""
+
+
 # ---------------------------------------------------------------------------
 # 分析日志
 # ---------------------------------------------------------------------------
