@@ -182,6 +182,37 @@ export default function OpportunityList() {
 
   const items = data?.items ?? []
 
+  /** 本地立即标记已读（反馈 3/9）：未读标识与角标秒级消失，不等轮询 */
+  const markReadLocally = (id: number) => {
+    let wasUnread = false
+    for (const [, cached] of queryClient.getQueriesData<OpportunityListOut>({
+      queryKey: ['opportunities'],
+    })) {
+      if (cached?.items.some((it) => it.id === id && it.unread)) {
+        wasUnread = true
+        break
+      }
+    }
+    queryClient.setQueriesData<OpportunityListOut>({ queryKey: ['opportunities'] },
+      (old) =>
+        old
+          ? { ...old, items: old.items.map((it) => (it.id === id ? { ...it, unread: false } : it)) }
+          : old,
+    )
+    if (wasUnread) {
+      queryClient.setQueryData<StatusOut>(['status'], (old) =>
+        old ? { ...old, unread_count: Math.max(0, old.unread_count - 1) } : old,
+      )
+    }
+  }
+
+  /** 打开详情：先本地置为已读，再异步通知后端（幂等） */
+  const openDetail = (id: number) => {
+    setDetailId(id)
+    markReadLocally(id)
+    void apiPost(`/api/opportunities/${id}/read`).catch(() => undefined)
+  }
+
   return (
     <Box>
       <Stack direction="row" spacing={1} sx={{ mb: 2, flexWrap: 'wrap' }} useFlexGap>
@@ -261,6 +292,7 @@ export default function OpportunityList() {
         <Table size="small">
           <TableHead>
             <TableRow>
+              <TableCell width={52}>未读</TableCell>
               <TableCell>类型</TableCell>
               <TableCell>来源</TableCell>
               <TableCell>发送人</TableCell>
@@ -275,14 +307,14 @@ export default function OpportunityList() {
           <TableBody>
             {isLoading && (
               <TableRow>
-                <TableCell colSpan={9}>加载中…</TableCell>
+                <TableCell colSpan={10}>加载中…</TableCell>
               </TableRow>
             )}
             {!isLoading && items.length === 0 && (
               <TableRow>
-                <TableCell colSpan={9}>
+                <TableCell colSpan={10}>
                   <Typography color="text.secondary" align="center" sx={{ py: 4 }}>
-                    暂无商机。请确认：① 设置页已配置监控对象与商机类型；② AI 接口可用；③ 新消息在发送人停止发言（默认 15 秒）后即触发分析并产生商机。
+                    暂无商机。请确认：① 设置页已配置监控对象与商机类型；② AI 接口可用（或在设置里改用轻量筛选）；③ 新消息在发送人停止发言（默认 15 秒）后即触发分析并产生商机。
                   </Typography>
                 </TableCell>
               </TableRow>
@@ -292,8 +324,28 @@ export default function OpportunityList() {
                 key={o.id}
                 hover
                 sx={{ cursor: 'pointer' }}
-                onClick={() => setDetailId(o.id)}
+                onClick={() => openDetail(o.id)}
               >
+                {/* 行内未读标识（反馈 9）：点击即消失并同步未读角标 */}
+                <TableCell>
+                  {o.unread ? (
+                    <Tooltip title="未读，点击标记为已读" arrow>
+                      <Chip
+                        size="small"
+                        color="error"
+                        label="未读"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          markReadLocally(o.id)
+                          void apiPost(`/api/opportunities/${o.id}/read`).catch(() => undefined)
+                        }}
+                        sx={{ height: 20, fontSize: 11, cursor: 'pointer' }}
+                      />
+                    </Tooltip>
+                  ) : (
+                    <Typography variant="caption" color="text.disabled">—</Typography>
+                  )}
+                </TableCell>
                 <TableCell>
                   <Stack direction="row" spacing={0.5} alignItems="center">
                     <Chip size="small" color="primary" variant="outlined" label={o.type_name} />
@@ -324,33 +376,41 @@ export default function OpportunityList() {
                   )}
                 </TableCell>
                 <TableCell sx={{ whiteSpace: 'nowrap' }}>{o.window_end.replace('T', ' ')}</TableCell>
-                <TableCell sx={{ maxWidth: 260, minWidth: 140 }}>
+                <TableCell sx={{ maxWidth: 260, minWidth: 160 }}>
                   {o.key_quote ? (
-                    <Tooltip
-                      title={o.key_quote}
-                      placement="top"
-                      arrow
-                      {...QUOTE_TOOLTIP_PROPS}
-                    >
-                      <Typography
-                        variant="body2"
-                        sx={{
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis',
-                          whiteSpace: 'nowrap',
-                        }}
+                    <Box sx={{ display: 'flex', alignItems: 'center' }}>
+                      <Tooltip
+                        title={o.key_quote}
+                        placement="top"
+                        arrow
+                        {...QUOTE_TOOLTIP_PROPS}
                       >
-                        {o.key_quote}
-                      </Typography>
-                    </Tooltip>
+                        <Typography
+                          variant="body2"
+                          sx={{
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          {o.key_quote}
+                        </Typography>
+                      </Tooltip>
+                      {/* 一键复制消息原文（反馈 10） */}
+                      <CopyButton text={o.key_quote} label="消息原文" />
+                    </Box>
                   ) : (
                     <Typography variant="body2" color="text.secondary">—</Typography>
                   )}
                 </TableCell>
                 <TableCell sx={{ maxWidth: 360 }}>
-                  <Typography variant="body2" sx={{ whiteSpace: 'pre-line' }}>
-                    {o.summary.length > 120 ? `${o.summary.slice(0, 120)}…` : o.summary}
-                  </Typography>
+                  <Box sx={{ display: 'flex', alignItems: 'flex-start' }}>
+                    <Typography variant="body2" sx={{ whiteSpace: 'pre-line', flexGrow: 1 }}>
+                      {o.summary.length > 120 ? `${o.summary.slice(0, 120)}…` : o.summary}
+                    </Typography>
+                    {/* 一键复制 AI 要点摘要（反馈 10） */}
+                    {o.summary && <CopyButton text={o.summary} label="要点摘要" />}
+                  </Box>
                 </TableCell>
                 <TableCell align="right">{o.confidence}</TableCell>
                 <TableCell>
@@ -358,7 +418,7 @@ export default function OpportunityList() {
                 </TableCell>
                 <TableCell align="right" onClick={(e) => e.stopPropagation()}>
                   <Tooltip title="去回复">
-                    <IconButton size="small" onClick={() => setDetailId(o.id)}>
+                    <IconButton size="small" onClick={() => openDetail(o.id)}>
                       <ReplyIcon fontSize="small" />
                     </IconButton>
                   </Tooltip>

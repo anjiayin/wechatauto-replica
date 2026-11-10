@@ -37,6 +37,9 @@ GROUP_MEMBER_CACHE_TTL_SEC = 600   # 群成员列表缓存 TTL（秒，发送人
 MAX_MONITOR_TARGETS = 200          # 监控对象数量上限兜底值（settings 无 monitor.max_targets 时使用）
 MONITOR_MAX_TARGETS_MIN = 10       # monitor.max_targets 允许下限
 MONITOR_MAX_TARGETS_MAX = 2000     # monitor.max_targets 允许上限
+# 关闭 AI 思考模式（实测 GLM-5.x 默认思考会让单条消息耗时 27s→3s 级别；
+# 网关不支持该参数时 AIClient 自动降级，不会报错）
+AI_DISABLE_THINKING_DEFAULT = True
 
 # ---------------------------------------------------------------------------
 # settings 表配置键（共享约定，前端与后端共同遵守）
@@ -46,6 +49,7 @@ KEY_AI_API_KEY_ENC = "ai.api_key_enc"      # Fernet 密文
 KEY_AI_MODEL = "ai.model"
 KEY_AI_TIMEOUT_SEC = "ai.timeout_sec"
 KEY_AI_TEMPERATURE = "ai.temperature"
+KEY_AI_ENABLED = "ai.enabled"              # 是否使用 AI 接口（0=用轻量筛选规则判定商机）
 KEY_ANALYSIS_STRICTNESS = "analysis.strictness"
 KEY_ANALYSIS_MIN_CONFIDENCE = "analysis.min_confidence"
 KEY_ANALYSIS_PRESCREEN_ENABLED = "analysis.prescreen_enabled"
@@ -59,6 +63,8 @@ KEY_MONITOR_MAX_TARGETS = "monitor.max_targets"  # 监控对象数量上限（10
 KEY_COMPLIANCE_CONFIRMED = "compliance.confirmed"
 KEY_RUNTIME_WM_SAVED_AT = "runtime.watermark_saved_at"  # 内部键：最近 watermark 刷回时间
 KEY_RUNTIME_MW_MIGRATED = "runtime.merge_window_migrated"  # 内部键：微窗口默认值迁移标记
+# 内部键：创建时间由 UTC 改为本地时间的迁移标记（一次性，防重复平移）
+KEY_RUNTIME_LOCALTIME_MIGRATED = "runtime.created_at_localtime"
 
 # ---------------------------------------------------------------------------
 # 默认配置值
@@ -68,6 +74,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     KEY_AI_MODEL: "",
     KEY_AI_TIMEOUT_SEC: "60",
     KEY_AI_TEMPERATURE: "0.2",
+    KEY_AI_ENABLED: "1",
     KEY_ANALYSIS_STRICTNESS: "balanced",
     KEY_ANALYSIS_MIN_CONFIDENCE: "60",
     KEY_ANALYSIS_PRESCREEN_ENABLED: "0",

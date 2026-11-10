@@ -51,11 +51,16 @@ def list_opportunities(
     direction: str = Query(default="", pattern="^(|buy|sell)$"),
     db: Database = Depends(get_db),
 ) -> OpportunityListOut:
-    """商机列表（时间倒序；status 为空时排除已忽略项；direction 买卖货筛选）。"""
+    """商机列表（时间倒序；status 为空时排除已忽略项；direction 买卖货筛选）。
+
+    每行附加 ``unread`` 未读标识（内存态，供列表页行内展示 + 点击消除）。
+    """
     total, rows = db.list_opportunities(
         page=page, page_size=page_size, session=session,
         type_id=type_id, status=status, keyword=keyword, direction=direction)
-    items = [OpportunityListItem(**r) for r in rows]
+    unread_ids = get_notifier().unread_ids()
+    items = [OpportunityListItem(**r, unread=r["id"] in unread_ids)
+             for r in rows]
     return OpportunityListOut(total=total, items=items)
 
 
@@ -76,17 +81,40 @@ def read_all_opportunities(
 # ---------------------------------------------------------------------------
 @router.get("/{opp_id}", response_model=OpportunityDetailOut)
 def get_opportunity(opp_id: int, db: Database = Depends(get_db),
+                    svc: WeChatService = Depends(get_wechat_service),
                     ) -> OpportunityDetailOut:
     """商机详情（并清除该条未读，广播 unread_cleared）。
 
     体验优化：详情与上下文拆分——本接口只读业务 SQLite（毫秒级），
     上下文消息由 GET /{opp_id}/context 异步加载，微信库繁忙时详情照常秒开。
+
+    ``raw_text_display``：群消息原文每行的发送者 ID 换成显示名（发送人昵称
+    已由 wechat_service 解析，失败时原样返回，绝不影响详情加载速度）。
     """
     opp = db.get_opportunity(opp_id)
     if not opp:
         raise HTTPException(status_code=404, detail="商机不存在")
     get_notifier().clear_unread(opp_id)
-    return OpportunityDetailOut(**opp)
+    try:
+        _session, raw_display = svc.build_log_displays(
+            str(opp.get("session_username") or ""),
+            str(opp.get("raw_text") or ""))
+    except Exception:  # 显示名解析失败不影响详情
+        logger.exception("商机 #%d 原文显示名解析失败（回退原始文本）", opp_id)
+        raw_display = str(opp.get("raw_text") or "")
+    return OpportunityDetailOut(**opp, unread=False, raw_text_display=raw_display)
+
+
+# ---------------------------------------------------------------------------
+# 单条已读（反馈 9：列表行内「未读」标识点击即消失，无需等详情加载）
+# ---------------------------------------------------------------------------
+@router.post("/{opp_id}/read")
+def mark_opportunity_read(opp_id: int, db: Database = Depends(get_db)) -> dict:
+    """把单条商机标记为已读（幂等；广播 unread_cleared 让其它页面同步）。"""
+    if not db.get_opportunity(opp_id):
+        raise HTTPException(status_code=404, detail="商机不存在")
+    cleared = get_notifier().clear_unread(opp_id)
+    return {"ok": True, "cleared": cleared}
 
 
 # ---------------------------------------------------------------------------

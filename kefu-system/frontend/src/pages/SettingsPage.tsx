@@ -764,6 +764,9 @@ function AiTab() {
   const [model, setModel] = useState('')
   const [timeoutSec, setTimeoutSec] = useState(60)
   const [temperature, setTemperature] = useState(0.2)
+  const [disableThinking, setDisableThinking] = useState(true)
+  // 是否使用 AI 接口（关闭 = 轻量筛选模式：关键词/正则命中即商机）
+  const [aiEnabled, setAiEnabled] = useState(true)
   const [compliance, setCompliance] = useState(false)
   const [loaded, setLoaded] = useState(false)
 
@@ -777,6 +780,8 @@ function AiTab() {
     setModel(ai.model)
     setTimeoutSec(ai.timeout_sec)
     setTemperature(ai.temperature)
+    setDisableThinking(ai.disable_thinking !== false)
+    setAiEnabled(ai.enabled !== false)
     setLoaded(true)
   }
 
@@ -958,6 +963,22 @@ function AiTab() {
 
       <Typography variant="subtitle2" sx={{ mb: 1 }}>AI 接口（OpenAI 兼容）</Typography>
       <Stack spacing={2} sx={{ mb: 2 }}>
+        {/* AI 开关（反馈 2）：关闭后不调用任何 AI，改用轻量筛选规则判定商机 */}
+        <FormControlLabel
+          control={
+            <Switch
+              checked={aiEnabled}
+              onChange={(e) => setAiEnabled(e.target.checked)}
+            />
+          }
+          label="使用 AI 接口分析商机（关闭后不调用 AI：改用「分析判定 → 轻量筛选」的关键词/正则，命中即算商机）"
+        />
+        {!aiEnabled && (
+          <Alert severity="warning">
+            已关闭 AI 接口：系统不再向任何第三方发送消息内容。
+            请务必在下方「分析判定 → 轻量筛选」中填写关键词或正则，否则不会产生任何商机。
+          </Alert>
+        )}
         <TextField
           label="API 地址（base_url）"
           placeholder="如 https://api.deepseek.com/v1"
@@ -1001,6 +1022,15 @@ function AiTab() {
         <FormControlLabel
           control={
             <Switch
+              checked={disableThinking}
+              onChange={(e) => setDisableThinking(e.target.checked)}
+            />
+          }
+          label="关闭思考模式（推荐开启）：判定只需固定 JSON，思考型模型会额外生成大量隐藏推理内容，单条分析可能从 3 秒变成 30~60 秒。对所有模型生效，会按模型自动匹配参数（thinking / enable_thinking / reasoning_effort），「测试连接」结果里会显示实际生效的参数"
+        />
+        <FormControlLabel
+          control={
+            <Switch
               checked={compliance}
               onChange={(e) => setCompliance(e.target.checked)}
             />
@@ -1010,7 +1040,10 @@ function AiTab() {
         <Stack direction="row" spacing={1}>
           <Button
             variant="contained"
-            disabled={!baseUrl.trim() || !model.trim() || saveAiMutation.isPending}
+            disabled={
+              saveAiMutation.isPending ||
+              (aiEnabled && (!baseUrl.trim() || !model.trim()))
+            }
             onClick={() =>
               saveAiMutation.mutate({
                 base_url: baseUrl.trim(),
@@ -1018,6 +1051,8 @@ function AiTab() {
                 model: model.trim(),
                 timeout_sec: timeoutSec,
                 temperature,
+                disable_thinking: disableThinking,
+                enabled: aiEnabled,
                 confirm_compliance: compliance,
               })
             }
@@ -1079,9 +1114,13 @@ function AiTab() {
                 onChange={(e) => setPrescreenEnabled(e.target.checked)}
               />
             }
-            label="启用轻量预筛（关键词/正则未命中不调用 AI，节省成本）"
+            label={
+              aiEnabled
+                ? '启用轻量预筛（关键词/正则未命中不调用 AI，节省成本）'
+                : '轻量筛选规则（已关闭 AI：命中关键词/正则即算商机，无需开启上方预筛开关）'
+            }
           />
-          {prescreenEnabled && (
+          {(prescreenEnabled || !aiEnabled) && (
             <Stack spacing={1} sx={{ mt: 1 }}>
               <TextField
                 label="预筛关键词"
@@ -1308,7 +1347,7 @@ function DataBillingTab() {
     <Box>
       <Typography variant="subtitle2" sx={{ mb: 1 }}>历史数据管理</Typography>
       <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
-        分别配置分析日志与商机的保留时长（每天 03:30 自动清理，也可手动立即清理）；删除不可恢复，请谨慎设置。
+        分别配置分析日志与商机的保留天数。系统不再自动清理，只在你点击「立即清理」时按保留天数删除；删除不可恢复，请谨慎设置。
       </Typography>
       <Stack spacing={2} sx={{ mb: 2 }}>
         <Stack direction="row" spacing={1} alignItems="center" useFlexGap>

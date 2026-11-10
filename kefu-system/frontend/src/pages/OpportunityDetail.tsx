@@ -195,7 +195,8 @@ export default function OpportunityDetail(props: {
             <Typography variant="subtitle2">消息原文（合并窗口）</Typography>
             <Box sx={{ bgcolor: '#fbfbfb', border: '1px solid #eee', borderRadius: 1, p: 1.5, mb: 1.5 }}>
               <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
-                {opp.raw_text}
+                {/* 群消息每行显示群昵称而非 wxid（后端已解析，反馈 6） */}
+                {opp.raw_text_display || opp.raw_text}
               </Typography>
             </Box>
 

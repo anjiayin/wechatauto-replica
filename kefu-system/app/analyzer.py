@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from typing import Any, List, Optional
 
@@ -184,6 +185,31 @@ def _normalize_result(data: dict) -> dict:
 # ---------------------------------------------------------------------------
 # 预筛
 # ---------------------------------------------------------------------------
+def prescreen_hits(text: str, keywords: str, regex: str) -> List[str]:
+    """返回命中的筛选条件描述（关键词原文 / 正则匹配到的文本）。
+
+    与 :func:`prescreen` 同一判定口径，供「不使用 AI 接口」模式把命中的
+    关键词写进商机要点，让用户知道为什么被判为商机。
+    """
+    text = text or ""
+    hits: List[str] = []
+    kws = [k.strip() for k in re.split(r"[,，]", keywords or "") if k.strip()]
+    for k in kws:
+        if k in text:
+            hits.append(k)
+    if regex:
+        try:
+            for m in re.finditer(regex, text):
+                matched = m.group(0).strip()
+                if matched and matched not in hits:
+                    hits.append(matched)
+                if len(hits) >= 10:
+                    break
+        except re.error as exc:
+            logger.warning("预筛正则无效（忽略）：%s", exc)
+    return hits[:10]
+
+
 def prescreen(text: str, keywords: str, regex: str) -> bool:
     """轻量预筛：关键词（逗号分隔，中英文逗号均可）或正则任一命中即通过。
 
@@ -206,6 +232,94 @@ def prescreen(text: str, keywords: str, regex: str) -> bool:
 # ---------------------------------------------------------------------------
 # openai SDK 客户端
 # ---------------------------------------------------------------------------
+def _is_unsupported_param_error(exc: BaseException) -> bool:
+    """判断异常是否为「网关不认识 extra_body 参数」（用于关闭思考模式降级）。
+
+    只在错误信息确实指向思考/附加参数时才判定，避免把 Key 无效、
+    模型不存在等 400 误当作参数不支持而重复请求。
+    """
+    text = str(exc).lower()
+    tokens = ("thinking", "extra_body", "enable_thinking",
+              "unexpected keyword", "unknown field", "unrecognized",
+              "unsupported parameter", "extra fields")
+    return any(t in text for t in tokens)
+
+
+# ---------------------------------------------------------------------------
+# 关闭思考模式的参数形态（多模型通用）
+# ---------------------------------------------------------------------------
+# 不同厂商关闭「思考/推理」的字段名不同，这里统一在 extra_body 中下发
+# （extra_body 会原样并入请求 JSON body，等价于顶层字段）：
+#   thinking.type      —— 智谱 GLM（bigmodel）、Anthropic / Claude 兼容网关
+#   enable_thinking    —— 通义 Qwen、DashScope、vLLM 原生、硅基流动
+#   reasoning_effort   —— OpenAI o 系 / gpt-5、Azure OpenAI（"none" 表示不推理）
+# 顺序即「不知道模型族时的尝试顺序」：先沿用已验证有效的 thinking，再逐个试探。
+THINKING_VARIANTS: dict = {
+    "thinking": {"thinking": {"type": "disabled"}},
+    "enable_thinking": {"enable_thinking": False},
+    "reasoning_effort": {"reasoning_effort": "none"},
+}
+THINKING_ORDER = ("thinking", "enable_thinking", "reasoning_effort")
+
+# (匹配片段, 首选形态)：片段同时匹配 base_url 与 model 的小写拼接串
+_PROVIDER_HINTS = (
+    ("bigmodel", "thinking"), ("zhipu", "thinking"), ("glm", "thinking"),
+    ("anthropic", "thinking"), ("claude", "thinking"), ("moonshot", "thinking"),
+    ("kimi", "thinking"), ("minimax", "thinking"),
+    ("dashscope", "enable_thinking"), ("aliyun", "enable_thinking"),
+    ("siliconflow", "enable_thinking"), ("qwen", "enable_thinking"),
+    ("qwq", "enable_thinking"), ("vllm", "enable_thinking"),
+    ("openai.com", "reasoning_effort"), ("azure", "reasoning_effort"),
+    ("gpt-5", "reasoning_effort"), ("o1", "reasoning_effort"),
+    ("o3", "reasoning_effort"), ("o4", "reasoning_effort"),
+)
+
+# 进程级「模型/网关 → 有效形态」记忆（"" 表示三种形态都被拒，只能走默认模式）
+_THINKING_CACHE: dict = {}
+_THINKING_LOCK = threading.Lock()
+
+
+def _thinking_key(base_url: str, model: str) -> tuple:
+    """缓存键：网关地址 + 模型名（各自归一化，忽略末尾斜杠与大小写）。"""
+    return ((base_url or "").strip().rstrip("/").lower(),
+            (model or "").strip().lower())
+
+
+def thinking_variants(base_url: str, model: str) -> List[str]:
+    """按模型族推断关闭思考参数的尝试顺序（首选形态在最前）。
+
+    识别不出来时按 THINKING_ORDER 全量试探——试探只在「进程内首次遇到
+    该模型」时发生，结果会被 ``_THINKING_CACHE`` 记住。
+    """
+    haystack = f"{base_url or ''} {model or ''}".lower()
+    for hint, key in _PROVIDER_HINTS:
+        if hint in haystack:
+            return [key] + [k for k in THINKING_ORDER if k != key]
+    return list(THINKING_ORDER)
+
+
+def thinking_variant_cached(base_url: str, model: str) -> Optional[str]:
+    """读取进程内已确认的形态；未确认过返回 None（"" 表示不支持）。"""
+    with _THINKING_LOCK:
+        return _THINKING_CACHE.get(_thinking_key(base_url, model))
+
+
+def remember_thinking_variant(base_url: str, model: str, key: str) -> bool:
+    """记住形态结论，返回是否为首次确认（用于日志去重）。"""
+    cache_key = _thinking_key(base_url, model)
+    with _THINKING_LOCK:
+        if cache_key in _THINKING_CACHE:
+            return False
+        _THINKING_CACHE[cache_key] = key
+        return True
+
+
+def reset_thinking_cache() -> None:
+    """清空进程级记忆（测试 / 用户改动 AI 配置后手动重置用）。"""
+    with _THINKING_LOCK:
+        _THINKING_CACHE.clear()
+
+
 class AIClient:
     """OpenAI 兼容接口客户端（openai SDK v1）。
 
@@ -216,16 +330,36 @@ class AIClient:
         timeout_sec: 请求超时（秒）。
         temperature: 温度（建议 0.2 保证判定稳定）。
         client: 测试注入用（openai 客户端替身）；None 时按配置真实创建。
+        disable_thinking: 关闭思考模式（默认开启）。
+
+    ``disable_thinking`` 说明（实测结论）：GLM-5.x 等思考型模型默认会把
+    "先推理再回答" 的推理 token 一起计入 completion，本系统只需要一个
+    固定格式的 JSON（约 40 token），但默认模式下单条消息会生成 700~1600
+    个 token（含隐藏 reasoning_content），耗时从 3 秒级放大到 30~60 秒且
+    波动极大。通过 ``extra_body={"thinking": {"type": "disabled"}}`` 关闭后
+    实测 27.2s → 2.9s、completion 1561 → 44。
+    该参数**不绑定具体模型**：换模型后仍会下发，并按模型族自动切换形态
+    （thinking / enable_thinking / reasoning_effort，见 ``THINKING_VARIANTS``）。
+    网关拒绝某形态时自动试下一个，全部被拒则降级为默认模式并打日志，
+    绝不因此报错；结论按 (base_url, model) 记入进程级缓存，后续请求
+    不再重复试探。
     """
 
     def __init__(self, base_url: str, api_key: str, model: str,
                  timeout_sec: int = 60, temperature: float = 0.2,
-                 client: Any = None) -> None:
+                 client: Any = None, disable_thinking: bool = True) -> None:
         self.base_url = base_url
         self.api_key = api_key
         self.model = model
         self.timeout_sec = timeout_sec
         self.temperature = temperature
+        self.disable_thinking = bool(disable_thinking)
+        # 网关是否支持关闭思考参数（全部形态被拒时置 False）
+        self._thinking_param_ok = True
+        # 已确认生效的形态（None 表示尚未确认或确认不支持）
+        self._thinking_variant: Optional[str] = None
+        self._thinking_resolved = False
+        self._thinking_candidates = thinking_variants(base_url, model)
         self._client = client
 
     def _ensure_client(self) -> Any:
@@ -244,6 +378,76 @@ class AIClient:
             )
         return self._client
 
+    def _thinking_plan(self) -> List[str]:
+        """本轮请求依次尝试的形态列表（"" 表示不带参数，即默认模式）。"""
+        if not self.disable_thinking:
+            return [""]
+        if self._thinking_resolved:
+            return [self._thinking_variant or ""]
+        cached = thinking_variant_cached(self.base_url, self.model)
+        if cached is not None:
+            self._thinking_resolved = True
+            self._thinking_variant = cached or None
+            self._thinking_param_ok = bool(cached)
+            return [cached]
+        return list(self._thinking_candidates) + [""]
+
+    def _note_thinking_ok(self, key: str) -> None:
+        """记录本次请求的思考参数结论（进程级复用，按 base_url+model）。"""
+        self._thinking_resolved = True
+        self._thinking_variant = key or None
+        self._thinking_param_ok = bool(key)
+        if not self.disable_thinking:
+            return
+        if not remember_thinking_variant(self.base_url, self.model, key):
+            return
+        if key:
+            logger.info(
+                "已确认模型 %s 关闭思考的参数形态：%s（进程内后续复用，"
+                "不再试探）", self.model, key)
+        else:
+            logger.warning(
+                "模型 %s 不接受任何关闭思考参数（%s 均被网关拒绝），已降级"
+                "为默认模式：响应更慢且波动更大，建议更换支持该参数的模型",
+                self.model, "/".join(THINKING_ORDER))
+
+    def thinking_label(self) -> str:
+        """当前实例的思考模式状态（日志/连接测试展示用）。"""
+        if not self.disable_thinking:
+            return "开关已关闭"
+        if self._thinking_variant:
+            return self._thinking_variant
+        if self._thinking_resolved:
+            return "不支持（已降级）"
+        return "待确认"
+
+    def _create(self, client: Any, messages: list, **extra: Any) -> Any:
+        """发起 chat.completions；思考参数按形态逐个试探，失败自动降级。"""
+        kwargs = dict(extra)
+        kwargs.setdefault("temperature", self.temperature)
+        last_exc: Optional[BaseException] = None
+        for key in self._thinking_plan():
+            attempt = dict(kwargs)
+            if key:
+                attempt["extra_body"] = dict(THINKING_VARIANTS[key])
+            try:
+                resp = client.chat.completions.create(
+                    model=self.model, messages=messages, **attempt)
+            except Exception as exc:
+                # "" = 已无参数可退，或错误与参数无关（如 Key 无效）：直接抛
+                if not key or not _is_unsupported_param_error(exc):
+                    raise
+                last_exc = exc
+                logger.warning(
+                    "模型 %s 不接受思考参数 %s（%s），改试下一形态",
+                    self.model, key, str(exc)[:100])
+                continue
+            self._note_thinking_ok(key)
+            return resp
+        if last_exc is not None:
+            raise last_exc
+        raise AIError("AI 请求未执行（无可用请求形态）")
+
     def chat(self, system_prompt: str, user_message: str) -> str:
         """执行一次 chat.completions（json_object 模式），返回原始文本。
 
@@ -254,15 +458,10 @@ class AIClient:
         client = self._ensure_client()
         started = time.monotonic()
         try:
-            resp = client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
-                temperature=self.temperature,
-                response_format={"type": "json_object"},
-            )
+            resp = self._create(client, [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ], response_format={"type": "json_object"})
         except Exception as exc:
             raise AIError(f"AI 接口调用失败：{exc}") from exc
         logger.debug("AI 调用耗时 %.0f ms", (time.monotonic() - started) * 1000)
@@ -283,20 +482,22 @@ class AIClient:
         return content
 
     def test_connection(self) -> tuple[bool, str, int]:
-        """测试连接：发 1 条最小补全。返回 (ok, 中文消息, 耗时 ms)。"""
+        """测试连接：发 1 条最小补全。返回 (ok, 中文消息, 耗时 ms)。
+
+        与正式分析一样关闭思考模式，否则「连接测试」会因隐藏推理 token
+        显示成 10 秒以上，与真实分析延迟不可比。消息里附带实际生效的
+        参数形态，便于换模型后确认该模型是否支持关闭思考。
+        """
         started = time.monotonic()
         try:
             client = self._ensure_client()
-            client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": "连接测试，请回复：OK"}],
-                max_tokens=8,
-                temperature=0,
-            )
+            self._create(client, [{"role": "user", "content": "连接测试，请回复：OK"}],
+                         max_tokens=8, temperature=0)
         except Exception as exc:
             return False, f"连接失败：{exc}", int((time.monotonic() - started) * 1000)
         latency = int((time.monotonic() - started) * 1000)
-        return True, f"连接成功（模型：{self.model}）", latency
+        return True, (f"连接成功（模型：{self.model} · 思考参数："
+                      f"{self.thinking_label()}）"), latency
 
 
 def analyze_unit(client: AIClient, unit_text: str, session_name: str,

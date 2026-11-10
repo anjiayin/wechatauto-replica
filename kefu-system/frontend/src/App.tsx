@@ -18,7 +18,6 @@ import {
   Typography,
 } from '@mui/material'
 import Inventory2Icon from '@mui/icons-material/Inventory2'
-import ChatIcon from '@mui/icons-material/Chat'
 import ReceiptLongIcon from '@mui/icons-material/ReceiptLong'
 import SettingsIcon from '@mui/icons-material/Settings'
 import { apiGet } from './api/client'
@@ -27,7 +26,6 @@ import { useEvents } from './hooks/useEvents'
 import { armAudioUnlock, playOpportunitySound } from './hooks/sound'
 import { setPendingOpportunity } from './hooks/pendingOpportunity'
 import OpportunityList from './pages/OpportunityList'
-import MessageBrowse from './pages/MessageBrowse'
 import AnalysisLogs from './pages/AnalysisLogs'
 import SettingsPage from './pages/SettingsPage'
 
@@ -151,13 +149,19 @@ export default function App() {
       <AppBar
         position="fixed"
         elevation={0}
-        sx={{ zIndex: (t) => t.zIndex.drawer + 1, bgcolor: '#2e2e2e' }}
+        sx={{
+          zIndex: (t) => t.zIndex.drawer + 1,
+          // 深色顶栏 + 绿色下边框：与下方白色内容区明确分层（反馈 4）
+          bgcolor: '#24292b',
+          borderBottom: '2px solid',
+          borderColor: 'primary.main',
+        }}
       >
         <Toolbar variant="dense">
-          <Typography variant="subtitle1" noWrap sx={{ flexGrow: 1 }}>
+          <Typography variant="subtitle1" noWrap sx={{ flexGrow: 1, fontWeight: 600 }}>
             微信商机监测与客服系统
           </Typography>
-          <Typography variant="caption" sx={{ mr: 2 }}>
+          <Typography variant="caption" sx={{ mr: 2, color: 'rgba(255,255,255,0.85)' }}>
             {status?.listener_running
               ? `监听运行中 · 监控 ${status.monitored_count} 个会话`
               : '监听未运行'}
@@ -165,17 +169,23 @@ export default function App() {
           {/* 今日 AI 估算费用（反馈 13；未配置单价时为 0 不展示） */}
           {(status?.today_cost ?? 0) > 0 && (
             <Tooltip title="今日 AI 估算费用（按设置中的单价与实际 token 用量计算）">
-              <Typography variant="caption" sx={{ mr: 2 }}>
+              <Typography variant="caption" sx={{ mr: 2, color: 'rgba(255,255,255,0.85)' }}>
                 今日 AI 费用：¥{(status!.today_cost).toFixed(2)}
               </Typography>
             </Tooltip>
           )}
-          {/* 微信窗口状态：实心 Chip 高对比（绿底白字可用 / 红底白字不可用） */}
+          {/* 微信窗口状态：浅底深字高对比（深色顶栏上不再糊成一团，反馈 4） */}
           <Chip
             size="small"
-            color={status?.wechat.visible ? 'success' : 'error'}
             label={status?.wechat.visible ? '微信窗口可用' : '微信窗口不可用'}
-            sx={{ mr: 1 }}
+            sx={{
+              mr: 1,
+              fontWeight: 600,
+              color: status?.wechat.visible ? '#0b6b34' : '#a3231d',
+              bgcolor: status?.wechat.visible ? '#e6f6ec' : '#fdecea',
+              border: '1px solid',
+              borderColor: status?.wechat.visible ? '#7fd3a0' : '#f0b4b0',
+            }}
           />
         </Toolbar>
       </AppBar>
@@ -196,7 +206,7 @@ export default function App() {
             label="商机列表"
             badge={status?.unread_count ?? 0}
           />
-          <NavItem to="/messages" icon={<ChatIcon />} label="消息浏览" />
+          {/* 消息浏览菜单已按用户要求下线（反馈 8） */}
           <NavItem to="/analysis-logs" icon={<ReceiptLongIcon />} label="分析日志" />
           <NavItem to="/settings" icon={<SettingsIcon />} label="设置" />
         </List>
@@ -210,7 +220,6 @@ export default function App() {
         )}
         <Routes>
           <Route path="/" element={<OpportunityList />} />
-          <Route path="/messages" element={<MessageBrowse />} />
           <Route path="/analysis-logs" element={<AnalysisLogs />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<OpportunityList />} />
@@ -297,6 +306,13 @@ function buildBanner(status?: StatusOut) {
   }
   if (!status.wechat.visible) {
     return { severity: 'info' as const, text: '发送功能暂不可用（微信窗口被遮挡或锁屏），商机监听不受影响' }
+  }
+  // 关闭 AI 接口：商机由「轻量筛选」关键词/正则产生，无需提示去配置 AI
+  if (status.ai_enabled === false) {
+    return {
+      severity: 'info' as const,
+      text: '当前未使用 AI 接口：商机由「设置 → 分析判定 → 轻量筛选」的关键词/正则产生',
+    }
   }
   if (!status.ai_configured) {
     return { severity: 'info' as const, text: 'AI 接口尚未配置完整，请在「设置 → AI 接口」完成配置' }

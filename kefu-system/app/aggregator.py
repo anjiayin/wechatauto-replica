@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
@@ -40,6 +41,11 @@ class AnalysisUnit:
     window_end: str                    # ISO8601
     merged_count: int
     lines: List[Tuple[str, str]] = field(default_factory=list)  # (HH:MM, 内容)
+    # 时序诊断：消息首次进入缓冲的墙钟时间（time.time()）与入队时的
+    # 单调时钟（time.monotonic()），用于拆分「合并等待」与「排队等待」
+    first_seen_epoch: float = 0.0     # 缓冲创建墙钟（与 enqueued_epoch 同源）
+    enqueued_epoch: float = 0.0       # 入队墙钟（算合并等待）
+    enqueued_mono: float = 0.0        # 入队单调时钟（算排队等待）
 
     def merged_text(self) -> str:
         """合并后全文：每行 "[HH:MM] 内容"。"""
@@ -56,6 +62,7 @@ class _Buffer:
     lines: List[Tuple[str, str]] = field(default_factory=list)
     window_start_epoch: float = 0.0
     last_epoch: float = 0.0            # 最后一条消息时间（静默计时基准）
+    first_seen_epoch: float = 0.0      # 缓冲创建墙钟时间（端到端计时起点）
 
     def count(self) -> int:
         return len(self.lines)
@@ -105,6 +112,7 @@ class Aggregator:
                     session_kind=session_kind,
                     sender_wxid=sender_wxid,
                     sender_name=sender_name,
+                    first_seen_epoch=time.time(),
                 )
                 self._buffers[key] = buf
             buf.lines.append((hm, content))
@@ -182,6 +190,7 @@ class Aggregator:
                     buf.last_epoch).isoformat(timespec="seconds"),
                 merged_count=buf.count(),
                 lines=list(buf.lines),
+                first_seen_epoch=buf.first_seen_epoch,
             )
             try:
                 self._flush_callback(unit)

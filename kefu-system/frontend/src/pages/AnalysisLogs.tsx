@@ -57,6 +57,22 @@ function stripTimePrefix(text: string): string {
     .trim()
 }
 
+/** 毫秒格式化（>=1s 显示秒，保留两位） */
+function fmtMs(v: number | null | undefined): string {
+  if (v === null || v === undefined) return '—'
+  return v >= 1000 ? `${(v / 1000).toFixed(2)}s` : `${v} ms`
+}
+
+/** 时序拆解文案（悬停提示：合并等待 / 排队 / AI / 端到端） */
+function timingBreakdown(log: AnalysisLogItem): string {
+  return [
+    `合并等待 ${fmtMs(log.agg_wait_ms)}`,
+    `排队 ${fmtMs(log.queue_wait_ms)}`,
+    `AI ${fmtMs(log.latency_ms)}`,
+    `端到端 ${fmtMs(log.e2e_ms)}`,
+  ].join('　·　')
+}
+
 /** AI 结果摘要（ok 显示命中/类型/置信度，skipped/error 显示原因） */
 function summarizeResult(log: AnalysisLogItem): string {
   if (log.status === 'ok' || log.status === 'below_threshold') {
@@ -267,7 +283,7 @@ export default function AnalysisLogs() {
                 <TableCell align="right">消息条数</TableCell>
                 <TableCell>消息内容</TableCell>
                 <TableCell>AI 结果摘要</TableCell>
-                <TableCell align="right">AI 耗时</TableCell>
+                <TableCell align="right">耗时（AI / 端到端）</TableCell>
                 <TableCell align="right">操作</TableCell>
               </TableRow>
             </TableHead>
@@ -379,7 +395,8 @@ function LogRow(props: {
       </TableCell>
       <TableCell align="right">{log.msg_count}</TableCell>
       <TableCell sx={{ maxWidth: 300, minWidth: 160 }}>
-        <Tooltip title={log.input_text} placement="top" arrow>
+        {/* 悬浮展示「显示名版」内容：群消息不再出现 wxid 前缀（反馈 7） */}
+        <Tooltip title={log.input_text_display || log.input_text} placement="top" arrow>
           <Typography
             variant="body2"
             sx={{
@@ -403,7 +420,19 @@ function LogRow(props: {
         </Typography>
       </TableCell>
       <TableCell align="right">
-        {log.latency_ms !== null ? `${log.latency_ms} ms` : '—'}
+        {log.latency_ms !== null ? (
+          <Tooltip title={timingBreakdown(log)} arrow placement="top">
+            <Box sx={{ display: 'inline-block', cursor: 'help' }}>
+              <Typography variant="body2">{fmtMs(log.latency_ms)}</Typography>
+              {log.e2e_ms !== null && log.e2e_ms !== undefined && (
+                <Typography variant="caption" color="text.secondary"
+                  sx={{ display: 'block' }}>
+                  端到端 {fmtMs(log.e2e_ms)}
+                </Typography>
+              )}
+            </Box>
+          </Tooltip>
+        ) : '—'}
       </TableCell>
       <TableCell align="right">
         {correctable && (

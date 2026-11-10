@@ -149,9 +149,15 @@ export function useEvents(): boolean {
             break
           }
           case 'opportunity_update':
-          case 'unread_cleared':
             void queryClient.invalidateQueries({ queryKey: ['opportunities'] })
             void queryClient.invalidateQueries({ queryKey: ['opportunity'] })
+            break
+          case 'unread_cleared':
+            // 已读即时生效（反馈 3）：列表 + 未读角标一起刷新，
+            // 不再等 /api/status 的 5 秒轮询
+            void queryClient.invalidateQueries({ queryKey: ['opportunities'] })
+            void queryClient.invalidateQueries({ queryKey: ['opportunity'] })
+            void queryClient.invalidateQueries({ queryKey: ['status'] })
             break
           case 'status_change':
             void queryClient.invalidateQueries({ queryKey: ['status'] })

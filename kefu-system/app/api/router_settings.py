@@ -68,6 +68,8 @@ def get_ai_settings(db: Database = Depends(get_db)) -> AISettingsOut:
         model=db.get_setting(KEY_AI_MODEL, ""),
         timeout_sec=db.get_int(KEY_AI_TIMEOUT_SEC, 60),
         temperature=db.get_float(KEY_AI_TEMPERATURE, 0.2),
+        disable_thinking=db.get_setting("ai.disable_thinking", "1") != "0",
+        enabled=db.get_setting("ai.enabled", "1") != "0",
     )
 
 
@@ -83,6 +85,9 @@ def update_ai_settings(body: AISettingsUpdate,
     db.set_setting(KEY_AI_MODEL, body.model.strip())
     db.set_setting(KEY_AI_TIMEOUT_SEC, str(body.timeout_sec))
     db.set_setting(KEY_AI_TEMPERATURE, str(body.temperature))
+    db.set_setting("ai.disable_thinking", "1" if body.disable_thinking else "0")
+    # 是否使用 AI 接口：关闭后管线改用「轻量筛选」规则判定商机（不再调 AI）
+    db.set_setting("ai.enabled", "1" if body.enabled else "0")
     if body.api_key.strip():
         # 仅非空/长度校验；测试连接失败不阻塞保存（用户可能离线配置）
         key = body.api_key.strip()
@@ -113,6 +118,7 @@ def test_ai_connection(db: Database = Depends(get_db)) -> AITestResult:
         model=model,
         timeout_sec=db.get_int(KEY_AI_TIMEOUT_SEC, 60),
         temperature=db.get_float(KEY_AI_TEMPERATURE, 0.2),
+        disable_thinking=db.get_setting("ai.disable_thinking", "1") != "0",
     )
     ok, message, latency_ms = client.test_connection()
     return AITestResult(ok=ok, message=message, latency_ms=latency_ms,

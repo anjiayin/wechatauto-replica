@@ -39,6 +39,16 @@ class AnalysisHealth(BaseModel):
     consecutive_failures: int = 0      # 连续失败次数（成功后归零）
 
 
+class CacheShardStatus(BaseModel):
+    """单个消息分片的解密缓存健康度（可选，仅内部排查/运营可见）。"""
+    rel: str = ""                        # 分片相对路径
+    stale_seconds: Optional[float] = None  # 距上次成功更新秒数（None = 从未成功）
+    last_ok_at: str = ""                 # 最近一次成功更新时刻（ISO8601）
+    last_error: str = ""                 # 最近一次失败原因（空 = 无失败）
+    fail_streak: int = 0                 # 连续失败次数
+    rebuilding: bool = False             # 当前是否正在后台重建
+
+
 class StatusOut(BaseModel):
     listener_running: bool = False
     monitored_count: int = 0
@@ -48,10 +58,16 @@ class StatusOut(BaseModel):
     monitor_quota: MonitorQuota = Field(default_factory=MonitorQuota)
     analysis_health: AnalysisHealth = Field(default_factory=AnalysisHealth)
     ai_configured: bool = False
+    # 是否启用 AI 接口（False = 轻量筛选模式，商机由关键词/正则规则产生）
+    ai_enabled: bool = True
     watermark_saved_at: str = ""
     degraded_reason: str = ""          # 微信接入降级原因（空 = 正常）
     unread_count: int = 0
     today_cost: float = 0.0            # 今日 AI 估算费用（元，反馈 13）
+    # 解密缓存健康度（新增追加字段，默认空列表，不影响既有前端契约）
+    cache: List[CacheShardStatus] = Field(default_factory=list)
+
+
 
 
 class SessionItemOut(BaseModel):
@@ -126,6 +142,9 @@ class AISettingsOut(BaseModel):
     model: str = ""
     timeout_sec: int = 60
     temperature: float = 0.2
+    disable_thinking: bool = True      # 关闭思考模式（显著降低响应延迟）
+    # 是否使用 AI 接口；False 时不调用 AI，改用「轻量筛选」关键词/正则判定商机
+    enabled: bool = True
 
 
 class AISettingsUpdate(BaseModel):
@@ -134,6 +153,8 @@ class AISettingsUpdate(BaseModel):
     model: str = ""
     timeout_sec: int = Field(default=60, ge=5, le=600)
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
+    disable_thinking: bool = True      # 关闭思考模式（默认开启）
+    enabled: bool = True               # 是否使用 AI 接口（关闭=轻量筛选模式）
     confirm_compliance: bool = False   # 首次保存需勾选合规知情确认
 
 
@@ -240,6 +261,8 @@ class OpportunityListItem(BaseModel):
     direction: str = ""                # 买/卖货方向（反馈 4）：buy/sell/''=不明
     status: str = "pending"
     created_at: str = ""
+    # 未读标识（内存态：新商机进入即未读，打开详情或点击行内「未读」后清除）
+    unread: bool = False
 
 
 class OpportunityListOut(BaseModel):
@@ -252,6 +275,8 @@ class OpportunityDetailOut(OpportunityListItem):
     window_start: str = ""
     merged_count: int = 1
     raw_text: str = ""
+    # 原文展示版：群消息每行发送者 ID 已替换为显示名（前端展示用）
+    raw_text_display: str = ""
     key_quote: str = ""
     reply_content: Optional[str] = None
     replied_at: Optional[str] = None
@@ -300,7 +325,10 @@ class AnalysisLogOut(BaseModel):
     status: str = ""                   # ok / error / skipped / below_threshold
     error: str = ""                    # skipped/error 原因
     model: str = ""
-    latency_ms: Optional[int] = None
+    latency_ms: Optional[int] = None   # AI 接口调用本身耗时
+    agg_wait_ms: Optional[int] = None   # 收到消息 → 合并窗口 flush
+    queue_wait_ms: Optional[int] = None  # 入队 → worker 取出
+    e2e_ms: Optional[int] = None        # 收到消息 → 分析完成（端到端）
 
 
 class AnalysisLogListOut(BaseModel):

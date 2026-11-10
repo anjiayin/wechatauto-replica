@@ -212,11 +212,15 @@ def wait_until(predicate, timeout: float = 3.0) -> bool:
 LIST_ITEM_KEYS = {"id", "session_username", "session_name", "sender_wxid",
                   "sender_name", "window_end", "type_id", "type_name",
                   "summary", "key_quote", "confidence", "direction",
-                  "status", "created_at"}
+                  "status", "created_at",
+                  # 反馈 9：行内「未读」标识（内存态，默认 False）
+                  "unread"}
 # 契约变更（体验优化 4）：详情与上下文拆分 —— 详情接口不再返回 context 字段，
 # 上下文由独立接口 GET /api/opportunities/{id}/context 提供（items + error）
 DETAIL_EXTRA_KEYS = {"window_start", "merged_count", "raw_text", "key_quote",
-                     "reply_content", "replied_at"}
+                     "reply_content", "replied_at",
+                     # 反馈 6：群消息原文的发送者显示名版（不再显示 wxid）
+                     "raw_text_display"}
 
 
 # ---------------------------------------------------------------------------
@@ -510,10 +514,11 @@ class FakeAIClient:
 
     def __init__(self, base_url: str, api_key: str, model: str,
                  timeout_sec: int = 60, temperature: float = 0.2,
-                 client=None) -> None:
+                 client=None, disable_thinking: bool = True) -> None:
         FakeAIClient.last_kwargs = {
             "base_url": base_url, "api_key": api_key, "model": model,
             "timeout_sec": timeout_sec, "temperature": temperature,
+            "disable_thinking": disable_thinking,
         }
 
     def test_connection(self):
@@ -967,7 +972,8 @@ class TestAnalysisLogsContract:
                                  "session_display", "sender_wxid",
                                  "msg_count", "input_text",
                                  "input_text_display", "result", "status",
-                                 "error", "model", "latency_ms"}
+                                 "error", "model", "latency_ms",
+                                 "agg_wait_ms", "queue_wait_ms", "e2e_ms"}
 
     def test_list_filters(self, env):
         self._insert_logs(env.db)

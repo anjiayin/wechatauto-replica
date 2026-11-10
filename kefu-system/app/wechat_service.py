@@ -627,6 +627,40 @@ class WeChatService:
                            MSG_QUERY_RETRY_INTERVAL_SEC)
             time.sleep(MSG_QUERY_RETRY_INTERVAL_SEC)
 
+    def _resolve_row_sender(self, username: str, content: str,
+                            fallback_wxid: str,
+                            sender_id: int = 0) -> tuple[str, str]:
+        """历史消息的 (发送人显示名, 剥离前缀后的正文)。
+
+        群聊与实时监听同一权威口径：正文首部「发送者ID:\\n」前缀优先
+        （SenderName2Id 映射不可靠，反馈 6 群昵称错乱）。只有前缀能对上
+        群成员（wxid 或群显示名）时才剥离，避免误伤「9:30 开会」这类正文；
+        私聊发送人即会话对方，sender_id=2 为自己。
+        """
+        text = str(content or "")
+        if not username.endswith("@chatroom"):
+            if sender_id in (2, "2"):
+                return "我", text
+            name = self.get_display_name(fallback_wxid) if fallback_wxid else "我"
+            return name or "我", text
+        names = self._get_group_member_names(username)
+        candidate = self.extract_content_sender(text)
+        reverse = self._group_member_reverse_names(username) if candidate else {}
+        resolved = ""
+        if candidate:
+            if candidate in names:
+                resolved = candidate
+            elif candidate in reverse:
+                resolved = reverse[candidate]
+        if resolved:
+            display = self.resolve_group_member_display(username, resolved)
+            clean = _SENDER_ID_STRICT_RE.sub("", text, count=1).lstrip("\n")
+            return display or resolved, clean
+        if fallback_wxid:
+            display = self.resolve_group_member_display(username, fallback_wxid)
+            return display or fallback_wxid, text
+        return (candidate or "未知用户"), text
+
     def _fetch_messages_once(self, username: str, limit: int,
                              before_seq: int) -> tuple[list[dict], bool]:
         """单次消息查询；返回 (msgs, failed)，异常不外抛。"""
@@ -642,17 +676,19 @@ class WeChatService:
                 continue
             sender_wxid = str(m.get("sender_username") or "")
             mtype = str(m.get("type") or "")
+            sender_id = int(m.get("sender_id") or 0)
+            # 发送人权威解析 + 剥掉正文里的「发送者ID:」前缀（反馈 6/11）
+            sender_name, clean_content = self._resolve_row_sender(
+                username, str(m.get("content") or ""), sender_wxid, sender_id)
             out.append({
                 "local_id": int(m.get("local_id") or 0),
                 "type": mtype,
                 "type_name": mtype,
-                "sender_id": int(m.get("sender_id") or 0),
-                "sender_name": (self.get_display_name(sender_wxid)
-                                if sender_wxid else "我"),
+                "sender_id": sender_id,
+                "sender_name": sender_name,
                 "create_time": epoch_to_iso(m.get("create_time")),
                 # 展示层友好化：链接/小程序/图片等 XML 转人可读短文本（反馈 3）
-                "content": content_format.format_content(
-                    mtype, str(m.get("content") or "")),
+                "content": content_format.format_content(mtype, clean_content),
                 "sort_seq": int(m.get("sort_seq") or 0),
             })
             if len(out) >= limit:
@@ -758,6 +794,41 @@ class WeChatService:
     def watermark_saved_at(self) -> str:
         """最近 watermark 刷回时间。"""
         return self._db.get_setting(KEY_RUNTIME_WM_SAVED_AT, "")
+
+    def cache_status(self) -> list:
+        """各消息分片解密缓存的健康度（只读，供 /api/status 展示）。
+
+        数据来自 wechatauto.db.WeChatDB.cache_status()：源库持续写入但缓存
+        长期未能成功更新时，轮询读陈旧缓存会恒返回空且没有任何信号——这里
+        把 stale_seconds / last_error 暴露到状态接口，供前端与运维发现
+        "消息停摆"类故障（对应线上 3 小时无新商机的排查缺口）。
+        任何异常都降级为空列表，绝不影响 /api/status 本身。
+        """
+        wxdb = self._wxdb
+        if wxdb is None:
+            return []
+        getter = getattr(wxdb, "cache_status", None)
+        if not callable(getter):
+            return []
+        try:
+            items = getter() or []
+        except Exception:  # 防御：状态读取失败不影响主接口
+            logger.exception("读取解密缓存健康度失败（按空列表处理）")
+            return []
+        result = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            stale = item.get("stale_seconds")
+            result.append({
+                "rel": str(item.get("rel") or ""),
+                "stale_seconds": (None if stale is None else float(stale)),
+                "last_ok_at": str(item.get("last_ok_at") or ""),
+                "last_error": str(item.get("last_error") or ""),
+                "fail_streak": int(item.get("fail_streak") or 0),
+                "rebuilding": bool(item.get("rebuilding")),
+            })
+        return result
 
     def probe_wechat_window(self) -> bool:
         """探测微信主窗口是否存在（ctypes FindWindow，轻量、不创建 GUI 实例）。"""

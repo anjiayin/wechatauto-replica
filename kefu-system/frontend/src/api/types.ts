@@ -45,11 +45,26 @@ export interface StatusOut {
   monitor_quota: MonitorQuota
   analysis_health: AnalysisHealth
   ai_configured: boolean
+  /** 是否启用 AI 接口（false = 轻量筛选模式，商机由关键词/正则产生） */
+  ai_enabled: boolean
   watermark_saved_at: string
   degraded_reason: string
   unread_count: number
   /** 今日 AI 估算费用（元，反馈 13） */
   today_cost: number
+  /** 各消息分片解密缓存健康度（可选，仅排查"消息停摆"类故障用） */
+  cache?: CacheShardStatus[]
+}
+
+/** 消息分片解密缓存健康度（/api/status.cache） */
+export interface CacheShardStatus {
+  rel: string
+  /** 距上次成功更新秒数；null = 从未成功 */
+  stale_seconds: number | null
+  last_ok_at: string
+  last_error: string
+  fail_streak: number
+  rebuilding: boolean
 }
 
 /** /api/sessions/search */
@@ -96,6 +111,10 @@ export interface AISettings {
   model: string
   timeout_sec: number
   temperature: number
+  /** 关闭思考模式（思考型模型默认会花大量隐藏 token，响应慢且波动大） */
+  disable_thinking: boolean
+  /** 是否使用 AI 接口（关闭后改用「轻量筛选」关键词/正则判定商机） */
+  enabled: boolean
 }
 
 export interface AISettingsPayload {
@@ -104,6 +123,8 @@ export interface AISettingsPayload {
   model: string
   timeout_sec: number
   temperature: number
+  disable_thinking: boolean
+  enabled: boolean
   confirm_compliance: boolean
 }
 
@@ -149,6 +170,8 @@ export interface OpportunityListItem {
   direction: '' | 'buy' | 'sell'
   status: 'pending' | 'replied' | 'ignored' | 'handled'
   created_at: string
+  /** 未读标识（内存态；打开详情或点击行内「未读」后清除） */
+  unread: boolean
 }
 
 export interface OpportunityListOut {
@@ -160,6 +183,8 @@ export interface OpportunityDetail extends OpportunityListItem {
   window_start: string
   merged_count: number
   raw_text: string
+  /** 原文展示版：群消息每行发送者 ID 已替换为群昵称（反馈 6） */
+  raw_text_display: string
   key_quote: string
   reply_content: string | null
   replied_at: string | null
@@ -188,7 +213,14 @@ export interface AnalysisLogItem {
   status: 'ok' | 'error' | 'skipped' | 'below_threshold'
   error: string
   model: string
+  /** AI 接口调用本身耗时 */
   latency_ms: number | null
+  /** 收到消息 → 合并窗口 flush 的等待 */
+  agg_wait_ms: number | null
+  /** 入队 → worker 取出（排队） */
+  queue_wait_ms: number | null
+  /** 收到消息 → 分析完成（端到端） */
+  e2e_ms: number | null
 }
 
 /** /api/analysis-logs 分页响应 */

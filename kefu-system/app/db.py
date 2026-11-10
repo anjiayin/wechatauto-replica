@@ -21,6 +21,7 @@ from app.config import (
     MONITOR_MAX_TARGETS_MAX,
     KEY_AI_BASE_URL,
     KEY_AI_MODEL,
+    KEY_AI_ENABLED,
     KEY_ANALYSIS_MERGE_WINDOW,
     KEY_ANALYSIS_OPP_MERGE_WINDOW,
     KEY_ANALYSIS_CORRECTION_EXAMPLES,
@@ -35,6 +36,7 @@ from app.config import (
     KEY_MONITOR_MAX_TARGETS,
     KEY_NOTIFY_SOUND,
     KEY_RUNTIME_MW_MIGRATED,
+    KEY_RUNTIME_LOCALTIME_MIGRATED,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,7 +83,7 @@ _OPPORTUNITIES_COLUMNS = """
                        CHECK (status IN ('pending','replied','ignored','handled')),
       reply_content    TEXT,
       replied_at       TEXT,
-      created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+      created_at       TEXT NOT NULL DEFAULT (datetime('now','localtime'))
     """
 
 DDL_STATEMENTS: tuple[str, ...] = (
@@ -130,7 +132,12 @@ DDL_STATEMENTS: tuple[str, ...] = (
       model            TEXT,
       latency_ms       INTEGER,
       opportunity_id   INTEGER REFERENCES opportunities(id),
-      created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+      created_at       TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+      prompt_tokens    INTEGER,
+      completion_tokens INTEGER,
+      agg_wait_ms      INTEGER,
+      queue_wait_ms    INTEGER,
+      e2e_ms           INTEGER
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_logs_created ON analysis_logs (created_at DESC)",
@@ -171,7 +178,38 @@ class Database:
         self._migrate_merge_window_default()
         self._migrate_opportunity_status_handled()
         self._migrate_add_columns()
+        self._migrate_created_at_localtime()
         logger.info("业务数据库已初始化：%s", self.path)
+
+    def _migrate_created_at_localtime(self) -> None:
+        """一次性把历史 created_at 从 UTC 平移到本地时间。
+
+        背景：旧版本 DDL 默认值为 ``datetime('now')``（UTC），前端直接展示
+        导致列表时间比实际早 8 小时（用户反馈 5）。新写入改为本地时间；
+        老数据按当前时区偏移整体平移一次，用设置键打标记防重复执行。
+        """
+        if self.get_setting(KEY_RUNTIME_LOCALTIME_MIGRATED, "0") == "1":
+            return
+        with self._lock:
+            try:
+                offset_hours = int(round(self._conn.execute(
+                    "SELECT (julianday('now','localtime') - julianday('now')) * 24"
+                ).fetchone()[0] or 0))
+            except Exception:  # pragma: no cover - 极端环境
+                logger.exception("计算本地时区偏移失败，跳过时间平移")
+                return
+            if offset_hours:
+                modifier = f"{offset_hours:+d} hours"
+                for table in ("opportunities", "analysis_logs"):
+                    try:
+                        self._conn.execute(
+                            f"UPDATE {table} SET created_at = "
+                            "datetime(created_at, ?)", (modifier,))
+                    except Exception:  # pragma: no cover - 表缺失等
+                        logger.exception("平移 %s.created_at 失败（已跳过）", table)
+            self._conn.commit()
+        self.set_setting(KEY_RUNTIME_LOCALTIME_MIGRATED, "1")
+        logger.info("历史时间已从 UTC 平移为本地时间（%+d 小时）", offset_hours)
 
     def _migrate_add_columns(self) -> None:
         """幂等加列迁移（反馈 4/13）：老库补 direction 与 token 用量列。
@@ -183,6 +221,10 @@ class Database:
             ("opportunities", "direction", "TEXT NOT NULL DEFAULT ''"),
             ("analysis_logs", "prompt_tokens", "INTEGER"),
             ("analysis_logs", "completion_tokens", "INTEGER"),
+            # 时序诊断（收消息→合并→排队→AI）：定位「延迟到底花在哪一段」
+            ("analysis_logs", "agg_wait_ms", "INTEGER"),
+            ("analysis_logs", "queue_wait_ms", "INTEGER"),
+            ("analysis_logs", "e2e_ms", "INTEGER"),
         )
         with self._lock:
             for table, column, col_type in plans:
@@ -515,8 +557,9 @@ class Database:
                 "INSERT INTO opportunities (session_username, session_name, "
                 "sender_wxid, sender_name, window_start, window_end, merged_count, "
                 "raw_text, type_id, type_name, summary, key_quote, confidence, "
-                "direction) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "direction, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "datetime('now','localtime'))",
                 (session_username, session_name, sender_wxid, sender_name,
                  window_start, window_end, merged_count, raw_text, type_id,
                  type_name, summary, key_quote, confidence,
@@ -686,21 +729,33 @@ class Database:
                             latency_ms: Optional[int] = None,
                             opportunity_id: Optional[int] = None,
                             prompt_tokens: Optional[int] = None,
-                            completion_tokens: Optional[int] = None) -> int:
+                            completion_tokens: Optional[int] = None,
+                            agg_wait_ms: Optional[int] = None,
+                            queue_wait_ms: Optional[int] = None,
+                            e2e_ms: Optional[int] = None) -> int:
         """写入一条分析日志（ok/error/skipped/below_threshold）。
 
         prompt_tokens/completion_tokens：AI 调用 token 用量（反馈 13
         账单估算数据源）；skipped 等未调用 AI 的场景为 None。
+
+        时序三段（诊断 AI 慢在哪）：
+        - agg_wait_ms：收到消息 → 合并窗口 flush（第一级窗口等待）；
+        - queue_wait_ms：入队 → worker 取出（排队等空闲 worker）；
+        - e2e_ms：收到消息 → 本条日志落库（端到端）。
+        ``latency_ms`` 仍只表示 AI 接口调用本身的耗时。
         """
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO analysis_logs (session_username, sender_wxid, "
                 "msg_count, input_text, result, status, error, model, "
-                "latency_ms, opportunity_id, prompt_tokens, completion_tokens) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "latency_ms, opportunity_id, prompt_tokens, completion_tokens, "
+                "agg_wait_ms, queue_wait_ms, e2e_ms, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "datetime('now','localtime'))",
                 (session_username, sender_wxid, msg_count, input_text, result,
                  status, error, model, latency_ms, opportunity_id,
-                 prompt_tokens, completion_tokens),
+                 prompt_tokens, completion_tokens,
+                 agg_wait_ms, queue_wait_ms, e2e_ms),
             )
             self._conn.commit()
             return int(cur.lastrowid or 0)
@@ -737,7 +792,8 @@ class Database:
             rows = self._conn.execute(
                 "SELECT id, created_at, session_username, sender_wxid, "
                 "msg_count, input_text, result, status, error, model, "
-                "latency_ms FROM analysis_logs"
+                "latency_ms, agg_wait_ms, queue_wait_ms, e2e_ms "
+                "FROM analysis_logs"
                 f"{where_sql} ORDER BY id DESC LIMIT ? OFFSET ?",
                 [*params, page_size, (max(page, 1) - 1) * page_size],
             ).fetchall()
@@ -849,13 +905,21 @@ class Database:
 # 便捷设置读取（管线与 API 共用）
 # ---------------------------------------------------------------------------
 def read_ai_settings(db: Database) -> dict[str, str]:
-    """读取 AI 接口配置（api_key_enc 保持密文，由调用方解密）。"""
+    """读取 AI 接口配置（api_key_enc 保持密文，由调用方解密）。
+
+    disable_thinking：是否关闭模型思考模式（默认 "1"）。思考型模型默认会
+    把隐藏推理 token 计入 completion，单条判定从 3 秒级放大到 30~60 秒。
+    enabled：是否使用 AI 接口（默认 "1"）。为 "0" 时管线不调用 AI，
+    改用「轻量筛选」（预筛关键词 / 正则）直接判定商机。
+    """
     return {
         "base_url": db.get_setting(KEY_AI_BASE_URL),
         "api_key_enc": db.get_setting("ai.api_key_enc"),
         "model": db.get_setting(KEY_AI_MODEL),
         "timeout_sec": db.get_setting(KEY_AI_TIMEOUT_SEC, "60"),
         "temperature": db.get_setting(KEY_AI_TEMPERATURE, "0.2"),
+        "disable_thinking": db.get_setting("ai.disable_thinking", "1"),
+        "enabled": db.get_setting(KEY_AI_ENABLED, "1"),
     }
 
 

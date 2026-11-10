@@ -29,6 +29,7 @@ from app.schemas import (
     AnalysisHealth,
     BillingDayOut,
     BillingOut,
+    CacheShardStatus,
     MessageOut,
     MonitorQuota,
     PurgeRequest,
@@ -106,13 +107,33 @@ def get_status(db: Database = Depends(get_db),
             consecutive_failures=int(health.get("consecutive_failures") or 0),
         ),
         ai_configured=ai_configured,
+        ai_enabled=db.get_setting("ai.enabled", "1") != "0",
         watermark_saved_at=svc.watermark_saved_at,
         degraded_reason=svc.degraded_reason,
         unread_count=notifier.unread_count,
         today_cost=round(_usage_cost(
             db.usage_by_date(datetime.now().strftime("%Y-%m-%d")),
             _billing_settings(db)), 4),
+        cache=_cache_status(svc),
     )
+
+
+def _cache_status(svc: WeChatService) -> List[CacheShardStatus]:
+    """读取解密缓存健康度（只读；异常降级为空列表，不影响状态接口）。"""
+    try:
+        items = svc.cache_status()
+    except Exception:  # 防御：缓存健康度不可用不应让 /api/status 失败
+        logger.exception("读取解密缓存健康度失败（按空列表处理）")
+        return []
+    result: List[CacheShardStatus] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            result.append(CacheShardStatus(**item))
+        except Exception:  # 单分片字段异常不影响其他分片
+            logger.exception("解密缓存健康度字段异常：%s", item)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +191,7 @@ def get_message_image(username: str, local_id: int,
 # ---------------------------------------------------------------------------
 @router.get("/api/system/retention", response_model=RetentionOut)
 def get_retention(db: Database = Depends(get_db)) -> RetentionOut:
-    """读取两表保留时长配置（天）。"""
+    """读取两表保留天数（仅手动清理时作为 keep_days 默认值，不再自动执行）。"""
     return RetentionOut(
         logs_days=db.get_int("retention.logs_days", 90),
         opportunities_days=db.get_int("retention.opportunities_days", 365),
@@ -180,7 +201,7 @@ def get_retention(db: Database = Depends(get_db)) -> RetentionOut:
 @router.put("/api/system/retention", response_model=RetentionOut)
 def update_retention(body: RetentionUpdate,
                      db: Database = Depends(get_db)) -> RetentionOut:
-    """更新保留时长配置（None = 不变更）。"""
+    """更新保留天数（None = 不变更）。系统不做定时清理，仅手动触发。"""
     if body.logs_days is not None:
         db.set_setting("retention.logs_days", str(int(body.logs_days)))
     if body.opportunities_days is not None:
@@ -192,7 +213,7 @@ def update_retention(body: RetentionUpdate,
 @router.post("/api/system/purge", response_model=PurgeResult)
 def purge_history(body: PurgeRequest,
                   db: Database = Depends(get_db)) -> PurgeResult:
-    """立即清理指定表中超过保留时长的历史数据。"""
+    """手动清理指定表中超过保留时长的历史数据（唯一的清理入口）。"""
     try:
         deleted = db.delete_older_than(body.table, body.keep_days)
     except ValueError as exc:

@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import glob
 import hashlib
@@ -33,6 +34,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from ctypes import wintypes
 from typing import Dict, List, Optional, Tuple
 
@@ -44,6 +46,31 @@ STAMP_VERSION = 2  # 解密缓存 stamp 格式版本，改合并逻辑时递增�
 # 后台重建节流：同一分片距上次重建完成不足该间隔时直接沿用旧缓存，
 # 避免微信活跃期无限重建（新消息最迟在下一次重建后可见）
 REBUILD_MIN_INTERVAL_SEC = 8.0
+# 后台重建的全局并发上限。10 个消息分片同时重建会互相抢 I/O，
+# 每个分片的重建都因此被拖慢十几倍（线上实测 50 页的 contact.db 也需 106s），
+# 拿不到配额的分片本轮直接跳过、下轮再试，不阻塞轮询线程。
+MAX_CONCURRENT_REBUILDS = 2
+# 单次后台重建的最大尝试次数。注意：确定性错误（如 key 类型错、磁盘写满）
+# 也会重试满 3 次，靠 REBUILD_MIN_INTERVAL_SEC（8s）的失败退避兜住成本；
+# 若将来把退避调小，需同步评估这里，否则会变成每轮白烧 3 次。
+BG_REBUILD_ATTEMPTS = 3
+# 源库仍在写入时的快速重试间隔：快照注定过期，没必要按撕裂退避等待
+FAST_RETRY_INTERVAL_SEC = 0.2
+# 缓存陈旧告警：源库有变化但缓存超过该秒数未成功 promote 时告警，
+# 同一分片最多每 CACHE_STALE_WARN_INTERVAL_SEC 秒告警一次
+CACHE_STALE_WARN_SEC = 120.0
+CACHE_STALE_WARN_INTERVAL_SEC = 60.0
+# last_error 会进 cache_status() → /api/status，必须限长（traceback 可达数 KB）
+MAX_CACHE_ERROR_LEN = 800
+# 临时缓存晋升为正式缓存的重试：Windows 上只要本进程还有只读连接持有
+# 目标文件，os.replace 就会 PermissionError。轮询每轮都会短暂打开缓存，
+# 因此把窗口放细（60×0.2s=12s），比原来的 20×0.5s 更容易挑到空档。
+PROMOTE_ATTEMPTS = 60
+PROMOTE_RETRY_INTERVAL_SEC = 0.2
+# 全局重建配额（进程内共享，跨分片生效）
+_REBUILD_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_REBUILDS)
+# 惰性状态初始化锁（兼容 __new__ 构造的实例）
+_CACHE_STATE_LOCK = threading.Lock()
 CONFIG_CIPHER_NAME = b"com.Tencent.WCDB.Config.Cipher"
 CONFIG_XOR_MASK = bytes.fromhex(
     "d2c7442458020000004889442450488b"
@@ -123,6 +150,44 @@ _k32.ReadProcessMemory.argtypes = [
 
 def _md5_hex(data: bytes) -> str:
     return hashlib.md5(data).hexdigest()
+
+
+def _ts_eq(a, b) -> bool:
+    """比较两个文件时间戳是否"同一个"。
+
+    不能直接用 ``==``：stamp 历史上用 ``%f`` 写 mtime（只保留 6 位小数），
+    而 ``os.path.getmtime`` 返回的 float 有更多有效位，例如源库
+    ``1794190031.4439065`` 写成 ``1794190031.443907``，读回与原值不再
+    相等。结果 ``_open`` 每轮都判定"源库已变化"，对每个分片无限触发
+    "增量 0 页"重建（9 个分片每 6 秒一轮，白烧 CPU/磁盘并挤占重建配额）。
+
+    容差 1e-6 秒：大于 ``%f`` 的最大舍入误差（5e-7），远小于任何真实的
+    文件修改间隔（NTFS 时间精度 100ns，实际写入间隔至少毫秒级）。
+    """
+    try:
+        return abs(float(a) - float(b)) <= 1e-6
+    except (TypeError, ValueError):
+        return False
+
+
+def _one_line(text, limit: int = 300) -> str:
+    """把多行错误（含 traceback）压成单行并截断。
+
+    错误串会同时进 stderr 与 ``cache_status()``（再进 ``/api/status``），
+    多行 traceback 直接塞进去会把日志刷屏、把响应撑大，因此统一压行截断。
+    """
+    if not text:
+        return ""
+    flat = " | ".join(line.strip() for line in str(text).splitlines()
+                      if line.strip())
+    if len(flat) <= limit:
+        return flat
+    # traceback 的关键信息在尾部（最深帧 + 异常原始消息），只截头会把最有用
+    # 的部分砍掉，导致 /api/status 里只剩 _bg_rebuild 入口帧、无法定位。
+    # 因此保留"首 + 尾"，中间省略。
+    tail = min(500, limit // 2)
+    head = max(0, limit - tail - 3)
+    return flat[:head] + "..." + flat[-tail:]
 
 
 # 微信内置系统/官方账号（不属于好友，get_contacts(kind="friend") 时排除）
@@ -497,6 +562,15 @@ class WeChatDB:
         self._rebuild_guard = threading.Lock()
         self._rebuild_locks: Dict[str, threading.Lock] = {}
         self._rebuild_done_at: Dict[str, float] = {}  # rel -> 上次重建完成时刻
+        # 缓存健康度（供 cache_status()/陈旧告警使用，全部为墙钟时间）
+        self._cache_ok_at: Dict[str, float] = {}        # rel -> 上次成功 promote
+        self._cache_first_seen: Dict[str, float] = {}   # rel -> 首次尝试重建
+        self._cache_last_error: Dict[str, str] = {}     # rel -> 最近一次失败原因
+        self._cache_fail_streak: Dict[str, int] = {}    # rel -> 连续失败次数
+        self._stale_warned_at: Dict[str, float] = {}    # rel -> 上次陈旧告警时刻
+        self._rebuild_skipped_at: Dict[str, float] = {}  # rel -> 上次因配额跳过
+        self._rebuild_sem = _REBUILD_SEMAPHORE
+        self._cache_state_ready = True
         self._load_or_extract_keys(master_key=master_key)
 
     # ------------------------------------------------------------------
@@ -970,8 +1044,12 @@ class WeChatDB:
         """写入解密缓存 stamp。"""
         os.makedirs(os.path.dirname(stamp), exist_ok=True)
         with open(stamp, "w") as f:
-            f.write("%d,%f,%d,%f,%d,%d"
-                    % (STAMP_VERSION, src_mtime, src_size, wal_mtime, wal_size, applied))
+            # 用 repr 写浮点保证可精确往返：%f 只有 6 位小数，会把
+            # 1794190031.4439065 写成 ...443907，读回与原值不等，
+            # 导致 _open 每轮都误判"源库已变化"而无限重建。
+            f.write("%d,%r,%d,%r,%d,%d"
+                    % (STAMP_VERSION, float(src_mtime), src_size,
+                       float(wal_mtime), wal_size, applied))
 
     @staticmethod
     def _connect_ro(dst: str) -> sqlite3.Connection:
@@ -1001,7 +1079,8 @@ class WeChatDB:
         stamp 不更新 → 下次打开自然再次触发重建）。
         源页哈希边车（.pages）随缓存一并替换，供下次增量重建使用。
         """
-        for _ in range(20):
+        last_err = ""
+        for _ in range(PROMOTE_ATTEMPTS):
             try:
                 os.replace(tmp, dst)
                 if os.path.exists(tmp + ".pages"):
@@ -1010,8 +1089,14 @@ class WeChatDB:
                     except OSError:
                         pass  # 边车替换失败：下次重建回退全量，不影响正确性
                 return True
-            except OSError:
-                time.sleep(0.5)
+            except OSError as exc:
+                last_err = "%s: %s" % (type(exc).__name__, exc)
+                time.sleep(PROMOTE_RETRY_INTERVAL_SEC)
+        # 失败时留下真实原因（如 PermissionError 表示缓存文件仍被只读连接
+        # 占用），否则日志只能写“被占用？”，无法定位是谁占着。
+        sys.stderr.write(
+            "[wechatauto] %s 晋升失败原因：%s（重试 %d 次仍未释放）\n"
+            % (os.path.basename(dst), last_err or "未知", PROMOTE_ATTEMPTS))
         for p in (tmp, tmp + ".pages"):
             try:
                 os.remove(p)
@@ -1027,6 +1112,165 @@ class WeChatDB:
                 lock = threading.Lock()
                 self._rebuild_locks[rel] = lock
             return lock
+
+    # ------------------------------------------------------------------
+    # 缓存健康度（失败可见 + 陈旧告警）
+    # ------------------------------------------------------------------
+    def _ensure_cache_state(self) -> None:
+        """惰性初始化缓存健康度字段。
+
+        兼容两种实例：正常 ``__init__`` 构造，以及测试里 ``__new__``
+        构造后只注入少量字段的实例（后者不应因缺字段而抛 AttributeError）。
+        """
+        if getattr(self, "_cache_state_ready", False):
+            return
+        with _CACHE_STATE_LOCK:
+            if getattr(self, "_cache_state_ready", False):
+                return
+            if not hasattr(self, "_cache_ok_at"):
+                self._cache_ok_at = {}
+            if not hasattr(self, "_cache_first_seen"):
+                self._cache_first_seen = {}
+            if not hasattr(self, "_cache_last_error"):
+                self._cache_last_error = {}
+            if not hasattr(self, "_cache_fail_streak"):
+                self._cache_fail_streak = {}
+            if not hasattr(self, "_stale_warned_at"):
+                self._stale_warned_at = {}
+            if not hasattr(self, "_rebuild_skipped_at"):
+                self._rebuild_skipped_at = {}
+            if not hasattr(self, "_rebuild_sem") or self._rebuild_sem is None:
+                self._rebuild_sem = _REBUILD_SEMAPHORE
+            self._cache_state_ready = True
+
+    def _record_cache_ok(self, rel: str) -> None:
+        """记录一次成功的缓存 promote（刷新陈旧计时、清零连续失败）。"""
+        self._ensure_cache_state()
+        now = time.time()
+        self._cache_ok_at[rel] = now
+        self._cache_fail_streak[rel] = 0
+        self._cache_last_error.pop(rel, None)
+
+    def _record_cache_error(self, rel: str, reason: str) -> None:
+        """记录一次缓存重建失败：连续失败次数 +1，保存最后一次原因。
+
+        原因串会进 ``cache_status()`` → ``/api/status``，因此在此统一压成
+        单行并截断到 ``MAX_CACHE_ERROR_LEN``（traceback 可达数 KB）。
+        """
+        self._ensure_cache_state()
+        self._cache_last_error[rel] = (
+            _one_line(reason, MAX_CACHE_ERROR_LEN) or "未知错误")
+        self._cache_fail_streak[rel] = int(self._cache_fail_streak.get(rel, 0)) + 1
+
+    def _maybe_warn_stale(self, rel: str) -> None:
+        """源库已变化但缓存长期未成功更新时告警（每分片最多每 60 秒一条）。
+
+        线上故障中重建连续失败却无任何日志，轮询读陈旧缓存恒返回空，
+        watermark 不推进也没有告警——这条 WARNING 是最外层的兜底信号。
+        """
+        self._ensure_cache_state()
+        now = time.time()
+        ok_at = self._cache_ok_at.get(rel)
+        if not ok_at:
+            # 进程刚启动尚无成功记录：从第一次尝试重建开始计时，
+            # 避免刚启动就误报陈旧
+            ok_at = self._cache_first_seen.setdefault(rel, now)
+        stale = now - ok_at
+        if stale < CACHE_STALE_WARN_SEC:
+            return
+        last_warn = self._stale_warned_at.get(rel, 0.0)
+        if now - last_warn < CACHE_STALE_WARN_INTERVAL_SEC:
+            return
+        self._stale_warned_at[rel] = now
+        sys.stderr.write(
+            "[wechatauto] WARNING %s 解密缓存已 %.0f 秒未成功更新（源库仍在变化），"
+            "轮询可能读不到新消息；连续失败 %d 次，最后错误: %s\n"
+            % (rel, stale, int(self._cache_fail_streak.get(rel, 0)),
+               _one_line(self._cache_last_error.get(rel), 200) or "无")
+        )
+
+    def cache_status(self) -> List[dict]:
+        """返回各分片解密缓存健康度（只读，供 /api/status 展示）。
+
+        字段：
+        - ``rel``            分片相对路径（如 ``message/message_8.db``）；
+        - ``stale_seconds``  距上次成功 promote 的秒数，从未成功为 None；
+        - ``last_ok_at``     最近一次成功 promote 的时刻（ISO8601，空 = 从未）；
+        - ``last_error``     最近一次失败原因（空 = 无失败）；
+        - ``fail_streak``    连续失败次数；
+        - ``rebuilding``     当前是否正在后台重建。
+        """
+        self._ensure_cache_state()
+        now = time.time()
+        with self._rebuild_guard:
+            rebuilding = set(self._rebuilding)
+        rels = set(self._cache_ok_at) | set(self._cache_last_error) \
+            | set(self._cache_first_seen) | rebuilding
+        items: List[dict] = []
+        for rel in sorted(rels):
+            ok_at = self._cache_ok_at.get(rel)
+            items.append({
+                "rel": rel,
+                "stale_seconds": (max(0.0, now - ok_at)
+                                  if ok_at else None),
+                "last_ok_at": (time.strftime("%Y-%m-%dT%H:%M:%S",
+                                             time.localtime(ok_at))
+                               if ok_at else ""),
+                "last_error": self._cache_last_error.get(rel, ""),
+                "fail_streak": int(self._cache_fail_streak.get(rel, 0)),
+                "rebuilding": rel in rebuilding,
+            })
+        return items
+
+    def _source_sig(self, src: str,
+                    wal_path: Optional[str]) -> Tuple[float, int, bytes, int]:
+        """采集源库一致性签名 ``(mtime, size, WAL salt, WAL 帧数)``。
+
+        仅 4 次轻量 stat/read（不读页内容），用于在每轮重建后快速判断
+        "源库是否仍在被写入"：一旦签名变化，本次快照必然过期，此时再做
+        ``quick_check`` 整库校验纯属浪费（线上实测单轮 130s，三次约 396s）。
+        """
+        try:
+            src_mtime = os.path.getmtime(src)
+            src_size = os.path.getsize(src)
+        except OSError:
+            src_mtime, src_size = 0.0, -1
+        salt = b""
+        frames = 0
+        if wal_path:
+            try:
+                wal_size = os.path.getsize(wal_path)
+                frames = max(0, (wal_size - self.WAL_HEADER_SZ)
+                             // self.WAL_FRAME_SZ)
+                with open(wal_path, "rb") as wal:
+                    header = wal.read(24)
+                if len(header) >= 24:
+                    salt = header[16:24]
+            except OSError:
+                salt, frames = b"", 0
+        return (src_mtime, src_size, salt, frames)
+
+    @contextlib.contextmanager
+    def _syncing_cache(self, rel: str):
+        """标记"同步重建中"，让 ``/api/status.cache[].rebuilding`` 也能看到。
+
+        同步路径（``_open`` 里旧缓存不可用时的阻塞重建）与后台重建同样
+        长时间占用 I/O，运维排查"消息停摆"时需要能区分"在重建"还是
+        "卡死/无变化"。这里复用 ``_rebuilding`` 集合（只在其内增删，
+        不新增任何锁获取），但仅在本方真正新增标记时才 discard，
+        避免与 ``_bg_rebuild`` 的标记互相踩踏。
+        """
+        self._ensure_cache_state()
+        with self._rebuild_guard:
+            owned = rel not in self._rebuilding
+            if owned:
+                self._rebuilding.add(rel)
+        try:
+            yield
+        finally:
+            if owned:
+                with self._rebuild_guard:
+                    self._rebuilding.discard(rel)
 
     def _open(self, rel: str) -> sqlite3.Connection:
         """打开解密(并合并 -wal 增量)后的只读库。
@@ -1059,10 +1303,15 @@ class WeChatDB:
         wal_size = os.path.getsize(wal_path) if wal_path else 0
         stamp = dst + ".stamp"
         old = self._read_stamp(stamp)
-        build = (not old or old["mtime"] != src_mtime or old["size"] != src_size
-                 or old["wal_mtime"] != wal_mtime or old["wal_size"] != wal_size)
+        build = (not old or not _ts_eq(old["mtime"], src_mtime)
+                 or old["size"] != src_size
+                 or not _ts_eq(old["wal_mtime"], wal_mtime)
+                 or old["wal_size"] != wal_size)
         if not build and not os.path.exists(dst):
             build = True  # stamp 残留但缓存文件丢失：强制重建
+        if build:
+            # 源库有变化却没能在阈值内更新缓存 → 打告警（每分片 60s 一条）
+            self._maybe_warn_stale(rel)
         if build and old and self._cache_readable(dst):
             # 全量重建耗时长：立即返回旧缓存（稍旧数据），后台原子重建
             self._kick_rebuild(rel, src, dst, key,
@@ -1070,20 +1319,38 @@ class WeChatDB:
             return self._connect_ro(dst)
         tmp = dst + ".rebuild"
         rel_lock = self._rel_lock(rel)
-        with rel_lock:
+        # 先拿分片锁再打"同步重建中"标记：标记只覆盖真正在重建的时间，
+        # 不把"排队等锁"的时间算进去
+        with rel_lock, self._syncing_cache(rel):
             attempt = 0
             while build:
                 attempt += 1
-                full = (not old or old["mtime"] != src_mtime or old["size"] != src_size
+                full = (not old or not _ts_eq(old["mtime"], src_mtime)
+                        or old["size"] != src_size
                         or wal_size < old["wal_size"] or wal_size == 0)
                 if full:
                     # 先构建到临时文件（页级增量优先）：校验通过才替换正式
                     # 缓存，失败不影响旧缓存
-                    page_hashes, _how = self._build_cache(src, tmp, dst, key)
-                    with open(tmp + ".pages", "wb") as hf:
-                        hf.write(page_hashes)
+                    stats: dict = {}
+                    try:
+                        page_hashes, _how = self._build_cache(src, tmp, dst, key,
+                                                              stats=stats)
+                        with open(tmp + ".pages", "wb") as hf:
+                            hf.write(page_hashes)
+                    except (OSError, sqlite3.Error) as exc:
+                        # 同步路径失败同样留痕（旧实现直接抛给上层，
+                        # 日志里只剩"分片不可用"，看不出是重建出了问题）
+                        self._record_cache_error(
+                            rel, "构建异常 %s: %s" % (type(exc).__name__, exc))
+                        sys.stderr.write(
+                            "[wechatauto] %s 同步重建失败（%s: %s），"
+                            "缓存保持旧版本并交给上层降级\n"
+                            % (rel, type(exc).__name__, exc)
+                        )
+                        raise
                     applied = 0
                 else:
+                    stats = {"full": False, "patched": -1}
                     applied = old["applied"] if old else 0
                 merged_pages = 0
                 if wal_path and wal_size > self.WAL_HEADER_SZ:
@@ -1091,22 +1358,35 @@ class WeChatDB:
                         tmp if full else dst, wal_path, key, applied)
                 else:
                     applied = 0
+                patched = int(stats.get("patched", -1))
                 # 轮询场景下 quick_check 整库校验(大分片秒级)是延迟大头，
-                # 在可证明安全时跳过：仅限增量路径——合并未写入任何页，
-                # 缓存与上次已验证状态完全一致。
+                # 在可证明安全时跳过：仅限增量路径——页级重建未改写任何页、
+                # WAL 合并也未写入任何页，缓存与上次已验证状态完全一致。
                 # 全量解密绝不跳过：微信 checkpoint 写库期间 mtime 可能不
                 # 更新，mtime 稳定不能证明源库页一致，实测会解出撕裂页
                 # （曾导致坏缓存被盖上有效戳，反复触发 40s+ 同步重建）。
-                skip_check = (attempt == 1 and merged_pages == 0 and not full)
-                if skip_check or self._check_merged(tmp if full else dst):
+                skip_check = (attempt == 1 and merged_pages == 0 and not full
+                              and patched == 0)
+                check_started = time.monotonic()
+                check_ok = True if skip_check else self._check_merged(
+                    tmp if full else dst)
+                if not skip_check and time.monotonic() - check_started > 5.0:
+                    # 慢校验留痕：便于判断重建耗时的真实构成
+                    sys.stderr.write(
+                        "[wechatauto] %s 整库校验耗时 %.1fs（第 %d 轮）\n"
+                        % (rel, time.monotonic() - check_started, attempt))
+                if check_ok:
                     build = False
                     if full and not self._promote_cache(tmp, dst):
                         old = None  # 替换失败（缓存被占用等）：重试
                         continue
                     self._write_stamp(stamp, src_mtime, src_size,
                                       wal_mtime, wal_size, applied)
+                    self._record_cache_ok(rel)
                 elif attempt >= 3:
                     # WAL 合并反复失败，尝试仅解密主库(不含 WAL 增量)作为兜底
+                    reason = "WAL 合并/整库校验连续 %d 轮失败" % attempt
+                    self._record_cache_error(rel, reason)
                     sys.stderr.write(
                         "[wechatauto] WAL 合并失败(%s)，尝试仅解密主库...\n" % rel
                     )
@@ -1117,11 +1397,14 @@ class WeChatDB:
                         applied = 0
                         build = False
                         self._write_stamp(stamp, src_mtime, src_size, 0, 0, 0)
+                        self._record_cache_ok(rel)
                     else:
                         # 源库正被微信写库、快照始终撕裂：不晋升未校验文件
                         # （旧实现会降级晋升坏缓存并盖上有效戳，导致后续反复
                         # 40s+ 同步重建）。直接返回临时文件的降级连接，
                         # 缓存保持待重建状态，下轮打开再次尝试。
+                        self._record_cache_error(
+                            rel, "主库解密后 quick_check 仍失败（快照撕裂）")
                         sys.stderr.write(
                             "[wechatauto] 主库解密校验失败，返回降级连接(部分数据可能缺失): %s\n"
                             % rel
@@ -1162,34 +1445,149 @@ class WeChatDB:
     def _bg_rebuild(self, rel: str, src: str, dst: str, key: bytes,
                     src_mtime: float, src_size: int,
                     wal_mtime: float, wal_size: int) -> None:
-        """后台线程：增量重建解密缓存并原子替换（详见 _open 的旧缓存策略）。"""
+        """后台线程：增量重建解密缓存并原子替换（详见 _open 的旧缓存策略）。
+
+        相对旧实现的修复（对应线上"14:39–17:52 三小时无新商机"故障）：
+        1. 三次尝试全部失败必须留痕（分片、耗时、原因、连续失败次数）；
+        2. 每轮结束快速比对源库签名，源库仍在写入时缩短重试间隔并跳过
+           昂贵的整库校验（生产环境实测 3×130s 全花在注定过期的快照上），
+           最后一次尝试仍强制校验，保证能推进出一个可用快照；
+        3. 全局 Semaphore 限制同时重建的分片数，拿不到配额本轮直接跳过，
+           不阻塞轮询线程（加锁顺序：先 semaphore 后 rel_lock，释放反序）。
+        """
+        self._ensure_cache_state()
+        if not self._rebuild_sem.acquire(blocking=False):
+            # 已有 MAX_CONCURRENT_REBUILDS 个分片在重建：本轮跳过，下轮再试。
+            # 必须清掉 _rebuilding 标记，否则该分片再也不会被重新调度。
+            now = time.time()
+            last_log = self._rebuild_skipped_at.get(rel, 0.0)
+            self._rebuild_skipped_at[rel] = now
+            with self._rebuild_guard:
+                self._rebuilding.discard(rel)
+            if now - last_log >= 60.0:
+                sys.stderr.write(
+                    "[wechatauto] %s 等待重建配额超时（当前已有 %d 个分片在重建），"
+                    "本轮跳过，下轮重试\n" % (rel, MAX_CONCURRENT_REBUILDS)
+                )
+            return
         tmp = dst + ".rebuild"
         started = time.monotonic()
         applied = 0
+        check_cost = 0.0
+        how = "未构建"
+        # 一轮重建只记一次失败（3 次尝试不该把 fail_streak 放大 3 倍）。
+        # 必须在 try 之前初始化：外层 except 覆盖 rel_lock 之外的异常时，
+        # 否则引用未定义变量会抛 UnboundLocalError。
+        recorded = False
         try:
             with self._rel_lock(rel):
-                how = ""
-                for _attempt in range(3):
+                wal_path = self._wal_path(rel)
+                # 构建前记录源库签名，用于"快速失败快速重试"
+                sig = self._source_sig(src, wal_path)
+                verified = False
+                last_error = ""
+                with_stack = ""   # 本轮首次异常的原因 + traceback（进 cache_status）
+                verified_how = ""
+                for attempt in range(1, BG_REBUILD_ATTEMPTS + 1):
                     try:
-                        page_hashes, how = self._build_cache(src, tmp, dst, key)
+                        stats: dict = {}
+                        page_hashes, how = self._build_cache(src, tmp, dst, key,
+                                                             stats=stats)
                         with open(tmp + ".pages", "wb") as hf:
                             hf.write(page_hashes)
-                        wal_path = self._wal_path(rel)
                         applied = 0
+                        merged_pages = 0
                         if wal_path and os.path.getsize(wal_path) > self.WAL_HEADER_SZ:
-                            applied, _merged = self._merge_wal(tmp, wal_path, key, 0)
-                        if self._check_merged(tmp):
-                            break
-                    except (OSError, sqlite3.Error):
-                        pass
-                    time.sleep(1.0)
-                else:
-                    # 三次尝试均失败：多为微信持续写库，保留下轮再试
+                            applied, merged_pages = self._merge_wal(
+                                tmp, wal_path, key, 0)
+                    except Exception as exc:  # noqa: BLE001 - 任何异常都必须可见
+                        # 兜底捕获任何异常（不只是 OSError/sqlite3.Error）：
+                        # 未知异常若逃出线程会静默杀死重建，正是本次故障的形态。
+                        base = "构建异常 %s: %s" % (type(exc).__name__, exc)
+                        last_error = base
+                        if not recorded:
+                            # 仅本轮首次异常：把完整栈折进 cache_status 的
+                            # last_error（限长 MAX_CACHE_ERROR_LEN），并单独
+                            # 打一份多行栈到 stderr；后两次只留短串避免刷屏
+                            detail = traceback.format_exc()
+                            with_stack = _one_line(
+                                "%s | %s" % (base, detail), MAX_CACHE_ERROR_LEN)
+                            self._record_cache_error(rel, with_stack)
+                            recorded = True
+                        else:
+                            detail = ""
+                        # 重试提示必须与真实节奏一致：最后一次尝试之后不再
+                        # sleep（直接进失败退避），不能说"X 后重试"
+                        retry_hint = (
+                            "%.1fs 后重试" % FAST_RETRY_INTERVAL_SEC
+                            if attempt < BG_REBUILD_ATTEMPTS
+                            else "已达最大尝试次数，进入收尾（不再重试）"
+                        )
+                        sys.stderr.write(
+                            "[wechatauto] %s 缓存重建第 %d/%d 次尝试异常"
+                            "（%s: %s），%s\n%s"
+                            % (rel, attempt, BG_REBUILD_ATTEMPTS,
+                               type(exc).__name__, exc, retry_hint, detail)
+                        )
+                        sig = self._source_sig(src, wal_path)
+                        if attempt < BG_REBUILD_ATTEMPTS:
+                            time.sleep(FAST_RETRY_INTERVAL_SEC)
+                        continue
+                    now_sig = self._source_sig(src, wal_path)
+                    patched = int(stats.get("patched", -1))
+                    unchanged = (not stats.get("full", True)) and patched == 0 \
+                        and merged_pages == 0
+                    if now_sig != sig and attempt < BG_REBUILD_ATTEMPTS:
+                        # 源库在本轮构建期间又被写入：快照已过期，
+                        # 此时整库校验纯属空转（线上单轮 130s）→ 短间隔重试
+                        last_error = ("源库在构建期间持续变化（签名 %s → %s）"
+                                      % (sig, now_sig))
+                        sig = now_sig
+                        time.sleep(FAST_RETRY_INTERVAL_SEC)
+                        continue
+                    if unchanged:
+                        # 页级重建未改写任何页、WAL 也未写入任何页：
+                        # 缓存与上次已验证状态完全一致，无需重复整库校验
+                        check_ok = True
+                    else:
+                        check_started = time.monotonic()
+                        check_ok = self._check_merged(tmp)
+                        check_cost += time.monotonic() - check_started
+                    if check_ok:
+                        verified = True
+                        verified_how = how
+                        break
+                    last_error = ("quick_check 校验失败（快照撕裂，第 %d 轮）"
+                                  % attempt)
+                    sig = now_sig
+                    if attempt < BG_REBUILD_ATTEMPTS:
+                        time.sleep(1.0)
+                if not verified:
+                    # 全部分片尝试均失败：必须留痕，不再静默 return
                     for p in (tmp, tmp + ".pages"):
                         try:
                             os.remove(p)
                         except OSError:
                             pass
+                    if recorded:
+                        # 异常分支已记账（fail_streak 已 +1），这里只刷新原因，
+                        # 避免同一轮被重复计数；保留首次异常的原因+traceback
+                        # （最有定位价值），无栈时退回最近一次失败原因
+                        self._cache_last_error[rel] = (
+                            with_stack
+                            or _one_line(last_error, MAX_CACHE_ERROR_LEN)
+                            or "未知错误")
+                    else:
+                        self._record_cache_error(rel, last_error)
+                    sys.stderr.write(
+                        "[wechatauto] %s 缓存重建失败：连续 %d 次未成功 promote"
+                        "（本轮尝试 %d 次，耗时 %.1fs），正式缓存保持旧版本，"
+                        "%.0fs 后重试；最后错误: %s\n"
+                        % (rel, int(self._cache_fail_streak.get(rel, 1)),
+                           BG_REBUILD_ATTEMPTS, time.monotonic() - started,
+                           REBUILD_MIN_INTERVAL_SEC,
+                           _one_line(last_error, 300))
+                    )
                     return
                 # 源库在重建期间又被改写 → 不写 stamp（缓存内容与 stamp 描述
                 # 不一致会被误判为最新），下次 _open 会再次触发重建（自愈）。
@@ -1200,16 +1598,43 @@ class WeChatDB:
                 except OSError:
                     snapshot_fresh = False
                 if not self._promote_cache(tmp, dst):
+                    self._record_cache_error(rel, "临时文件晋升正式缓存失败")
+                    sys.stderr.write(
+                        "[wechatauto] %s 缓存重建完成但晋升失败（正式缓存被占用？），"
+                        "耗时 %.1fs，下轮重试\n" % (rel, time.monotonic() - started)
+                    )
                     return
                 if snapshot_fresh:
                     self._write_stamp(stamp=dst + ".stamp", src_mtime=src_mtime,
                                       src_size=src_size, wal_mtime=wal_mtime,
                                       wal_size=wal_size, applied=applied)
+                self._record_cache_ok(rel)
                 sys.stderr.write(
-                    "[wechatauto] %s 缓存重建完成（%s，%.1fs%s）\n"
-                    % (rel, how, time.monotonic() - started,
+                    "[wechatauto] %s 缓存重建完成（%s，%.1fs，校验 %.1fs%s）\n"
+                    % (rel, verified_how or how, time.monotonic() - started,
+                       check_cost,
                        "" if snapshot_fresh else "，源库持续写入下轮继续"))
+        except Exception as exc:  # noqa: BLE001 - 外层兜底，任何逃逸异常都要可见
+            # 内层 try 只覆盖"构建 + WAL 合并"。外层的 _wal_path / _source_sig /
+            # _promote_cache / _write_stamp（磁盘写满）等仍可能抛异常：
+            # finally 会保证配额与标记归位（不会停摆），但若不做记账，
+            # cache_status() 里 fail_streak/last_error 会停在旧值，运维只能看到
+            # threading 打的裸 traceback。这里补一次记账 + 结构化日志后原样抛出，
+            # 保持"异常仍向上传播"的既有语义。
+            if not recorded:
+                # 一轮只记一次：内层已记账时不再叠加，避免 fail_streak 双计。
+                self._record_cache_error(
+                    rel, "重建过程异常逃出 %s: %s | %s"
+                         % (type(exc).__name__, exc, traceback.format_exc()))
+            sys.stderr.write(
+                "[wechatauto] %s 缓存重建异常逃出（%s: %s），本轮放弃；"
+                "配额与 rebuilding 标记将在收尾(finally)时归还，下轮重试\n%s"
+                % (rel, type(exc).__name__, exc, traceback.format_exc())
+            )
+            raise
         finally:
+            # 释放顺序与获取顺序相反：先放分片锁（with 已退出）再放全局配额
+            self._rebuild_sem.release()
             with self._rebuild_guard:
                 self._rebuilding.discard(rel)
                 self._rebuild_done_at[rel] = time.monotonic()
@@ -1430,7 +1855,7 @@ class WeChatDB:
         仅对变化页执行 AES 解密。微信 checkpoint 后通常只有几十~几百页
         变化，重建耗时从全量解密的几十秒降到约 1~2 秒（主要是顺序读盘）。
 
-        返回 (新源页哈希串, 实际解密页数)；缺少旧缓存/哈希或发生异常时
+        返回 (新源页哈希串, 实际改写页数)；缺少旧缓存/哈希或发生异常时
         返回 None（调用方回退全量解密）。
         """
         hashes_path = dst_old + ".pages"
@@ -1445,6 +1870,7 @@ class WeChatDB:
             pages = size // PAGE_SZ + (1 if size % PAGE_SZ else 0)
             new_hashes = bytearray()
             patched = 0
+            logical_pages = 0
             with open(src, "rb") as fin, open(tmp, "r+b") as fout:
                 for pgno in range(1, pages + 1):
                     page = fin.read(PAGE_SZ)
@@ -1458,6 +1884,22 @@ class WeChatDB:
                     off = idx * 8
                     old_h = (old_hashes[off:off + 8]
                              if off + 8 <= len(old_hashes) else None)
+                    if pgno == 1:
+                        # 旧缓存 page1 可能被 WAL 提交帧覆盖，不能因主库源页
+                        # 哈希未变就信任它。始终解密主库 page1，以其逻辑页数
+                        # 界定预分配尾页，并清除缓存中可能残留的 WAL overlay。
+                        plain_page = _decrypt_page(key, page, pgno)
+                        if len(plain_page) >= 32:
+                            logical_pages = struct.unpack(">I", plain_page[28:32])[0]
+                        fout.seek(0)
+                        cached_page = fout.read(PAGE_SZ) if tmp_size >= PAGE_SZ else b""
+                        if cached_page != plain_page:
+                            fout.seek(0)
+                            fout.write(plain_page)
+                            patched += 1
+                        continue
+                    if 0 < logical_pages < pgno:
+                        continue
                     # 页内容未变且旧缓存中确实存在该页 → 沿用旧解密结果
                     if old_h == h and idx * PAGE_SZ < tmp_size:
                         continue
@@ -1474,18 +1916,29 @@ class WeChatDB:
             return None
 
     def _build_cache(self, src: str, tmp: str, dst: str,
-                     key: bytes) -> Tuple[bytes, str]:
+                     key: bytes,
+                     stats: Optional[dict] = None) -> Tuple[bytes, str]:
         """构建解密缓存到 tmp：优先页级增量，无旧缓存/哈希时全量解密。
 
         返回 (源页哈希串, 构建方式描述)——哈希随晋升写入 .pages 边车，
         供下一次增量重建比对。
+
+        ``stats`` 传入 dict 时回填构建统计：``full``（是否全量解密）、
+        ``patched``（页级重建实际改写的页数，全量路径为 -1）。调用方据此
+        判断"缓存是否与上次已验证状态完全相同"，从而安全跳过整库校验。
         """
         patched = self._patch_cache(src, dst, tmp, key)
         if patched is not None:
             hashes, n = patched
+            if stats is not None:
+                stats["full"] = False
+                stats["patched"] = int(n)
             return hashes, "增量 %d 页" % n
         hashes: list = []
         self._decrypt_file(src, tmp, key, hashes_out=hashes)
+        if stats is not None:
+            stats["full"] = True
+            stats["patched"] = -1
         return b"".join(hashes), "全量"
 
     def _message_dbs(self) -> List[str]:
@@ -1698,7 +2151,18 @@ class WeChatDB:
             for c in conns:
                 c.close()
             return None
-        # 成功路径：返回全部命中分片列表，交由调用方消费并负责关闭连接
+        # 成功路径：只返回命中分片，**未命中的连接必须在此关闭**。
+        # 这些未命中的只读连接同样持有缓存文件句柄，Windows 下会让
+        # _promote_cache 的 os.replace 一直 PermissionError（日志里的
+        # “缓存重建完成但晋升失败”），且要等 GC 才释放——进程长期运行时
+        # 9 个分片的句柄会一直挂着，正式缓存永远换不上去。
+        keep = {id(c) for c, _ in found}
+        for c in conns:
+            if id(c) not in keep:
+                try:
+                    c.close()
+                except Exception:
+                    pass
         return found
 
     def _run_msg_query(self, user: str, build):

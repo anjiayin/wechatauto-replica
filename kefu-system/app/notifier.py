@@ -74,6 +74,14 @@ class Notifier:
         """新商机 → 记为未读并广播。"""
         self._unread.add(opportunity_id)
 
+    def is_unread(self, opportunity_id: int) -> bool:
+        """指定商机是否未读（列表页行内「未读」标识数据源）。"""
+        return opportunity_id in self._unread
+
+    def unread_ids(self) -> Set[int]:
+        """当前未读商机 id 快照（列表页批量标注用）。"""
+        return set(self._unread)
+
     def clear_unread(self, opportunity_id: int) -> bool:
         """清除未读；确实清除了返回 True。"""
         if opportunity_id in self._unread:

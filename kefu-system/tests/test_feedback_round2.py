@@ -300,7 +300,9 @@ class TestBilling:
                                prompt_tokens=1500, completion_tokens=300)
         db.insert_analysis_log(session_username="a@chatroom", msg_count=1,
                                status="error")  # 失败调用无 usage，不计费
-        usage = db.usage_by_date("2026-11-09")
+        # 日期按写入当天（created_at 默认 now），避免硬编码日期随运行日期漂移
+        from datetime import datetime as _dt
+        usage = db.usage_by_date(_dt.now().strftime("%Y-%m-%d"))
         assert usage["calls"] == 1
         assert usage["prompt_tokens"] == 1500
         assert usage["completion_tokens"] == 300
