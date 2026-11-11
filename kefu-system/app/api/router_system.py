@@ -9,6 +9,7 @@
 - GET /api/system/retention | POST /api/system/purge          历史数据（反馈 7）
 - GET /api/system/purge/last                                 上次清理留痕（本轮修复）
 - GET /api/system/billing                                     AI 账单（反馈 13）
+- GET/PUT /api/system/asr | POST /api/system/asr/download      语音转写（本地离线）
 - WS  /ws/events
 """
 from __future__ import annotations
@@ -20,16 +21,24 @@ from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 
+from app import voice_asr
 from app.api.deps import (
     get_db,
     get_notifier,
     get_pipeline,
     get_wechat_service,
 )
-from app.config import KEY_RUNTIME_CACHE_DIR, KEY_RUNTIME_LAST_PURGE, check_cache_dir
+from app.config import (
+    KEY_ASR_ENABLED,
+    KEY_RUNTIME_CACHE_DIR,
+    KEY_RUNTIME_LAST_PURGE,
+    check_cache_dir,
+)
 from app.db import Database, now_iso, read_monitor_max_targets
 from app.schemas import (
     AnalysisHealth,
+    AsrStatusOut,
+    AsrUpdate,
     BillingDayOut,
     BillingOut,
     CacheDirOut,
@@ -331,6 +340,83 @@ def update_cache_dir(body: CacheDirUpdate,
     db.set_setting(KEY_RUNTIME_CACHE_DIR, str(path) if raw else "")
     logger.info("缓存目录已更新为：%s（重启服务后生效）", path)
     return CacheDirOut(**wechat.cache_dir_info())
+
+
+# ---------------------------------------------------------------------------
+# 语音识别（本地离线 SenseVoice；音频绝不上传）
+# ---------------------------------------------------------------------------
+def _asr_payload(db: Database) -> dict:
+    """组装 /api/system/asr 的响应字段（任何子项异常都降级为默认值）。"""
+    transcriber = voice_asr.get_transcriber()
+    try:
+        available, reason = transcriber.available()
+    except Exception:  # 依赖检测异常（缺 DLL/权限）不应让接口 500
+        logger.exception("检测语音识别可用性失败（按不可用处理）")
+        available, reason = False, "语音识别依赖检测失败，请查看服务日志"
+    state = voice_asr.download_state()
+    status = str(state.get("status") or voice_asr.STATUS_IDLE)
+    model_ready = voice_asr.model_ready()
+    model_size = voice_asr.model_size_bytes()
+    # 模型已就位但从未触发过下载时，对外统一报 ready（避免前端看到 idle 却
+    # 显示「未安装」的错位）；下载中保持真实进度状态。
+    if status != voice_asr.STATUS_DOWNLOADING and model_ready:
+        status = voice_asr.STATUS_READY
+    downloaded = int(state.get("downloaded_bytes") or 0)
+    total = int(state.get("total_bytes") or 0)
+    if status == voice_asr.STATUS_READY and not downloaded:
+        downloaded = total = model_size
+    return {
+        "enabled": db.get_setting(KEY_ASR_ENABLED, "1") != "0",
+        "available": available,
+        "reason": reason,
+        "engine": voice_asr.ENGINE_NAME,
+        "model_dir": str(voice_asr.ASR_MODEL_DIR),
+        "model_ready": model_ready,
+        "model_size_bytes": model_size,
+        "decoder_ready": voice_asr.decoder_ready(),
+        "download_status": status,
+        "downloaded_bytes": downloaded,
+        "total_bytes": total,
+        "error": str(state.get("error") or ""),
+    }
+
+
+def _asr_status(db: Database) -> AsrStatusOut:
+    """读取语音识别状态；任何异常都返回结构化降级状态（绝不 500）。"""
+    try:
+        return AsrStatusOut(**_asr_payload(db))
+    except Exception:
+        logger.exception("读取语音识别状态失败（返回降级状态）")
+        return AsrStatusOut(engine=voice_asr.ENGINE_NAME)
+
+
+@router.get("/api/system/asr", response_model=AsrStatusOut)
+def get_asr_status(db: Database = Depends(get_db)) -> AsrStatusOut:
+    """语音识别状态：开关 / 可用性 / 模型就位与下载进度。"""
+    return _asr_status(db)
+
+
+@router.put("/api/system/asr", response_model=AsrStatusOut)
+def update_asr_status(body: AsrUpdate,
+                      db: Database = Depends(get_db)) -> AsrStatusOut:
+    """打开/关闭「语音消息自动转文字」（写 settings: asr.enabled）。"""
+    db.set_setting(KEY_ASR_ENABLED, "1" if body.enabled else "0")
+    logger.info("语音自动转文字已%s", "开启" if body.enabled else "关闭")
+    return _asr_status(db)
+
+
+@router.post("/api/system/asr/download", response_model=AsrStatusOut)
+def download_asr_model(db: Database = Depends(get_db)) -> AsrStatusOut:
+    """触发后台下载 SenseVoice 模型（幂等：下载中重复调用直接返回进度）。
+
+    下载跑在后台线程（228MB，15 秒~数分钟），接口立即返回当前状态；
+    前端轮询 GET /api/system/asr 展示进度。任何异常都不返回 500。
+    """
+    try:
+        voice_asr.start_model_download()
+    except Exception:
+        logger.exception("触发语音模型下载失败（返回当前状态）")
+    return _asr_status(db)
 
 
 # ---------------------------------------------------------------------------

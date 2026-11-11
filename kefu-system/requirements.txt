@@ -5,5 +5,9 @@ uvicorn[standard]>=0.29
 pydantic>=2.6
 openai>=1.30
 cryptography>=42.0
+# 语音消息离线转写（可选依赖：缺失时语音功能自动降级为「不转写」，
+# 其余功能不受影响。音频全程在本机解码/识别，不上传任何外部服务）
+sherpa-onnx>=2.0.1
+numpy
 # 测试
 pytest>=8.0

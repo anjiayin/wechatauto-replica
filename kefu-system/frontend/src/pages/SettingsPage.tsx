@@ -15,6 +15,7 @@ import {
   FormControlLabel,
   IconButton,
   InputAdornment,
+  LinearProgress,
   List,
   ListItem,
   ListItemText,
@@ -48,6 +49,7 @@ import type {
   AISettingsPayload,
   AITestResult,
   AnalysisSettings,
+  AsrStatus,
   BillingOut,
   CacheDirInfo,
   LastPurge,
@@ -1411,6 +1413,47 @@ function DataBillingTab() {
     onError: (e: Error) => setSnack(`保存失败：${e.message}`),
   })
 
+  // 语音消息本地离线转写（SenseVoice；音频全程不出本机）
+  const { data: asr } = useQuery({
+    queryKey: ['asr-status'],
+    queryFn: () => apiGet<AsrStatus>('/api/system/asr'),
+    // 下载中加快轮询显示进度，其余状态不轮询（避免无谓请求）
+    refetchInterval: (query) =>
+      query.state.data?.download_status === 'downloading' ? 1500 : false,
+  })
+
+  const toggleAsrMutation = useMutation({
+    mutationFn: (enabled: boolean) =>
+      apiPut<AsrStatus>('/api/system/asr', { enabled }),
+    onSuccess: (info) => {
+      void queryClient.invalidateQueries({ queryKey: ['asr-status'] })
+      setSnack(info.enabled ? '已开启语音自动转文字' : '已关闭语音自动转文字')
+    },
+    onError: (e: Error) => setSnack(`保存失败：${e.message}`),
+  })
+
+  const downloadAsrMutation = useMutation({
+    mutationFn: () => apiPost<AsrStatus>('/api/system/asr/download'),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['asr-status'] })
+      setSnack('已开始下载语音识别模型（约 228MB）')
+    },
+    onError: (e: Error) => setSnack(`下载失败：${e.message}`),
+  })
+
+  // 下载进度百分比（总字节未知时按 0 处理，避免出现 100% 的假象）
+  const asrPercent =
+    asr && asr.total_bytes > 0
+      ? Math.min(100, Math.round((asr.downloaded_bytes / asr.total_bytes) * 100))
+      : 0
+  const asrStateText = !asr
+    ? '读取中…'
+    : asr.download_status === 'downloading'
+      ? `下载中 ${asrPercent}%`
+      : asr.model_ready
+        ? `模型已就绪 ${fmtBytes(asr.model_size_bytes)}`
+        : '未安装'
+
   // AI 账单
   const { data: billing } = useQuery({
     queryKey: ['billing'],
@@ -1581,6 +1624,72 @@ function DataBillingTab() {
             检测到旧版临时目录缓存：{cacheInfo.legacy_dirs.join('、')}
             。确认新目录运行正常后可手动删除以释放空间（密钥缓存已自动复制到新目录）。
           </Alert>
+        )}
+      </Stack>
+
+      <Divider sx={{ my: 2 }} />
+      <Typography variant="subtitle2" sx={{ mb: 1 }}>语音识别</Typography>
+      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
+        客户发来的语音消息在<strong>本机离线</strong>转成文字后进入商机分析：音频不出本机、不调用任何外部服务、
+        不产生费用。每条约 0.5~2 秒；未安装模型时首次需下载约 228MB（1~3 分钟，之后无需联网）。
+      </Typography>
+      <Stack spacing={1.5}>
+        <FormControlLabel
+          control={
+            <Switch
+              checked={asr?.enabled ?? true}
+              disabled={!asr || toggleAsrMutation.isPending}
+              onChange={(e) => toggleAsrMutation.mutate(e.target.checked)}
+            />
+          }
+          label="语音消息自动转文字（本地离线识别，不上传音频）"
+        />
+        <Typography variant="body2" component="div">
+          状态：{asr?.engine || 'SenseVoice-Small（离线）'} · {asrStateText}
+          {asr && !asr.decoder_ready ? ' · 缺少 SILK 解码器' : ''}
+        </Typography>
+        {asr?.download_status === 'downloading' && (
+          <Box>
+            <Typography variant="caption" color="text.secondary" component="div">
+              已下载 {fmtBytes(asr.downloaded_bytes)}
+              {asr.total_bytes > 0 ? ` / ${fmtBytes(asr.total_bytes)}` : ''}
+            </Typography>
+            <LinearProgress
+              variant={asr.total_bytes > 0 ? 'determinate' : 'indeterminate'}
+              value={asrPercent}
+              sx={{ mt: 0.5, height: 6, borderRadius: 3 }}
+            />
+          </Box>
+        )}
+        {asr && !asr.model_ready && asr.download_status !== 'downloading' && (
+          <Button
+            variant="contained"
+            sx={{ alignSelf: 'flex-start' }}
+            disabled={downloadAsrMutation.isPending}
+            onClick={() => downloadAsrMutation.mutate()}
+          >
+            下载模型（约 228MB）
+          </Button>
+        )}
+        {asr?.download_status === 'failed' && !!asr.error && (
+          <Alert severity="error" sx={{ py: 0.5 }}>
+            模型下载失败：{asr.error}（可点击上方按钮重试）
+          </Alert>
+        )}
+        {asr && asr.model_ready && !asr.available && !!asr.reason && (
+          <Alert severity="warning" sx={{ py: 0.5 }}>
+            语音转写暂不可用：{asr.reason}
+          </Alert>
+        )}
+        {asr && asr.enabled && asr.available && (
+          <Alert severity="success" sx={{ py: 0.5 }}>
+            语音转写已就绪：识别过程完全在本机完成，音频数据不会离开本机。
+          </Alert>
+        )}
+        {asr?.model_dir && (
+          <Typography variant="caption" color="text.secondary" component="div">
+            模型目录：{asr.model_dir}
+          </Typography>
         )}
       </Stack>
 

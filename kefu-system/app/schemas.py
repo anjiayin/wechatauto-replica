@@ -251,6 +251,34 @@ class CacheDirUpdate(BaseModel):
     dir: str = ""
 
 
+class AsrStatusOut(BaseModel):
+    """语音识别（本地离线 SenseVoice）状态。
+
+    - ``enabled``：设置里的启用开关（asr.enabled）；
+    - ``available``：当前是否真的能转写（开关 **不** 参与该判断），
+      ``reason`` 为不可用时的中文原因；
+    - ``download_status``：idle / downloading / ready / failed；
+    - 下载进度用 downloaded/total 两个字节数，前端自行算百分比。
+    """
+    enabled: bool = True
+    available: bool = False
+    reason: str = ""
+    engine: str = ""                       # 固定「SenseVoice-Small（离线）」
+    model_dir: str = ""
+    model_ready: bool = False
+    model_size_bytes: int = 0
+    decoder_ready: bool = False
+    download_status: str = "idle"
+    downloaded_bytes: int = 0
+    total_bytes: int = 0
+    error: str = ""
+
+
+class AsrUpdate(BaseModel):
+    """语音识别开关（仅暴露启用/关闭，模型下载走独立 POST 接口）。"""
+    enabled: bool = True
+
+
 class PurgeResult(BaseModel):
     """清理结果（dry_run=True 时 deleted 为「将删除条数」，未真正删除）。
 

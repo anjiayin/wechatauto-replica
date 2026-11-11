@@ -14,6 +14,12 @@ DB_PATH = DATA_DIR / "kefu.sqlite3"                        # 业务 SQLite
 SECRET_KEY_PATH = DATA_DIR / "secret.key"                  # Fernet 密钥文件
 LOG_PATH = DATA_DIR / "kefu.log"                           # 滚动日志
 IMG_CACHE_DIR = DATA_DIR / "imgcache"                      # 图片解密缓存（反馈 2）
+# 语音消息落盘缓存（微信 SILK 原始文件，转写前临时解码）
+VOICE_CACHE_DIR = DATA_DIR / "voicecache"
+# 离线语音识别模型目录（SenseVoice-Small：model.int8.onnx + tokens.txt）
+ASR_MODEL_DIR = DATA_DIR / "asr_models"
+# 微信 SILK v3 解码器（32 位 exe，仓库内置；缺失时可从镜像下载）
+SILK_DECODER_PATH = BASE_DIR / "tools" / "silk_v3_decoder.exe"
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"             # 前端构建产物
 
 # 微信数据库解密缓存（SQLCipher 解密副本 + 页哈希 + 密钥缓存）默认目录。
@@ -127,6 +133,10 @@ KEY_ANALYSIS_MERGE_WINDOW = "analysis.merge_window_sec"
 KEY_ANALYSIS_OPP_MERGE_WINDOW = "analysis.opp_merge_window_sec"
 KEY_ANALYSIS_CORRECTION_EXAMPLES = "analysis.correction_examples"  # JSON 数组字符串
 KEY_NOTIFY_SOUND = "notify.sound_enabled"
+# 语音消息自动转文字（本地离线识别，音频绝不上传外部服务）
+KEY_ASR_ENABLED = "asr.enabled"
+# 单条语音转写时长上限（秒）：超长语音直接放弃，避免长时间占用识别线程
+KEY_ASR_MAX_SECONDS = "asr.max_seconds"
 KEY_MONITOR_MAX_TARGETS = "monitor.max_targets"  # 监控对象数量上限（10~2000，默认 200）
 KEY_COMPLIANCE_CONFIRMED = "compliance.confirmed"
 KEY_RUNTIME_WM_SAVED_AT = "runtime.watermark_saved_at"  # 内部键：最近 watermark 刷回时间
@@ -159,6 +169,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     KEY_ANALYSIS_OPP_MERGE_WINDOW: str(OPP_MERGE_WINDOW_SEC_DEFAULT),
     KEY_ANALYSIS_CORRECTION_EXAMPLES: "[]",
     KEY_NOTIFY_SOUND: "0",
+    KEY_ASR_ENABLED: "1",          # 语音消息自动转文字（本地离线识别）
+    KEY_ASR_MAX_SECONDS: "180",    # 单条语音转写时长上限（秒）
     KEY_MONITOR_MAX_TARGETS: str(MAX_MONITOR_TARGETS),
     KEY_COMPLIANCE_CONFIRMED: "0",
     KEY_RUNTIME_CACHE_DIR: "",     # 空 = 使用 CACHE_DIR_DEFAULT

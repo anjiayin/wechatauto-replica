@@ -163,6 +163,22 @@ DDL_STATEMENTS: tuple[str, ...] = (
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     )
     """,
+    # 语音消息转写结果缓存：同一条语音会在商机上下文/消息列表里被反复读到，
+    # 每次重跑离线识别（0.5~2 秒）会明显拖慢接口，故落库缓存。
+    # 注意：本表**不在** _PURGE_TABLES 白名单里 —— 转写结果与商机/日志的
+    # 清理口径解耦，避免「清了日志后语音又要重新识别」。
+    """
+    CREATE TABLE IF NOT EXISTS voice_texts (
+      username    TEXT NOT NULL,
+      local_id    INTEGER NOT NULL,
+      text        TEXT NOT NULL DEFAULT '',
+      status      TEXT NOT NULL DEFAULT '',
+      error       TEXT NOT NULL DEFAULT '',
+      duration_ms INTEGER NOT NULL DEFAULT 0,
+      created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+      PRIMARY KEY (username, local_id)
+    )
+    """,
 )
 
 
@@ -873,6 +889,8 @@ class Database:
     _PURGE_TABLES = ("analysis_logs", "opportunities")
     # 注意：ai_usage（账单数据源）刻意不在清理白名单里 —— 无论用户怎么
     # 清理日志/商机，AI 用量与费用历史都必须保留完整。
+    # 同理 voice_texts（语音转写缓存）也不可清理：它是纯缓存，删了只会让
+    # 同一条语音被重复识别，不产生任何收益。
 
     # 截断点表达式：由 SQLite 自己在本地时间下按自然日计算，格式与落库值
     # （datetime('now','localtime')）完全一致。
@@ -1012,6 +1030,70 @@ class Database:
                 [(u, int(s), ts) for u, s in marks.items()],
             )
             self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # 语音转写缓存 DAO（voice_texts）
+    # ------------------------------------------------------------------
+    def get_voice_text(self, username: str, local_id: int) -> Optional[dict]:
+        """取单条语音的转写缓存；无缓存返回 None。
+
+        Returns:
+            {username, local_id, text, status, error, duration_ms, created_at}
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT username, local_id, text, status, error, duration_ms, "
+                "created_at FROM voice_texts "
+                "WHERE username=? AND local_id=?",
+                (str(username or ""), int(local_id)),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_voice_text(self, username: str, local_id: int, *,
+                        text: str, status: str, error: str = "",
+                        duration_ms: int = 0) -> None:
+        """写入/覆盖一条语音转写结果（INSERT OR REPLACE，主键 username+local_id）。"""
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO voice_texts "
+                "(username, local_id, text, status, error, duration_ms, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (str(username or ""), int(local_id), str(text or ""),
+                 str(status or ""), str(error or ""), int(duration_ms or 0),
+                 now_iso()),
+            )
+            self._conn.commit()
+
+    def get_voice_texts(self, username: str,
+                        local_ids: list[int]) -> dict[int, dict]:
+        """批量取多条语音的转写缓存（避免消息列表逐条查询 N 次）。
+
+        Args:
+            username: 会话 username。
+            local_ids: 消息 local_id 列表（空列表直接返回 ``{}``）。
+
+        Returns:
+            {local_id: 缓存行 dict}，未命中的 local_id 不出现在结果里。
+        """
+        ids: list[int] = []
+        for raw in local_ids or []:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                ids.append(value)
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT username, local_id, text, status, error, duration_ms, "
+                "created_at FROM voice_texts "
+                f"WHERE username=? AND local_id IN ({placeholders})",
+                [str(username or ""), *ids],
+            ).fetchall()
+        return {int(r["local_id"]): dict(r) for r in rows}
 
     # ------------------------------------------------------------------
     # 聚合查询（/api/status 用）

@@ -178,6 +178,8 @@ def create_app() -> FastAPI:
         # 注入引用消息查询（避免 sender ↔ wechat_service 循环导入）
         sender.set_message_lookup(wechat.get_message_by_local_id)
         sender.set_latest_lookup(wechat.get_latest_local_id)
+        # 注入语音补转写（分析线程兜住历史上未转写的 [语音] 消息）
+        pipeline.set_voice_lookup(wechat.transcribe_voice)
         # 启动后台组件
         pipeline.start()
         sender.start()

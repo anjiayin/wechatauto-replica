@@ -26,7 +26,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Optional
 
-from app import analyzer, db as dbmod
+from app import analyzer, content_format, db as dbmod
 from app.aggregator import AnalysisUnit
 from app.config import (
     AGGREGATOR_FORCE_FLUSH_FACTOR,
@@ -42,6 +42,10 @@ from app.db import Database
 from app.notifier import Notifier
 
 logger = logging.getLogger(__name__)
+
+# 单次分析最多补转写的语音条数：一次 20 条语音全补要卡几分钟，
+# 而合并窗口里的前几条语音通常已足够判定商机。
+VOICE_TOPUP_MAX = 3
 
 
 def _elapsed_ms(later: float, earlier: float) -> Optional[int]:
@@ -96,6 +100,14 @@ class Pipeline:
         self._health_lock = threading.Lock()
         self._consecutive_failures = 0
         self._last_error = ""
+        # 语音补转写查询（main.py 组装时注入 wechat_service.transcribe_voice）。
+        # 用 setter 注入而不是构造参数：避免 pipeline ↔ wechat_service 循环依赖
+        # （与 Sender.set_message_lookup 同一手法）。
+        self._voice_lookup = None
+
+    def set_voice_lookup(self, lookup) -> None:
+        """注入语音补转写函数 ``(username, local_id) -> (text, error)``。"""
+        self._voice_lookup = lookup
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -220,6 +232,10 @@ class Pipeline:
         # 避免把合并窗口/排队的等待误读成 AI 接口慢。
         t_dequeued = time.monotonic()
         start_wall = unit.first_seen_epoch or time.time()
+        # 语音补转写：只补「仍是 [语音] 占位」的行（实时回调路径已转写成功
+        # 的消息不会重复识别；这里兜住历史消息/转写曾经失败的情况）。
+        # 放在最前面，保证落库的 input_text 与分析输入一致。
+        self._topup_voice_lines(unit)
         # 合并等待用墙钟（同一时钟源），排队等待用单调时钟（不受校时影响）
         agg_wait_ms = _elapsed_ms(unit.enqueued_epoch, unit.first_seen_epoch)
         queue_wait_ms = _elapsed_ms(t_dequeued, unit.enqueued_mono)
@@ -320,6 +336,50 @@ class Pipeline:
         self._db.insert_analysis_log(status="error", error=last_err,
                                      model=ai_cfg.get("model", ""), **base_log)
         self._record_failure(unit.session_username, last_err)
+
+    def _topup_voice_lines(self, unit: AnalysisUnit) -> None:
+        """给仍是 ``[语音]`` 占位的行补一次离线转写（最多 VOICE_TOPUP_MAX 条）。
+
+        只改 ``unit.lines`` 里的文本，不动 merged_count / 时间窗。
+        **全部 try/except**：转写失败绝不影响分析主流程（分析本来就会慢，
+        这里多花 0.5~2 秒/条是可接受的，但抛异常会让整单元失败）。
+
+        预算按「尝试次数」扣减（不是按成功次数）：转写失败同样要花时间
+        （模型没装时每次都要先走一遍依赖探测，解码失败也要起子进程），
+        若只对成功扣减，一次 10 条全失败的语音会连做 10 次尝试，把分析
+        线程拖住十几秒。
+        """
+        lookup = self._voice_lookup
+        if lookup is None:
+            return
+        candidates = [i for i, (_hm, text) in enumerate(unit.lines)
+                      if content_format.voice_needs_text(text)]
+        if not candidates:
+            return
+        budget = VOICE_TOPUP_MAX
+        new_lines: list = []
+        for idx, (hm, text) in enumerate(unit.lines):
+            local_id = (unit.local_ids[idx]
+                        if idx < len(unit.local_ids) else 0)
+            if budget <= 0 or idx not in candidates or local_id <= 0:
+                new_lines.append((hm, text))
+                continue
+            # 先扣预算再尝试：成功与失败一视同仁（见方法文档）
+            budget -= 1
+            voice_text = ""
+            try:
+                voice_text, _err = lookup(unit.session_username, local_id)
+            except Exception:  # 转写异常按失败处理，不影响分析
+                logger.exception("语音补转写异常（%s local_id=%s）",
+                                 unit.session_username, local_id)
+                voice_text = ""
+            voice_text = str(voice_text or "").strip()
+            if voice_text:
+                new_lines.append((hm, content_format.voice_text_content(
+                    voice_text)))
+            else:
+                new_lines.append((hm, text))
+        unit.lines = new_lines
 
     @staticmethod
     def _ai_enabled(ai_cfg: dict) -> bool:

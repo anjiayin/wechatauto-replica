@@ -35,6 +35,23 @@ def _norm_type(type_name: str) -> str:
     return _TYPE_SEP_RE.sub("", str(type_name or ""))
 
 
+def is_voice_type(type_name: str) -> bool:
+    """是否语音消息（微信 4.x 类型名固定为「语音」，兼容英文 voice）。"""
+    norm = _norm_type(type_name).lower()
+    return norm in ("语音", "voice", "语音消息")
+
+
+def voice_needs_text(content: str) -> bool:
+    """是否「只有占位、还没有转写文本」的语音内容（形如 ``[语音]``）。"""
+    return str(content or "").strip() == "[语音]"
+
+
+def voice_text_content(text: str) -> str:
+    """语音消息的展示/分析文本：``[语音] 转写文字``（无文本时回退占位）。"""
+    body = " ".join(str(text or "").split()).strip()
+    return f"[语音] {body}" if body else "[语音]"
+
+
 def _strip_sender_prefix(content: str) -> str:
     """去掉正文首部的「发送者ID:\\n」前缀行（微信 4.x 群消息原生格式）。
 

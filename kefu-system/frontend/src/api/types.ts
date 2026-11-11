@@ -307,6 +307,27 @@ export interface CacheDirInfo {
   legacy_dirs: string[]
 }
 
+/** /api/system/asr（语音消息本地离线转写状态） */
+export interface AsrStatus {
+  /** 设置里的启用开关（asr.enabled） */
+  enabled: boolean
+  /** 当前是否真的能转写（开关不参与该判断） */
+  available: boolean
+  /** 不可用原因（中文，直接展示） */
+  reason: string
+  /** 识别引擎名，固定 "SenseVoice-Small（离线）" */
+  engine: string
+  model_dir: string
+  model_ready: boolean
+  model_size_bytes: number
+  decoder_ready: boolean
+  /** idle / downloading / ready / failed */
+  download_status: 'idle' | 'downloading' | 'ready' | 'failed'
+  downloaded_bytes: number
+  total_bytes: number
+  error: string
+}
+
 /** WS 事件（{event, data}） */
 export interface WsEvent {
   event: string

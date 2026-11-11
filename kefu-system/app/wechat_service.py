@@ -24,6 +24,7 @@ from typing import List, Optional
 
 from app import db as dbmod
 from app import content_format
+from app import voice_asr
 from app.aggregator import Aggregator
 from app.config import (
     CONTEXT_COUNT,
@@ -34,7 +35,10 @@ from app.config import (
     MSG_QUERY_RETRY_TIMES,
     SESSION_CACHE_TTL_SEC,
     SESSION_SEARCH_LIMIT_DEFAULT,
+    VOICE_CACHE_DIR,
     WATERMARK_FLUSH_SEC,
+    KEY_ASR_ENABLED,
+    KEY_ASR_MAX_SECONDS,
     KEY_RUNTIME_CACHE_DIR,
     KEY_RUNTIME_WM_SAVED_AT,
     CACHE_DIR_DEFAULT,
@@ -49,6 +53,9 @@ logger = logging.getLogger(__name__)
 MSG_DB_BUSY_ERROR = "微信数据库正忙（微信客户端正在写入），请稍后点击重新加载"
 # 微信服务未接入时的提示
 MSG_DB_UNAVAILABLE_ERROR = "微信数据库不可用，请确认微信已登录"
+# 语音转写相关提示（用户可读，直接进分析日志 error 字段）
+MSG_ASR_DISABLED = "语音转写已关闭（可在设置 → 数据与账单 开启）"
+MSG_ASR_NO_VOICE = "未找到语音数据（微信可能尚未下载该语音）"
 
 # 微信 4.x 群消息正文自带的发送者前缀（wxid_xxx: / 自定义微信号:），
 # 原生格式为 "发送者ID:\n正文"；sender_id 映射不可靠，此前缀为权威发送者。
@@ -120,6 +127,16 @@ class WeChatService:
         # 群成员显示名缓存（chatroom → (timestamp, {username: 显示名})，TTL 600s）
         self._group_members_cache: dict[str, tuple[float, dict[str, str], bool]] = {}
         self._group_members_lock = threading.Lock()
+        # 媒体下载器懒加载单例（MediaDownloader 首次使用会解密媒体库，约 13s，
+        # 不能每条消息/每张图片都新建一个）。图片与语音共用同一实例。
+        self._media_downloader = None
+        self._media_lock = threading.Lock()
+        # 语音转写的时长上限由 settings 热更（asr.max_seconds），交给转写器
+        # 每次识别时实时读取，避免改设置后需要重启服务。
+        if database is not None:
+            voice_asr.get_transcriber().set_max_seconds_provider(
+                lambda: database.get_int(KEY_ASR_MAX_SECONDS,
+                                         voice_asr.MAX_SECONDS_DEFAULT))
 
     # ------------------------------------------------------------------
     # 缓存目录（可配置；默认 kefu-system/data/wechat_cache）
@@ -217,6 +234,8 @@ class WeChatService:
                 cache_dir = self.configured_cache_dir()
                 self._adopt_legacy_keys(cache_dir)
                 self._wxdb = WeChatDB(workdir=str(cache_dir))
+                # 换了 wxdb 实例：旧的媒体下载器绑在旧实例上，必须丢弃
+                self._media_downloader = None
                 logger.info("微信数据库缓存目录：%s（%.1f MB）",
                             cache_dir, self._dir_size_mb(cache_dir))
             except Exception as exc:
@@ -295,24 +314,50 @@ class WeChatService:
     # 消息回调（Listener 工作线程调用）
     # ------------------------------------------------------------------
     def _on_message(self, msg: dict, listener=None) -> None:
-        """Listener 新消息回调：非文本记 skipped 后丢弃，文本进合并窗口。"""
+        """Listener 新消息回调：非文本记 skipped 后丢弃，文本进合并窗口。
+
+        语音消息特殊处理：先本地离线转写为文字，成功则改写 content 为
+        ``[语音] 文本`` 并按**文本消息**正常进合并窗口参与商机分析；
+        失败（开关关闭 / 模型未装 / 解码失败）保持原 skipped 行为，
+        error 里写清原因，便于用户在分析日志里定位问题。
+        """
         try:
             username = str(msg.get("username") or "")
             mtype = str(msg.get("type") or "")
             kind = "group" if username.endswith("@chatroom") else "friend"
             sender_wxid, sender_name = self._resolve_sender(username, kind, msg)
             if mtype != "文本":
-                self._db.insert_analysis_log(
-                    session_username=username,
-                    sender_wxid=sender_wxid,
-                    msg_count=1,
-                    # 日志展示友好化：非文本消息存可读摘要而非原始 XML（反馈 3）
-                    input_text=content_format.format_content(
-                        mtype, str(msg.get("content") or ""))[:200],
-                    status="skipped",
-                    error=f"非文本消息（{mtype or '未知类型'}），不分析",
-                )
-                return
+                if content_format.is_voice_type(mtype):
+                    local_id = int(msg.get("local_id") or 0)
+                    voice_text, voice_err = self.transcribe_voice(username,
+                                                                 local_id)
+                    if not voice_text:
+                        self._db.insert_analysis_log(
+                            session_username=username,
+                            sender_wxid=sender_wxid,
+                            msg_count=1,
+                            input_text=content_format.format_content(
+                                mtype, str(msg.get("content") or ""))[:200],
+                            status="skipped",
+                            error=("语音转写失败：" +
+                                   (voice_err or "未知原因")),
+                        )
+                        return
+                    # 转写成功：按文本消息继续走聚合窗口（音频不出本机）
+                    msg["content"] = content_format.voice_text_content(
+                        voice_text)
+                else:
+                    self._db.insert_analysis_log(
+                        session_username=username,
+                        sender_wxid=sender_wxid,
+                        msg_count=1,
+                        # 日志展示友好化：非文本消息存可读摘要而非原始 XML（反馈 3）
+                        input_text=content_format.format_content(
+                            mtype, str(msg.get("content") or ""))[:200],
+                        status="skipped",
+                        error=f"非文本消息（{mtype or '未知类型'}），不分析",
+                    )
+                    return
             session_name = self.get_display_name(username)
             # 发送人已用可靠数据源解析（群=正文前缀 / 私聊=会话对方），
             # 覆盖 msg 中不可靠的 sender_username 供 Aggregator/管线透传
@@ -894,7 +939,38 @@ class WeChatService:
             })
             if len(out) >= limit:
                 break
+        self._fill_voice_texts(username, out)
         return out, False
+
+    def _fill_voice_texts(self, username: str, msgs: list[dict]) -> None:
+        """用 voice_texts 缓存回填语音消息文本（**不在请求线程里转写**）。
+
+        消息列表/商机上下文一次可能返回 200 条，其中若有 10 条语音，
+        逐条现场识别要十几秒，会直接把列表接口拖崩。这里只做一次批量
+        查询，命中缓存才替换 content，未命中的保持 ``[语音]`` 占位，
+        真正的补转写交给分析线程（pipeline，可接受慢）。
+        """
+        voice_ids = [int(m.get("local_id") or 0) for m in msgs
+                     if content_format.is_voice_type(str(m.get("type") or ""))]
+        voice_ids = [i for i in voice_ids if i > 0]
+        if not voice_ids:
+            return
+        try:
+            cached = self._db.get_voice_texts(username, voice_ids)
+        except Exception:  # 缓存读取失败只是少显示文字，不影响消息列表
+            logger.exception("读取语音转写缓存失败（按未命中处理）")
+            return
+        if not cached:
+            return
+        for item in msgs:
+            if not content_format.is_voice_type(str(item.get("type") or "")):
+                continue
+            row = cached.get(int(item.get("local_id") or 0))
+            if not row:
+                continue
+            text = str(row.get("text") or "").strip()
+            if text:
+                item["content"] = content_format.voice_text_content(text)
 
     def get_message_by_local_id(self, username: str,
                                 local_id: int) -> Optional[dict]:
@@ -977,6 +1053,30 @@ class WeChatService:
     # ------------------------------------------------------------------
     # 图片消息解密（反馈 2：详情/上下文中的图片显示为真图）
     # ------------------------------------------------------------------
+    def _get_media_downloader(self):
+        """懒加载并复用 MediaDownloader（图片解密 / 语音下载共用）。
+
+        首次调用会解密媒体库（本机约 13s），因此**不能**每条消息都新建；
+        失败返回 None（由调用方转成用户可读原因）。
+        """
+        if self._media_downloader is not None:
+            return self._media_downloader
+        with self._media_lock:
+            if self._media_downloader is not None:
+                return self._media_downloader
+            try:
+                from wechatauto.media import MediaDownloader
+            except Exception:
+                logger.warning("wechatauto.media 不可用，图片/语音媒体功能降级")
+                return None
+            try:
+                self._media_downloader = MediaDownloader(
+                    self._wxdb, save_dir=str(IMG_CACHE_DIR))
+            except Exception:
+                logger.exception("创建 MediaDownloader 失败")
+                return None
+            return self._media_downloader
+
     def get_image_bytes(self, username: str, local_id: int) -> Optional[bytes]:
         """解密会话中指定图片消息，返回图片字节；失败返回 None。
 
@@ -990,13 +1090,10 @@ class WeChatService:
         """
         if self._wxdb is None:
             return None
-        try:
-            from wechatauto.media import MediaDownloader
-        except Exception:
-            logger.warning("wechatauto.media 不可用，图片解密功能降级")
+        downloader = self._get_media_downloader()
+        if downloader is None:
             return None
         try:
-            downloader = MediaDownloader(self._wxdb, save_dir=str(IMG_CACHE_DIR))
             path = downloader.download_image(username, local_id)
         except Exception as exc:
             logger.warning("图片解密失败（%s local_id=%d）：%s",
@@ -1011,6 +1108,130 @@ class WeChatService:
                 return f.read()
         except OSError:
             return None
+
+    # ------------------------------------------------------------------
+    # 语音消息离线转写（本地识别，音频绝不上传外部服务）
+    # ------------------------------------------------------------------
+    def transcribe_voice(self, username: str, local_id: int) -> tuple[str, str]:
+        """把一条语音消息转成文字，返回 (文本, 失败原因)。
+
+        流程：``voice_texts`` 缓存命中直接返回 → 否则从微信本地库取
+        ``.silk`` → 本地解码 + SenseVoice 识别 → 成功结果写缓存。
+
+        缓存是刚需：同一条语音会在商机上下文、消息列表、分析输入里被
+        反复读到，每次重跑识别（0.5~2 秒、CPU 满载）会明显拖慢整条链路。
+        失败结果**不写缓存**（可能是「微信还没下载该语音」这类可恢复状态，
+        下次重试应能成功），也不影响调用方主流程。
+        """
+        try:
+            local_id_int = int(local_id or 0)
+        except (TypeError, ValueError):
+            return "", "语音消息标识非法"
+        username = str(username or "")
+        if not username or local_id_int <= 0:
+            return "", "语音消息标识非法"
+
+        # 1) 缓存命中（只认有文本的行；失败结果不落缓存，见方法文档）
+        cached = self._read_voice_text(username, local_id_int)
+        if cached and str(cached.get("text") or "").strip():
+            return str(cached.get("text") or "").strip(), ""
+
+        # 2) 开关 / 依赖可用性
+        try:
+            enabled = self._db.get_setting(KEY_ASR_ENABLED, "1") != "0"
+        except Exception:  # 设置读取失败按「开启」处理，由可用性检查兜底
+            enabled = True
+        if not enabled:
+            return "", MSG_ASR_DISABLED
+        transcriber = voice_asr.get_transcriber()
+        ok, reason = transcriber.available()
+        if not ok:
+            return "", reason
+        if self._wxdb is None:
+            return "", MSG_DB_UNAVAILABLE_ERROR
+
+        # 3) 取音频 → 本地识别
+        silk_path = self._download_voice_silk(username, local_id_int)
+        if not silk_path:
+            return "", MSG_ASR_NO_VOICE
+        started = time.monotonic()
+        text, err = transcriber.transcribe(silk_path)
+        wall_ms = int((time.monotonic() - started) * 1000)
+        # duration_ms 只统计「解码 + 识别」本身：首次调用会把模型加载时间
+        # （实测 2.5~11s）算进墙钟，直接落库会让耗时统计严重虚高。
+        duration_ms = self._recognition_ms(transcriber, wall_ms)
+        if not text:
+            logger.info("语音转写失败（%s local_id=%d，耗时 %dms）：%s",
+                        username, local_id_int, wall_ms, err)
+            return "", err or "语音转写失败"
+        self._write_voice_text(username, local_id_int, text=text,
+                              status="ok", duration_ms=duration_ms)
+        logger.info("语音转写成功（%s local_id=%d，%d 字，识别耗时 %dms，"
+                    "整体 %dms）", username, local_id_int, len(text),
+                    duration_ms, wall_ms)
+        return text, ""
+
+    @staticmethod
+    def _recognition_ms(transcriber, wall_ms: int) -> int:
+        """本条语音的「识别耗时」（毫秒）：SILK 解码 + decode_stream。
+
+        优先取转写器的分段计时（不含首次模型加载）；转写器被替身替换或
+        未产生分段计时时，退回墙钟耗时（此时也没有模型加载可扣）。
+        """
+        getter = getattr(transcriber, "last_timing", None)
+        if callable(getter):
+            try:
+                timing = getter() or {}
+            except Exception:  # 分段计时读取失败：退回墙钟
+                logger.exception("读取语音分段耗时失败（按墙钟处理）")
+                timing = {}
+            if timing:
+                return max(0, int(timing.get("decode_ms") or 0)
+                           + int(timing.get("recognize_ms") or 0))
+        return max(0, wall_ms)
+
+    def _read_voice_text(self, username: str,
+                         local_id: int) -> Optional[dict]:
+        """读语音转写缓存（异常降级为未命中，不影响主流程）。"""
+        try:
+            return self._db.get_voice_text(username, local_id)
+        except Exception:
+            logger.exception("读取语音转写缓存失败（按未命中处理）")
+            return None
+
+    def _write_voice_text(self, username: str, local_id: int, *, text: str,
+                          status: str, duration_ms: int = 0) -> None:
+        """写语音转写缓存（异常只记日志：缓存失败不该让转写结果丢失）。"""
+        try:
+            self._db.save_voice_text(username, local_id, text=text,
+                                     status=status, duration_ms=duration_ms)
+        except Exception:
+            logger.exception("写入语音转写缓存失败（已忽略）")
+
+    def _download_voice_silk(self, username: str,
+                             local_id: int) -> Optional[str]:
+        """从微信本地库取出语音原始 SILK 文件；失败返回 None。
+
+        wechatauto 的 ``download_voice`` 只在 ``media_*.db`` 的 VoiceInfo
+        里找 voice_data（微信未播放/未下载的语音在这里就是空的），因此
+        返回 None 属正常情况，由调用方转成「未找到语音数据」提示。
+        """
+        if self._wxdb is None:
+            return None
+        downloader = self._get_media_downloader()
+        if downloader is None:
+            return None
+        try:
+            VOICE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            path = downloader.download_voice(username, local_id,
+                                             save_dir=str(VOICE_CACHE_DIR))
+        except Exception as exc:
+            logger.warning("取语音数据失败（%s local_id=%d）：%s",
+                           username, local_id, exc)
+            return None
+        if not path:
+            return None
+        return str(path)
 
     # ------------------------------------------------------------------
     # 状态
