@@ -46,6 +46,7 @@ from app.config import (
     resolve_cache_dir,
 )
 from app.db import Database, epoch_to_iso
+from app.voice_retry import VoiceRetryQueue
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,9 @@ MSG_DB_BUSY_ERROR = "微信数据库正忙（微信客户端正在写入），�
 MSG_DB_UNAVAILABLE_ERROR = "微信数据库不可用，请确认微信已登录"
 # 语音转写相关提示（用户可读，直接进分析日志 error 字段）
 MSG_ASR_DISABLED = "语音转写已关闭（可在设置 → 数据与账单 开启）"
-MSG_ASR_NO_VOICE = "未找到语音数据（微信可能尚未下载该语音）"
+# 「音频还没落库」是可恢复状态（微信按需下载语音），文案要能让用户自己
+# 解决，而不是读起来像系统坏了。
+MSG_ASR_NO_VOICE = "微信尚未下载该语音（在微信里点开播放一次即可）"
 
 # 微信 4.x 群消息正文自带的发送者前缀（wxid_xxx: / 自定义微信号:），
 # 原生格式为 "发送者ID:\n正文"；sender_id 映射不可靠，此前缀为权威发送者。
@@ -137,6 +140,15 @@ class WeChatService:
             voice_asr.get_transcriber().set_max_seconds_provider(
                 lambda: database.get_int(KEY_ASR_MAX_SECONDS,
                                          voice_asr.MAX_SECONDS_DEFAULT))
+        # 语音补转写队列：微信语音是「消息先到、音频后到」（音频在客户端
+        # 按需下载后才写进 media_*.db），监听器秒级轮询导致首次转写几乎
+        # 必然撞上「音频未落库」。失败不丢消息，按退避序列自动重试，补上
+        # 后再回填日志并重新纳入分析（见 app/voice_retry.py）。
+        self._voice_retry = VoiceRetryQueue(
+            transcribe=self.transcribe_voice,
+            on_success=self._on_voice_retry_success,
+            on_failure=self._on_voice_retry_failure,
+        )
 
     # ------------------------------------------------------------------
     # 缓存目录（可配置；默认 kefu-system/data/wechat_cache）
@@ -220,6 +232,9 @@ class WeChatService:
     # ------------------------------------------------------------------
     def start(self) -> None:
         """拉起微信监听（失败降级，不抛异常）。"""
+        # 补转写队列独立于微信监听可用性：即使微信库暂时不可用也先跑起来，
+        # 任务失败会自然耗尽重试（不占用监听线程）。
+        self._voice_retry.start()
         with self._listener_lock:
             if self._listener is not None:
                 return
@@ -266,6 +281,10 @@ class WeChatService:
     def stop(self) -> None:
         """停止监听并把 watermark 刷回数据库。"""
         self._stop.set()
+        try:
+            self._voice_retry.stop()
+        except Exception:
+            logger.exception("停止语音补转写队列异常（已忽略）")
         with self._listener_lock:
             listener = self._listener
             self._listener = None
@@ -332,16 +351,11 @@ class WeChatService:
                     voice_text, voice_err = self.transcribe_voice(username,
                                                                  local_id)
                     if not voice_text:
-                        self._db.insert_analysis_log(
-                            session_username=username,
-                            sender_wxid=sender_wxid,
-                            msg_count=1,
-                            input_text=content_format.format_content(
-                                mtype, str(msg.get("content") or ""))[:200],
-                            status="skipped",
-                            error=("语音转写失败：" +
-                                   (voice_err or "未知原因")),
-                        )
+                        self._handle_voice_failure(
+                            msg, username=username, kind=kind,
+                            sender_wxid=sender_wxid, sender_name=sender_name,
+                            mtype=mtype, local_id=local_id,
+                            error=voice_err or "未知原因")
                         return
                     # 转写成功：按文本消息继续走聚合窗口（音频不出本机）
                     msg["content"] = content_format.voice_text_content(
@@ -366,6 +380,158 @@ class WeChatService:
             self._aggregator.add(msg, session_name, kind)
         except Exception:
             logger.exception("处理新消息回调异常（已忽略）")
+
+    # ------------------------------------------------------------------
+    # 语音转写失败 → 延迟补转写
+    # ------------------------------------------------------------------
+    def _is_voice_retryable(self, error: str) -> bool:
+        """该失败原因是否值得排队重试。
+
+        只有「音频还没落库」是可恢复的（微信稍后/用户播放后才会下载音频）。
+        开关关闭、模型未安装、微信库不可用、标识非法等属于配置/环境问题，
+        重试多少次都一样，直接落终态让用户按提示处理。
+        """
+        return str(error or "") == MSG_ASR_NO_VOICE
+
+    def _handle_voice_failure(self, msg: dict, *, username: str, kind: str,
+                              sender_wxid: str, sender_name: str,
+                              mtype: str, local_id: int,
+                              error: str) -> None:
+        """语音转写失败的统一出口：先落占位日志，再按需排入补转写队列。
+
+        占位日志让用户立刻能在分析日志里看到「这条语音没转成、为什么」；
+        队列补上后会就地更新这条日志（不新插一条，避免重复）。
+        """
+        retryable = self._is_voice_retryable(error)
+        shown = content_format.format_content(
+            mtype, str(msg.get("content") or ""))[:200]
+        note = ("；音频稍后落库即可补上，已加入自动重试"
+                if retryable else "")
+        try:
+            log_id = self._db.insert_analysis_log(
+                session_username=username,
+                sender_wxid=sender_wxid,
+                msg_count=1,
+                input_text=shown,
+                status="skipped",
+                error=f"语音转写失败：{error}{note}",
+                voice_local_id=local_id or None,
+            )
+        except Exception:
+            logger.exception("写入语音失败日志异常（已忽略）")
+            log_id = 0
+        if not retryable:
+            return
+        if local_id <= 0:
+            logger.info("语音消息缺少 local_id，无法排队重试（%s）", username)
+            return
+        self._voice_retry.enqueue(username, local_id, {
+            # 消息快照：补转写成功后按文本消息重新走一遍合并窗口
+            "msg": {k: v for k, v in msg.items() if k != "content"},
+            "kind": kind,
+            "sender_wxid": sender_wxid,
+            "sender_name": sender_name,
+            "log_id": log_id,
+        })
+
+    def _on_voice_retry_success(self, username: str, local_id: int, text: str,
+                                payload: dict, attempt: int) -> None:
+        """补转写成功：回填占位日志，并把这条语音重新纳入一次分析。
+
+        重新分析是必要的：首次失败时这条语音被直接丢弃，没有进入过 AI
+        分析；补上文本后按普通文本消息重新入窗口，商机才不会漏。
+        """
+        shown = content_format.voice_text_content(text)
+        log_id = int(payload.get("log_id") or 0)
+        if log_id:
+            self._db.update_analysis_log_voice(
+                log_id, input_text=shown, status="ok",
+                error=f"语音延迟到达，第 {attempt} 次重试补转写成功（已重新分析）")
+        msg = dict(payload.get("msg") or {})
+        if not msg:
+            return
+        msg["content"] = shown
+        msg["sender_username"] = payload.get("sender_wxid") or ""
+        msg["sender_display_name"] = payload.get("sender_name") or ""
+        # 语音消息的原始 local_id 已在 msg 中（快照保留），聚合器按需对齐
+        self._aggregator.add(msg, self.get_display_name(username),
+                             payload.get("kind") or "friend")
+
+    def _on_voice_retry_failure(self, username: str, local_id: int, error: str,
+                                payload: dict, attempts: int) -> None:
+        """重试用尽仍未取到音频：落终态，并给出手动恢复路径。"""
+        log_id = int(payload.get("log_id") or 0)
+        if not log_id:
+            return
+        try:
+            self._db.update_analysis_log_voice(
+                log_id, input_text="[语音]", status="skipped",
+                error=(f"语音转写失败：{error}；已自动重试 {attempts} 次仍未取到。"
+                       "在微信里点开播放这条语音，再点右侧「重新识别」即可补上"))
+        except Exception:
+            logger.exception("回填语音失败日志异常（已忽略）")
+
+    def retry_voice(self, username: str, local_id: int,
+                    log_id: int = 0) -> tuple[str, str]:
+        """手动补转写（分析日志「重新识别」按钮）。
+
+        与自动重试同一条链路：转写成功 → 回填日志 → 重新纳入分析。区别是
+        消息快照已不在手里，用微信库里的消息行重建（拿不到时间就跳过重新
+        分析，只回填文本，仍能满足「看看这条语音说了什么」）。
+        """
+        username = str(username or "")
+        try:
+            local_id = int(local_id)
+        except (TypeError, ValueError):
+            return "", "语音消息标识非法"
+        text, error = self.transcribe_voice(username, local_id)
+        if not text:
+            return "", error or "语音转写失败"
+        shown = content_format.voice_text_content(text)
+        if log_id:
+            try:
+                self._db.update_analysis_log_voice(
+                    log_id, input_text=shown, status="ok",
+                    error="手动重新识别成功（已重新分析）")
+            except Exception:
+                logger.exception("回填语音日志异常（已忽略）")
+        msg = self._rebuild_voice_msg(username, local_id, shown)
+        if msg is not None:
+            try:
+                kind = ("group" if username.endswith("@chatroom")
+                        else "friend")
+                sender_wxid, sender_name = self._resolve_sender(
+                    username, kind, msg)
+                msg["sender_username"] = sender_wxid
+                msg["sender_display_name"] = sender_name
+                self._aggregator.add(msg, self.get_display_name(username),
+                                     kind)
+            except Exception:
+                logger.exception("手动重试后重新纳入分析失败（已忽略）")
+        return text, ""
+
+    def _rebuild_voice_msg(self, username: str, local_id: int,
+                           shown: str) -> Optional[dict]:
+        """用手动重试场景重建一条可入窗口的消息；拿不到返回 None。"""
+        wxdb = self._wxdb
+        if wxdb is None:
+            return None
+        try:
+            row = wxdb.get_message_row(username, local_id)
+        except Exception:
+            logger.exception("读取语音消息行失败（跳过重新分析）")
+            return None
+        if not row:
+            return None
+        return {
+            "username": username,
+            "type": "语音",
+            "content": shown,
+            "local_id": local_id,
+            "create_time": row.get("create_time") or 0,
+            "sender_id": row.get("sender_id"),
+            "sender_username": row.get("sender_username") or "",
+        }
 
     # ------------------------------------------------------------------
     # 发送人权威解析（修复：SenderName2Id rowid 映射不可靠导致的显示错误）

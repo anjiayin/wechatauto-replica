@@ -176,6 +176,10 @@ class WeChatUIA:
     def __init__(self, timeout: float = 15.0, search_timeout: float = 2.0):
         self.timeout = timeout
         self._win = None
+        # 输入框控件缓存：open_chat 成功后 send_text / current_chat 直接复用，
+        # 免去每次都在主窗口整棵 UIA 树里深扫。窗口句柄变化或控件失效时重建。
+        self._cached_input = None
+        self._cached_input_hwnd = 0
         # 线程安全：WeChatBot 等宿主可能在后台线程实例化本驱动，COM 未初始化
         # 时 uiautomation 会报「尚未调用 CoInitialize / 无法加载
         # UIAutomationCore.dll」。CoInitializeEx 幂等，主线程重复调用无害。
@@ -720,8 +724,23 @@ class WeChatUIA:
         win = win or self._win
         if win is None:
             return None
+        # 缓存命中：同窗口且控件仍存活（Exists(0) 是一次轻量探测），
+        # 跳过整树深扫。会话切换时控件对象不变（仅 Name 变化），可安全复用。
+        cached = self._cached_input
+        if (cached is not None
+                and self._cached_input_hwnd == (win.NativeWindowHandle or 0)):
+            try:
+                if cached.Exists(0, 0):
+                    return cached
+            except Exception:
+                pass
+            self._cached_input = None
         e = win.EditControl(AutomationId=CHAT_INPUT_AID)
-        return e if e.Exists(1.0, 0.2) else None
+        if e.Exists(1.0, 0.2):
+            self._cached_input = e
+            self._cached_input_hwnd = win.NativeWindowHandle or 0
+            return e
+        return None
 
     def current_chat(self) -> Optional[str]:
         e = self._chat_input()
@@ -729,10 +748,25 @@ class WeChatUIA:
 
     def _find_search_list(self, timeout: float = 3.0):
         deadline = time.time() + timeout
+        win = self._win
         while time.time() < deadline:
-            lst = auto.ListControl(searchDepth=0xFFFFFFFF, AutomationId=SEARCH_LIST_AID)
-            if lst.Exists(0.2, 0.1):
-                return lst
+            # 优先限定在主窗口子树内查找：从桌面根全局深搜会枚举所有
+            # 顶层窗口的无障碍树（实测慢约 10 倍，微信 4.x 树极大）
+            if win is not None:
+                try:
+                    lst = win.ListControl(AutomationId=SEARCH_LIST_AID)
+                    if lst.Exists(0.2, 0.1):
+                        return lst
+                except Exception:
+                    pass
+            # 兜底：搜索下拉若独立于主窗口（弹窗场景），仍从桌面根找
+            try:
+                lst = auto.ListControl(searchDepth=0xFFFFFFFF,
+                                       AutomationId=SEARCH_LIST_AID)
+                if lst.Exists(0.2, 0.1):
+                    return lst
+            except Exception:
+                pass
             time.sleep(0.2)
         return None
 
@@ -888,7 +922,10 @@ class WeChatUIA:
         time.sleep(0.7)
 
         name = self.current_chat()
-        if name and (name == chosen["name"] or name == used_kw):
+        # same_chat 容忍群名「(123)」后缀与空格差异：严格相等会把
+        # 「搜索点击已成功」误判为失败，导致调用方落入十几秒的 OCR 兜底
+        if name and (self.same_chat(name, chosen["name"])
+                     or self.same_chat(name, used_kw)):
             return True
         return False
 

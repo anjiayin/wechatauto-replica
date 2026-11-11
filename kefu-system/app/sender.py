@@ -210,26 +210,35 @@ class Sender:
             self._fail(task, f"发送失败：{exc}", stage)
 
     def _do_send(self, gui, task: SendTask):
-        """按 @成员 / 引用 / 普通文本选择发送接口（全部 verify=True 回读确认）。"""
+        """按 @成员 / 引用 / 普通文本选择发送接口（全部 verify=True 回读确认）。
+
+        who_username 传会话 wxid：数据库回读直查，跳过显示名模糊搜索
+        （既慢，同名联系人时还可能确认失败导致白等 8s 轮询）。
+        UIA 会话比较仍用显示名（who），两者互不影响。
+        """
         if task.at:
             members = [m.strip() for m in task.at if m.strip()]
             # 新版一次 @ 多个成员（同一条消息）；旧版按「逐个 @」兜底
             if hasattr(gui, "at_members"):
                 return gui.at_members(members, task.text,
-                                      who=task.session_name, verify=True)
+                                      who=task.session_name, verify=True,
+                                      who_username=task.session_username)
             resp = None
             for i, member in enumerate(members):
                 text = task.text if i == len(members) - 1 else ""
                 resp = gui.at_member(member, text, who=task.session_name,
-                                     verify=True)
+                                     verify=True,
+                                     who_username=task.session_username)
             return resp
         if task.quote_local_id:
             target_text = self._quote_target_text(task)
             return gui.quote_msg(task.text, who=task.session_name,
                                  target_text=target_text, verify=True,
-                                 assume_open=True)
+                                 assume_open=True,
+                                 who_username=task.session_username)
         return gui.send_msg(task.text, who=task.session_name, verify=True,
-                            assume_open=True)
+                            assume_open=True,
+                            who_username=task.session_username)
 
     @staticmethod
     def _quote_snippet(content: str) -> str:

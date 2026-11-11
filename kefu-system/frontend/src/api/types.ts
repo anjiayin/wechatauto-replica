@@ -225,6 +225,18 @@ export interface AnalysisLogItem {
   queue_wait_ms: number | null
   /** 收到消息 → 分析完成（端到端） */
   e2e_ms: number | null
+  /**
+   * 语音消息在微信会话内的 local_id（非语音为 null）。
+   * 语音是异步落库的，转写失败的行带回该值，用于「重新识别」。
+   */
+  voice_local_id?: number | null
+}
+
+/** POST /api/voice/retry：手动补转写一条语音 */
+export interface VoiceRetryResult {
+  ok: boolean
+  text: string
+  error: string
 }
 
 /** /api/analysis-logs 分页响应 */

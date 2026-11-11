@@ -10,6 +10,7 @@
 - GET /api/system/purge/last                                 上次清理留痕（本轮修复）
 - GET /api/system/billing                                     AI 账单（反馈 13）
 - GET/PUT /api/system/asr | POST /api/system/asr/download      语音转写（本地离线）
+- POST /api/voice/retry                                       语音补转写（手动重试）
 - WS  /ws/events
 """
 from __future__ import annotations
@@ -53,6 +54,8 @@ from app.schemas import (
     RetentionUpdate,
     SessionItemOut,
     StatusOut,
+    VoiceRetryIn,
+    VoiceRetryOut,
     WechatStatus,
     WorkerStatus,
 )
@@ -417,6 +420,30 @@ def download_asr_model(db: Database = Depends(get_db)) -> AsrStatusOut:
     except Exception:
         logger.exception("触发语音模型下载失败（返回当前状态）")
     return _asr_status(db)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/voice/retry
+# ---------------------------------------------------------------------------
+@router.post("/api/voice/retry", response_model=VoiceRetryOut)
+def retry_voice(body: VoiceRetryIn,
+                wechat: WeChatService = Depends(get_wechat_service),
+                ) -> VoiceRetryOut:
+    """手动补转写一条语音（分析日志「重新识别」按钮）。
+
+    微信语音的音频是按需下载的，首次转写失败通常是「音频还没落库」；
+    用户在微信里点开播放一次后再点这里即可补上。成功会回填 ``log_id``
+    对应的日志并重新纳入一次分析；失败返回中文原因，绝不 500。
+    """
+    try:
+        text, error = wechat.retry_voice(body.username, body.local_id,
+                                         body.log_id)
+    except Exception:      # 兜底：任何异常都不该让前端只看到 500
+        logger.exception("手动补转写异常（%s/%s）", body.username, body.local_id)
+        return VoiceRetryOut(ok=False, error="补转写失败，请稍后再试")
+    if text:
+        return VoiceRetryOut(ok=True, text=text)
+    return VoiceRetryOut(ok=False, error=error or "语音转写失败")
 
 
 # ---------------------------------------------------------------------------

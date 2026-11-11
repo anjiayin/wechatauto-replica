@@ -31,8 +31,14 @@ import ManageAccountsIcon from '@mui/icons-material/ManageAccounts'
 import EditIcon from '@mui/icons-material/Edit'
 import DeleteIcon from '@mui/icons-material/Delete'
 import AddIcon from '@mui/icons-material/Add'
-import { apiGet, apiPut, qs } from '../api/client'
-import type { AnalysisLogItem, AnalysisLogListOut, AnalysisSettings } from '../api/types'
+import ReplayIcon from '@mui/icons-material/Replay'
+import { apiGet, apiPost, apiPut, qs } from '../api/client'
+import type {
+  AnalysisLogItem,
+  AnalysisLogListOut,
+  AnalysisSettings,
+  VoiceRetryResult,
+} from '../api/types'
 
 const STATUS_LABELS: Record<string, string> = {
   ok: '成功',
@@ -319,6 +325,7 @@ export default function AnalysisLogs() {
                     saveSettingsMutation.mutate({ correction_examples: next })
                   }}
                   examplesFull={examples.length >= 20}
+                  onNotify={(msg, severity) => setSnack({ msg, severity })}
                 />
               ))}
             </TableBody>
@@ -360,9 +367,32 @@ function LogRow(props: {
   onSaveKeyword: (kw: string) => void
   onSaveExample: (text: string) => void
   examplesFull: boolean
+  onNotify: (msg: string, severity: 'success' | 'error') => void
 }) {
   const { log } = props
-  const correctable = isCorrectable(log)
+  const queryClient = useQueryClient()
+  // 语音转写失败（音频是微信异步下载的，首次转写常因「还没落库」失败）
+  const isVoiceFail =
+    !!log.voice_local_id && log.error.includes('语音转写失败')
+  const correctable = isCorrectable(log) && !isVoiceFail
+  // ③ 语音「重新识别」：用户先在微信里播放一次，再点这里补转写
+  const retryVoice = useMutation({
+    mutationFn: () =>
+      apiPost<VoiceRetryResult>('/api/voice/retry', {
+        username: log.session_username,
+        local_id: log.voice_local_id,
+        log_id: log.id,
+      }),
+    onSuccess: (resp) => {
+      if (resp.ok) {
+        void queryClient.invalidateQueries({ queryKey: ['analysis-logs'] })
+        props.onNotify(`已识别：${resp.text}`, 'success')
+      } else {
+        props.onNotify(resp.error || '语音转写失败', 'error')
+      }
+    },
+    onError: (err: Error) => props.onNotify(err.message, 'error'),
+  })
   // ① 加为预筛关键词
   const [kwOpen, setKwOpen] = useState(false)
   const [kwText, setKwText] = useState('')
@@ -435,7 +465,22 @@ function LogRow(props: {
         ) : '—'}
       </TableCell>
       <TableCell align="right">
-        {correctable && (
+        {isVoiceFail ? (
+          <Tooltip
+            title="微信语音是异步下载的：先在微信里点开播放这条语音，再点此补转写（成功后会自动重新分析）"
+          >
+            <span>
+              <Button
+                size="small"
+                startIcon={<ReplayIcon />}
+                disabled={retryVoice.isPending}
+                onClick={() => retryVoice.mutate()}
+              >
+                {retryVoice.isPending ? '识别中…' : '重新识别'}
+              </Button>
+            </span>
+          </Tooltip>
+        ) : correctable && (
           <Stack direction="row" spacing={0.5} justifyContent="flex-end">
             <Tooltip title="编辑为短关键词，追加到预筛关键词（去重）">
               <Button size="small" startIcon={<KeyIcon />} onClick={openKeywordDialog}>

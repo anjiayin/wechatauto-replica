@@ -839,6 +839,7 @@ class FakeGUI:
         self.open_ok = open_ok
         self.send_ok = send_ok
         self.sent: List[str] = []
+        self.last_send_kwargs: dict = {}
 
     def is_alive(self):
         return self.alive
@@ -852,8 +853,12 @@ class FakeGUI:
     def open_chat(self, name, exact=False):
         return self.open_ok
 
-    def send_msg(self, text, who=None, verify=False, assume_open=False):
+    def send_msg(self, text, who=None, verify=False, assume_open=False,
+                 who_username=None):
         self.sent.append(text)
+        self.last_send_kwargs = dict(who=who, verify=verify,
+                                     assume_open=assume_open,
+                                     who_username=who_username)
         return FakeWxResponse(self.send_ok,
                               "消息已发送并确认" if self.send_ok else "发送失败：模拟")
 
@@ -883,6 +888,10 @@ class TestSender:
         assert row["status"] == "replied"
         assert row["reply_content"] == "您好，可以做"
         assert gui.sent == ["您好，可以做"]
+        # DB 回读用会话 wxid 直查（who_username 透传不丢）
+        assert gui.last_send_kwargs["who_username"] == "12345@chatroom"
+        assert gui.last_send_kwargs["who"] == "加工群"       # UIA 比较仍用显示名
+        assert gui.last_send_kwargs["verify"] is True
 
     def test_window_invisible_fails(self):
         db, opp, sender = self._prepare()

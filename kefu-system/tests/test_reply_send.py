@@ -71,17 +71,22 @@ class FakeGui:
 
     def send_msg(self, text: str, who: str | None = None, verify: bool = False,
                  **kwargs):
-        self.calls.append(("send_msg", text, who, verify, kwargs.get("assume_open")))
+        self.calls.append(("send_msg", text, who, verify,
+                           kwargs.get("assume_open"),
+                           kwargs.get("who_username")))
         return Resp(self.send_ok, "消息已发送并确认" if self.send_ok else "发送失败")
 
     def quote_msg(self, text: str, who: str | None = None,
                   target_text: str | None = None, verify: bool = False, **kwargs):
-        self.calls.append(("quote_msg", text, target_text, verify, kwargs.get("assume_open")))
+        self.calls.append(("quote_msg", text, target_text, verify,
+                           kwargs.get("assume_open"),
+                           kwargs.get("who_username")))
         return Resp(True, "引用已发送并确认")
 
     def at_members(self, members, text: str, who: str | None = None,
-                   verify: bool = False):
-        self.calls.append(("at_members", list(members), text, who, verify))
+                   verify: bool = False, who_username: str | None = None):
+        self.calls.append(("at_members", list(members), text, who, verify,
+                           who_username))
         return Resp(True, "@成员消息已发送并确认")
 
 
@@ -225,6 +230,8 @@ class TestAtMembers:
         assert calls[0][1] == ["张三", "李四"]
         assert calls[0][2] == "明天发货"
         assert calls[0][4] is True  # verify
+        # DB 回读用会话 wxid 直查（不按显示名搜索，同名联系人不歧义）
+        assert calls[0][5] == "21264829018@chatroom"
 
     def test_blank_member_names_ignored(self, sender):
         gui = FakeGui()
@@ -243,6 +250,21 @@ class TestAtMembers:
         sends = [c for c in gui.calls if c[0] == "send_msg"]
         # 会话刚由本流程打开：assume_open=True，避免 gui 内部再搜一次会话
         assert sends and sends[0][4] is True
+        # DB 回读用会话 wxid 直查（who_username 透传不丢）
+        assert sends[0][5] == "21264829018@chatroom"
+
+    def test_quote_msg_passes_session_username(self, sender):
+        """引用回复：quote_msg 收到 who_username（DB 回读按 wxid 直查）。"""
+        gui = FakeGui()
+        sender.sender._gui = gui
+        sender.sender._message_lookup = lambda u, i: {"content": "张三:\n上周的报价单"}
+        sender.sender._latest_lookup = lambda u: 99
+        sender.sender._process(make_task(quote_local_id=5))
+
+        quotes = [c for c in gui.calls if c[0] == "quote_msg"]
+        assert len(quotes) == 1
+        assert quotes[0][2] == "上周的报价单"      # target_text
+        assert quotes[0][5] == "21264829018@chatroom"
 
 
 # ---------------------------------------------------------------------------

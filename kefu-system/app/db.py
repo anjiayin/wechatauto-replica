@@ -138,7 +138,8 @@ DDL_STATEMENTS: tuple[str, ...] = (
       completion_tokens INTEGER,
       agg_wait_ms      INTEGER,
       queue_wait_ms    INTEGER,
-      e2e_ms           INTEGER
+      e2e_ms           INTEGER,
+      voice_local_id   INTEGER
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_logs_created ON analysis_logs (created_at DESC)",
@@ -284,6 +285,10 @@ class Database:
             ("analysis_logs", "agg_wait_ms", "INTEGER"),
             ("analysis_logs", "queue_wait_ms", "INTEGER"),
             ("analysis_logs", "e2e_ms", "INTEGER"),
+            # 语音消息标识（微信会话内 local_id）：语音转写失败时记录，
+            # 供补转写成功后回填日志、以及前端「重新识别」按 (会话, local_id)
+            # 精确定位那条语音（消息正文里没有可用标识）
+            ("analysis_logs", "voice_local_id", "INTEGER"),
         )
         with self._lock:
             for table, column, col_type in plans:
@@ -806,7 +811,8 @@ class Database:
                             completion_tokens: Optional[int] = None,
                             agg_wait_ms: Optional[int] = None,
                             queue_wait_ms: Optional[int] = None,
-                            e2e_ms: Optional[int] = None) -> int:
+                            e2e_ms: Optional[int] = None,
+                            voice_local_id: Optional[int] = None) -> int:
         """写入一条分析日志（ok/error/skipped/below_threshold）。
 
         prompt_tokens/completion_tokens：AI 调用 token 用量（反馈 13
@@ -817,19 +823,24 @@ class Database:
         - queue_wait_ms：入队 → worker 取出（排队等空闲 worker）；
         - e2e_ms：收到消息 → 本条日志落库（端到端）。
         ``latency_ms`` 仍只表示 AI 接口调用本身的耗时。
+
+        ``voice_local_id``：语音消息在微信会话内的 local_id（非语音消息为
+        None）。语音转写失败时靠它做延迟重试回填与前端手动重试。
         """
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO analysis_logs (session_username, sender_wxid, "
                 "msg_count, input_text, result, status, error, model, "
                 "latency_ms, opportunity_id, prompt_tokens, completion_tokens, "
-                "agg_wait_ms, queue_wait_ms, e2e_ms, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "agg_wait_ms, queue_wait_ms, e2e_ms, voice_local_id, "
+                "created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
                 "datetime('now','localtime'))",
                 (session_username, sender_wxid, msg_count, input_text, result,
                  status, error, model, latency_ms, opportunity_id,
                  prompt_tokens, completion_tokens,
-                 agg_wait_ms, queue_wait_ms, e2e_ms),
+                 agg_wait_ms, queue_wait_ms, e2e_ms,
+                 int(voice_local_id) if voice_local_id else None),
             )
             # 同一事务里镜像到 ai_usage：账单只认这张表，即使之后分析日志
             # 被「历史清理」删掉，用量与费用统计也不会出现空洞。
@@ -843,6 +854,35 @@ class Database:
                 )
             self._conn.commit()
             return int(cur.lastrowid or 0)
+
+    def update_analysis_log_voice(self, log_id: int, *, input_text: str,
+                                  status: str, error: str) -> bool:
+        """回填一条语音分析日志（补转写成功 / 重试用尽时更新终态）。
+
+        语音转写失败时会先落一条 ``skipped`` 日志占位（让用户在分析日志里
+        看到这条语音的存在与原因），随后由补转写队列异步更新它 —— 不新插
+        日志，避免同一条语音在列表里出现两条。
+
+        Args:
+            log_id: 待更新的日志 id（``insert_analysis_log`` 的返回值）。
+            input_text: 替换后的输入摘要（补转写成功时为 ``[语音] 文本``）。
+            status: 新状态（补转写成功 ``ok``；重试用尽仍 ``skipped``）。
+            error: 新的原因文案（成功时说明「已补齐并重新分析」）。
+
+        Returns:
+            是否更新到了目标行（id 缺失/已被清理时返回 False）。
+        """
+        if not log_id:
+            return False
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE analysis_logs SET input_text=?, status=?, error=? "
+                "WHERE id=?",
+                (str(input_text or ""), str(status or "skipped"),
+                 str(error or ""), int(log_id)),
+            )
+            self._conn.commit()
+            return bool(cur.rowcount)
 
     def list_analysis_logs(self, *, page: int = 1, page_size: int = 20,
                            status: str = "", session: str = "",
@@ -876,7 +916,8 @@ class Database:
             rows = self._conn.execute(
                 "SELECT id, created_at, session_username, sender_wxid, "
                 "msg_count, input_text, result, status, error, model, "
-                "latency_ms, agg_wait_ms, queue_wait_ms, e2e_ms "
+                "latency_ms, agg_wait_ms, queue_wait_ms, e2e_ms, "
+                "voice_local_id "
                 "FROM analysis_logs"
                 f"{where_sql} ORDER BY id DESC LIMIT ? OFFSET ?",
                 [*params, page_size, (max(page, 1) - 1) * page_size],

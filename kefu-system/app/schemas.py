@@ -279,6 +279,24 @@ class AsrUpdate(BaseModel):
     enabled: bool = True
 
 
+class VoiceRetryIn(BaseModel):
+    """手动补转写（分析日志「重新识别」）。
+
+    ``log_id`` 可选：带上时把结果回填到该条日志（覆盖为 ok + 转写文本）；
+    不带则只返回值，不影响任何历史日志。
+    """
+    username: str
+    local_id: int
+    log_id: int = 0
+
+
+class VoiceRetryOut(BaseModel):
+    """补转写结果：``ok=False`` 时 ``error`` 为中文原因（可直接展示）。"""
+    ok: bool = False
+    text: str = ""
+    error: str = ""
+
+
 class PurgeResult(BaseModel):
     """清理结果（dry_run=True 时 deleted 为「将删除条数」，未真正删除）。
 
@@ -407,6 +425,9 @@ class AnalysisLogOut(BaseModel):
     agg_wait_ms: Optional[int] = None   # 收到消息 → 合并窗口 flush
     queue_wait_ms: Optional[int] = None  # 入队 → worker 取出
     e2e_ms: Optional[int] = None        # 收到消息 → 分析完成（端到端）
+    # 语音消息标识（非语音为 None）：语音转写失败的行带此值，前端据此提供
+    # 「重新识别」（微信语音是异步落库的，首次转写常因音频未下载而失败）
+    voice_local_id: Optional[int] = None
 
 
 class AnalysisLogListOut(BaseModel):

@@ -1650,7 +1650,8 @@ class WeChatGUI:
         return False
 
     def send_msg(self, text: str, who: Optional[str] = None,
-                 verify: bool = False, assume_open: bool = False) -> WxResponse:
+                 verify: bool = False, assume_open: bool = False,
+                 who_username: Optional[str] = None) -> WxResponse:
         """发送一条文本消息。
 
         Args:
@@ -1660,6 +1661,8 @@ class WeChatGUI:
             assume_open: 调用方已确认目标会话就在前台（刚 open_chat 成功），
                 跳过窗口前置/会话重开等重复检查，只做「输入 + 发送 + 校验」。
                 调用方误传时由 :meth:`_verify_sent` 拦截，不会发错会话。
+            who_username: 目标会话的 username（wxid），verify=True 时数据库
+                回读直查用；None 则仍按显示名 search_contact 解析。
 
         Returns:
             WxResponse
@@ -1678,7 +1681,15 @@ class WeChatGUI:
         # UIA 路径：热激活后可直接输入+回车发送，无 OCR 抖动，最快。
         uia = self._get_uia()
         if uia is not None:
-            already_open = uia.same_chat(uia.current_chat(), who) if who else True
+            if who:
+                # open_chat 刚成功时 _current_chat 已是目标会话：直接复用，
+                # 不再全树扫一次输入框（current_chat）重复判定同一件事
+                already_open = self._same_chat(
+                    who, getattr(self, '_current_chat', None))
+                if not already_open:
+                    already_open = uia.same_chat(uia.current_chat(), who)
+            else:
+                already_open = True
             if already_open or uia.open_chat(who):
                 if already_open:
                     time.sleep(0.2)   # 已在前台：无需等面板切换
@@ -1687,12 +1698,12 @@ class WeChatGUI:
                 if uia.send_text(text):
                     if not verify:
                         return WxResponse.success(f'消息已发送：{text}', data={'content': text})
-                    if self._verify_sent(text, who):
+                    if self._verify_sent(text, who, who_username):
                         return WxResponse.success(f'消息已发送并确认：{text}', data={'content': text})
                     wait_until = time.time() + 8
                     while time.time() < wait_until:
                         time.sleep(1.0)
-                        if self._verify_sent(text, who):
+                        if self._verify_sent(text, who, who_username):
                             return WxResponse.success(f'消息已发送并确认：{text}', data={'content': text})
                     return WxResponse.failure('消息已操作发送，但数据库未确认', data={'content': text})
         # assume_open 只在会话确实是刚打开的那个时才跳过前置检查
@@ -1726,13 +1737,13 @@ class WeChatGUI:
                 continue
             if not verify:
                 return WxResponse.success(f'消息已发送：{text}', data={'content': text})
-            if self._verify_sent(text, who):
+            if self._verify_sent(text, who, who_username):
                 return WxResponse.success(f'消息已发送并确认：{text}', data={'content': text})
             # 可能已发送但 DB 异步落库，轮询确认，不重发避免重复
             wait_until = time.time() + 8
             while time.time() < wait_until:
                 time.sleep(1.0)
-                if self._verify_sent(text, who):
+                if self._verify_sent(text, who, who_username):
                     return WxResponse.success(f'消息已发送并确认：{text}', data={'content': text})
             return WxResponse.failure('消息已操作发送，但数据库未确认', data={'content': text})
         return WxResponse.failure('发送失败：多次重试未完成')
@@ -1744,16 +1755,22 @@ class WeChatGUI:
             self._cached_db = WeChatDB()
         return self._cached_db
 
-    def _verify_sent(self, text: str, who: Optional[str]) -> bool:
+    def _verify_sent(self, text: str, who: Optional[str],
+                     who_username: Optional[str] = None) -> bool:
         try:
             db = self._get_db()
-            if not who:
-                who = db.get_self_info()['username']
-            else:
+            if who_username:
+                # username（wxid）直查：跳过显示名模糊搜索（慢且同名时
+                # 可能命中错误联系人，导致确认永远失败而白等 8s 轮询）
+                username = who_username
+            elif who:
                 hits = db.search_contact(who)
                 if hits:
                     who = hits[0]["username"]
-            msgs = db.get_messages(who, limit=3)
+                username = who
+            else:
+                username = db.get_self_info()['username']
+            msgs = db.get_messages(username, limit=3)
             for m in msgs:
                 if m.get('sender_id') == 2 and text in (m.get('content') or ''):
                     return True
@@ -2087,11 +2104,13 @@ class WeChatGUI:
 
     def quote_msg(self, text: str, who: Optional[str] = None,
                   target_text: Optional[str] = None, verify: bool = False,
-                  assume_open: bool = False) -> WxResponse:
+                  assume_open: bool = False,
+                  who_username: Optional[str] = None) -> WxResponse:
         """引用指定/最近一条消息（右键 → 菜单「引用」→ 输入 → 发送）。
 
         UIA 优先：菜单项是真实控件，图片/小程序/长文本消息也能引用；OCR
         仅作兜底。target_text 用于定位要引用的消息（可选，省略=最新一条）。
+        who_username：目标会话 wxid，verify=True 时数据库回读直查用。
         """
         uia = self._get_uia()
         if uia is not None:
@@ -2100,13 +2119,13 @@ class WeChatGUI:
                 if not verify:
                     return WxResponse.success(f'引用已发送：{text}',
                                               data={'content': text})
-                if self._verify_sent(text, who):
+                if self._verify_sent(text, who, who_username):
                     return WxResponse.success(f'引用已发送并确认：{text}',
                                               data={'content': text})
                 wait_until = time.time() + 8
                 while time.time() < wait_until:
                     time.sleep(1.0)
-                    if self._verify_sent(text, who):
+                    if self._verify_sent(text, who, who_username):
                         return WxResponse.success(f'引用已发送并确认：{text}',
                                                   data={'content': text})
                 return WxResponse.failure('引用已操作发送，但数据库未确认',
@@ -2157,7 +2176,7 @@ class WeChatGUI:
             return WxResponse.failure('输入引用内容失败')
         self.click_send()
         if verify:
-            ok = self._verify_sent(text, who)
+            ok = self._verify_sent(text, who, who_username)
             return (WxResponse.success(f'引用已发送并确认：{text}', data={'content': text})
                     if ok else WxResponse.failure('引用已操作发送，但数据库未确认', data={'content': text}))
         return WxResponse.success(f'引用已发送：{text}', data={'content': text})
@@ -2166,16 +2185,19 @@ class WeChatGUI:
     # 艾特成员（群聊）
     # ------------------------------------------------------------------
     def at_members(self, members: List[str], text: str,
-                   who: Optional[str] = None, verify: bool = False) -> WxResponse:
+                   who: Optional[str] = None, verify: bool = False,
+                   who_username: Optional[str] = None) -> WxResponse:
         """群聊 @ 多个成员并发送正文（同一条消息）。
 
         UIA 优先：@ 弹层是 ``mmui::XPopover/MentionPopover`` 真实控件，按
         名称精确选中，不再依赖 OCR 识别弹层文字（旧实现 OCR 读不到就报
         「未在成员列表中找到」）。OCR 仅作兜底。
+        who_username：目标会话 wxid，verify=True 时数据库回读直查用。
         """
         names = [m.strip() for m in (members or []) if m and m.strip()]
         if not names:
-            return self.send_msg(text, who=who, verify=verify)
+            return self.send_msg(text, who=who, verify=verify,
+                                 who_username=who_username)
         uia = self._get_uia()
         if uia is not None:
             if uia.at_members(names, text, who=who):
@@ -2183,12 +2205,12 @@ class WeChatGUI:
                 data = {'members': names, 'content': text}
                 if not verify:
                     return WxResponse.success('@成员消息已发送', data=data)
-                if self._verify_sent(text, who):
+                if self._verify_sent(text, who, who_username):
                     return WxResponse.success('@成员消息已发送并确认', data=data)
                 wait_until = time.time() + 8
                 while time.time() < wait_until:
                     time.sleep(1.0)
-                    if self._verify_sent(text, who):
+                    if self._verify_sent(text, who, who_username):
                         return WxResponse.success('@成员消息已发送并确认', data=data)
                 return WxResponse.failure('@消息已操作发送，但数据库未确认', data=data)
             wxlog.debug('UIA @ 成员失败，降级 OCR 路径')
@@ -2202,15 +2224,19 @@ class WeChatGUI:
         if who and not self._same_chat(who, getattr(self, '_current_chat', None)):
             self.open_chat(who)
             time.sleep(0.8)
-        return self._at_member_ocr(names[0], text, who, verify)
+        return self._at_member_ocr(names[0], text, who, verify,
+                                   who_username)
 
     def at_member(self, member: str, text: str, who: Optional[str] = None,
-                  verify: bool = False) -> WxResponse:
+                  verify: bool = False,
+                  who_username: Optional[str] = None) -> WxResponse:
         """在群聊中 @ 单个成员后追加发送 text（兼容旧签名）。"""
-        return self.at_members([member], text, who=who, verify=verify)
+        return self.at_members([member], text, who=who, verify=verify,
+                               who_username=who_username)
 
     def _at_member_ocr(self, member: str, text: str, who: Optional[str],
-                       verify: bool) -> WxResponse:
+                       verify: bool,
+                       who_username: Optional[str] = None) -> WxResponse:
         """OCR 兜底：输入框键入 '@' → OCR 弹层定位成员 → 点击 → 正文 → 发送。"""
         if not self.focus_input():
             return WxResponse.failure('输入框不可用')
@@ -2234,7 +2260,7 @@ class WeChatGUI:
             return WxResponse.failure('输入消息正文失败')
         self.click_send()
         if verify:
-            ok = self._verify_sent(text, who)
+            ok = self._verify_sent(text, who, who_username)
             return (WxResponse.success(f'@成员消息已发送并确认', data={'member': member, 'content': text})
                     if ok else WxResponse.failure('@消息已操作发送，但数据库未确认', data={'member': member}))
         return WxResponse.success(f'@成员消息已发送', data={'member': member, 'content': text})

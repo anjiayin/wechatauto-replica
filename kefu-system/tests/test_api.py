@@ -977,7 +977,8 @@ class TestAnalysisLogsContract:
                                  "msg_count", "input_text",
                                  "input_text_display", "result", "status",
                                  "error", "model", "latency_ms",
-                                 "agg_wait_ms", "queue_wait_ms", "e2e_ms"}
+                                 "agg_wait_ms", "queue_wait_ms", "e2e_ms",
+                                 "voice_local_id"}
 
     def test_list_filters(self, env):
         self._insert_logs(env.db)
