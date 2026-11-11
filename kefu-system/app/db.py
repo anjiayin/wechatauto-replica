@@ -37,6 +37,7 @@ from app.config import (
     KEY_NOTIFY_SOUND,
     KEY_RUNTIME_MW_MIGRATED,
     KEY_RUNTIME_LOCALTIME_MIGRATED,
+    KEY_RUNTIME_AI_USAGE_BACKFILLED,
 )
 
 logger = logging.getLogger(__name__)
@@ -142,6 +143,19 @@ DDL_STATEMENTS: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_logs_created ON analysis_logs (created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_logs_session ON analysis_logs (session_username, created_at DESC)",
+    # AI 用量独立存档（账单数据源）：与 analysis_logs 解耦，历史清理/日志
+    # 重建都不会影响账单，避免「近 7 日只剩今日有数」这类数据空洞。
+    """
+    CREATE TABLE IF NOT EXISTS ai_usage (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at        TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+      model             TEXT NOT NULL DEFAULT '',
+      session_username  TEXT NOT NULL DEFAULT '',
+      prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+      completion_tokens INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_usage_created ON ai_usage (created_at)",
     """
     CREATE TABLE IF NOT EXISTS watermarks (
       username   TEXT PRIMARY KEY,
@@ -179,6 +193,7 @@ class Database:
         self._migrate_opportunity_status_handled()
         self._migrate_add_columns()
         self._migrate_created_at_localtime()
+        self._migrate_ai_usage_backfill()
         logger.info("业务数据库已初始化：%s", self.path)
 
     def _migrate_created_at_localtime(self) -> None:
@@ -210,6 +225,34 @@ class Database:
             self._conn.commit()
         self.set_setting(KEY_RUNTIME_LOCALTIME_MIGRATED, "1")
         logger.info("历史时间已从 UTC 平移为本地时间（%+d 小时）", offset_hours)
+
+    def _migrate_ai_usage_backfill(self) -> None:
+        """一次性把 analysis_logs 里已有的 token 用量回填到 ai_usage。
+
+        背景：账单原先直接聚合 analysis_logs，日志被「历史清理」删掉后
+        账单历史就出现 0 值空洞（用户反馈：近 7 日只有今日有数）。改为
+        独立表存档后，这里把存量用量搬一次，保证升级后历史账单不跳变。
+        失败/未调用 AI 的行（tokens 为 NULL）不回填。
+        """
+        if self.get_setting(KEY_RUNTIME_AI_USAGE_BACKFILLED, "0") == "1":
+            return
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    "INSERT INTO ai_usage (created_at, model, session_username, "
+                    "prompt_tokens, completion_tokens) "
+                    "SELECT created_at, COALESCE(model, ''), "
+                    "COALESCE(session_username, ''), "
+                    "COALESCE(prompt_tokens, 0), COALESCE(completion_tokens, 0) "
+                    "FROM analysis_logs "
+                    "WHERE prompt_tokens IS NOT NULL "
+                    "OR completion_tokens IS NOT NULL")
+                self._conn.commit()
+            except Exception:  # pragma: no cover - 表缺失等极端情况
+                logger.exception("回填 AI 用量失败（已跳过，账单从新增用量开始累计）")
+                return
+        self.set_setting(KEY_RUNTIME_AI_USAGE_BACKFILLED, "1")
+        logger.info("已回填历史 AI 用量 %d 条（账单改用独立存档）", cur.rowcount)
 
     def _migrate_add_columns(self) -> None:
         """幂等加列迁移（反馈 4/13）：老库补 direction 与 token 用量列。
@@ -722,6 +765,21 @@ class Database:
     # ------------------------------------------------------------------
     # analysis_logs DAO
     # ------------------------------------------------------------------
+    def insert_ai_usage(self, *, prompt_tokens: int,
+                        completion_tokens: int, model: str = "",
+                        session_username: str = "") -> int:
+        """写入一条 AI 用量存档（账单数据源，与 analysis_logs 解耦）。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO ai_usage (model, session_username, prompt_tokens, "
+                "completion_tokens, created_at) "
+                "VALUES (?, ?, ?, ?, datetime('now','localtime'))",
+                (model or "", session_username or "",
+                 int(prompt_tokens or 0), int(completion_tokens or 0)),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid or 0)
+
     def insert_analysis_log(self, *, session_username: str,
                             sender_wxid: str = "", msg_count: int = 0,
                             input_text: str = "", result: str = "",
@@ -757,6 +815,16 @@ class Database:
                  prompt_tokens, completion_tokens,
                  agg_wait_ms, queue_wait_ms, e2e_ms),
             )
+            # 同一事务里镜像到 ai_usage：账单只认这张表，即使之后分析日志
+            # 被「历史清理」删掉，用量与费用统计也不会出现空洞。
+            if prompt_tokens is not None or completion_tokens is not None:
+                self._conn.execute(
+                    "INSERT INTO ai_usage (model, session_username, "
+                    "prompt_tokens, completion_tokens, created_at) "
+                    "VALUES (?, ?, ?, ?, datetime('now','localtime'))",
+                    (model or "", session_username or "",
+                     int(prompt_tokens or 0), int(completion_tokens or 0)),
+                )
             self._conn.commit()
             return int(cur.lastrowid or 0)
 
@@ -803,41 +871,99 @@ class Database:
     # 历史数据管理（反馈 7）
     # ------------------------------------------------------------------
     _PURGE_TABLES = ("analysis_logs", "opportunities")
+    # 注意：ai_usage（账单数据源）刻意不在清理白名单里 —— 无论用户怎么
+    # 清理日志/商机，AI 用量与费用历史都必须保留完整。
 
-    def delete_older_than(self, table: str, days: int) -> int:
-        """删除指定表创建时间早于 N 天前的记录，返回删除行数。
+    # 截断点表达式：由 SQLite 自己在本地时间下按自然日计算，格式与落库值
+    # （datetime('now','localtime')）完全一致。
+    # 绝不能用 Python 拼时间字符串做比较：isoformat() 产生 'T' 分隔
+    # （2026-11-10T11:00:53），而落库值是空格分隔（2026-11-10 23:32:22），
+    # SQLite 按 memcmp 比较 TEXT 时 ' '(0x20) < 'T'(0x54)，会把「与截断点
+    # 同一天」的记录全部误判为更早而删掉（曾导致保留 1 天时丢一整天的数据）。
+    _PURGE_CUTOFF_SQL = "datetime('now','localtime','start of day', ?)"
+
+    def _purge_modifier(self, days: int) -> str:
+        """校验保留天数并返回 SQLite 时间修饰符。
+
+        语义「保留最近 N 个自然日（含今天）」→ 截断点为 (今天 - (N-1)) 00:00:00，
+        因此修饰符是 ``-(N-1) days``；N=1 时为 ``'-0 days'``（SQLite 合法，
+        等价于今天 00:00:00，只保留今天）。
+        """
+        if days < 1:
+            raise ValueError("保留天数必须 ≥ 1")
+        return f"-{int(days) - 1} days"
+
+    def purge_cutoff(self, days: int) -> str:
+        """清理截断点（YYYY-MM-DD HH:MM:SS，本地时间，按自然日对齐）。
+
+        语义：保留最近 ``days`` 个自然日（含今天），即删除
+        (今天 - (days-1)) 00:00:00 之前的记录。例如：
+        - days=1 → 截断点「今天 00:00:00」，只保留今天（删昨天及更早）；
+        - days=2 → 截断点「昨天 00:00:00」，昨天与今天完整保留；
+        - days=30 → 截断点「29 天前 00:00:00」，正好 30 个自然日。
+        该值同时用于清理预览、真删与前端确认提示，保证三处口径一致。
+        """
+        modifier = self._purge_modifier(days)
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self._PURGE_CUTOFF_SQL}", (modifier,)).fetchone()
+        return str(row[0]) if row and row[0] is not None else ""
+
+    def count_older_than(self, table: str, days: int) -> int:
+        """统计指定表将被清理的记录条数（预览用，不做任何删除）。
 
         Args:
             table: 仅允许 analysis_logs / opportunities（白名单防注入）。
-            days: 保留天数（≥1；删除 created_at < now - days 的记录）。
+            days: 保留最近 N 个自然日（含今天，≥1）。
+        """
+        if table not in self._PURGE_TABLES:
+            raise ValueError(f"不允许清理的表：{table}")
+        modifier = self._purge_modifier(days)
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE created_at < "
+                f"{self._PURGE_CUTOFF_SQL}", (modifier,)).fetchone()
+        return int(row[0]) if row else 0
 
+    def delete_older_than(self, table: str, days: int) -> int:
+        """删除指定表创建时间早于截断点的记录，返回删除行数。
+
+        Args:
+            table: 仅允许 analysis_logs / opportunities（白名单防注入）。
+            days: 保留最近 N 个自然日（含今天，≥1）；删除截断点之前的记录。
+
+        截断点由 SQLite 按本地时间计算（见 _PURGE_CUTOFF_SQL），与 created_at
+        落库格式一致，避免字符串格式差异造成的「差一天」误删。
         opportunities 删除前先把 analysis_logs.opportunity_id 引用置空，
         避免外键约束阻止删除（日志保留完整，仅断开关联）。
         """
         if table not in self._PURGE_TABLES:
             raise ValueError(f"不允许清理的表：{table}")
-        if days < 1:
-            raise ValueError("保留天数必须 ≥ 1")
-        cutoff = (datetime.now() - timedelta(days=days)).isoformat(
-            timespec="seconds")
+        modifier = self._purge_modifier(days)
         with self._lock:
             if table == "opportunities":
                 self._conn.execute(
                     "UPDATE analysis_logs SET opportunity_id=NULL "
                     "WHERE opportunity_id IN ("
-                    "SELECT id FROM opportunities WHERE created_at < ?)",
-                    (cutoff,),
+                    "SELECT id FROM opportunities WHERE created_at < "
+                    f"{self._PURGE_CUTOFF_SQL})",
+                    (modifier,),
                 )
             cur = self._conn.execute(
-                f"DELETE FROM {table} WHERE created_at < ?", (cutoff,))
+                f"DELETE FROM {table} WHERE created_at < "
+                f"{self._PURGE_CUTOFF_SQL}", (modifier,))
             self._conn.commit()
-            return cur.rowcount
+            return int(cur.rowcount)
 
     # ------------------------------------------------------------------
     # AI 账单估算（反馈 13）
     # ------------------------------------------------------------------
     def usage_by_date(self, date_str: str) -> dict:
         """某日（YYYY-MM-DD）的 AI token 用量与调用次数汇总。
+
+        数据源是 ai_usage 独立存档（不是 analysis_logs）：日志被手工清理
+        后账单历史仍然完整。命中但低于置信度门槛（below_threshold）的调用
+        同样消耗 token，也计入这里。
 
         Returns:
             {calls, prompt_tokens, completion_tokens}（无数据为 0）。
@@ -847,9 +973,7 @@ class Database:
                 "SELECT COUNT(*) AS calls, "
                 "COALESCE(SUM(prompt_tokens), 0) AS pt, "
                 "COALESCE(SUM(completion_tokens), 0) AS ct "
-                "FROM analysis_logs WHERE status='ok' "
-                "AND prompt_tokens IS NOT NULL "
-                "AND substr(created_at, 1, 10) = ?",
+                "FROM ai_usage WHERE substr(created_at, 1, 10) = ?",
                 (date_str,),
             ).fetchone()
         return {"calls": int(row["calls"]), "prompt_tokens": int(row["pt"]),

@@ -17,6 +17,7 @@ import concurrent.futures
 import json
 import re
 import time
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import List, Optional
 
@@ -1189,3 +1190,99 @@ class TestConcurrency:
             if f.exception():
                 errors.append(f.exception())
         assert errors == []
+
+
+# ---------------------------------------------------------------------------
+# Bug C 回归：清理前可预览条数（dry_run）+ 清理结果落库留痕
+# ---------------------------------------------------------------------------
+def insert_log_at(db: Database, created_at: str,
+                  session: str = "log@chatroom") -> int:
+    """插入一条分析日志并把 created_at 改成指定时刻（格式同落库值）。"""
+    log_id = db.insert_analysis_log(
+        session_username=session, msg_count=1, status="skipped")
+    db._conn.execute(
+        "UPDATE analysis_logs SET created_at=? WHERE id=?", (created_at, log_id))
+    db._conn.commit()
+    return log_id
+
+
+def days_ago_str(days_ago: int, clock: str = "12:00:00") -> str:
+    """N 天前的时刻字符串（YYYY-MM-DD HH:MM:SS）。"""
+    day = (datetime.now() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+    return f"{day} {clock}"
+
+
+class TestPurgeSafety:
+    """POST /api/system/purge 的 dry_run 预览与 GET /api/system/purge/last 留痕。"""
+
+    def test_dry_run_previews_without_deleting(self, env):
+        """dry_run=true：返回将删条数与截断点，但一条都不删。
+
+        keep_days=1 语义为「保留最近 1 个自然日（含今天）」→ 昨天及更早都算待删。
+        """
+        insert_log_at(env.db, days_ago_str(3))    # 将被清理
+        insert_log_at(env.db, days_ago_str(1))    # 昨天 → 也将被清理
+        insert_log_at(env.db, days_ago_str(0))    # 今天 → 保留
+        resp = env.client.post("/api/system/purge", json={
+            "table": "analysis_logs", "keep_days": 1, "dry_run": True})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["dry_run"] is True
+        assert body["deleted"] == 2
+        assert "T" not in body["cutoff"]                     # 与落库同格式（空格分隔）
+        assert body["cutoff"] == days_ago_str(0, "00:00:00")  # 今天 00:00:00
+        assert env.db.list_analysis_logs()[0] == 3           # 预览不删数据
+        assert env.client.get("/api/system/purge/last").json() == {}
+
+    def test_real_purge_deletes_and_records_last(self, env):
+        """dry_run=false：真删并写入 runtime.last_purge 留痕（不依赖日志）。"""
+        insert_log_at(env.db, days_ago_str(3))
+        insert_log_at(env.db, days_ago_str(1))
+        keep = insert_log_at(env.db, days_ago_str(0))
+        resp = env.client.post("/api/system/purge", json={
+            "table": "analysis_logs", "keep_days": 1})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["dry_run"] is False
+        assert body["deleted"] == 2
+        remaining = {r["id"] for r in
+                     env.db._conn.execute("SELECT id FROM analysis_logs")}
+        assert remaining == {keep}
+
+        last = env.client.get("/api/system/purge/last").json()
+        assert last["table"] == "analysis_logs"
+        assert last["deleted"] == 2
+        assert last["keep_days"] == 1
+        assert last["cutoff"] == body["cutoff"]
+        assert last["at"]                                   # 清理时间非空
+
+    def test_purge_opportunities_records_and_nulls_refs(self, env):
+        """清理商机：日志保留但引用置空，留痕记录为 opportunities。"""
+        opp = insert_opp(env.db)
+        env.db._conn.execute(
+            "UPDATE opportunities SET created_at=? WHERE id=?",
+            (days_ago_str(400), opp["id"]))
+        log_id = insert_log_at(env.db, days_ago_str(0))
+        env.db._conn.execute(
+            "UPDATE analysis_logs SET opportunity_id=? WHERE id=?",
+            (opp["id"], log_id))
+        env.db._conn.commit()
+        resp = env.client.post("/api/system/purge", json={
+            "table": "opportunities", "keep_days": 365, "dry_run": False})
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] == 1
+        row = env.db._conn.execute(
+            "SELECT opportunity_id FROM analysis_logs WHERE id=?",
+            (log_id,)).fetchone()
+        assert row["opportunity_id"] is None
+        assert env.client.get("/api/system/purge/last").json()["table"] == \
+            "opportunities"
+
+    def test_last_purge_returns_empty_dict_when_missing(self, env):
+        """从未清理过时返回 {}，前端按「暂无清理记录」展示。"""
+        assert env.client.get("/api/system/purge/last").json() == {}
+
+    def test_last_purge_tolerates_bad_json(self, env):
+        """历史脏值（非 JSON）按无记录处理，不影响页面。"""
+        env.db.set_setting("runtime.last_purge", "not-a-json")
+        assert env.client.get("/api/system/purge/last").json() == {}

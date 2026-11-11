@@ -205,9 +205,13 @@ class MonitorSettingsUpdate(BaseModel):
 # 历史数据管理（反馈 7）/ AI 账单（反馈 13）
 # ---------------------------------------------------------------------------
 class RetentionOut(BaseModel):
-    """历史数据保留配置（两表分开管理）。"""
-    logs_days: int = Field(default=90, ge=1, le=3650)    # analysis_logs 保留天数
-    opportunities_days: int = Field(default=365, ge=1, le=3650)
+    """历史数据保留配置（两表分开管理）。
+
+    天数语义统一为「保留最近 N 个自然日（含今天）」：N=1 只保留今天，
+    N=2 保留昨天与今天，以此类推。
+    """
+    logs_days: int = Field(default=90, ge=1, le=3650)    # analysis_logs 保留最近 N 天（含今天）
+    opportunities_days: int = Field(default=365, ge=1, le=3650)  # 商机保留最近 N 天（含今天）
 
 
 class RetentionUpdate(BaseModel):
@@ -216,14 +220,45 @@ class RetentionUpdate(BaseModel):
 
 
 class PurgeRequest(BaseModel):
-    """立即清理请求。"""
+    """立即清理请求。
+
+    keep_days 语义为「保留最近 N 个自然日（含今天）」：N=1 只保留今天。
+    dry_run=True 时只预览将被删除的条数（不写库、不可逆操作前先给用户看），
+    dry_run=False（默认）才真正执行删除。
+    """
     table: str = Field(pattern="^(analysis_logs|opportunities)$")
     keep_days: int = Field(ge=1, le=3650)
+    dry_run: bool = False
+
+
+class CacheDirOut(BaseModel):
+    """微信数据库解密缓存目录信息。"""
+    dir: str = ""                 # 当前配置解析后的绝对路径
+    default_dir: str = ""         # 默认目录（客服系统运行目录下）
+    configured: str = ""          # 配置值原文（空 = 默认）
+    is_default: bool = True
+    size_bytes: int = 0
+    file_count: int = 0
+    active_dir: str = ""          # 监听实例实际使用的目录
+    active: bool = False          # 是否已在新目录上运行（false = 需重启）
+    legacy_dirs: List[str] = []   # 旧版 %TEMP%\wechatauto_db 下的目录
+
+
+class CacheDirUpdate(BaseModel):
+    """修改缓存目录（空字符串 = 恢复默认目录）。"""
+    dir: str = ""
 
 
 class PurgeResult(BaseModel):
+    """清理结果（dry_run=True 时 deleted 为「将删除条数」，未真正删除）。
+
+    cutoff 为由 SQLite 按本地时间计算的截断点（YYYY-MM-DD HH:MM:SS），
+    供前端在确认对话框中明确展示「将删除早于某时刻的记录」。
+    """
     table: str
     deleted: int
+    dry_run: bool = False
+    cutoff: str = ""
 
 
 class BillingDayOut(BaseModel):

@@ -8,6 +8,7 @@
 - 反馈 3：content_format 非文本消息友好化（链接/图片/小程序/失败回退）；
 - 反馈 4：direction 买卖货（DAO 落库/筛选 + AI 结果规整）；
 - 反馈 7：delete_older_than 历史清理（白名单/天数/外键置空）；
+- Bug A 回归：清理口径差一天（截断点改由 SQLite 按自然日计算）；
 - 反馈 12：notifier.clear_all_unread；
 - 反馈 13：token 用量记录 + usage_by_date + 费用换算。
 
@@ -18,6 +19,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timedelta
 from typing import List
 
 from app.aggregator import Aggregator
@@ -276,6 +278,134 @@ class TestPurge:
 
 
 # ---------------------------------------------------------------------------
+# Bug A 回归：清理口径差一天（保留 1 天时把「昨天一整天」也删掉）
+#
+# 根因：截断点由 Python isoformat() 生成（'2026-11-10T11:00:53'，T 分隔），
+# 而 created_at 落库是 datetime('now','localtime')（'2026-11-10 23:32:22'，
+# 空格分隔）；SQLite 对 TEXT 按 memcmp 比较，' '(0x20) < 'T'(0x54)，于是
+# 与截断点同一天的记录全部被判为「更早」而被误删。
+# 修复：截断点交给 SQLite 按自然日计算 ——
+#   datetime('now','localtime','start of day', '-(N-1) days')
+# 语义「保留最近 N 个自然日（含今天）」：
+#   N=1 → 今天 00:00:00（只保留今天）；N=2 → 昨天 00:00:00；N=30 → 29 天前。
+# ---------------------------------------------------------------------------
+def insert_log_at(db: Database, created_at: str,
+                  session: str = "a@chatroom") -> int:
+    """插入一条分析日志并把 created_at 改成指定时刻（格式同落库值）。"""
+    log_id = db.insert_analysis_log(
+        session_username=session, msg_count=1, status="skipped")
+    db._conn.execute(
+        "UPDATE analysis_logs SET created_at=? WHERE id=?", (created_at, log_id))
+    db._conn.commit()
+    return log_id
+
+
+def day_str(days_ago: int, clock: str = "12:00:00") -> str:
+    """N 天前的时刻字符串（YYYY-MM-DD HH:MM:SS，空格分隔）。"""
+    day = (datetime.now() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+    return f"{day} {clock}"
+
+
+def all_log_ids(db: Database) -> set:
+    """当前 analysis_logs 的全部 id。"""
+    return {r["id"] for r in db._conn.execute("SELECT id FROM analysis_logs")}
+
+
+class TestPurgeCutoff:
+    def test_keep_one_day_keeps_only_today(self):
+        """保留 1 天（含今天）：昨天及更早全部删除，只留今天。"""
+        db = Database(":memory:")
+        insert_log_at(db, day_str(2))              # 前天 → 删
+        insert_log_at(db, day_str(1))              # 昨天 → 删
+        today = insert_log_at(db, day_str(0))       # 今天 → 保留
+        assert db.count_older_than("analysis_logs", 1) == 2
+        assert db.delete_older_than("analysis_logs", 1) == 2
+        assert all_log_ids(db) == {today}
+
+    def test_keep_two_days_keeps_yesterday_and_today(self):
+        """保留 2 天（含今天）：只删前天，昨天与今天完整保留。"""
+        db = Database(":memory:")
+        old = insert_log_at(db, day_str(2))         # 前天 → 删
+        yest = insert_log_at(db, day_str(1))        # 昨天 → 保留
+        today = insert_log_at(db, day_str(0))       # 今天 → 保留
+        assert db.count_older_than("analysis_logs", 2) == 1
+        assert db.delete_older_than("analysis_logs", 2) == 1
+        assert all_log_ids(db) == {yest, today}
+        assert old not in all_log_ids(db)
+
+    def test_keep_one_day_boundary_yesterday_235959_deleted(self):
+        """边界：保留 1 天时，昨天 23:59:59 必须删除。"""
+        db = Database(":memory:")
+        log_id = insert_log_at(db, day_str(1, "23:59:59"))
+        assert db.count_older_than("analysis_logs", 1) == 1
+        assert db.delete_older_than("analysis_logs", 1) == 1
+        assert all_log_ids(db) == set()
+        assert log_id
+
+    def test_keep_one_day_boundary_today_000001_kept(self):
+        """边界：保留 1 天时，今天 00:00:01 必须保留。"""
+        db = Database(":memory:")
+        log_id = insert_log_at(db, day_str(0, "00:00:01"))
+        assert db.count_older_than("analysis_logs", 1) == 0
+        assert db.delete_older_than("analysis_logs", 1) == 0
+        assert all_log_ids(db) == {log_id}
+
+    def test_keep_two_days_boundary_yesterday_235959_kept(self):
+        """边界：保留 2 天时，昨天 23:59:59 必须保留（原 bug 的失败点）。"""
+        db = Database(":memory:")
+        log_id = insert_log_at(db, day_str(1, "23:59:59"))
+        assert db.count_older_than("analysis_logs", 2) == 0
+        assert db.delete_older_than("analysis_logs", 2) == 0
+        assert all_log_ids(db) == {log_id}
+
+    def test_cutoff_uses_db_format_and_natural_day(self):
+        """截断点必须是空格分隔、当天 00:00:00，且按「含今天」口径偏移。"""
+        db = Database(":memory:")
+        cutoff_one = db.purge_cutoff(1)
+        assert "T" not in cutoff_one
+        assert cutoff_one == day_str(0, "00:00:00")   # 今天 00:00:00
+        assert db.purge_cutoff(2) == day_str(1, "00:00:00")   # 昨天 00:00:00
+        assert db.purge_cutoff(30) == day_str(29, "00:00:00")  # 29 天前 00:00:00
+
+    def test_count_matches_delete_for_opportunities(self):
+        """预览条数（count_older_than）与真删条数一致（含外键置空路径）。"""
+        db = Database(":memory:")
+        kept: list = []
+        for i, ts in enumerate((day_str(3), day_str(2), day_str(1), day_str(0))):
+            opp = db.insert_opportunity(
+                session_username="a@chatroom", session_name="g",
+                sender_wxid=f"w{i}", sender_name="s",
+                window_start=ts, window_end=ts, merged_count=1,
+                raw_text="x", type_id=None, type_name="t",
+                summary="p", key_quote="q", confidence=80)
+            db._conn.execute(
+                "UPDATE opportunities SET created_at=? WHERE id=?", (ts, opp["id"]))
+            kept.append(opp["id"])
+        db._conn.commit()
+        pending = db.count_older_than("opportunities", 2)
+        # 保留 2 天（含今天）→ 截断点为昨天 00:00:00，3 天前与 2 天前各一条更早
+        assert pending == 2
+        assert db.delete_older_than("opportunities", 2) == pending
+        remaining = {r["id"] for r in
+                     db._conn.execute("SELECT id FROM opportunities")}
+        assert remaining == set(kept[-2:])      # 昨天、今天
+
+    def test_count_rejects_bad_table_and_days(self):
+        db = Database(":memory:")
+        for bad in ("settings", "ai_usage", ""):
+            try:
+                db.count_older_than(bad, 30)
+                raise AssertionError("应拒绝非白名单表")
+            except ValueError:
+                pass
+        try:
+            db.count_older_than("analysis_logs", 0)
+            raise AssertionError("天数 0 应被拒绝")
+        except ValueError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # 反馈 12：全部已读
 # ---------------------------------------------------------------------------
 class TestReadAll:
@@ -320,3 +450,59 @@ class TestBilling:
         cost = _usage_cost(
             {"prompt_tokens": 1_500_000, "completion_tokens": 0}, billing)
         assert abs(cost - 3.0) < 1e-9
+
+    # -- 账单必须独立于 analysis_logs（否则清理日志后历史变成 0）--------
+    def test_usage_survives_log_cleanup(self):
+        """删光 analysis_logs 后，账单用量仍然在（ai_usage 独立存档）。"""
+        from datetime import datetime as _dt
+        db = Database(":memory:")
+        db.insert_analysis_log(session_username="a@chatroom", msg_count=1,
+                               status="ok", model="m",
+                               prompt_tokens=1200, completion_tokens=200)
+        day = _dt.now().strftime("%Y-%m-%d")
+        assert db.usage_by_date(day)["calls"] == 1
+        # 模拟「历史清理」把日志全删（保留 1 天不会删今天，这里直接清表）
+        with db._lock:
+            db._conn.execute("DELETE FROM analysis_logs")
+            db._conn.commit()
+        usage = db.usage_by_date(day)
+        assert usage["calls"] == 1
+        assert usage["prompt_tokens"] == 1200
+        assert usage["completion_tokens"] == 200
+        assert db.list_analysis_logs(page=1, page_size=10)[0] == 0
+
+    def test_below_threshold_calls_are_billed(self):
+        """命中但低于置信度门槛的调用同样烧 token，必须计费。"""
+        from datetime import datetime as _dt
+        db = Database(":memory:")
+        db.insert_analysis_log(session_username="a@chatroom", msg_count=1,
+                               status="below_threshold", model="m",
+                               prompt_tokens=800, completion_tokens=60)
+        usage = db.usage_by_date(_dt.now().strftime("%Y-%m-%d"))
+        assert usage["calls"] == 1
+        assert usage["prompt_tokens"] == 800
+
+    def test_usage_not_mirrored_without_tokens(self):
+        """没有 token 的行（skipped/error）不产生账单记录。"""
+        from datetime import datetime as _dt
+        db = Database(":memory:")
+        db.insert_analysis_log(session_username="a@chatroom", msg_count=1,
+                               status="skipped")
+        assert db.usage_by_date(_dt.now().strftime("%Y-%m-%d"))["calls"] == 0
+
+    def test_backfill_from_existing_logs(self):
+        """升级回填：存量 analysis_logs 的 token 搬到 ai_usage，只搬一次。"""
+        db = Database(":memory:")
+        with db._lock:
+            db._conn.execute(
+                "INSERT INTO analysis_logs (session_username, msg_count, "
+                "status, model, prompt_tokens, completion_tokens, created_at) "
+                "VALUES ('a@chatroom', 1, 'ok', 'm', 500, 50, "
+                "'2026-01-02 03:04:05')")
+            db._conn.commit()
+        db.set_setting("runtime.ai_usage_backfilled", "0")
+        db._migrate_ai_usage_backfill()
+        assert db.usage_by_date("2026-01-02")["prompt_tokens"] == 500
+        # 幂等：再跑一次不会重复计数
+        db._migrate_ai_usage_backfill()
+        assert db.usage_by_date("2026-01-02")["calls"] == 1

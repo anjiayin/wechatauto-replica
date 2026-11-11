@@ -7,14 +7,16 @@
 - GET /api/messages/{username}?before_seq=&limit=50
 - GET /api/messages/{username}/images/{local_id}   图片解密（反馈 2）
 - GET /api/system/retention | POST /api/system/purge          历史数据（反馈 7）
+- GET /api/system/purge/last                                 上次清理留痕（本轮修复）
 - GET /api/system/billing                                     AI 账单（反馈 13）
 - WS  /ws/events
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
-from typing import List
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 
@@ -24,11 +26,14 @@ from app.api.deps import (
     get_pipeline,
     get_wechat_service,
 )
-from app.db import Database, read_monitor_max_targets
+from app.config import KEY_RUNTIME_CACHE_DIR, KEY_RUNTIME_LAST_PURGE, check_cache_dir
+from app.db import Database, now_iso, read_monitor_max_targets
 from app.schemas import (
     AnalysisHealth,
     BillingDayOut,
     BillingOut,
+    CacheDirOut,
+    CacheDirUpdate,
     CacheShardStatus,
     MessageOut,
     MonitorQuota,
@@ -191,7 +196,10 @@ def get_message_image(username: str, local_id: int,
 # ---------------------------------------------------------------------------
 @router.get("/api/system/retention", response_model=RetentionOut)
 def get_retention(db: Database = Depends(get_db)) -> RetentionOut:
-    """读取两表保留天数（仅手动清理时作为 keep_days 默认值，不再自动执行）。"""
+    """读取两表保留天数（仅手动清理时作为 keep_days 默认值，不再自动执行）。
+
+    天数为「保留最近 N 个自然日（含今天）」，与清理按钮文案一致。
+    """
     return RetentionOut(
         logs_days=db.get_int("retention.logs_days", 90),
         opportunities_days=db.get_int("retention.opportunities_days", 365),
@@ -213,14 +221,59 @@ def update_retention(body: RetentionUpdate,
 @router.post("/api/system/purge", response_model=PurgeResult)
 def purge_history(body: PurgeRequest,
                   db: Database = Depends(get_db)) -> PurgeResult:
-    """手动清理指定表中超过保留时长的历史数据（唯一的清理入口）。"""
+    """手动清理指定表中超过保留时长的历史数据（唯一的清理入口）。
+
+    keep_days 语义为「保留最近 N 个自然日（含今天）」：N=1 只保留今天
+    （截断点 = 今天 00:00:00），N=2 保留昨天与今天，以此类推。
+    dry_run=True 时只统计将被删除的条数（预览），供前端弹出二次确认；
+    dry_run=False 才真正删除，并把清理结果写入 settings（runtime.last_purge）
+    留痕——不依赖日志文件，日志轮转失败时也能查到「数据被哪次清理删掉的」。
+    """
     try:
+        cutoff = db.purge_cutoff(body.keep_days)
+        if body.dry_run:
+            pending = db.count_older_than(body.table, body.keep_days)
+            logger.info("清理预览：%s 将删除 %d 条（保留最近 %d 天含今天，截断点 %s）",
+                        body.table, pending, body.keep_days, cutoff)
+            return PurgeResult(table=body.table, deleted=pending,
+                              dry_run=True, cutoff=cutoff)
         deleted = db.delete_older_than(body.table, body.keep_days)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    logger.info("手动清理：%s 删除 %d 条（保留 %d 天）",
-                body.table, deleted, body.keep_days)
-    return PurgeResult(table=body.table, deleted=deleted)
+    logger.info("手动清理：%s 删除 %d 条（保留最近 %d 天含今天，删除了 %s 之前的记录）",
+                body.table, deleted, body.keep_days, cutoff)
+    # 清理结果落库留痕（settings 表），与日志双保险
+    record = {
+        "table": body.table,
+        "deleted": int(deleted),
+        "keep_days": int(body.keep_days),
+        "cutoff": cutoff,
+        "at": now_iso(),
+    }
+    try:
+        db.set_setting(KEY_RUNTIME_LAST_PURGE,
+                       json.dumps(record, ensure_ascii=False))
+    except Exception:  # 留痕失败不应让清理接口报错（删除已经完成）
+        logger.exception("写入清理记录失败（已忽略）")
+    return PurgeResult(table=body.table, deleted=deleted,
+                       dry_run=False, cutoff=cutoff)
+
+
+@router.get("/api/system/purge/last")
+def get_last_purge(db: Database = Depends(get_db)) -> Dict[str, Any]:
+    """上次手动清理记录（settings: runtime.last_purge）。
+
+    无记录、或历史遗留值不是合法 JSON 对象时返回 ``{}``，前端按「暂无记录」展示。
+    """
+    raw = db.get_setting(KEY_RUNTIME_LAST_PURGE, "")
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        logger.warning("清理记录格式非法（已按空记录处理）：%s", raw)
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +302,35 @@ def get_billing(db: Database = Depends(get_db)) -> BillingOut:
                             cost=round(_usage_cost(today_usage, billing), 4)),
         series=series,
     )
+
+
+# ---------------------------------------------------------------------------
+# 微信数据库解密缓存目录（可配置，默认客服系统运行目录下）
+# ---------------------------------------------------------------------------
+@router.get("/api/system/cache", response_model=CacheDirOut)
+def get_cache_dir(wechat: WeChatService = Depends(get_wechat_service),
+                  ) -> CacheDirOut:
+    """读取缓存目录配置与实际占用（解密副本可达数百 MB）。"""
+    return CacheDirOut(**wechat.cache_dir_info())
+
+
+@router.put("/api/system/cache", response_model=CacheDirOut)
+def update_cache_dir(body: CacheDirUpdate,
+                     db: Database = Depends(get_db),
+                     wechat: WeChatService = Depends(get_wechat_service),
+                     ) -> CacheDirOut:
+    """修改缓存目录；空值恢复默认。
+
+    先做可写性校验（创建目录 + 写探针），避免保存后在后台重建线程里才
+    失败。路径会在重启服务后生效（当前监听实例仍用旧目录）。
+    """
+    raw = (body.dir or "").strip()
+    ok, reason, path = check_cache_dir(raw)
+    if not ok:
+        raise HTTPException(status_code=400, detail=reason)
+    db.set_setting(KEY_RUNTIME_CACHE_DIR, str(path) if raw else "")
+    logger.info("缓存目录已更新为：%s（重启服务后生效）", path)
+    return CacheDirOut(**wechat.cache_dir_info())
 
 
 # ---------------------------------------------------------------------------

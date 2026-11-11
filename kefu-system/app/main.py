@@ -13,6 +13,7 @@ import logging
 import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import IO, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,20 +46,83 @@ logger = logging.getLogger("kefu")
 # POST /api/system/purge 由用户在「设置 → 数据与账单」手动触发。
 
 
+class SafeRotatingFileHandler(RotatingFileHandler):
+    """轮转失败也不中断的滚动文件日志处理器。
+
+    背景：Windows 上 ``RotatingFileHandler.doRollover()`` 需要把
+    ``kefu.log`` 重命名为 ``kefu.log.1``；若此时文件正被另一个进程占用
+    （例如 pytest 进程同样调用过 ``setup_logging()``），rename 会抛
+    ``PermissionError``。基类实现此时已经把 ``self.stream`` close 掉了，
+    异常又被 ``handleError`` 吞掉，于是后续每次 emit 都失败 —— 进程从此
+    永久静默（现场表现：数据库还在写，日志文件却不再增长）。
+
+    策略：轮转失败时放弃本次轮转、重新以追加方式打开原文件继续写。
+    宁可文件超过上限，也绝不丢日志。
+    """
+
+    def doRollover(self) -> None:  # noqa: D102 - 覆盖基类，语义见类文档
+        try:
+            super().doRollover()
+        except OSError:  # PermissionError 也是 OSError 子类
+            # 牺牲一次轮转：把可能已被 close 的流重新打开，继续追加
+            self.stream = self._reopen_quietly()
+
+    def _reopen_quietly(self) -> Optional[IO[str]]:
+        """重新打开当前日志文件（追加模式）；失败返回 None 不抛异常。"""
+        try:
+            if self.stream is not None:
+                try:
+                    self.stream.close()
+                except OSError:  # 防御：关闭失败不影响重新打开
+                    pass
+            return self._open()
+        except OSError:
+            return None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """流被关闭/未建立时先重新打开再写，避免永久静默。"""
+        if self.stream is None:
+            self.stream = self._reopen_quietly()
+        super().emit(record)
+
+
 def setup_logging() -> None:
-    """滚动文件日志（data/kefu.log）+ 控制台输出（共享约定 4/8-7）。"""
+    """滚动文件日志（data/kefu.log）+ 控制台输出（共享约定 4/8-7）。
+
+    幂等：测试里 ``create_app()`` 会被多次调用，重复执行不会叠加 handler。
+    启动时会打印日志文件的绝对路径与当前大小，便于用户自查「日志还在写吗」。
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-    file_handler = RotatingFileHandler(
-        LOG_PATH, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT,
-        encoding="utf-8")
-    file_handler.setFormatter(fmt)
-    console = logging.StreamHandler()
-    console.setFormatter(fmt)
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    root.addHandler(file_handler)
-    root.addHandler(console)
+
+    # 幂等识别：本模块创建的 handler 带有 _kefu_file / _kefu_console 标记
+    file_handler = next(
+        (h for h in root.handlers if getattr(h, "_kefu_file", False)), None)
+    if file_handler is None:
+        file_handler = SafeRotatingFileHandler(
+            LOG_PATH, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT,
+            encoding="utf-8")
+        file_handler.setFormatter(fmt)
+        setattr(file_handler, "_kefu_file", True)
+        root.addHandler(file_handler)
+
+    if not any(getattr(h, "_kefu_console", False) for h in root.handlers):
+        console = logging.StreamHandler()
+        console.setFormatter(fmt)
+        setattr(console, "_kefu_console", True)
+        root.addHandler(console)
+
+    # 启动自检：日志文件位置与大小（超过上限说明轮转未成功，需人工处理）
+    try:
+        size_bytes = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
+    except OSError:  # 文件系统异常不影响启动
+        size_bytes = 0
+    logger.info(
+        "日志文件：%s（当前 %.2f MB，轮转上限 %.2f MB，保留 %d 个备份）",
+        Path(LOG_PATH).resolve(), size_bytes / 1024 / 1024,
+        LOG_MAX_BYTES / 1024 / 1024, LOG_BACKUP_COUNT)
 
 
 def create_app() -> FastAPI:

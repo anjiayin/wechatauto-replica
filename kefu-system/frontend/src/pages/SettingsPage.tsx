@@ -49,9 +49,12 @@ import type {
   AITestResult,
   AnalysisSettings,
   BillingOut,
+  CacheDirInfo,
+  LastPurge,
   MonitorSettings,
   MonitorTarget,
   OpportunityType,
+  PurgeResult,
   RetentionSettings,
   SessionItem,
   StatusOut,
@@ -1268,9 +1271,34 @@ const RETENTION_PRESETS = [
   { label: '1 年', days: 365 },
 ]
 
+/** 清理目标表 → 中文名（提示文案用）。 */
+function purgeTableLabel(table: string): string {
+  return table === 'analysis_logs' ? '分析日志' : table === 'opportunities' ? '商机' : table
+}
+
+/** 字节数 → 人类可读（缓存目录占用展示用）。 */
+function fmtBytes(n: number): string {
+  if (!n) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let value = n
+  let idx = 0
+  while (value >= 1024 && idx < units.length - 1) {
+    value /= 1024
+    idx += 1
+  }
+  return `${value.toFixed(idx === 0 ? 0 : 1)} ${units[idx]}`
+}
+
+/** 清理预览结果 + 本次请求的保留天数（确认对话框真删时复用）。 */
+interface PurgeConfirm extends PurgeResult {
+  keep_days: number
+}
+
 function DataBillingTab() {
   const queryClient = useQueryClient()
   const [snack, setSnack] = useState<string | null>(null)
+  // 待确认的清理预览（非空时弹二次确认对话框）
+  const [pendingPurge, setPendingPurge] = useState<PurgeConfirm | null>(null)
 
   // 保留时长配置
   const { data: retention } = useQuery({
@@ -1301,12 +1329,64 @@ function DataBillingTab() {
     onError: (e: Error) => setSnack(`保存失败：${e.message}`),
   })
 
+  // 立即清理：先 dry_run 预览条数 → 二次确认 → 真删（防误删一整天的数据）
+  const previewPurgeMutation = useMutation({
+    mutationFn: (p: { table: string; keep_days: number }) =>
+      apiPost<PurgeResult>('/api/system/purge', { ...p, dry_run: true }),
+    onSuccess: (r, vars) => {
+      if (r.deleted <= 0) {
+        setSnack('没有需要清理的记录')
+        return
+      }
+      setPendingPurge({ ...r, keep_days: vars.keep_days })
+    },
+    onError: (e: Error) => setSnack(`预览失败：${e.message}`),
+  })
+
   const purgeMutation = useMutation({
     mutationFn: (p: { table: string; keep_days: number }) =>
-      apiPost<{ table: string; deleted: number }>('/api/system/purge', p),
-    onSuccess: (r) =>
-      setSnack(`已清理 ${r.table === 'analysis_logs' ? '分析日志' : '商机'} ${r.deleted} 条`),
-    onError: (e: Error) => setSnack(`清理失败：${e.message}`),
+      apiPost<PurgeResult>('/api/system/purge', { ...p, dry_run: false }),
+    onSuccess: (r) => {
+      setPendingPurge(null)
+      void queryClient.invalidateQueries({ queryKey: ['purge-last'] })
+      setSnack(`已清理${purgeTableLabel(r.table)} ${r.deleted} 条`)
+    },
+    onError: (e: Error) => {
+      setPendingPurge(null)
+      setSnack(`清理失败：${e.message}`)
+    },
+  })
+
+  // 上次清理记录（后端从 settings 读取，不依赖日志文件）
+  const { data: lastPurge } = useQuery({
+    queryKey: ['purge-last'],
+    queryFn: () => apiGet<LastPurge>('/api/system/purge/last'),
+  })
+
+  // 微信数据库解密缓存目录（默认客服系统 data/wechat_cache，不占 %TEMP%）
+  const { data: cacheInfo } = useQuery({
+    queryKey: ['cache-dir'],
+    queryFn: () => apiGet<CacheDirInfo>('/api/system/cache'),
+  })
+  const [cacheDir, setCacheDir] = useState('')
+  const [cacheLoaded, setCacheLoaded] = useState(false)
+  useEffect(() => {
+    if (cacheInfo && !cacheLoaded) {
+      // 配置值为空 → 输入框留空，placeholder 显示默认目录
+      setCacheDir(cacheInfo.configured || '')
+      setCacheLoaded(true)
+    }
+  }, [cacheInfo, cacheLoaded])
+
+  const saveCacheDirMutation = useMutation({
+    mutationFn: (dir: string) =>
+      apiPut<CacheDirInfo>('/api/system/cache', { dir }),
+    onSuccess: (info) => {
+      void queryClient.invalidateQueries({ queryKey: ['cache-dir'] })
+      setCacheDir(info.configured || '')
+      setSnack('缓存目录已保存，重启服务后生效')
+    },
+    onError: (e: Error) => setSnack(`保存失败：${e.message}`),
   })
 
   // AI 账单
@@ -1347,7 +1427,13 @@ function DataBillingTab() {
     <Box>
       <Typography variant="subtitle2" sx={{ mb: 1 }}>历史数据管理</Typography>
       <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
-        分别配置分析日志与商机的保留天数。系统不再自动清理，只在你点击「立即清理」时按保留天数删除；删除不可恢复，请谨慎设置。
+        分别配置分析日志与商机的保留天数，含义为「保留最近 N 天（含今天）」：填 1 只保留今天，
+        填 2 保留昨天与今天。系统不再自动清理，只在你点击「立即清理」时按保留天数删除；删除不可恢复，请谨慎设置。
+      </Typography>
+      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
+        {lastPurge && lastPurge.at
+          ? `上次清理：${lastPurge.at} · ${purgeTableLabel(lastPurge.table ?? '')} · 删除 ${lastPurge.deleted ?? 0} 条 · 截断点 ${lastPurge.cutoff || '—'}`
+          : '上次清理：暂无清理记录'}
       </Typography>
       <Stack spacing={2} sx={{ mb: 2 }}>
         <Stack direction="row" spacing={1} alignItems="center" useFlexGap>
@@ -1372,8 +1458,8 @@ function DataBillingTab() {
           <Button
             size="small"
             color="warning"
-            disabled={purgeMutation.isPending || !Number(logsDays)}
-            onClick={() => purgeMutation.mutate({ table: 'analysis_logs', keep_days: Number(logsDays) })}
+            disabled={previewPurgeMutation.isPending || purgeMutation.isPending || !Number(logsDays)}
+            onClick={() => previewPurgeMutation.mutate({ table: 'analysis_logs', keep_days: Number(logsDays) })}
           >
             立即清理
           </Button>
@@ -1400,8 +1486,8 @@ function DataBillingTab() {
           <Button
             size="small"
             color="warning"
-            disabled={purgeMutation.isPending || !Number(oppsDays)}
-            onClick={() => purgeMutation.mutate({ table: 'opportunities', keep_days: Number(oppsDays) })}
+            disabled={previewPurgeMutation.isPending || purgeMutation.isPending || !Number(oppsDays)}
+            onClick={() => previewPurgeMutation.mutate({ table: 'opportunities', keep_days: Number(oppsDays) })}
           >
             立即清理
           </Button>
@@ -1417,9 +1503,70 @@ function DataBillingTab() {
       </Stack>
 
       <Divider sx={{ my: 2 }} />
+      <Typography variant="subtitle2" sx={{ mb: 1 }}>微信数据库缓存目录</Typography>
+      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
+        微信数据库需解密后才能读取，解密副本缓存在此目录（可增长到数百 MB）。默认放在客服系统运行目录下，
+        不再使用系统临时目录（%TEMP%），避免被磁盘清理后需要全量重新解密、甚至重新提取密钥。
+        修改后需重启服务生效，旧目录不会自动删除。
+      </Typography>
+      <Stack spacing={1.5}>
+        <Stack direction="row" spacing={1} alignItems="center" useFlexGap>
+          <TextField
+            size="small"
+            sx={{ flex: 1, minWidth: 320 }}
+            label="缓存目录（留空 = 默认）"
+            value={cacheDir}
+            placeholder={cacheInfo?.default_dir ?? ''}
+            onChange={(e) => setCacheDir(e.target.value)}
+          />
+          <Button
+            variant="contained"
+            disabled={saveCacheDirMutation.isPending}
+            onClick={() => saveCacheDirMutation.mutate(cacheDir.trim())}
+          >
+            保存
+          </Button>
+          <Button
+            disabled={saveCacheDirMutation.isPending || !cacheInfo?.configured}
+            onClick={() => saveCacheDirMutation.mutate('')}
+          >
+            恢复默认
+          </Button>
+        </Stack>
+        {cacheInfo && (
+          <Box>
+            <Typography variant="caption" color="text.secondary" component="div">
+              生效目录：{cacheInfo.dir}（{fmtBytes(cacheInfo.size_bytes)}，{cacheInfo.file_count} 个文件）
+              {cacheInfo.is_default ? ' · 默认' : ' · 自定义'}
+            </Typography>
+            <Typography variant="caption" color="text.secondary" component="div">
+              默认目录：{cacheInfo.default_dir}
+            </Typography>
+            {cacheInfo.active_dir && (
+              <Typography variant="caption" color="text.secondary" component="div">
+                监听实际使用：{cacheInfo.active_dir}
+              </Typography>
+            )}
+          </Box>
+        )}
+        {!!cacheInfo?.active_dir && !cacheInfo.active && (
+          <Alert severity="warning" sx={{ py: 0.5 }}>
+            配置已保存但尚未生效：当前监听仍在使用 {cacheInfo.active_dir}，重启服务后切换到新目录。
+          </Alert>
+        )}
+        {!!cacheInfo?.legacy_dirs?.length && (
+          <Alert severity="info" sx={{ py: 0.5 }}>
+            检测到旧版临时目录缓存：{cacheInfo.legacy_dirs.join('、')}
+            。确认新目录运行正常后可手动删除以释放空间（密钥缓存已自动复制到新目录）。
+          </Alert>
+        )}
+      </Stack>
+
+      <Divider sx={{ my: 2 }} />
       <Typography variant="subtitle2" sx={{ mb: 1 }}>AI 账单估算</Typography>
       <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
         填写所用 AI 接口的输入/输出单价，系统按每次调用的实际 token 用量自动累计每日估算费用（仅本机估算，非官方账单）。
+        用量单独存档，清理分析日志不会影响账单历史；显示 ¥0.00 表示当天没有产生 AI 调用。
       </Typography>
       <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1.5 }} useFlexGap>
         <TextField
@@ -1470,6 +1617,36 @@ function DataBillingTab() {
           )}
         </Box>
       )}
+
+      <Dialog open={pendingPurge !== null} onClose={() => setPendingPurge(null)} maxWidth="xs" fullWidth>
+        <DialogTitle>确认清理</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2">
+            将删除 {pendingPurge?.deleted ?? 0} 条早于 {pendingPurge?.cutoff || '—'} 的
+            {purgeTableLabel(pendingPurge?.table ?? '')}记录，不可恢复。
+          </Typography>
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
+            保留最近 {pendingPurge?.keep_days ?? 0} 天（含今天）：该时刻之后的记录会保留，请确认后再执行。
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setPendingPurge(null)}>取消</Button>
+          <Button
+            color="warning"
+            variant="contained"
+            disabled={purgeMutation.isPending}
+            onClick={() => {
+              if (!pendingPurge) return
+              purgeMutation.mutate({
+                table: pendingPurge.table,
+                keep_days: pendingPurge.keep_days,
+              })
+            }}
+          >
+            确认删除
+          </Button>
+        </DialogActions>
+      </Dialog>
 
       <Snackbar
         open={snack !== null}

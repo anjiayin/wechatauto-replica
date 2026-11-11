@@ -15,6 +15,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import re
+import shutil
 import sys
 import threading
 import time
@@ -28,12 +29,17 @@ from app.config import (
     CONTEXT_COUNT,
     GROUP_MEMBER_CACHE_TTL_SEC,
     IMG_CACHE_DIR,
+    LEGACY_CACHE_ROOT,
     MSG_QUERY_RETRY_INTERVAL_SEC,
     MSG_QUERY_RETRY_TIMES,
     SESSION_CACHE_TTL_SEC,
     SESSION_SEARCH_LIMIT_DEFAULT,
     WATERMARK_FLUSH_SEC,
+    KEY_RUNTIME_CACHE_DIR,
     KEY_RUNTIME_WM_SAVED_AT,
+    CACHE_DIR_DEFAULT,
+    dir_usage,
+    resolve_cache_dir,
 )
 from app.db import Database, epoch_to_iso
 
@@ -96,6 +102,83 @@ class WeChatService:
         self._group_members_lock = threading.Lock()
 
     # ------------------------------------------------------------------
+    # 缓存目录（可配置；默认 kefu-system/data/wechat_cache）
+    # ------------------------------------------------------------------
+    def configured_cache_dir(self) -> Path:
+        """当前配置的缓存目录（绝对路径；配置为空时用默认目录）。"""
+        raw = self._db.get_setting(KEY_RUNTIME_CACHE_DIR, "")
+        return resolve_cache_dir(raw)
+
+    def cache_dir_info(self) -> dict:
+        """缓存目录信息（设置页展示 / 保存后回显）。
+
+        ``active`` 表示当前监听实例是否已经在用这个目录：改配置后必须重启
+        服务才会切换，这里如实反映，避免用户以为立即生效。
+        """
+        configured = self._db.get_setting(KEY_RUNTIME_CACHE_DIR, "")
+        path = resolve_cache_dir(configured)
+        size, count = dir_usage(path)
+        wxdb = self._wxdb
+        active_dir = str(getattr(wxdb, "workdir", "") or "") if wxdb else ""
+        return {
+            "dir": str(path),
+            "default_dir": str(CACHE_DIR_DEFAULT),
+            "configured": configured,
+            "is_default": not str(configured).strip(),
+            "size_bytes": size,
+            "file_count": count,
+            "active_dir": active_dir,
+            "active": bool(active_dir) and active_dir == str(path),
+            "legacy_dirs": [str(d) for d in self._legacy_cache_dirs()],
+        }
+
+    @staticmethod
+    def _legacy_cache_dirs() -> list[Path]:
+        """旧版本默认缓存位置（%TEMP%/wechatauto_db/<account>）。"""
+        try:
+            return [d for d in LEGACY_CACHE_ROOT.iterdir() if d.is_dir()]
+        except OSError:
+            return []
+
+    @staticmethod
+    def _dir_size_mb(path: Path) -> float:
+        size, _ = dir_usage(path)
+        return size / 1048576.0
+
+    def _adopt_legacy_keys(self, target: Path) -> None:
+        """把旧 TEMP 目录里的密钥缓存搬到新目录（仅当目标缺失）。
+
+        不搬的话首次启动要重新从微信进程内存提取密钥，微信升级后可能提取
+        失败（表现为"数据库不可用"）。keys.json 很小，且 WeChatDB 会对每个
+        库做页 1 HMAC 校验、不匹配就重新提取，所以即使账号不同也不会用错。
+        """
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("缓存目录创建失败（%s）：%s", target, exc)
+            return
+        for name in ("keys.json", "image_keys.json"):
+            dst = target / name
+            if dst.exists():
+                continue
+            best: Optional[Path] = None
+            best_mtime = 0.0
+            for d in self._legacy_cache_dirs():
+                src = d / name
+                try:
+                    if src.is_file() and src.stat().st_mtime >= best_mtime:
+                        best, best_mtime = src, src.stat().st_mtime
+                except OSError:
+                    continue
+            if best is None:
+                continue
+            try:
+                shutil.copy2(best, dst)
+                logger.info("已迁移密钥缓存：%s → %s", best, dst)
+            except OSError as exc:
+                logger.warning("密钥缓存迁移失败（%s）：%s", best, exc)
+
+    # ------------------------------------------------------------------
     # 启停
     # ------------------------------------------------------------------
     def start(self) -> None:
@@ -109,7 +192,13 @@ class WeChatService:
                 self._degrade(f"微信组件加载失败：{exc}")
                 return
             try:
-                self._wxdb = WeChatDB()
+                # 缓存目录可配置（默认 kefu-system/data/wechat_cache）：
+                # 不再落在 %TEMP% 下，避免被系统清理后全量重新解密。
+                cache_dir = self.configured_cache_dir()
+                self._adopt_legacy_keys(cache_dir)
+                self._wxdb = WeChatDB(workdir=str(cache_dir))
+                logger.info("微信数据库缓存目录：%s（%.1f MB）",
+                            cache_dir, self._dir_size_mb(cache_dir))
             except Exception as exc:
                 self._degrade(f"微信数据库不可用（微信可能未登录）：{exc}")
                 return

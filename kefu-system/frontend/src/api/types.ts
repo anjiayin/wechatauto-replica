@@ -254,6 +254,24 @@ export interface RetentionSettings {
   opportunities_days: number
 }
 
+/** POST /api/system/purge 结果：dry_run=true 时 deleted 为「将删除条数」 */
+export interface PurgeResult {
+  table: string
+  deleted: number
+  dry_run: boolean
+  /** SQLite 计算的截断点（YYYY-MM-DD HH:MM:SS），删除早于该时刻的记录 */
+  cutoff: string
+}
+
+/** GET /api/system/purge/last：上次清理记录（无记录时后端返回 {}） */
+export interface LastPurge {
+  table?: string
+  deleted?: number
+  keep_days?: number
+  cutoff?: string
+  at?: string
+}
+
 /** /api/system/billing 单日用量与费用（元） */
 export interface BillingDay {
   date: string
@@ -270,6 +288,19 @@ export interface BillingOut {
   output_price: number
   today: BillingDay
   series: BillingDay[]
+}
+
+/** /api/system/cache（微信数据库解密缓存目录） */
+export interface CacheDirInfo {
+  dir: string
+  default_dir: string
+  configured: string
+  is_default: boolean
+  size_bytes: number
+  file_count: number
+  active_dir: string
+  active: boolean
+  legacy_dirs: string[]
 }
 
 /** WS 事件（{event, data}） */

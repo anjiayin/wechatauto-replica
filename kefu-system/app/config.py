@@ -2,6 +2,7 @@
 """全局路径与可配置常量（共享约定见 docs/技术方案与任务分解.md 第 8 节）。"""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -14,6 +15,73 @@ SECRET_KEY_PATH = DATA_DIR / "secret.key"                  # Fernet 密钥文件
 LOG_PATH = DATA_DIR / "kefu.log"                           # 滚动日志
 IMG_CACHE_DIR = DATA_DIR / "imgcache"                      # 图片解密缓存（反馈 2）
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"             # 前端构建产物
+
+# 微信数据库解密缓存（SQLCipher 解密副本 + 页哈希 + 密钥缓存）默认目录。
+# 放在客服系统运行目录下，避免落到 %TEMP% 被系统/清理软件删除（删了要全量
+# 重新解密，且需重新提取密钥）。可在设置页改为其它磁盘（如 D:\wxcache）。
+CACHE_DIR_DEFAULT = DATA_DIR / "wechat_cache"
+LEGACY_CACHE_ROOT = Path(os.environ.get("TEMP") or os.environ.get("TMP")
+                         or "/tmp") / "wechatauto_db"
+
+
+def resolve_cache_dir(raw: str | None = None) -> Path:
+    """把配置值规整为绝对路径（空值 / 相对路径 / ~ / 环境变量均可）。
+
+    相对路径按 kefu-system/ 解析，避免受进程工作目录影响。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return CACHE_DIR_DEFAULT
+    text = os.path.expandvars(os.path.expanduser(text))
+    path = Path(text)
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    try:
+        return path.resolve()
+    except OSError:      # 盘符不存在等极端情况：返回未解析路径
+        return path
+
+
+def check_cache_dir(raw: str | None = None) -> tuple[bool, str, Path]:
+    """校验缓存目录可用性并确保目录存在，返回 (是否可用, 中文原因, 绝对路径)。
+
+    Windows 上「目录不存在 / 只读 / 是文件」都会在真正写入缓存时才炸，
+    且现场是后台重建线程，报错不明显，所以在保存配置前就验证一次。
+    """
+    path = resolve_cache_dir(raw)
+    if len(str(path)) > 240:
+        return False, "路径过长（超过 240 个字符）", path
+    if path.exists() and not path.is_dir():
+        return False, "该路径已存在且不是文件夹", path
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return False, f"无法创建目录：{exc}", path
+    probe = path / f".kefu_write_test_{os.getpid()}"
+    try:
+        probe.write_bytes(b"ok")
+        probe.unlink()
+    except OSError as exc:
+        return False, f"目录不可写：{exc}", path
+    return True, "", path
+
+
+def dir_usage(path: Path | str) -> tuple[int, int]:
+    """统计目录占用 (字节数, 文件数)。缓存目录是平铺文件，只统计一层。"""
+    total = 0
+    count = 0
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+                        count += 1
+                except OSError:
+                    continue
+    except OSError:
+        return 0, 0
+    return total, count
 
 # ---------------------------------------------------------------------------
 # 管线常量（窗口允许 settings 覆盖：analysis.merge_window_sec / analysis.opp_merge_window_sec）
@@ -65,6 +133,13 @@ KEY_RUNTIME_WM_SAVED_AT = "runtime.watermark_saved_at"  # 内部键：最近 wat
 KEY_RUNTIME_MW_MIGRATED = "runtime.merge_window_migrated"  # 内部键：微窗口默认值迁移标记
 # 内部键：创建时间由 UTC 改为本地时间的迁移标记（一次性，防重复平移）
 KEY_RUNTIME_LOCALTIME_MIGRATED = "runtime.created_at_localtime"
+# 内部键：把 analysis_logs 已有 token 用量回填到 ai_usage 的一次性标记
+KEY_RUNTIME_AI_USAGE_BACKFILLED = "runtime.ai_usage_backfilled"
+# 微信数据库解密缓存目录（空 = 默认 DATA_DIR/wechat_cache；相对路径按 kefu-system/ 解析）
+KEY_RUNTIME_CACHE_DIR = "runtime.cache_dir"
+# 内部键：最近一次手动清理记录（JSON：table/deleted/keep_days/cutoff/at）。
+# 落库留痕，不依赖日志文件——日志轮转失败时仍能查出「数据是被谁清理掉的」。
+KEY_RUNTIME_LAST_PURGE = "runtime.last_purge"
 
 # ---------------------------------------------------------------------------
 # 默认配置值
@@ -86,6 +161,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     KEY_NOTIFY_SOUND: "0",
     KEY_MONITOR_MAX_TARGETS: str(MAX_MONITOR_TARGETS),
     KEY_COMPLIANCE_CONFIRMED: "0",
+    KEY_RUNTIME_CACHE_DIR: "",     # 空 = 使用 CACHE_DIR_DEFAULT
+    KEY_RUNTIME_LAST_PURGE: "",    # 空 = 尚未执行过手动清理（JSON 字符串）
 }
 
 # 判定严格度取值
