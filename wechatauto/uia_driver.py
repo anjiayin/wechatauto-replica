@@ -759,6 +759,11 @@ class WeChatUIA:
                 raw.append({
                     "cell": c,
                     "name": name.split("\n", 1)[0].strip(),
+                    # 副标题（第二行起的其余文本）：通常是「企业微信」
+                    # 「微信号: xxx」或最近消息摘要。留作同名联系人区分，
+                    # 为空时不影响既有逻辑。
+                    "sub": " ".join(
+                        p.strip() for p in name.split("\n")[1:] if p.strip()),
                     "section": section,
                     "aid": aid,
                 })
@@ -812,6 +817,12 @@ class WeChatUIA:
                         candidates.append(k)
         except Exception:
             pass
+        # 企业微信/客服账号（xxx@openim、@kefu）：这类 ID 在微信搜索框里
+        # 不是有效关键词，先搜它必然空等一轮重试（约 2.4s）才轮到昵称。
+        # 因此把昵称提前、ID 退到末尾仅作兜底。
+        low = kw.lower()
+        if low.endswith("@openim") or "@kefu" in low:
+            candidates = [c for c in candidates if c != kw] + [kw]
         return candidates
 
     def open_chat(self, keyword: str, index: Optional[int] = None,
@@ -862,6 +873,15 @@ class WeChatUIA:
             exact = [r for r in results if r["name"] == used_kw]
             if exact:
                 results = exact
+        # 企业微信/客服联系人常与普通好友同名（同一个人的两个身份），
+        # 搜索结果里只靠名称无法区分；此时优先副标题标注「企业微信」的
+        # 那一条。副标题缺失或都不含该字样时保持原有取第一条行为。
+        low_kw = (keyword or "").strip().lower()
+        if len(results) > 1 and (low_kw.endswith("@openim")
+                                or "@kefu" in low_kw):
+            wx = [r for r in results if "企业微信" in (r.get("sub") or "")]
+            if wx:
+                results = wx
 
         chosen = results[0]
         chosen["cell"].Click()

@@ -74,6 +74,8 @@ class SessionItemOut(BaseModel):
     username: str
     display_name: str
     kind: str                          # group / friend
+    openim: bool = False               # 企业微信/客服联系人（一对一同为 friend）
+    corp: str = ""                     # 企业微信所属企业简称（显示名「昵称@企业」）
 
 
 # ---------------------------------------------------------------------------

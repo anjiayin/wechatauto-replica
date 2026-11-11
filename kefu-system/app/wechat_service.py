@@ -63,6 +63,26 @@ _SENDER_ID_STRICT_RE = re.compile(r"^([^\s:：/]{2,64})\s*:(?!//)\s*")
 # 合并文本行首的 "[HH:MM] " 时间前缀（Aggregator.merged_text 系统加的）
 _TIME_PREFIX_RE = re.compile(r"^\[\d{1,2}:\d{2}\]\s*")
 
+# 微信内置系统会话 / 占位账号：不对应真人或真实群，参与监控毫无意义，
+# 但它们在 contact/session 表里与普通联系人同形，且按 username 排序时
+# 往往排在很前面，会把「添加监控」的默认候选列表刷成垃圾。
+_SYSTEM_ACCOUNTS = frozenset({
+    "brandsessionholder", "brandservicesessionholder", "filehelper",
+    "weixin", "wechatteam", "mphelper", "qqmail", "qmessage", "qqsafe",
+    "qqsync", "floatbottle", "medianote", "fmessage", "tmessage",
+    "newsapp", "notifymessage", "weibo", "facebook", "twitter",
+    "linkedin", "weixinreminder", "reminder", "exmail_tool",
+})
+
+
+def _is_system_account(username: str) -> bool:
+    """是否微信内置系统会话（文件传输助手 / 品牌会话占位 / 各类助手号）。"""
+    u = (username or "").strip().lower()
+    if not u:
+        return True
+    return u in _SYSTEM_ACCOUNTS or u.startswith("brandsessionholder") \
+        or u.startswith("brandservicesession")
+
 # 仓库根目录（wechatauto-replica/）加入 sys.path，保证从 kefu-system 目录
 # 启动时也能 import wechatauto（只 import 调用，不做任何修改）
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -565,40 +585,95 @@ class WeChatService:
             self._name_cache[username] = name
         return name
 
+    @staticmethod
+    def is_openim(username: str) -> bool:
+        """是否企业微信/客服类会话（@openim、@kefu.openim 等）。
+
+        微信 4.x 的 contact 表里这类账号 local_type 为 5/6/7，username
+        统一以 ``@openim``（企业微信联系人）或 ``@kefu``（客服）结尾。
+        它们本质是一对一私聊，可监控、可回复，但历史上被 friend 过滤器
+        以「不是个人好友」为由排除，导致全部搜不到。
+        """
+        u = (username or "").strip().lower()
+        return u.endswith("@openim") or "@kefu" in u
+
     def _build_contact_list(self) -> list[dict]:
-        """构建全量联系人/会话列表（群+好友，含显示名）。
+        """构建全量联系人/会话列表（群 + 好友 + 企业微信联系人，含显示名）。
 
         会话（≤100 条，最近活跃优先）逐个解析显示名；联系人用
         wechatauto 自带的 remark/nick_name 快照，免逐个解析（快）。
         公众号（gh_ 前缀）不参与监控，直接跳过。
+
+        好友与群聊均取**全量**（``limit=0``）：本机好友可达 3 万条，
+        原先固定 ``limit=2000`` 会把按 username 排序后的绝大多数好友
+        截断掉，表现为「明明有这个人却搜不到」。
+
+        企业微信联系人单独取 ``kind="openim"`` 并归入 friend（一对一
+        私聊），带 ``openim=True`` 标记供前端区分同名联系人；能解析出
+        所属企业时显示名按微信端习惯拼成「昵称@企业简称」。
         """
+        corp_map = self._openim_corp_map()
         items: list[dict] = []
         seen: set[str] = set()
         for s in self._wxdb.get_sessions(limit=100):
             username = str(s.get("username") or "")
-            if not username or username in seen or username.startswith("gh_"):
+            if not username or username in seen or username.startswith("gh_") \
+                    or _is_system_account(username):
                 continue
-            kind = "group" if username.endswith("@chatroom") else "friend"
+            openim = self.is_openim(username)
+            corp = corp_map.get(username, "")
             items.append({"username": username,
-                          "display_name": self.get_display_name(username),
-                          "kind": kind})
+                          "display_name": self._with_corp(
+                              self.get_display_name(username), corp),
+                          "kind": "group" if username.endswith("@chatroom")
+                                  else "friend",
+                          "openim": openim, "corp": corp})
             seen.add(username)
-        # wechatauto.get_contacts 的群聊取值为 "chatroom"（不是 "group"）
-        for c_kind, item_kind in (("chatroom", "group"), ("friend", "friend")):
+        # wechatauto.get_contacts 的群聊取值为 "chatroom"（不是 "group"）；
+        # openim 为企业微信/客服联系人，按一对一私聊归入 friend
+        for c_kind, item_kind in (("chatroom", "group"), ("friend", "friend"),
+                                  ("openim", "friend")):
             try:
-                contacts = self._wxdb.get_contacts(kind=c_kind, limit=2000)
+                contacts = self._wxdb.get_contacts(kind=c_kind, limit=0)
             except Exception as exc:
                 logger.warning("读取联系人（%s）失败：%s", c_kind, exc)
                 contacts = []
             for c in contacts:
                 username = str(c.get("username") or "")
-                if not username or username in seen or username.startswith("gh_"):
+                if not username or username in seen or username.startswith("gh_") \
+                        or _is_system_account(username):
                     continue
-                name = c.get("remark") or c.get("nick_name") or username
+                remark = str(c.get("remark") or "").strip()
+                nick = str(c.get("nick_name") or "").strip()
+                corp = corp_map.get(username, "")
+                # 用户手动备注优先（微信里备注会盖掉「昵称@企业」）；
+                # 无备注且能拿到企业简称时才拼后缀
+                name = remark or self._with_corp(nick or username, corp)
                 items.append({"username": username,
-                              "display_name": name, "kind": item_kind})
+                              "display_name": name, "kind": item_kind,
+                              "openim": c_kind == "openim"
+                                        or self.is_openim(username),
+                              "corp": corp})
                 seen.add(username)
+        logger.info("联系人列表构建完成：%d 条（群/好友/企业微信合并去重后，"
+                    "其中 %d 个企业微信联系人有企业名）",
+                    len(items), len(corp_map))
         return items
+
+    def _openim_corp_map(self) -> dict[str, str]:
+        """企业微信联系人 → 企业简称（读取失败返回空字典，不影响列表构建）。"""
+        try:
+            return self._wxdb.get_openim_corp_names()
+        except Exception as exc:
+            logger.warning("读取企业微信企业名失败：%s", exc)
+            return {}
+
+    @staticmethod
+    def _with_corp(name: str, corp: str) -> str:
+        """按微信端习惯拼「昵称@企业简称」（已含后缀或无企业名时原样返回）。"""
+        if not corp or not name or "@" in name:
+            return name
+        return f"{name}@{corp}"
 
     def _get_cached_contact_list(self) -> list[dict]:
         """全量联系人/会话列表（TTL 60s 内存缓存 + single-flight 构建）。
@@ -649,23 +724,60 @@ class WeChatService:
             kind: `all` / `group` / `friend`，按类型过滤返回结果。
 
         Returns:
-            [{username, display_name, kind}]
+            [{username, display_name, kind, openim}]
         """
         kind = kind if kind in ("group", "friend", "all") else "all"
         limit = max(1, min(limit, 100))
         if self._wxdb is None:
             return []
-        out: list[dict] = []
-        for item in self._get_cached_contact_list():
+        kw = (keyword or "").strip()
+        items = self._get_cached_contact_list()
+        if not kw:
+            # 默认列表（打开面板时的首屏）：不用排序，按缓存顺序取够即止，
+            # 避免对 3 万条全量排序
+            out: list[dict] = []
+            for item in items:
+                if kind != "all" and item["kind"] != kind:
+                    continue
+                out.append(dict(item))
+                if len(out) >= limit:
+                    break
+            return out
+        # 有关键词：先收集全部命中，按匹配质量排序后再按 limit 截断。
+        # 好友基数很大（本机约 3 万条），若边收集边截断，会出现
+        # 「名字完全一致的联系人」被一堆昵称含同字的账号挤出前 50 条。
+        hits: list[tuple[int, int, dict]] = []
+        for order, item in enumerate(items):
             if kind != "all" and item["kind"] != kind:
                 continue
-            if keyword and keyword not in item["display_name"] \
-                    and keyword not in item["username"]:
+            name = item["display_name"]
+            if kw not in name and kw not in item["username"]:
                 continue
-            out.append(dict(item))
-            if len(out) >= limit:
-                break
-        return out
+            hits.append((self._match_rank(name, item["username"], kw),
+                         order, item))
+        hits.sort(key=lambda t: (t[0], t[1]))
+        return [dict(t[2]) for t in hits[:limit]]
+
+    @staticmethod
+    def _match_rank(name: str, username: str, kw: str) -> int:
+        """搜索匹配质量排序权重：越小越靠前。
+
+        0 = 显示名完全等于关键词（用户最可能想找的人）
+        1 = 显示名以关键词开头
+        2 = 显示名包含关键词
+        3 = 仅 username 命中（wxid / openim id 等）
+
+        企业微信联系人的显示名是「昵称@企业简称」，匹配时把 ``@`` 之后的
+        企业名视作后缀：搜「邢不行」应命中原名并获得与普通好友相同的权重。
+        """
+        base = name.split("@", 1)[0] if "@" in name else name
+        if name == kw or base == kw:
+            return 0
+        if name.startswith(kw) or base.startswith(kw):
+            return 1
+        if kw in name:
+            return 2
+        return 3 if kw in username else 4
 
     def get_messages(self, username: str, limit: int = 50,
                      before_seq: int = 0) -> list[dict]:

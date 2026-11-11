@@ -204,6 +204,46 @@ def _is_malformed(exc) -> bool:
     return isinstance(exc, sqlite3.DatabaseError) and "malformed" in str(exc).lower()
 
 
+# 企业微信联系人的 extra_buffer 里，"企业" 分组的 desc 就是企业标识
+# （形如 "C06F...RI01@im.wxwork"）；配合 contact.db 的 openim_wording
+# 表可还原成企业简称。JSON 解析失败时用这个正则兜底。
+_CORP_ID_RE = re.compile(
+    r'"title"\s*:\s*"企业".{0,600}?"desc"\s*:\s*"([^"]+@im\.wxwork)"', re.S)
+
+
+def _extract_openim_corp_id(buf) -> str:
+    """从企业微信联系人的 extra_buffer 中取企业标识（取不到返回空串）。
+
+    extra_buffer 是「protobuf 头 + JSON(custom_info)」的混合体，这里不做
+    protobuf 解析，直接定位 JSON 段按结构取 ``title == "企业"`` 的 desc。
+    """
+    if not buf:
+        return ""
+    try:
+        text = (buf.decode("utf-8", "replace")
+                if isinstance(buf, (bytes, bytearray)) else str(buf))
+    except Exception:
+        return ""
+    start = text.find("{")
+    if start < 0:
+        return ""
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text[start:])
+    except Exception:
+        m = _CORP_ID_RE.search(text)
+        return m.group(1) if m else ""
+    for block in (obj.get("custom_info") or []):
+        if not isinstance(block, dict) or block.get("title") != "企业":
+            continue
+        for detail in (block.get("detail") or []):
+            if not isinstance(detail, dict):
+                continue
+            desc = str(detail.get("desc") or "")
+            if desc.endswith("@im.wxwork"):
+                return desc
+    return ""
+
+
 def _pbkdf2(passwd: bytes, salt: bytes, iters: int) -> bytes:
     return hashlib.pbkdf2_hmac("sha512", passwd, salt, iters, dklen=32)
 
@@ -2491,6 +2531,45 @@ class WeChatDB:
                    and c["username"] != self_user]
         if limit and limit > 0:
             out = out[:limit]
+        return out
+
+    def get_openim_corp_names(self) -> Dict[str, str]:
+        """企业微信/客服联系人 → 所属企业名称（还原微信端「昵称@企业名」）。
+
+        数据来源：``contact.extra_buffer`` 的 "企业" 分组给出企业标识
+        （``xxx@im.wxwork``），``openim_wording`` 表把该标识映射为企业
+        简称（如 "磐达斯"）。任一步缺失时该联系人不出现在结果里，调用方
+        回退到只显示昵称。
+
+        Returns:
+            {username: 企业简称}，只含能解析出企业名的联系人。
+        """
+        conn = self._contact_conn()
+        if not conn:
+            return {}
+        try:
+            try:
+                words = {r["wording_id"]: r["wording"] for r in conn.execute(
+                    "SELECT wording_id, wording FROM openim_wording")}
+            except sqlite3.Error:
+                words = {}      # 老版本库可能没有这张表
+            if not words:
+                return {}
+            try:
+                rows = conn.execute(
+                    "SELECT username, extra_buffer FROM contact "
+                    "WHERE delete_flag=0 AND (username LIKE '%@openim' "
+                    "OR username LIKE '%@kefu%')").fetchall()
+            except sqlite3.Error:
+                return {}
+        finally:
+            conn.close()
+        out: Dict[str, str] = {}
+        for r in rows:
+            corp_id = _extract_openim_corp_id(r["extra_buffer"])
+            name = str(words.get(corp_id) or "").strip()
+            if name:
+                out[r["username"]] = name
         return out
 
     def get_nickname(self, user: str) -> str:

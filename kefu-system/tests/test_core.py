@@ -1004,6 +1004,10 @@ class FakeWxDb:
     def get_nickname(self, username: str) -> str:
         return {"111@chatroom": "加工群"}.get(username, "")
 
+    def get_openim_corp_names(self) -> dict[str, str]:
+        """企业微信联系人 → 企业简称（本替身无企业微信联系人）。"""
+        return {}
+
     def get_messages(self, username: str, limit: int = 50) -> list[dict]:
         self.msg_calls += 1
         if self.msg_calls <= self.msg_fail_times:
@@ -1029,7 +1033,7 @@ class TestSessionCache:
         svc.search_sessions(keyword="王五")
         svc.search_sessions(kind="group")
         assert first.sessions_calls == 1
-        assert first.contacts_calls == 2  # chatroom + friend 各一次
+        assert first.contacts_calls == 3  # chatroom + friend + openim 各一次
 
     def test_kind_and_keyword_filter_on_cached_list(self):
         svc = make_svc()

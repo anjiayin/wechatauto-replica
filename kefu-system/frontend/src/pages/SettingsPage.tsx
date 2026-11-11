@@ -128,9 +128,13 @@ function TargetRow({
       />
       <ListItemText
         primary={target.display_name || target.username}
-        secondary={`${target.kind === 'group' ? '群聊' : '私聊'} · ${target.username}${
-          target.enabled === 1 ? '' : '（已停用）'
-        }`}
+        secondary={`${
+          target.kind === 'group'
+            ? '群聊'
+            : target.username.endsWith('@openim') || target.username.includes('@kefu')
+              ? '企业微信'
+              : '私聊'
+        } · ${target.username}${target.enabled === 1 ? '' : '（已停用）'}`}
       />
     </ListItem>
   )
@@ -456,6 +460,9 @@ function TargetsTab() {
               ))}
             {candidates.map((s) => {
               const monitored = targetUsernames.has(s.username)
+              // 显示名已带「@企业简称」时不再重复标「企业微信」（有备注时仍标）
+              const showWxTag =
+                s.openim && !(s.corp && s.display_name.endsWith(`@${s.corp}`))
               return (
                 <ListItem
                   key={s.username}
@@ -477,7 +484,22 @@ function TargetsTab() {
                     sx={{ p: 0.5, mr: 1 }}
                   />
                   <ListItemText
-                    primary={s.display_name}
+                    primary={
+                      <Box
+                        component="span"
+                        sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.75 }}
+                      >
+                        {s.display_name}
+                        {showWxTag && (
+                          <Chip
+                            label="企业微信"
+                            size="small"
+                            variant="outlined"
+                            sx={{ height: 18, fontSize: 11 }}
+                          />
+                        )}
+                      </Box>
+                    }
                     secondary={s.username}
                   />
                 </ListItem>

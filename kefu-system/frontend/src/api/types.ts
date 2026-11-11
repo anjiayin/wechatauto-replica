@@ -72,6 +72,10 @@ export interface SessionItem {
   username: string
   display_name: string
   kind: 'group' | 'friend'
+  /** 企业微信/客服联系人：kind 仍是 friend，用标签区分同名联系人 */
+  openim?: boolean
+  /** 企业微信所属企业简称（display_name 为「昵称@企业」时非空） */
+  corp?: string
 }
 
 /** 消息（历史/上下文） */
