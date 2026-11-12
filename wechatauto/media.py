@@ -644,12 +644,28 @@ class MediaDownloader:
             return None
 
     def _wxgf_to_jpg(self, data: bytes) -> Optional[bytes]:
-        """用 ffmpeg 把 wxgf 内的 HEVC 裸流转码为 jpg。失败返回 None。"""
-        exe = self._ffmpeg_exe()
-        if exe is None:
-            return None
+        """把 wxgf 内的 HEVC 裸流转码为 jpg：先 ffmpeg，失败再用 OpenCV。
+
+        为什么要 cv2 兜底：本机（以及绝大多数只装 requirements 的环境）没有
+        ffmpeg，原图**必然**回退到 ``_t.dat`` 缩略图（实测 136x180）。缩略图
+        里 VIN/件号只有 2~3 像素高，视觉模型读不出来就会硬编一个（实测把
+        ``LFV3A24F2A3102185`` 读成 ``LFV3A23P2N3782165``）。OpenCV 自带
+        FFmpeg 后端能直接解 HEVC 裸流（本机 cv2 5.0.0 实测输出 1706x1280 原图），
+        所以这里加一条零新增依赖的兜底路径。
+        """
         hevc = self._extract_hevc(data)
         if not hevc:
+            return None
+        out = self._hevc_to_jpg_ffmpeg(hevc)
+        if out:
+            return out
+        return self._hevc_to_jpg_cv2(hevc)
+
+    @staticmethod
+    def _hevc_to_jpg_ffmpeg(hevc: bytes) -> Optional[bytes]:
+        """ffmpeg 转码（PATH 里的 ffmpeg 或 imageio_ffmpeg 自带的可执行文件）。"""
+        exe = MediaDownloader._ffmpeg_exe()
+        if exe is None:
             return None
         import subprocess
         import tempfile
@@ -673,6 +689,43 @@ class MediaDownloader:
                 except OSError:
                     return None
         return None
+
+    @staticmethod
+    def _hevc_to_jpg_cv2(hevc: bytes) -> Optional[bytes]:
+        """OpenCV 解码 HEVC 裸流（无 ffmpeg 时的兜底）。
+
+        cv2.VideoCapture 只吃文件/流地址，不吃内存字节，所以落一个临时
+        ``.h265`` 再读首帧；任何异常返回 None（调用方继续回退缩略图）。
+        """
+        try:
+            import cv2
+        except Exception:
+            return None
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".h265")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(hevc)
+            cap = cv2.VideoCapture(path)
+            try:
+                if not cap.isOpened():
+                    return None
+                ok, frame = cap.read()
+            finally:
+                cap.release()
+            if not ok or frame is None:
+                return None
+            ok, buf = cv2.imencode(
+                ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+            return buf.tobytes() if ok else None
+        except Exception:
+            logger.debug("cv2 解码 HEVC 失败（回退缩略图）", exc_info=True)
+            return None
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     def _img_md5(self, row: dict) -> Optional[str]:
         pi = row.get("packed_info")
@@ -775,6 +828,49 @@ class MediaDownloader:
         _remember_verified(out)
         return out
 
+    # 已尝试过「缩略图缓存 → 原图」升级的 (user, local_id)：同一张图只试一次，
+    # 避免原图确实不存在（微信没下载）时每次取图都白跑一遍解密
+    _upgrade_tried: Set[Tuple[str, int]] = set()
+
+    def _upgrade_thumbnail_cache(self, user: str, local_id: int, md5: str,
+                                 create_time: int, cached: str, current: bytes,
+                                 aes_key: Optional[str], xor_key: Optional[int],
+                                 save_dir: Optional[str]
+                                 ) -> Optional[Tuple[bytes, Optional[str]]]:
+        """命中缩略图缓存时，再尝试解一次原图（拿到就升级缓存）。
+
+        背景：旧版本没有 HEVC 解码能力，原图必然回落缩略图并写成
+        ``*_thumb.jpg``；这类缓存**命中后不再解密**，于是视觉模型永远只看到
+        136x180 的图（VIN/件号 2~3 像素高，读不出就会硬编）。补上 OpenCV
+        兜底后原图可解，这里给老缓存一次升级机会；原图仍拿不到就保持现状
+        （不删缓存、不抛异常、不影响调用方）。
+        """
+        if "_thumb" not in os.path.basename(cached):
+            return None
+        key = (str(user), int(local_id))
+        if key in self._upgrade_tried:
+            return None
+        self._upgrade_tried.add(key)
+        if not md5:
+            return None
+        try:
+            decoded = self._decode_usable_image(
+                user, md5, create_time, aes_key, xor_key)
+        except Exception:
+            logger.debug("缩略图缓存升级失败（%s/%s）", user, local_id,
+                         exc_info=True)
+            return None
+        if not decoded:
+            return None
+        data, thumbnail = decoded
+        if thumbnail or len(data) <= len(current):
+            return None
+        path = self._write_image_cache(user, local_id, data, save_dir,
+                                       thumbnail=False)
+        logger.info("图片缓存由缩略图升级为原图：%s/%s（%d → %d 字节）",
+                    user, local_id, len(current), len(data))
+        return data, path or cached
+
     def _decode_usable_image(self, user: str, md5: str, create_time: int,
                              aes_key: Optional[str],
                              xor_key: Optional[int]
@@ -862,6 +958,11 @@ class MediaDownloader:
                 forget_verified(cached)
                 data = b""
             if data:
+                upgraded = self._upgrade_thumbnail_cache(
+                    user, local_id, md5, row["create_time"], cached, data,
+                    aes_key, xor_key, save_dir)
+                if upgraded is not None:
+                    return upgraded[0], upgraded[1], ""
                 return data, cached, ""
         decoded = self._decode_usable_image(
             user, md5, row["create_time"], aes_key, xor_key)

@@ -57,6 +57,52 @@ VISION_PROMPT = (
 # VIN 合法字符：数字 + 字母，排除 I / O / Q（与车辆识别代号标准一致）
 _VIN_RE = re.compile(r"[A-HJ-NPR-Z0-9]{17}")
 
+# 送模型的图像长边低于此值时，**不允许**输出 VIN（宁缺勿错）。
+# 依据（2026-11-12 实测）：微信只给缩略图时是 136x180，其中 VIN 一行字符高度
+# 仅 2~3 像素，人眼放大也读不出；而模型会照着「LFV3A2…」的厂商前缀愣编 17 位
+# （实测编出 LFV3A23P2N3782165，真值是 LFV3A24F2A3102185）。同一张图用 603x799
+# 的版本就能读对，可见瓶颈是分辨率不是提示词。600 的依据：136x180 拦截、
+# 603x799 / 1706x1280 放行（字符高度 ≥8px 时才可能逐字辨认）。
+VIN_MIN_IMAGE_SIDE = 600
+
+# VIN 校验位（GB 16735 / ISO 3779）：第 9 位由前 17 位加权和模 11 得出，
+# 余数 10 记作 X。这是拦「模型编 VIN」的确定性手段——实测真实 VIN 通过、
+# 编造的那个差 7（应 9 实 2）。
+_VIN_VALUES = {
+    **{str(d): d for d in range(10)},
+    "A": 1, "B": 2, "C": 3, "D": 4, "E": 5, "F": 6, "G": 7, "H": 8,
+    "J": 1, "K": 2, "L": 3, "M": 4, "N": 5, "P": 7, "R": 9,
+    "S": 2, "T": 3, "U": 4, "V": 5, "W": 6, "X": 7, "Y": 8, "Z": 9,
+}
+_VIN_WEIGHTS = (8, 7, 6, 5, 4, 3, 2, 10, 0, 9, 8, 7, 6, 5, 4, 3, 2)
+
+# 低分辨率时追加到提示词末尾的强约束
+LOW_RES_VIN_NOTE = (
+    "\n【重要】当前图像分辨率较低（{w}x{h}），17 位车架号大概率无法逐字符辨认。"
+    "vin 必须返回空字符串，**不要猜测、不要按车型或厂商前缀补全**。"
+) 
+
+
+def vin_check_digit_ok(vin: str) -> bool:
+    """VIN 第 9 位校验位是否成立（长度/字符集不符返回 False）。
+
+    注意：少数进口车或早期车型不填校验位，此时真实 VIN 也会判 False——
+    对「宁可没有、也不要错」的场景这是可接受的取舍，被丢弃的 VIN 会写进
+    ``result["vin_rejected"]`` 供排查。
+    """
+    text = str(vin or "").strip().upper()
+    if len(text) != 17:
+        return False
+    total = 0
+    for char, weight in zip(text, _VIN_WEIGHTS):
+        value = _VIN_VALUES.get(char)
+        if value is None:
+            return False
+        total += value * weight
+    remainder = total % 11
+    expected = "X" if remainder == 10 else str(remainder)
+    return text[8] == expected
+
 # 「图片不完整或已损坏」= 可重试错误（微信还没把原图下载完）：
 # 调用方**不要**把它写进 image_analysis 缓存，下次还能再试一次
 MSG_INCOMPLETE = "图片不完整或已损坏"
@@ -79,8 +125,13 @@ def _error_summary(exc: BaseException) -> str:
     return "图片识别失败：" + text[:120]
 
 
-def _prepare_image(data: bytes, max_side: int) -> bytes:
-    """等比缩放到长边 ≤ max_side，转 RGB 并存为 JPEG 字节。"""
+def _prepare_image(data: bytes, max_side: int) -> tuple:
+    """等比缩放到长边 ≤ max_side，转 RGB 并存为 JPEG 字节。
+
+    Returns:
+        ``(jpeg 字节, (宽, 高))``：尺寸是**实际送给模型**的尺寸，调用方据此
+        判断分辨率是否足以读 VIN（见 :data:`VIN_MIN_IMAGE_SIDE`）。
+    """
     from PIL import Image
 
     with Image.open(io.BytesIO(data)) as im:
@@ -94,7 +145,7 @@ def _prepare_image(data: bytes, max_side: int) -> bytes:
                           max(1, int(round(height * ratio)))))
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=VISION_JPEG_QUALITY)
-    return buf.getvalue()
+    return buf.getvalue(), img.size
 
 
 def _normalize(raw: dict) -> dict:
@@ -156,8 +207,11 @@ def analyze_image(data: bytes, *, base_url: str = "", api_key: str = "",
 
     Returns:
         ``{"is_vehicle_part": bool, "part_name": str, "vin": str,
-        "reason": str, "prompt_tokens": int|None, "completion_tokens":
-        int|None, "latency_ms": int}``
+        "reason": str, "vin_rejected": str, "prompt_tokens": int|None,
+        "completion_tokens": int|None, "latency_ms": int}``
+
+        ``vin_rejected``：模型给了 VIN 但被丢弃的原因（空串 = 未丢弃）：
+        ``"low_res"`` 图像分辨率不足、``"check_digit"`` 校验位不符。
 
     Raises:
         VisionError: 图片为空/不完整/花屏、未配置、调用失败、解析失败。
@@ -184,14 +238,19 @@ def analyze_image(data: bytes, *, base_url: str = "", api_key: str = "",
                         timeout=float(timeout_sec))
 
     try:
-        jpeg = _prepare_image(raw, max_side)
+        jpeg, sent_size = _prepare_image(raw, max_side)
     except Exception as exc:
         raise VisionError(f"图片预处理失败：{exc}") from exc
+    # 分辨率不足时明确告诉模型「别猜」（代码侧还会兜一道，见下）
+    low_res = max(sent_size) < VIN_MIN_IMAGE_SIDE
+    prompt = VISION_PROMPT
+    if low_res:
+        prompt += LOW_RES_VIN_NOTE.format(w=sent_size[0], h=sent_size[1])
     b64 = base64.b64encode(jpeg).decode("ascii")
     messages = [{
         "role": "user",
         "content": [
-            {"type": "text", "text": VISION_PROMPT},
+            {"type": "text", "text": prompt},
             {"type": "image_url",
              "image_url": {"url": "data:image/jpeg;base64," + b64}},
         ],
@@ -212,15 +271,32 @@ def analyze_image(data: bytes, *, base_url: str = "", api_key: str = "",
     except (AttributeError, IndexError):
         text = ""
     result = _normalize(_parse_json(text))
+    # 两道「宁缺勿错」的 VIN 防线（顺序有意义：先看信息是否存在，再看好不好）
+    result["vin_rejected"] = ""
+    if result["vin"]:
+        if low_res:
+            result["vin_rejected"] = "low_res"
+            logger.info(
+                "丢弃模型给出的 VIN %s：送模型图像仅 %dx%d，低于 %dpx 无法逐字辨认",
+                result["vin"], sent_size[0], sent_size[1], VIN_MIN_IMAGE_SIDE)
+            result["vin"] = ""
+        elif not vin_check_digit_ok(result["vin"]):
+            result["vin_rejected"] = "check_digit"
+            logger.info("丢弃模型给出的 VIN %s：校验位不符（疑似误读/编造）",
+                        result["vin"])
+            result["vin"] = ""
     usage = getattr(resp, "usage", None)
     result["prompt_tokens"] = (getattr(usage, "prompt_tokens", None)
                                if usage is not None else None)
     result["completion_tokens"] = (getattr(usage, "completion_tokens", None)
                                    if usage is not None else None)
     result["latency_ms"] = latency_ms
-    logger.info("图片识别完成（%s，%d ms）：车辆/配件=%s 部件=%s VIN=%s",
-                model, latency_ms, result["is_vehicle_part"],
-                result["part_name"] or "-", result["vin"] or "-")
+    logger.info("图片识别完成（%s，%d ms，%dx%d）：车辆/配件=%s 部件=%s VIN=%s%s",
+                model, latency_ms, sent_size[0], sent_size[1],
+                result["is_vehicle_part"], result["part_name"] or "-",
+                result["vin"] or "-",
+                f"（已丢弃误读 VIN：{result['vin_rejected']}）"
+                if result["vin_rejected"] else "")
     return result
 
 

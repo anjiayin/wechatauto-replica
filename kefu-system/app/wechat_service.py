@@ -530,6 +530,22 @@ class WeChatService:
                 return reason
         return "图片识别失败：" + reason
 
+    @staticmethod
+    def _vin_reject_note(result: dict) -> str:
+        """把「VIN 被丢弃」的原因转成可直接展示的中文说明。
+
+        批次 9：视觉模型给过 VIN 但被拦下（图太小 / 校验位不符）时，用户会
+        发现「这次没有车架号」——必须能解释为什么，否则会以为识别退化了。
+        """
+        reason = str(result.get("vin_rejected") or "")
+        if not reason:
+            return ""
+        if reason == "low_res":
+            return "未提取车架号：图片分辨率过低（微信只给了缩略图，字符无法辨认）"
+        if reason == "check_digit":
+            return "未提取车架号：读取结果校验位不符（疑似误读，已丢弃）"
+        return "未提取车架号"
+
     def _save_image_analysis(self, username: str, local_id: int, *,
                              is_vehicle_part: bool, part_name: str = "",
                              vin: str = "", model: str = "",
@@ -790,7 +806,8 @@ class WeChatService:
             self._save_image_analysis(
                 username, local_id, is_vehicle_part=True,
                 part_name=str(result.get("part_name") or ""),
-                vin=str(result.get("vin") or ""), model=model)
+                vin=str(result.get("vin") or ""), model=model,
+                error=self._vin_reject_note(result))
             self._emit_image_sell(task, result)
             return True
         except vision.VisionError as exc:
@@ -999,7 +1016,8 @@ class WeChatService:
         self._save_image_analysis(
             username, local_id, is_vehicle_part=True,
             part_name=str(result.get("part_name") or ""),
-            vin=str(result.get("vin") or ""), model=model)
+            vin=str(result.get("vin") or ""), model=model,
+            error=self._vin_reject_note(result))
         self._emit_image_sell(task, result)
         self._log_image_skipped(
             username, sender_wxid, mtype, raw_content,

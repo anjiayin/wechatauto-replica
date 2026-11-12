@@ -114,6 +114,12 @@ function ContextImage(props: { username: string; localId: number; fallback: stri
           )}
         </Stack>
       )}
+      {/* 车架号被主动丢弃时说明原因：否则用户看到「这次没有 VIN」会以为识别退化了 */}
+      {analysis?.is_vehicle_part && !analysis.vin && analysis.error && (
+        <Typography variant="caption" display="block" color="text.secondary" sx={{ mt: 0.5 }}>
+          {analysis.error}
+        </Typography>
+      )}
     </Box>
   )
 }

@@ -378,7 +378,8 @@ class FakeVisionClient:
                  error: BaseException | None = None) -> None:
         self.content = content if content is not None else json.dumps(
             {"is_vehicle_part": True, "part_name": "发动机总成",
-             "vin": "lsgmj5p578v016154", "reason": "发动机实物照片"},
+             # 校验位合法的 VIN（批次 8 起 analyze_image 会校验第 9 位）
+             "vin": "lfv3a24f2a3102185", "reason": "发动机实物照片"},
             ensure_ascii=False)
         self.error = error
         self.kwargs: dict = {}
@@ -413,8 +414,10 @@ class TestVisionAnalyze:
 
     def test_request_structure_and_result(self):
         client = FakeVisionClient()
+        # 用 900x700 的大图：批次 8 起长边 < 600 的图会拒收模型给的 VIN
         result = vision.analyze_image(
-            _complete_jpeg(), base_url="https://mock.local/v1",
+            _jpeg_bytes(_noise_image(size=(900, 700))),
+            base_url="https://mock.local/v1",
             api_key="sk-x", model="GLM-5.3-Flash", client=client)
         # 请求结构：text + image_url(base64 data URI)，json_object，无 thinking
         content = client.kwargs["messages"][0]["content"]
@@ -431,7 +434,8 @@ class TestVisionAnalyze:
         # 结果规整：VIN 转大写
         assert result["is_vehicle_part"] is True
         assert result["part_name"] == "发动机总成"
-        assert result["vin"] == "LSGMJ5P578V016154"
+        assert result["vin"] == "LFV3A24F2A3102185"
+        assert result["vin_rejected"] == ""
         assert result["prompt_tokens"] == 1200
         assert result["completion_tokens"] == 48
 
