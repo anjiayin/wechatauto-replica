@@ -19,8 +19,10 @@ server_id、packed_info），本模块负责把媒体内容从本地取回/解�
 
     - AES 密钥: 16 字节 ASCII（字母/数字），仅在 Weixin.exe 进程内存中。
       通过 AES-ECB 解首块密文、校验 JPEG/PNG 魔数反推出（内存正则扫描）。
-    - XOR 密钥: 单字节，从同图缩略图 ``<md5>_t.dat`` 尾部 JPEG 结束标记
-      ``FF D9`` 反推（``key = tail[0] ^ 0xFF``）。
+    - XOR 密钥: 单字节，从同图兄弟文件尾部反推：JPEG（缩略图 ``<md5>_t.dat``）
+      看 ``FF D9``（``key = tail[-2] ^ 0xFF``），PNG 原图（复制粘贴的图片存在
+      ``<md5>_h.dat``）看 IEND 块 CRC 末字节 ``0x82``。多个候选逐个试，
+      解出可用图就停（见 :meth:`MediaDownloader._xor_key_candidates`）。
 
 用法::
 
@@ -231,6 +233,23 @@ def aligned_aes_block_size(aes_size: int) -> int:
     return aes_size + (16 - aes_size % 16) if aes_size % 16 else aes_size + 16
 
 
+# 单字节 XOR 用 256 项换表（C 层 translate），500KB 原图比逐字节生成快一个量级
+_XOR_TABLES: Dict[int, bytes] = {}
+
+
+def xor_bytes(data: bytes, key: int) -> bytes:
+    """按单字节密钥 XOR 一段数据（key=0 直接返回，避免无谓拷贝）。"""
+    key &= 0xFF
+    if key == 0:
+        return bytes(data)
+    table = _XOR_TABLES.get(key)
+    if table is None:
+        table = bytes(i ^ key for i in range(256))
+        if len(_XOR_TABLES) < 256:
+            _XOR_TABLES[key] = table
+    return data.translate(table)
+
+
 class MediaDownloader:
     """微信 4.x 媒体下载器"""
 
@@ -359,27 +378,83 @@ class MediaDownloader:
                 return key
         return None
 
+    # 同一张图的三种 .dat：<md5>.dat（聊天里那张）/ <md5>_h.dat（原图）/ <md5>_t.dat（缩略图）
+    _DAT_SUFFIXES = ("_h.dat", "_t.dat", ".dat")
+
+    @classmethod
+    def _dat_stem(cls, dat_path: str) -> str:
+        """把 ``<md5>.dat`` / ``<md5>_h.dat`` / ``<md5>_t.dat`` 统一成 ``<md5>``。
+
+        旧实现直接 ``dat_path[:-4]``：传 ``_h.dat`` 会得到 ``<md5>_h``，拼出的
+        兄弟名 ``<md5>_h_t.dat`` 根本不存在 → 密钥推导**必然**落到默认 0x88 →
+        高清原图解成乱码被判定「花屏」→ 回退缩略图。复制粘贴的图片尤其明显
+        （原图存 ``_h.dat`` 里的 PNG，缩略图只有 4KB），所以必须先剥掉
+        ``_h`` / ``_t`` 再拼兄弟名。
+        """
+        for suffix in cls._DAT_SUFFIXES:
+            if dat_path.endswith(suffix):
+                return dat_path[: -len(suffix)]
+        return dat_path
+
+    @staticmethod
+    def _key_from_tail(tail: bytes) -> Optional[int]:
+        """由文件尾字节反推 XOR 密钥。
+
+        - JPEG：尾部固定 ``FF D9`` → ``key = tail[-2] ^ 0xFF``，并要求
+          ``tail[-1] ^ 0xD9`` 自洽；
+        - PNG：IEND 块 CRC 末字节恒为 ``0x82`` → ``key = tail[-1] ^ 0x82``
+          （复制粘贴的图片，原图就是 PNG）。
+        """
+        if len(tail) >= 2:
+            key = tail[-2] ^ 0xFF
+            if tail[-1] ^ 0xD9 == key:
+                return key
+        if tail:
+            return tail[-1] ^ 0x82
+        return None
+
+    @staticmethod
+    def _read_tail(path: str, size: int = 12) -> bytes:
+        """读文件尾部若干字节（文件不存在/太短返回空）。"""
+        try:
+            with open(path, "rb") as f:
+                f.seek(-size, 2)
+                return f.read(size)
+        except OSError:
+            return b""
+
+    def _xor_key_candidates(self, dat_path: str) -> List[int]:
+        """按可信度排序的 XOR 密钥候选（去重，最多 4 个）。
+
+        顺序：同图 ``_t.dat``（缩略图总是完整 JPEG，尾部 FF D9 最可靠）→
+        同图 ``_h.dat`` → 文件自身 → 旧实现 ``_derive_xor_key`` 的结果。
+
+        **为什么要多候选**：单字节密钥按账号固定，但推导依赖「文件已写完整」——
+        微信还在下载时尾部是半截数据，推出来的就是错的。多候选交给上层
+        「解出来能不能用」的校验兜底，不必等下一次重试。
+        """
+        stem = self._dat_stem(dat_path)
+        keys: List[int] = []
+        for path in (stem + "_t.dat", stem + "_h.dat", dat_path):
+            if path != dat_path and not os.path.exists(path):
+                continue
+            key = self._key_from_tail(self._read_tail(path))
+            if key is not None and key not in keys:
+                keys.append(key)
+        legacy = self._derive_xor_key(dat_path)
+        if legacy not in keys:
+            keys.append(legacy)
+        return keys[:4] or [0x88]
+
     def _derive_xor_key(self, dat_path: str) -> int:
-        """从同图缩略图 <md5>_t.dat 尾部 FF D9 反推单字节 XOR 密钥"""
-        for cand in (
-            dat_path[:-4] + "_t.dat",
-            dat_path[:-4] + "_h.dat",
-            dat_path,
-        ):
+        """从同图兄弟文件尾部反推单字节 XOR 密钥（推不出时返回旧默认 0x88）。"""
+        stem = self._dat_stem(dat_path)
+        for cand in (stem + "_t.dat", stem + "_h.dat", dat_path):
             if not os.path.exists(cand):
                 continue
-            try:
-                with open(cand, "rb") as f:
-                    f.seek(-2, 2)
-                    tail = f.read(2)
-            except OSError:
-                continue
-
-            if len(tail) == 2:
-                key = tail[0] ^ 0xFF
-                if tail[1] ^ 0xD9 == key:
-                    return key
-
+            key = self._key_from_tail(self._read_tail(cand))
+            if key is not None:
+                return key
         return 0x88
 
     def _scan_aes_key(self, monitor: bool = False,
@@ -533,7 +608,7 @@ class MediaDownloader:
                 xor_key = self._derive_xor_key(dat_path)
             key = data[6:22]
             body = data[22:]
-            return bytes(b ^ (xor_key & 0xFF) for b in body)
+            return xor_bytes(body, xor_key)
         # 早期纯异或格式：逐字节 ^ 0xFF（无签名），按 JPEG/PNG 魔数回退判断
         for cand in (0x88, 0x30, 0xFF, 0xE9):
             out = bytes(b ^ cand for b in data)
@@ -583,7 +658,7 @@ class MediaDownloader:
         pad = pt[-1] if pt else 0
         if 1 <= pad <= 16 and all(b == pad for b in pt[-pad:]):
             pt = pt[:-pad]
-        return pt + raw_data + bytes(b ^ (xor_key & 0xFF) for b in xor_data)
+        return pt + raw_data + xor_bytes(xor_data, xor_key)
 
     # ------------------------------------------------------------------
     # 定位本地文件
@@ -892,27 +967,44 @@ class MediaDownloader:
                 seen.add(path)
                 candidates.append((path, thumbnail))
         for path, thumbnail in candidates:
-            try:
-                data = self.decrypt_image(path, aes_key, xor_key)
-            except Exception as exc:
-                logger.warning("图片解密失败（%s）：%s",
-                               os.path.basename(path), exc)
-                continue
-            if data[:4] == b"wxgf":
-                # HEVC 容器转码后同样要过校验（这条路径最容易出半截绿块）
-                jpg = self._wxgf_to_jpg(data)
-                if jpg is None:
-                    logger.info("wxgf 转码失败，跳过：%s",
-                                os.path.basename(path))
+            # 显式传入密钥时只认那一个；否则按可信度逐个试，直到解出可用图。
+            # 单字节密钥推导依赖「文件已写完整」，微信边下边写时尾部是半截
+            # 数据、推出来的密钥是错的，多候选 + 可用性校验才能自愈。
+            keys = [xor_key] if xor_key is not None \
+                else self._xor_key_candidates(path)
+            last_size = 0
+            decrypted = False
+            for index, key in enumerate(keys):
+                try:
+                    data = self.decrypt_image(path, aes_key, xor_key=key)
+                except Exception as exc:
+                    logger.warning("图片解密失败（%s）：%s",
+                                   os.path.basename(path), exc)
+                    break
+                decrypted = True
+                last_size = len(data)
+                if data[:4] == b"wxgf":
+                    # HEVC 容器转码后同样要过校验（这条路径最容易出半截绿块）
+                    jpg = self._wxgf_to_jpg(data)
+                    if jpg is None:
+                        logger.info("wxgf 转码失败（%s key=0x%02x），换密钥重试",
+                                    os.path.basename(path), key)
+                        continue
+                    data = jpg
+                if not is_usable_image(data):
                     continue
-                data = jpg
-            if is_usable_image(data):
+                if index:
+                    logger.info(
+                        "图片 XOR 密钥回退命中：%s 用 key=0x%02x"
+                        "（首选 0x%02x 解不出可用图）",
+                        os.path.basename(path), key, keys[0])
                 if thumbnail:
                     logger.info("原图不可用，已回退缩略图：%s %s",
                                 user, os.path.basename(path))
                 return data, thumbnail
-            logger.info("图片不完整或疑似花屏，跳过：%s（%d 字节）",
-                        os.path.basename(path), len(data))
+            if decrypted:
+                logger.info("图片不完整或疑似花屏，跳过：%s（%d 字节）",
+                            os.path.basename(path), last_size)
         return None
 
     def load_image(self, user: str, local_id: int,
@@ -926,10 +1018,11 @@ class MediaDownloader:
         花屏」双重校验，第一个合格的胜出；全都不合格返回 None（宁可让前端
         显示占位，也不要花图）。
 
-        注意（本机现状）：原图解密出来的常是 ``wxgf`` 容器（微信自研 HEVC），
-        转码依赖 ffmpeg；本机未安装 ffmpeg / imageio_ffmpeg 时原图**必然**
-        回退到 ``_t.dat`` 缩略图（20KB 左右，清晰度足够看清配件与 VIN）。
-        这不是降级故障，装好 ffmpeg 后同一套代码会自动用上原图。
+        注意：原图解密出来常见两种形态——``wxgf``（微信自研 HEVC 容器，走
+        OpenCV/ffmpeg 转码）和 PNG（复制粘贴的图片，``_h.dat`` 就是原图）。
+        单字节 XOR 密钥按账号固定但推导依赖文件已写完整，所以这里对每个候选
+        文件按可信度试多个密钥（见 :meth:`_xor_key_candidates`），解不出可用
+        图就继续下一个候选，最后才回退缩略图。
 
         Args:
             user: 会话 username。
