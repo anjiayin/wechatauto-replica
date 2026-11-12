@@ -55,6 +55,7 @@ from app.config import (
     resolve_cache_dir,
 )
 from app.db import Database, epoch_to_iso
+from app.image_retry import ImageRetryQueue
 from app.voice_retry import VoiceRetryQueue
 
 logger = logging.getLogger(__name__)
@@ -180,6 +181,14 @@ class WeChatService:
         self._vision_warn_ts: float = 0.0   # 积压告警限频时间戳（monotonic）
         self._vision_ok: int = 0            # 已得出结论的任务数
         self._vision_fail: int = 0          # 识别失败（坏图/网关异常）任务数
+        # 图片「不完整」延迟重试队列（批次 7 需求 2）：微信原图要等客户端下载
+        # 完才落库，首次取图经常拿到「不完整」；批次 6 只落 skipped 日志，这张
+        # 图就永久漏识别。现在按退避序列自动补识别（见 app/image_retry.py）。
+        # on_drop：队列满丢最旧任务时落一条可见日志（否则用户完全不知道
+        # 哪张图被丢了，批次 7 QA-P3-2）。
+        self._image_retry = ImageRetryQueue(
+            handler=self._retry_image_task,
+            on_drop=self._on_image_retry_dropped)
 
     # ------------------------------------------------------------------
     # 缓存目录（可配置；默认 kefu-system/data/wechat_cache）
@@ -269,6 +278,9 @@ class WeChatService:
         # 图片识别 worker 同理：与监听生命周期解耦，先起线程再拉监听，
         # 避免监听刚启动就有图片消息却没人消费
         self._start_vision_workers()
+        # 补识别队列放在 worker 之后：worker 才是「发现图片不完整」的一方，
+        # 队列消费者后起不会漏任务
+        self._image_retry.start()
         with self._listener_lock:
             if self._listener is not None:
                 return
@@ -331,6 +343,11 @@ class WeChatService:
         # 手头这一张跑完（视觉调用最长 60s，join 只等 5s，剩下交给 daemon
         # 线程随进程退出，不阻塞退出流程）
         self._stop_vision_workers()
+        # 补识别队列最后停：worker 在上一步可能刚把「不完整」的图片排进来
+        try:
+            self._image_retry.stop()
+        except Exception:
+            logger.exception("停止图片补识别队列异常（已忽略）")
         if self._flush_thread:
             self._flush_thread.join(timeout=5)
             self._flush_thread = None
@@ -675,13 +692,20 @@ class WeChatService:
 
         流程：
         1. 命中 ``image_analysis`` 缓存 → 直接用（同一张图绝不重复识别）；
-        2. 取图（``get_image_bytes`` 已保证完整/不花屏）→ 调视觉模型；
+        2. 取图（``get_image_bytes`` 已保证完整/不花屏）→ 调视觉模型
+           （**调模型前复查图片识别开关**：任务排队期间用户可能关掉开关，
+           此时落一条 skipped 直接返回，绝不产生 token）；
         3. 是车辆/配件 → 合成文本消息（``image_sell=True``）进聚合窗口；
            不是 → 落 skipped 带 AI 原因；
         4. **只有成功拿到模型 JSON 才写缓存**（无论结论是/不是配件）；
-        5. 任何失败（``MSG_INCOMPLETE`` / 额度 / 超时 / Key / 未配置 / 异常）
-           **一律不写缓存**，只落 skipped 日志：失败落库会把这张图永久钉成
-           「非配件」，额度恢复后也不会再识别（假阴性）。
+        5. 「原图还没下载完」这类**可恢复**失败（``get_image_bytes`` 返回
+           None / ``vision.MSG_INCOMPLETE``）**不落库、也不丢**：排进
+           ``ImageRetryQueue`` 按退避序列补识别（见 app/image_retry.py），
+           否则这张图就永久漏识别；
+        6. 其它失败（额度 / 超时 / Key / 未配置 / 异常）**一律不写缓存、
+           不重试**，只落 skipped 日志：失败落库会把这张图永久钉成
+           「非配件」，额度恢复后也不会再识别（假阴性）；而额度不足这类
+           原因重试多少次都一样，反复重试只会白烧 token。
 
         Returns:
             True = 已有结论（含「非车辆/配件」这种正常结论）；
@@ -719,11 +743,28 @@ class WeChatService:
                 self._log_image_skipped(username, sender_wxid, mtype,
                                         raw_content, text, local_id)
                 return True
+            # 开关复查（批次 7 QA-P3-6）：开关原来只在监听侧
+            # ``_enqueue_image_message`` 检查；任务已经在识别队列里时，用户
+            # 关掉开关，worker 仍会调 1 次视觉模型（用户明确在意 token 成本）。
+            # 这里每次任务现读一次配置，关闭则落一条 skipped 直接返回：
+            # **不调模型、不入补识别队列、不落库**。
+            if not self._image_vision_settings().get("enabled"):
+                self._log_image_skipped(username, sender_wxid, mtype,
+                                        raw_content,
+                                        "图片识别开关已关闭，跳过识别",
+                                        local_id)
+                return False
             data = self.get_image_bytes(username, local_id)
             if not data:
-                self._log_image_skipped(
-                    username, sender_wxid, mtype, raw_content,
-                    "图片读取失败或不完整，未识别", local_id)
+                # 实测这是「原图还没下载完」的**主路径**：load_image 取不到
+                # 完整图片时直接返回 None，根本走不到视觉调用，也就不会有
+                # VisionError(MSG_INCOMPLETE)。所以这里同样要排队补识别，
+                # 否则微信稍后才下载完原图的那张图永远漏识别。
+                self._queue_image_retry(task, username=username,
+                                        sender_wxid=sender_wxid, mtype=mtype,
+                                        raw_content=raw_content,
+                                        local_id=local_id,
+                                        reason="图片读取失败或不完整，未识别")
                 return False
             settings = self._image_vision_settings()
             model = str(settings.get("model") or "")
@@ -755,10 +796,12 @@ class WeChatService:
         except vision.VisionError as exc:
             text = str(exc)
             if text == vision.MSG_INCOMPLETE:
-                # 微信可能还没下载完原图：不写缓存，下次消息/重试还能再识别
-                self._log_image_skipped(
-                    username, sender_wxid, mtype, raw_content,
-                    f"{text}，未识别（等微信下载完原图后可重试）", local_id)
+                # 微信可能还没下载完原图：不写缓存，排进补识别队列等原图落库
+                self._queue_image_retry(task, username=username,
+                                        sender_wxid=sender_wxid, mtype=mtype,
+                                        raw_content=raw_content,
+                                        local_id=local_id,
+                                        reason=f"{text}，未识别")
             else:
                 # 临时性失败（额度/限流/超时/Key/未配置）：**绝不落库**，
                 # 否则额度恢复后这张图会被永久判成「非配件」不再识别
@@ -773,6 +816,196 @@ class WeChatService:
                                     raw_content, "图片识别异常，未识别",
                                     local_id)
             return False
+
+    def _queue_image_retry(self, task: dict, *, username: str,
+                           sender_wxid: str, mtype: str, raw_content: str,
+                           local_id: int, reason: str) -> bool:
+        """把一张「原图还没下载完」的图片排进补识别队列，并落一条 skipped 日志。
+
+        日志文案在原有前缀（``图片读取失败或不完整，未识别`` /
+        ``图片不完整或已损坏，未识别``）后面追加「已排入重试队列」，让用户
+        知道这张图**不会被永久丢掉**，不必自己手动处理。
+
+        Args:
+            task: ``_enqueue_image_message`` 构造的任务 dict（含 create_time /
+                session_name，补识别成功后要用它进聚合窗口）。
+            username: 会话 username。
+            sender_wxid: 权威解析后的发送人 ID。
+            mtype: 原始消息类型（日志摘要用）。
+            raw_content: 原始消息原文（日志摘要用）。
+            local_id: 图片消息的会话内 ID（去重键之一，日志里必须出现）。
+            reason: 原始失败原因（保留旧前缀，避免老文案断链）。
+
+        Returns:
+            True = 本次新排入队列；False = 已在队列中（去重）或入队失败。
+        """
+        queued = False
+        try:
+            queued = bool(self._image_retry.enqueue(username, local_id, task))
+        except Exception:
+            logger.exception("图片补识别队列入队失败（已忽略）")
+        if queued:
+            text = f"{reason}，已排入重试队列（微信下载完原图后会自动补识别）"
+        else:
+            text = f"{reason}，该图已在补识别队列中，等待自动补识别"
+        self._log_image_skipped(username, sender_wxid, mtype, raw_content,
+                                text, local_id)
+        return queued
+
+    def _on_image_retry_dropped(self, username: str, local_id: int,
+                                task: dict) -> None:
+        """补识别队列满丢弃最旧任务时，落一条用户可见的 skipped 日志。
+
+        队列内部的 ``logger.warning`` 用户看不到，页面上「这张图怎么没识别」
+        无从解释；这里补一条与「图片识别队列已满，跳过识别」同口径的分析日志，
+        文案里带上被丢弃的 local_id（由 ``_log_image_skipped`` 统一追加
+        ``（{username} local_id={local_id}）``）。
+
+        Args:
+            username: 被丢弃任务所属会话。
+            local_id: 被丢弃图片的会话内 ID（去重键之一）。
+            task: 入队时带的原始任务 dict（取发送人/类型/原文写日志）。
+        """
+        payload = dict(task or {})
+        try:
+            sender_wxid = str(payload.get("sender_wxid") or "")
+            mtype = str(payload.get("mtype") or "")
+            raw_content = str(payload.get("content") or "")
+            self._log_image_skipped(
+                str(username or payload.get("username") or ""),
+                sender_wxid, mtype, raw_content,
+                "图片补识别队列已满，已丢弃最旧任务",
+                local_id)
+        except Exception:
+            logger.exception("写图片补识别队列丢弃日志失败（已忽略）")
+
+    def _retry_image_task(self, task: dict) -> str:
+        """补识别队列的 handler：再取一次图并识别。
+
+        调用时机：worker 判定「原图还没下载完」后，由
+        :class:`app.image_retry.ImageRetryQueue` 按退避序列（10/30/90/300s）
+        回调，``task`` 里带 ``retry_attempt``（从 1 开始）。
+
+        决策口径（对应「宁可多试几次，也别丢商机；但不反复烧 token」）：
+
+        a. ``image_analysis`` 已有结论 → 直接复用（同一个 local_id 重试时可能
+           已经在别的路径得出过结论），返回 ``"done"``，**不再调模型**；
+        b. 取不到图 / 图不完整 → ``"retry"``（微信原图可能还要更久才落库）；
+        c. 识别成功 → 落库 + ``_emit_image_sell``（按卖货进聚合窗口）；
+        d. ``VisionError`` 且不是「图片不完整」（额度/限流/Key/未配置/预处理）
+           → ``"abort"``：这类原因重试多少次都一样，反复调用只会白烧 token；
+        e. 其它异常 → ``"abort"``（同上，且不把异常抛回调度线程）。
+
+        Returns:
+            ``"done"`` / ``"retry"`` / ``"abort"``（语义见 image_retry 模块）。
+        """
+        username = str(task.get("username") or "")
+        mtype = str(task.get("mtype") or "")
+        sender_wxid = str(task.get("sender_wxid") or "")
+        raw_content = str(task.get("content") or "")
+        try:
+            attempt = int(task.get("retry_attempt") or 1)
+        except (TypeError, ValueError):
+            attempt = 1
+        tag = f"第 {attempt} 次重试："
+        try:
+            local_id = int(task.get("local_id") or 0)
+        except (TypeError, ValueError):
+            local_id = 0
+        if local_id <= 0:
+            logger.warning("图片补识别任务缺少 local_id，放弃（%s）", username)
+            return "abort"
+
+        # 开关可能在排队期间被关掉（用户随时能在设置页关）：开关是「不许花
+        # token」的总闸，这里每次尝试都现读一次，关闭即放弃，绝不再调模型。
+        if not self._image_vision_settings().get("enabled"):
+            self._log_image_skipped(
+                username, sender_wxid, mtype, raw_content,
+                f"{tag}图片识别开关已关闭，放弃补识别", local_id)
+            return "abort"
+
+        # a. 已有结论 → 直接复用，绝不重复烧 token
+        cached = None
+        try:
+            cached = self._db.get_image_analysis(username, local_id)
+        except Exception:
+            logger.exception("读取图片识别缓存失败（按未命中处理）")
+        if cached is not None:
+            if int(cached.get("is_vehicle_part") or 0):
+                self._emit_image_sell(task, cached)
+                self._log_image_skipped(
+                    username, sender_wxid, mtype, raw_content,
+                    f"{tag}已有识别结论（车辆/汽车配件），已按卖货产出商机",
+                    local_id)
+            else:
+                reason = str(cached.get("error") or "").strip()
+                detail = (f"图片非车辆/汽车配件（AI 识别：{reason}）"
+                          if reason else "图片已识别，非车辆/汽车配件")
+                self._log_image_skipped(username, sender_wxid, mtype,
+                                        raw_content, f"{tag}{detail}",
+                                        local_id)
+            return "done"
+
+        # b. 取图：取不到 = 微信原图还没下载完，继续等
+        data = self.get_image_bytes(username, local_id)
+        if not data:
+            self._log_image_skipped(
+                username, sender_wxid, mtype, raw_content,
+                f"{tag}原图仍未就绪（微信尚未下载完），继续等待后自动补识别",
+                local_id)
+            return "retry"
+
+        # c/d/e. 识别
+        settings = self._image_vision_settings()
+        model = str(settings.get("model") or "")
+        try:
+            result = vision.analyze_image(
+                data,
+                base_url=str(settings.get("base_url") or ""),
+                api_key=decrypt_api_key(settings.get("api_key_enc") or ""),
+                model=model,
+                timeout_sec=int(settings.get("timeout_sec") or 60))
+        except vision.VisionError as exc:
+            text = str(exc)
+            if text == vision.MSG_INCOMPLETE:
+                # 图还是坏的（原图仍在下载中）：不写缓存，继续退避重试
+                self._log_image_skipped(
+                    username, sender_wxid, mtype, raw_content,
+                    f"{tag}{text}，继续等待后自动补识别", local_id)
+                return "retry"
+            # 额度/限流/Key/未配置/预处理：重试无意义，立刻放弃
+            self._log_image_skipped(
+                username, sender_wxid, mtype, raw_content,
+                self._vision_error_text(f"{tag}{text}"), local_id)
+            return "abort"
+        except Exception:
+            logger.exception("图片补识别任务异常（%s local_id=%d 第 %d 次）",
+                             username, local_id, attempt)
+            self._log_image_skipped(username, sender_wxid, mtype, raw_content,
+                                    f"{tag}图片识别异常，已放弃重试", local_id)
+            return "abort"
+
+        is_part = bool(result.get("is_vehicle_part"))
+        reason_text = str(result.get("reason") or "").strip()
+        if not is_part:
+            self._save_image_analysis(
+                username, local_id, is_vehicle_part=False,
+                model=model, error=reason_text)
+            self._log_image_skipped(
+                username, sender_wxid, mtype, raw_content,
+                f"{tag}图片非车辆/汽车配件（AI 识别：{reason_text or '不确定'}）",
+                local_id)
+            return "done"
+        self._save_image_analysis(
+            username, local_id, is_vehicle_part=True,
+            part_name=str(result.get("part_name") or ""),
+            vin=str(result.get("vin") or ""), model=model)
+        self._emit_image_sell(task, result)
+        self._log_image_skipped(
+            username, sender_wxid, mtype, raw_content,
+            f"{tag}补识别成功，判定为车辆/汽车配件，已按卖货产出商机",
+            local_id)
+        return "done"
 
     def _emit_image_sell(self, task: dict, row: dict) -> None:
         """把「是车辆/配件」的图片合成一条文本消息送进聚合窗口。
@@ -2119,6 +2352,19 @@ class WeChatService:
         """识别失败（坏图 / 取图失败 / 网关异常）的任务数。"""
         with self._vision_lock:
             return int(self._vision_fail)
+
+    @property
+    def image_retry_pending(self) -> int:
+        """待补识别的图片数（原图未下载完、已排入退避重试队列的任务）。
+
+        ``/api/status`` 的 ``queue.vision_retry_pending`` 数据源；读取失败按 0
+        处理（状态接口绝不应因队列异常而 500）。
+        """
+        try:
+            return int(self._image_retry.pending_count())
+        except Exception:       # 防御性兜底：属性访问不应抛错
+            logger.exception("读取图片补识别队列长度失败（按 0 处理）")
+            return 0
 
     def cache_status(self) -> list:
         """各消息分片解密缓存的健康度（只读，供 /api/status 展示）。

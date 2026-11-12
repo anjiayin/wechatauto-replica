@@ -22,6 +22,8 @@ class QueueStatus(BaseModel):
     dropped_total: int = 0
     # 待识别的图片任务数（批次 6 需求 5 异步化；默认 0 以保持向后兼容）
     vision_pending: int = 0
+    # 待补识别的图片数（批次 7 需求 2：原图未下载完、正在退避重试）
+    vision_retry_pending: int = 0
 
 
 class WorkerStatus(BaseModel):

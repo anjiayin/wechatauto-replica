@@ -1287,7 +1287,12 @@ function AiTab() {
       </Stack>
 
       <Divider sx={{ my: 2 }} />
-      <Typography variant="subtitle2" sx={{ mb: 1 }}>图片识别</Typography>
+      <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1, mb: 1 }}>
+        <Typography variant="subtitle2">图片识别</Typography>
+        <Typography variant="caption" color="text.secondary">
+          关闭后图片消息不做识别，只落一条「非文本消息（图片），不分析」日志
+        </Typography>
+      </Box>
       <Stack spacing={2} sx={{ mb: 2 }}>
         {/* 图片内容识别（批次 6 需求 5）：群里只发实拍配件图时，纯文本分析看不到内容 */}
         <FormControlLabel
@@ -1297,7 +1302,7 @@ function AiTab() {
               onChange={(e) => setImageVisionEnabled(e.target.checked)}
             />
           }
-          label="识别图片里的车辆/配件（发配件实拍图通常是在卖货，识别到即按「卖货」方向产出商机；同时尽力提取图片里的 17 位车架号）"
+          label="识别图片里的车辆/配件（发配件实拍图通常是在卖货，识别到即按「卖货」方向产出商机；同时尽力提取图片里的 17 位车架号）（开启后每张图片会调用一次视觉模型，按 token 计费；关闭则图片消息不做识别，不产生费用）"
         />
         <TextField
           label="视觉模型（留空则沿用上方 AI 模型）"
@@ -1404,7 +1409,24 @@ function AiTab() {
             </li>
           </Box>
           <Typography variant="body2" sx={{ mt: 1.5, mb: 0.5 }}>
-            VIN 预设（单独一个）：17 位、排除 I / O / Q，例如 <code>LSGMJ5P578V016154</code>、
+            输入不标准也能识别：匹配时会先把编号内部的分隔符（空格 <code>-</code>
+            <code>.</code> <code>/</code> <code>·</code> 以及全角 <code>－</code>
+            和各种长短横线 <code>–</code> <code>‑</code>）去掉再匹配一次，
+            例如 <code>8K0-615-301</code>、<code>8K0 615 301</code>、
+            <code>8K0－615－301</code>、<code>1K0 807 217 C</code> 都会被识别；
+            一条消息里并排写多个件号（用空格或 <code>/</code> 隔开，
+            例如 <code>8K0-615-301 4M0-615-301</code>、
+            <code>8K0-615-301/4M0-615-301</code>）会逐个识别出来，不会粘成一条；
+            也能识别「短前缀 + 8 位件号」的写法，例如 <code>V6 26345704</code>
+            （通用/别克 8 位件号），<b>8 位件号建议带前缀写</b>，只写
+            <code>84848671</code> 这种裸件号识别不出来；下划线不算分隔符
+            （避免把用户名当成 OE）。因此召回会比严格格式更宽（宁可多送 AI，
+            也不漏商机），但发送人用户名、网址、日期时间、价格区间这类不会被
+            误判为 OE。
+          </Typography>
+          <Typography variant="body2" sx={{ mt: 1.5, mb: 0.5 }}>
+            VIN 预设（单独一个）：17 位、排除 I / O / Q、且同时含字母和数字，
+            例如 <code>LSGMJ5P578V016154</code>、
             <code>LFV3A23C8K3123456</code>；17 位编号不会再被 OE 规则重复命中。
           </Typography>
           <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1.5 }}>

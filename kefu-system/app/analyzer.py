@@ -222,11 +222,261 @@ def _normalize_result(data: dict) -> dict:
 # ---------------------------------------------------------------------------
 # 预筛
 # ---------------------------------------------------------------------------
+# OE 宽松识别（批次 7 需求 1）：用户输入的 OE 号经常不标准——``8K0-615-301``
+# 也可能写成 ``8K0 615 301``、``8K0.615.301``、``1K0 807 217 C``，甚至被
+# 分隔符拆开的 VIN。现有 5 类 OE 正则够用，缺的是「分隔符把一段编号切断」。
+#
+# **绝对不能对全文做「去分隔符后再跑正则」**（实测过的坑）：合并窗口的文本是
+# ``[HH:MM] 发送人: 内容`` 多行拼接，发送人用户名本身就在被分析文本里，而
+# 用户名/网址/日期里到处是「字母数字 + 分隔符」，全文紧凑化会把它们粘成
+# 8~15 位字母数字串去撞 OE 规则第 5 类：
+#   ``zhaoyu_4932403`` → ``zhaoyu4932403``（群成员用户名）
+#   ``https://www.cpfly.top/`` → ``wwwcpflytop``（网址）
+#   ``2026-11-11 20:56:21`` → ``2026111120``（日期 + 时间）
+# 真实语料上全文紧凑化净增 54 条、几乎全是这类误召回。
+#
+# 因此改成两步：先取**局部候选片段**（片段内部允许带分隔符），再对候选做
+# **形状约束**（段长/段数/必须含数字与大小写等），只接受像 OE 的片段。
+#
+# 候选片段内的分隔符集合：空格（含全角）、``-``、``.``、``/``、``·``、``•``，
+# 加上**全角减号与各种连字符变体**（中文输入法 / Word / 企业微信转贴极易打出
+# 全角 ``－`` U+FF0D，以及 U+2010/2011/2012/2013/FF63 这些长短横线）。
+# **不含下划线**（下划线是用户名/文件名特征，``NoO_x1ao9``、``zhaoyu_4932403``
+# 就是靠它被排除的），也**不含冒号**（冒号会把时间 ``20:56`` 粘坏）。
+# **刻意不含** em dash U+2014（中文破折号，用于断句而非分隔件号）与波浪线
+# U+FF5E/``~``：后者会把 ``8000~12000元`` 这类价格区间粘成假 OE
+# （实测 ``800012000`` 会被 A 类「9~13 位纯数字」命中）。
+_OE_SEP_CHARS = (" \u3000-./\u00b7\u2022"
+                 + "\uff0d\u2010\u2011\u2012\u2013\ufe63")
+_OE_SEP_RE = re.compile("[" + re.escape(_OE_SEP_CHARS) + "]")
+# 候选片段：字母数字段 + 1 个以上（分隔符 + 字母数字段）。
+# **段数刻意不设上限**（批次 7 QA C-2）：原来写死 ``{1,6}``（最多 7 段），
+# 遇到 ``8K0-615-001 8K0-615-002 8K0-615-003 8K0-615-004`` 就会断在件号
+# 中间的 ``8K0`` 上，下一个匹配又从 ``615-003`` 开始，于是切出
+# ``615-003 8K0-615-004`` 这种**半截畸形片段**，它居然能通过形状判定被当成
+# 「合格件号」写进商机要点——展示错误件号比不展示更误导用户。去掉上限后
+# 整条消息是一个完整候选，交给 :data:`_OE_SPLIT_RE` 切分时不会切在件号中间，
+# 4 个件号一个都不会漏（只靠切分而不去掉上限，``…003`` 会丢）。
+_OE_CAND_RE = re.compile(
+    r"(?<![A-Za-z0-9])[A-Za-z0-9]{1,8}"
+    r"(?:[" + re.escape(_OE_SEP_CHARS) + r"]{1,2}[A-Za-z0-9]{1,8})+"
+    r"(?![A-Za-z0-9])")
+# 日期形态（挡 ``2026-11-11`` / ``2026.11.11`` / ``2026/11/11``，以及全角减号
+# 写法 ``2026－11－11``——不纳入的话它会被当「纯数字」去撞 A 类）
+_OE_DATE_RE = re.compile(
+    r"\d{4}[-./\u2010\u2011\u2012\u2013\uff0d]\d{1,2}"
+    r"[-./\u2010\u2011\u2012\u2013\uff0d]\d{1,2}")
+# 切分点：**空白 + 斜杠**（都是「两个件号之间」的天然分界）。
+# ``-`` ``.`` ``·`` 和全角减号只在**件号内部**出现，绝不能当切分点，
+# 否则 ``8K0-615-301`` 会被切成三段全丢；``/`` 反过来几乎不会出现在件号
+# 内部（``8K0-615-301/4M0-615-301`` 是两个件号并排写），所以要切。
+_OE_SPLIT_RE = re.compile("[ \u3000/]+")
+# 候选原文的最大可能长度：合格形状紧凑长度 ≤17 位，分隔符每次 1~2 个字符、
+# 最多 16 处 → 17 + 16*2 = 49。超过 49 的候选**不可能**通过形状判定，
+# :func:`_oe_shape_kind` 一进门就 O(1) 拒掉，省掉几十万字符的 split/sub
+# （批次 7 QA 性能项：``"a " * 50000`` 这种病态输入靠这一行压住大头）。
+_OE_COMPACT_MAX = 17
+_OE_SHAPE_MAX_RAW = _OE_COMPACT_MAX + 16 * 2
+# VIN：17 位，排除 I / O / Q（与车辆识别代号标准一致）
+_OE_VIN_RE = re.compile(r"[A-HJ-NPR-Z0-9]{17}")
+# 每段长度上限 = 4：真实 OE 分段都在 4 以内（``8K0``/``615``/``301`` 各 3 位），
+# 而 ``www.cpfly.top`` 的 ``cpfly`` = 5 位、``zhaoyu_4932403`` 的 ``zhaoyu`` = 6 位
+_OE_SEG_MAX_LEN = 4
+# 段数上限 = 6：``1K0 807 217 C`` 是 4 段，OE 最多见过 5~6 段（留 1 段余量）
+_OE_SEG_MAX_COUNT = 6
+# 纯数字 OE 位数区间 9~13：``313340-32080`` = 11 位、``42041-02870`` = 10 位，
+# 下界 9 挡住 8 位日期串 ``20261111``，上界 13 与 OE 规则第 4 类一致
+_OE_NUM_MIN, _OE_NUM_MAX = 9, 13
+# 纯数字类里「所有段都 ≤3 位」= 小数串/递增序列，不是 OE：
+# ``1-3-7-11-15-22-30``（刷单节奏）、``25.1 25.4 26.4 26.8``（股价小数）
+_OE_SHORT_SEG = 3
+
+
+def _oe_shape_kind(cand: str) -> str:
+    """判断候选片段是否「像 OE」；返回类别（``num`` / ``seg`` / ``vin``），
+    ``""`` 表示不接受。
+
+    四类形状（批次 7 需求 1）：
+
+    A. ``num``：紧凑后 9~13 位**纯数字**，不是日期形态，且**最长一段 > 3 位**
+       （排除「每段都很短」的小数串/递增序列）。
+       例：``313340-32080``（11 位）、``42041-02870``（10 位）。
+    B. ``seg``：紧凑后 8~15 位，含数字、每段 ≤ :data:`_OE_SEG_MAX_LEN`、
+       段数 ≤ :data:`_OE_SEG_MAX_COUNT`；再分两种：
+       - 含**大写**字母的分段号（``8K0-615-301``、``4M0-615-301-A``、
+         ``A000 420 26 20``、``1K0 807 217 C``）；
+       - 全小写的分段号（``8k0-615-301``）额外要求段数 ≥3、至少一段字母
+         数字混合、至少一段纯数字——这样 ``zhang.san``（无数字）、
+         ``li.si-2024``（无混合段）、``www.cpfly.top``（无数字）都不命中。
+    C. ``vin``：紧凑后恰好 17 位且符合 VIN 字符规则，**不受段长限制**
+       （VIN 可能被写成 ``LSG-MJ5P57-8V016154``）。
+    D. ``num``（短前缀 + 8 位件号）：``[短混合段][7~9 位纯数字段]``，
+       如 ``V6 26345704``（通用件号是 8 位，原预设只认 10~13 位数字，原本漏）。
+
+    Args:
+        cand: :data:`_OE_CAND_RE` 匹配到的**候选原文片段**（保留分隔符）。
+
+    Returns:
+        ``"num"`` / ``"seg"`` / ``"vin"``；不接受时返回 ``""``。
+    """
+    text = str(cand or "")
+    if len(text) > _OE_SHAPE_MAX_RAW:
+        return ""                 # 原文都超长了，紧凑后必然是 >17 位，直接拒
+    parts = _OE_SEP_RE.split(text)
+    compact = _OE_SEP_RE.sub("", text)
+    if not compact:
+        return ""
+    # C：被分隔符拆开的 VIN（17 位，不受段长限制）。
+    # 必须**同时含字母和数字**：真实 VIN 的 WMI 段是字母、序号段是数字，而
+    # 17 位**纯数字**（病态输入 ``"1-" * 20000`` 切出的 17 个 ``1``）或 17 位
+    # 纯字母都不是 VIN，不能只靠字符集判定（批次 7 QA 复验发现的误命中）。
+    if (len(compact) == 17 and _OE_VIN_RE.fullmatch(compact)
+            and any(c.isalpha() for c in compact)
+            and any(c.isdigit() for c in compact)):
+        return "vin"
+    # A：纯数字类（9~13 位、非日期形态、且不是「每段都很短」的序列）
+    if compact.isdigit():
+        if not (_OE_NUM_MIN <= len(compact) <= _OE_NUM_MAX):
+            return ""
+        if _OE_DATE_RE.search(text):
+            return ""
+        if max(len(p) for p in parts) <= _OE_SHORT_SEG:
+            return ""
+        return "num"
+    if not (8 <= len(compact) <= 15):
+        return ""
+    if not any(c.isdigit() for c in compact):
+        return ""
+    # D：短混合前缀 + 7~9 位纯数字段（``V6 26345704`` 这种通用 8 位件号）
+    if (len(parts) == 2 and len(parts[0]) <= _OE_SHORT_SEG
+            and any(c.isalpha() for c in parts[0])
+            and any(c.isdigit() for c in parts[0])
+            and parts[1].isdigit() and 7 <= len(parts[1]) <= 9):
+        return "num"
+    if max(len(p) for p in parts) > _OE_SEG_MAX_LEN:
+        return ""
+    if len(parts) > _OE_SEG_MAX_COUNT:
+        return ""
+    # B1：含大写字母的分段号（8K0-615-301 / 4M0-615-301-A / A000 420 26 20）
+    if any(c.isupper() for c in compact) and len(parts) >= 2:
+        return "seg"
+    # B2：全小写的分段号（8k0-615-301 / 4m0-615-301-a）：要求段数≥3、
+    # 至少一段字母数字混合、至少一段纯数字（``li.si-2024``/``abc-123-def``
+    # 没有混合段，``zhang.san`` 没有数字，``a100 h100`` 段数不足，均不命中）
+    if (len(parts) >= 3
+            and any(any(c.isalpha() for c in p) and any(c.isdigit() for c in p)
+                    for p in parts)
+            and any(p.isdigit() for p in parts)):
+        return "seg"
+    return ""
+
+
+def _oe_seps_homogeneous(cand: str) -> bool:
+    """候选内部的分隔符是否**同一种**（件号可信的必要条件）。
+
+    一个件号内部通常只用同一种分隔符：``8K0-615-301`` 全用 ``-``、
+    ``A000 420 26 20`` 全用空格、``LSG-MJ5P57-8V016154`` 全用 ``-``。
+    出现「混用」几乎必然是**两个件号被粘在一起**（``8K0-615-301 4M0``、
+    ``615-003 8K0-615-004``）——这种串即使能过 :func:`_oe_shape_kind` 的
+    形状判定，也**不可信、不能展示**给用户（展示错误件号比不展示更误导）。
+
+    Args:
+        cand: 候选原文片段。
+
+    Returns:
+        ``True`` 表示 0~1 种分隔符（可信）；``False`` 表示混用（不可信）。
+    """
+    seps = {m.group(0) for m in re.finditer(
+        "[" + re.escape(_OE_SEP_CHARS) + "]", str(cand or ""))}
+    return len(seps) <= 1
+
+
+def loose_oe_hits(text: str) -> List[str]:
+    """宽松识别「不标准 OE」：返回**符合条件的候选原文片段**（去重、保序、≤10）。
+
+    只扫描局部候选片段（:data:`_OE_CAND_RE`）+ 形状约束
+    （:func:`_oe_shape_kind`），**不对全文做紧凑化**——全文紧凑化会把发送人
+    用户名 / 网址 / 日期+时间粘成假的 8~15 位字母数字串（见本节顶部注释）。
+
+    粘连切分兜底：拆车件群里「一条消息报多个件号、只用空格或 ``/`` 隔开」
+    很常见（``8K0-615-301 4M0-615-301 有吗``、``8K0-615-301/4M0-615-301``）。
+    候选正则本身允许用空格/横杠/``/`` 连接各段，于是相邻几个件号会被整段
+    吃成一个超长候选（紧凑后 18~36 位 > 15 → 直接拒绝），真 OE 一起丢掉。
+    所以**整段不通过形状判定时，按 :data:`_OE_SPLIT_RE`（空白 + 斜杠）切一层
+    再逐段重判**（整段已通过的不切，``8K0 615 301`` 这种单个带空格的件号
+    不会被切坏）。
+
+    **已知限制（刻意不修）**：``8K0 615 301 8K0 615 302``——两个件号**都用
+    空格**写且紧邻时仍识别不出，返回 ``[]``。原因是空格既是件号内部的分隔符
+    （``8K0 615 301``、``1K0 807 217 C`` 都是这种写法），又是件号之间的天然
+    分界；在没有更多上下文时，「两个 3 段件号」与「一个 6 段件号」在文本上
+    无法区分，按空白切开后每段只剩 ``8K0``/``615``/``301``，单独看全都不合格。
+    **这是刻意的取舍：宁可漏这一种少见写法，也不吐出错误件号**（商机要点里
+    出现错误件号比不出现更误导用户）。未来若要支持，需要引入分词器/件号词典
+    级别的上下文，不能靠正则堆规则。``/`` 是例外——它几乎只出现在件号之间
+    （``8K0-615-301/4M0-615-301``），所以纳入了切分点。
+
+    另：候选若内部**混用**不同分隔符（``8K0-615-301 4M0``），几乎必然是
+    「两个件号被粘在一起」，由 :func:`_oe_seps_homogeneous` 拒掉，绝不整体展示。
+
+    开销（批次 7 QA-P3-9，刻意不加窗口长度上限）：候选扫描覆盖整段文本、
+    不设滑动窗口；合并文本一般只有几行到几十行，候选本身稀疏（要求 >=2 段
+    且中间有分隔符），单次正则线性扫描，1800 条真实语料全量跑完 < 1 秒。
+    切分分支对**不含空白/斜杠**的候选直接跳过（``_OE_SPLIT_RE.search`` 一行），
+    :func:`_oe_shape_kind` 侧还有 :data:`_OE_SHAPE_MAX_RAW` 的 O(1) 早退，
+    病态输入（``"1-" * 50000``）因此仍在几十毫秒内。结果上限由
+    :func:`prescreen` / :func:`prescreen_hits` 侧的 10 条兜住。
+
+    Args:
+        text: 待匹配文本（合并后的分析文本）。
+
+    Returns:
+        命中的候选**原文片段**列表（保留原始分隔符，便于直接展示给用户），
+        例：``["8K0-615-301", "4M0-615-301"]``。
+    """
+    raw = str(text or "")
+    if not raw:
+        return []
+    out: List[str] = []
+    try:
+        matched = list(_OE_CAND_RE.finditer(raw))
+    except re.error as exc:      # 理论上不会发生（正则常量固定）
+        logger.warning("OE 候选正则异常（忽略）：%s", exc)
+        return []
+    for m in matched:
+        cand = m.group(0)
+        if _oe_shape_kind(cand) and _oe_seps_homogeneous(cand):
+            if cand not in out:
+                out.append(cand)
+        else:
+            # 粘连兜底：按空白/斜杠切一层逐段重判。不含空白和斜杠的候选切了
+            # 也切不出东西（分隔符只剩 - . · 全角减号，属于件号内部），跳过。
+            if not _OE_SPLIT_RE.search(cand):
+                continue
+            for piece in _OE_SPLIT_RE.split(cand):
+                if (piece and _oe_shape_kind(piece)
+                        and _oe_seps_homogeneous(piece)
+                        and piece not in out):
+                    out.append(piece)
+                if len(out) >= 10:
+                    break
+        if len(out) >= 10:
+            break
+    return out
+
+
 def prescreen_hits(text: str, keywords: str, regex: str) -> List[str]:
     """返回命中的筛选条件描述（关键词原文 / 正则匹配到的文本）。
 
     与 :func:`prescreen` 同一判定口径，供「不使用 AI 接口」模式把命中的
     关键词写进商机要点，让用户知道为什么被判为商机。
+
+    原文正则命中不到的「不标准 OE」由 :func:`loose_oe_hits` 补充；这类命中
+    写进返回值的格式是 ``"<候选原文片段>（宽松匹配）"``——用**原文片段**而不是
+    紧凑串，用户才看得懂「为什么这条被判为商机」。标记写「宽松匹配」而不是
+    「已去分隔符」：展示的是**保留分隔符**的原文片段，写「已去分隔符」会自相
+    矛盾；而且短前缀件号类（``V6 26345704``）根本没去分隔符。原文命中的描述
+    格式保持不变。
     """
     text = text or ""
     hits: List[str] = []
@@ -244,6 +494,16 @@ def prescreen_hits(text: str, keywords: str, regex: str) -> List[str]:
                     break
         except re.error as exc:
             logger.warning("预筛正则无效（忽略）：%s", exc)
+    # 宽松 OE 回退（只补「为什么命中」的描述，不改判定口径）
+    if regex and len(hits) < 10:
+        for cand in loose_oe_hits(text):
+            if cand in hits:            # 原文已命中，不重复记
+                continue
+            label = f"{cand}（宽松匹配）"
+            if label not in hits:
+                hits.append(label)
+            if len(hits) >= 10:
+                break
     return hits[:10]
 
 
@@ -251,6 +511,16 @@ def prescreen(text: str, keywords: str, regex: str) -> bool:
     """轻量预筛：关键词（逗号分隔，中英文逗号均可）或正则任一命中即通过。
 
     关键词与正则均为空时视为全部通过（预筛不误伤）。
+
+    正则未命中原文时，再用 :func:`loose_oe_hits` 做一次**宽松 OE 识别**：
+    用户输入的 OE 经常不标准（``8K0-615-301``、``8K0 615 301``、
+    ``1K0 807 217 C``、被分隔符拆开的 VIN），不能因为多打了个横杠/空格就
+    丢掉商机。宽松识别只看**局部候选片段的形状**（段长/段数/是否含数字与
+    大小写字母），**不对全文去分隔符**，因此不会把发送人用户名、网址、
+    「日期 + 时间」误粘成 OE（详见本节顶部注释）。
+
+    关键词只在**原文**里匹配，绝不碰候选/紧凑文本（否则「前杠」这类正常词
+    会被粘坏）。
     """
     text = text or ""
     kws = [k.strip() for k in re.split(r"[,，]", keywords or "") if k.strip()]
@@ -262,6 +532,9 @@ def prescreen(text: str, keywords: str, regex: str) -> bool:
                 return True
         except re.error as exc:
             logger.warning("预筛正则无效（按通过处理）：%s", exc)
+            return True
+        # 宽松 OE 回退（候选片段 + 形状约束）
+        if loose_oe_hits(text):
             return True
     return not kws and not regex
 

@@ -127,7 +127,11 @@ def get_status(db: Database = Depends(get_db),
                           # 图片识别队列积压（可选字段；服务替身/旧实现
                           # 没有该属性时按 0 处理，保持向后兼容）
                           vision_pending=int(
-                              getattr(svc, "vision_queue_size", 0) or 0)),
+                              getattr(svc, "vision_queue_size", 0) or 0),
+                          # 待补识别的图片数（批次 7 需求 2：原图未下载完，
+                          # 正在退避重试；替身/旧实现没有该属性时按 0）
+                          vision_retry_pending=int(
+                              getattr(svc, "image_retry_pending", 0) or 0)),
         worker=WorkerStatus(busy=pipeline.busy, max=2),
         monitor_quota=MonitorQuota(used=db.count_targets(),
                                    max=read_monitor_max_targets(db)),
