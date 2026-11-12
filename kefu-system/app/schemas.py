@@ -393,7 +393,11 @@ class OpportunityListItem(BaseModel):
     type_id: Optional[int] = None
     type_name: str = ""
     summary: str = ""
-    key_quote: str = ""                # 关键原文摘录（列表页「消息原文」列）
+    key_quote: str = ""                # 关键原文摘录（AI 从原文里挑的一句话）
+    # 合并窗口里的全部消息行（每行 "[HH:MM] 内容"）：列表页「消息原文」列按
+    # 条展示，避免「合并了 N 条却只显示 1 条」的错觉
+    raw_text: str = ""
+    merged_count: int = 1
     confidence: int = 0
     direction: str = ""                # 买/卖货方向（反馈 4）：buy/sell/''=不明
     status: str = "pending"

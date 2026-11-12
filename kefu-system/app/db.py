@@ -713,7 +713,11 @@ class Database:
             rows = self._conn.execute(
                 "SELECT id, session_username, session_name, sender_wxid, "
                 "sender_name, window_end, type_id, type_name, summary, "
-                "key_quote, confidence, direction, status, created_at "
+                "key_quote, confidence, direction, status, created_at, "
+                # raw_text = 合并窗口里的**全部**消息行（每行 "[HH:MM] 内容"）。
+                # 列表页「消息原文」列要按条展示，只给 key_quote（AI 摘录的
+                # 一条）会出现「合并了 3 条却只显示 1 条」的错觉。
+                "raw_text, merged_count "
                 f"FROM opportunities WHERE {where_sql} "
                 "ORDER BY created_at DESC, id DESC "
                 "LIMIT ? OFFSET ?",

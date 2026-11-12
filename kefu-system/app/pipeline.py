@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import re
 import threading
 import time
 from datetime import datetime, timedelta
@@ -46,6 +47,16 @@ logger = logging.getLogger(__name__)
 # 单次分析最多补转写的语音条数：一次 20 条语音全补要卡几分钟，
 # 而合并窗口里的前几条语音通常已足够判定商机。
 VOICE_TOPUP_MAX = 3
+
+# 图片已被视觉模型确认为整车/配件时，商机置信度的下限。
+# 背景：视觉确认是「看到了实物」这一事实，而文本模型只看到一句
+# 「[图片] 识别：车辆/汽车配件（前保险杠）」，容易按「无明确意向」给
+# 40~60 分甚至判未命中，卡在 min_confidence（默认 60）门槛上导致漏商机
+# （实测同一句 friend 场景 70 分、群聊场景 60 分、铭牌场景直接 hit=false）。
+IMAGE_EVIDENCE_CONFIDENCE = 70
+
+# 视觉识别结论在合成文本里的固定前缀（与 wechat_service._image_sell_text 一致）
+IMAGE_TAG = "[图片] 识别："
 
 
 def _elapsed_ms(later: float, earlier: float) -> Optional[int]:
@@ -117,23 +128,125 @@ class Pipeline:
         self._at_resolver = resolver
 
     @staticmethod
-    def _apply_image_direction(unit: AnalysisUnit, result: dict) -> None:
-        """含「识别为车辆/汽车配件」的图片时，把 direction 覆盖为 sell。
+    def _apply_image_direction(unit: AnalysisUnit, result: dict,
+                               types: Optional[list] = None) -> None:
+        """含「已识别为车辆/汽车配件」的图片时，据视觉结论校正 AI 结果。
 
-        用户口径（批次 6 需求 5）：群里发实拍配件/车辆图 = 在卖货。AI 只
-        看文本时经常判不出方向（``direction`` 为空甚至误判 buy），所以这里
-        以图片识别结论为准做覆盖——**只改 direction**，hit / type /
-        confidence / points / quote 一律不动。
+        用户口径（批次 6 需求 5）：群里发实拍配件/车辆图 = 在卖货。
+
+        两件事，按 AI 是否命中分两条路：
+
+        1. AI 命中 → **只把 direction 覆盖为 sell**，hit / type /
+           confidence / points / quote 一律不动（原设计语义）。唯一例外是
+           置信度：视觉确认的实物照属于硬证据，低于
+           :data:`IMAGE_EVIDENCE_CONFIDENCE` 时抬到该下限，否则会被
+           ``min_confidence`` 拦成 below_threshold 白丢商机。
+        2. AI 未命中 → **兜底判为商机**。根因是文本模型看不到图：它面对的
+           只是一句「[图片] 识别：车辆/汽车配件（前保险杠）」，既无意向
+           措辞也无数量价格，按 prompt 里「只基于消息文本判断、不要臆测」
+           只能判 hit=false——于是视觉识别花掉的 token 全部白费（实测
+           「车辆铭牌」稳定未命中）。视觉结论本身就是「有实物」的证据，
+           这里直接补齐 hit/type/points/quote/confidence 并置
+           ``image_forced`` 供日志与排查区分。
+
+        Args:
+            unit: 分析单元（读 ``has_image_sell``）。
+            result: AI 返回（就地修改）。
+            types: 已启用的商机类型列表（未命中时用来挑类型；None = 不挑，
+                交给下游存「未知类型」）。
         """
         if not getattr(unit, "has_image_sell", False):
             return
         before = str(result.get("direction") or "")
-        result["direction"] = "sell"
-        if before != "sell":
-            logger.info(
-                "[图片方向] %s/%s 命中含车辆/配件图片，direction 覆盖为 sell"
-                "（原：%s）", unit.session_name, unit.sender_name,
-                before or "空")
+        if result.get("hit"):
+            result["direction"] = "sell"
+            try:
+                confidence = int(result.get("confidence") or 0)
+            except (TypeError, ValueError):
+                confidence = 0
+            if confidence < IMAGE_EVIDENCE_CONFIDENCE:
+                result["confidence"] = IMAGE_EVIDENCE_CONFIDENCE
+            if before != "sell":
+                logger.info(
+                    "[图片方向] %s/%s 命中含车辆/配件图片，direction 覆盖为 sell"
+                    "（原：%s）", unit.session_name, unit.sender_name,
+                    before or "空")
+            return
+
+        # ---- AI 未命中：视觉结论兜底 ----
+        quote = Pipeline._image_quote(unit)
+        part = Pipeline._image_part_name(quote)
+        points = [f"图片识别：{part or '车辆/汽车配件实物'}"]
+        vin = Pipeline._image_vin(quote)
+        if vin:
+            points.append(f"车架号：{vin}")
+        picked_type = result.get("type") or Pipeline._pick_image_type(types)
+        if not picked_type:
+            # 没有可用类型名：宁可让下游存「未知类型」也要保住这条商机，
+            # 用户能在商机详情看到原文并手动归类
+            picked_type = "未知类型"
+        result.update({
+            "hit": True,
+            "type": picked_type,
+            "points": points,
+            "confidence": max(int(result.get("confidence") or 0),
+                              IMAGE_EVIDENCE_CONFIDENCE),
+            "quote": quote,
+            "direction": "sell",
+            "image_forced": True,
+        })
+        logger.info(
+            "[图片兜底] %s/%s AI 未命中，但图片已被视觉模型确认为车辆/配件"
+            "（%s），强制按卖货商机处理（类型：%s）",
+            unit.session_name, unit.sender_name, part or "部件未识别",
+            picked_type)
+
+    @staticmethod
+    def _image_quote(unit: AnalysisUnit) -> str:
+        """取本单元里「图片识别」那一行作为 quote（没有则退回第一行）。
+
+        quote 必须是原文逐字摘录：合成文本本身就是进分析的原文，所以逐字
+        取行是合规的；优先没有 `[HH:MM]` 前缀的内容部分。
+        """
+        for _hm, text in unit.lines:
+            line = str(text or "").strip()
+            if IMAGE_TAG in line:
+                return line[:200]
+        for _hm, text in unit.lines:
+            line = str(text or "").strip()
+            if line:
+                return line[:200]
+        return ""
+
+    @staticmethod
+    def _image_part_name(quote: str) -> str:
+        """从「[图片] 识别：车辆/汽车配件（前保险杠）」里取出部件名。"""
+        match = re.search(r"（([^）]*)）", str(quote or ""))
+        return match.group(1).strip() if match else ""
+
+    @staticmethod
+    def _image_vin(quote: str) -> str:
+        """取出合成文本里的车架号（``车架号：XXXX``）。"""
+        match = re.search(r"车架号[：:]\s*([A-HJ-NPR-Z0-9]{17})",
+                          str(quote or ""), re.IGNORECASE)
+        return match.group(1).upper() if match else ""
+
+    @staticmethod
+    def _pick_image_type(types: Optional[list]) -> str:
+        """给兜底命中挑一个商机类型名。
+
+        优先名称含「配件 / 汽车 / 车辆 / 汽配」的启用类型；次选「只有一个
+        启用类型」的情形（用户只配了一个类型时它必然是对的）；都没有则
+        返回空串（由调用方存「未知类型」）。
+        """
+        items = [t for t in (types or []) if str(t.get("name") or "").strip()]
+        for keyword in ("配件", "汽配", "汽车", "车辆"):
+            for t in items:
+                if keyword in str(t.get("name") or ""):
+                    return str(t["name"]).strip()
+        if len(items) == 1:
+            return str(items[0]["name"]).strip()
+        return ""
 
     def _ai_input_text(self, unit: AnalysisUnit, unit_text: str) -> str:
         """AI 判定的输入文本：群聊里把 @人 ID 还原为显示名（需求 ④）。
@@ -358,8 +471,9 @@ class Pipeline:
                 self._record_success()
                 latency_ms = int((time.monotonic() - started) * 1000)
                 base_log["e2e_ms"] = _elapsed_ms(time.time(), start_wall)
-                # 图片识别为车辆/配件 → direction 强制 sell（批次 6 需求 5）
-                self._apply_image_direction(unit, result)
+                # 图片识别为车辆/配件 → direction 强制 sell；AI 未命中时按
+                # 视觉结论兜底判为商机（批次 6 需求 5 / 批次 8 修复）
+                self._apply_image_direction(unit, result, types)
                 logger.info(
                     "[分析返回] %s/%s AI %.2fs（%d token）| 端到端 %.2fs"
                     " | %s",
@@ -486,7 +600,8 @@ class Pipeline:
         }
         latency_ms = int((time.monotonic() - started) * 1000)
         base_log["e2e_ms"] = _elapsed_ms(time.time(), start_wall)
-        # 图片识别为车辆/配件 → direction 强制 sell（批次 6 需求 5）
+        # 图片识别为车辆/配件 → direction 强制 sell（轻量筛选模式无 AI 判定，
+        # 只需覆盖方向；hit 已由关键词/正则给出）
         self._apply_image_direction(unit, result)
         logger.info("[轻量筛选] %s/%s 命中 %s（未使用 AI，未调用接口）",
                     unit.session_name, unit.sender_name, "、".join(hits[:3]))

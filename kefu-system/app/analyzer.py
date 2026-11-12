@@ -42,7 +42,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是微信群聊/私聊消息的销售商机分�
 4. quote 必须是原文的逐字摘录。
 5. direction 判断商机方向：发送人表达"求购/找货/收货/谁有"等买入意向为 "buy"；表达"出售/供货/有货/低价处理"等卖出意向为 "sell"；无法判断或非商机时为 ""。
 6. 只输出一个 JSON 对象，不要输出任何其他文字或 Markdown 代码块标记。
-{direction_block}{group_at_block}{examples_block}
+{direction_block}{image_block}{group_at_block}{examples_block}
 
 ## 输出 JSON 格式
 {{"hit": <bool>, "type": <string|null>, "points": <string[]>, "confidence": <0-100>, "quote": <string>, "direction": <"buy"|"sell"|"">}}"""
@@ -84,6 +84,26 @@ direction 表示**发送人自己想买还是想卖**，与消息里出现什么
 反例（易错，必须避免）：
 1. 「那个有车壳有的打电话15887775311」**不能**判成 sell —— 出现手机号就当成卖货是错的，这里是求购；正确是 buy。
 2. 「求购 31340-32080 减震，有的私聊我」**不能**判成 sell —— 求购 + 私聊我 是求对方联系自己，正确是 buy。
+"""
+
+# 图片消息识别结论段落（图片识别链路）。
+# 背景：图片识别成功后，管道会合成一条
+# 「[图片] 识别：车辆/汽车配件（前保险杠）」的文本送进分析。文本模型看不到
+# 图，只看到这句既无数量价格、又无意向措辞的短句，按「只基于文本判断、
+# 不要臆测」只能判 hit=false——视觉识别白花钱（实测「车辆铭牌」稳定未命中，
+# 「前保险杠」在 60~70 分间抖动，卡在 min_confidence 门槛）。
+# 这里把标记的含义讲清楚：它等价于「已经看过实物照片」。
+# 注意：本常量会被 _SYSTEM_PROMPT_TEMPLATE.format() 注入，正文里不能出现
+# 未转义的花括号，否则 format 会抛 KeyError。
+_IMAGE_HINT_GUIDANCE = """
+## 图片消息识别结论（重要）
+消息里出现形如「[图片] 识别：车辆/汽车配件（前保险杠）」的字样时，说明系统已经用视觉模型看过这张实拍图，并确认图中是**汽车整车或汽车配件实物**，括号里是识别出的具体部件（如保险杠、发动机、变速箱、轮毂、车辆铭牌）。
+遇到这种标记，按以下规则判定：
+- 这是「看到实物照片」的等价证据，**不受**判定原则第 1 条「不要臆测」限制——实物照片本身就是交易线索，车商互发配件图通常是在报现货、问件或询价。
+- 即使没有任何求购/出售措辞、没有数量价格、句子很短，也**必须 hit=true**，confidence 不低于 70。
+- 商机类型优先填与汽车/配件相关的类型（如「汽车配件」）；type 与 points 里的部件名用括号中的具体部件，points 至少含一条「图片识别：<部件名>」。
+- direction 默认 "sell"（发送人在展示现货）；但若同一单元里另有明确求购措辞（谁有 / 求购 / 找货 / 有的私聊我），按发送人的真实意图判 "buy"。
+- quote 原样摘录含该标记的那一行，不要改写、不要省略括号里的部件名。
 """
 
 _STRICTNESS_LABELS = {
@@ -139,6 +159,7 @@ def build_system_prompt(types: List[dict], strictness: str = "balanced",
         strictness_label=_STRICTNESS_LABELS[strictness],
         strictness_rules=_STRICTNESS_RULES[strictness],
         direction_block=_DIRECTION_GUIDANCE,
+        image_block=_IMAGE_HINT_GUIDANCE,
         group_at_block=_GROUP_AT_GUIDANCE if group_chat else "",
         examples_block=format_examples_block(examples),
     )

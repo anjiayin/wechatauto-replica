@@ -28,6 +28,7 @@ import OpenInNewIcon from '@mui/icons-material/OpenInNew'
 import { apiGet, apiPatch, apiPost, qs } from '../api/client'
 import { consumePendingOpportunity } from '../hooks/pendingOpportunity'
 import type {
+  OpportunityListItem,
   OpportunityListOut,
   OpportunityType,
   StatusOut,
@@ -101,6 +102,68 @@ const QUOTE_TOOLTIP_PROPS = {
     },
   },
 } as const
+
+/** 单元格里最多显示几条原文，其余折叠为「还有 N 条」（悬浮可见全部）。 */
+const QUOTE_MAX_LINES = 3
+
+/**
+ * 「消息原文」单元格：按条展示合并窗口里的**全部**消息。
+ *
+ * 背景（用户反馈）：多条消息合并成一条商机后，要点与详情都是多条，但这列
+ * 只渲染 `key_quote`（AI 从原文里挑的一句话），于是「合并了 3 条只看到 1 条」，
+ * 用户以为消息丢了。改为逐行渲染 `raw_text`（每行 "[HH:MM] 内容"），超出
+ * `QUOTE_MAX_LINES` 行折叠提示，悬浮 tooltip 与复制按钮给完整原文。
+ */
+function QuoteCell(props: { opp: OpportunityListItem }) {
+  const text = (props.opp.raw_text || props.opp.key_quote || '').trim()
+  if (!text) {
+    return (
+      <Typography variant="body2" color="text.secondary">
+        —
+      </Typography>
+    )
+  }
+  const lines = text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+  const shown = lines.slice(0, QUOTE_MAX_LINES)
+  const rest = lines.length - shown.length
+  return (
+    <Box sx={{ display: 'flex', alignItems: 'flex-start' }}>
+      <Tooltip title={lines.join('\n')} placement="top" arrow {...QUOTE_TOOLTIP_PROPS}>
+        <Box sx={{ minWidth: 0, flex: 1 }}>
+          {shown.map((line, idx) => (
+            <Typography
+              // 同一条消息内容可能重复（连发两次同型号），用下标兜底唯一 key
+              key={`${idx}-${line.slice(0, 12)}`}
+              variant="body2"
+              sx={{
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {line}
+            </Typography>
+          ))}
+          {rest > 0 && (
+            <Typography variant="caption" color="text.secondary" display="block">
+              …还有 {rest} 行，悬浮查看全部
+            </Typography>
+          )}
+          {rest === 0 && props.opp.merged_count > 1 && (
+            <Typography variant="caption" color="text.disabled" display="block">
+              共 {props.opp.merged_count} 条消息（合并窗口）
+            </Typography>
+          )}
+        </Box>
+      </Tooltip>
+      {/* 一键复制完整原文（多条一起复制，方便贴到微信里回复） */}
+      <CopyButton text={lines.join('\n')} label="消息原文" />
+    </Box>
+  )
+}
 
 /** 商机列表页：筛选栏、未读角标联动、行内快捷操作、详情抽屉。 */
 export default function OpportunityList() {
@@ -388,32 +451,8 @@ export default function OpportunityList() {
                   )}
                 </TableCell>
                 <TableCell sx={{ whiteSpace: 'nowrap' }}>{o.window_end.replace('T', ' ')}</TableCell>
-                <TableCell sx={{ maxWidth: 260, minWidth: 160 }}>
-                  {o.key_quote ? (
-                    <Box sx={{ display: 'flex', alignItems: 'center' }}>
-                      <Tooltip
-                        title={o.key_quote}
-                        placement="top"
-                        arrow
-                        {...QUOTE_TOOLTIP_PROPS}
-                      >
-                        <Typography
-                          variant="body2"
-                          sx={{
-                            overflow: 'hidden',
-                            textOverflow: 'ellipsis',
-                            whiteSpace: 'nowrap',
-                          }}
-                        >
-                          {o.key_quote}
-                        </Typography>
-                      </Tooltip>
-                      {/* 一键复制消息原文（反馈 10） */}
-                      <CopyButton text={o.key_quote} label="消息原文" />
-                    </Box>
-                  ) : (
-                    <Typography variant="body2" color="text.secondary">—</Typography>
-                  )}
+                <TableCell sx={{ maxWidth: 300, minWidth: 180 }}>
+                  <QuoteCell opp={o} />
                 </TableCell>
                 <TableCell sx={{ maxWidth: 360 }}>
                   <Box sx={{ display: 'flex', alignItems: 'flex-start' }}>

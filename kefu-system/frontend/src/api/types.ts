@@ -191,8 +191,12 @@ export interface OpportunityListItem {
   type_id: number | null
   type_name: string
   summary: string
-  /** 关键原文摘录（列表页「消息原文」列） */
+  /** 关键原文摘录（AI 从原文里挑的一句话） */
   key_quote: string
+  /** 合并窗口里的全部消息行（每行「[HH:MM] 内容」）：列表「消息原文」列按条展示 */
+  raw_text: string
+  /** 合并的消息条数 */
+  merged_count: number
   confidence: number
   /** 买/卖货方向（反馈 4）：buy=买货 sell=卖货 ''=不明 */
   direction: '' | 'buy' | 'sell'

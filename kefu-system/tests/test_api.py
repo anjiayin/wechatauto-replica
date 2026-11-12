@@ -214,6 +214,11 @@ LIST_ITEM_KEYS = {"id", "session_username", "session_name", "sender_wxid",
                   "sender_name", "window_end", "type_id", "type_name",
                   "summary", "key_quote", "confidence", "direction",
                   "status", "created_at",
+                  # 批次 8 契约变更：列表页「消息原文」列改为按条展示合并窗口
+                  # 里的全部消息，故列表项新增 raw_text（全部消息行）与
+                  # merged_count（合并条数）；此前该列只渲染 key_quote，
+                  # 会出现「合并 3 条只显示 1 条」的错觉
+                  "raw_text", "merged_count",
                   # 反馈 9：行内「未读」标识（内存态，默认 False）
                   "unread"}
 # 契约变更（体验优化 4）：详情与上下文拆分 —— 详情接口不再返回 context 字段，

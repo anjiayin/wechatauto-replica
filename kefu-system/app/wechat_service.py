@@ -935,7 +935,7 @@ class WeChatService:
                 self._emit_image_sell(task, cached)
                 self._log_image_skipped(
                     username, sender_wxid, mtype, raw_content,
-                    f"{tag}已有识别结论（车辆/汽车配件），已按卖货产出商机",
+                    f"{tag}已有识别结论（车辆/汽车配件），已按卖货送入分析",
                     local_id)
             else:
                 reason = str(cached.get("error") or "").strip()
@@ -1003,7 +1003,7 @@ class WeChatService:
         self._emit_image_sell(task, result)
         self._log_image_skipped(
             username, sender_wxid, mtype, raw_content,
-            f"{tag}补识别成功，判定为车辆/汽车配件，已按卖货产出商机",
+            f"{tag}补识别成功，判定为车辆/汽车配件，已按卖货送入分析",
             local_id)
         return "done"
 
@@ -1030,7 +1030,7 @@ class WeChatService:
         }
         self._aggregator.add(msg, str(task.get("session_name") or ""),
                              str(task.get("kind") or "friend"))
-        logger.info("[图片识别] %s 的图片判定为车辆/配件（%s%s），按卖货处理",
+        logger.info("[图片识别] %s 的图片判定为车辆/配件（%s%s），已按卖货送入分析",
                     username, str(row.get("part_name") or "") or "未识别部件",
                     f"，车架号 {row.get('vin')}"
                     if str(row.get("vin") or "").strip() else "")
