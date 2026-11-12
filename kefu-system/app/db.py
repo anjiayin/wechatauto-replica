@@ -195,6 +195,23 @@ DDL_STATEMENTS: tuple[str, ...] = (
       PRIMARY KEY (username, local_id)
     )
     """,
+    # 图片内容识别结果缓存（批次 6 需求 5）：视觉模型按次计费，同一张图
+    # 在「消息到达」与「详情展示」两条链路上都会被问到，必须落库去重。
+    # 注意：本表**不在** _PURGE_TABLES 白名单里 —— 与 voice_texts 同理，
+    # 它是纯缓存，清理商机/日志时不应连带删掉（删了只会重复烧钱）。
+    """
+    CREATE TABLE IF NOT EXISTS image_analysis (
+      username        TEXT NOT NULL,
+      local_id        INTEGER NOT NULL,
+      is_vehicle_part INTEGER NOT NULL DEFAULT 0,
+      part_name       TEXT NOT NULL DEFAULT '',
+      vin             TEXT NOT NULL DEFAULT '',
+      model           TEXT NOT NULL DEFAULT '',
+      error           TEXT NOT NULL DEFAULT '',
+      created_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+      PRIMARY KEY (username, local_id)
+    )
+    """,
 )
 
 
@@ -899,15 +916,51 @@ class Database:
             self._conn.commit()
             return bool(cur.rowcount)
 
+    def distinct_log_sessions(self, limit: int = 500) -> list[str]:
+        """分析日志中出现过的会话 username（去重，按最近出现倒序）。
+
+        批次 6 需求 2：日志页「来源会话」列展示的是解析后的显示名（备注/
+        群名），而库里只存 ``session_username``。用户贴显示名搜索时后端需要
+        先把「显示名 → username」映射出来，而映射要逐条调用显示名解析，
+        因此这里先做一次去重的候选集查询（按最近 id 倒序 = 最近活跃优先）。
+
+        Args:
+            limit: 最多返回多少条候选（上限保护，避免大表全表扫描）。
+
+        Returns:
+            非空 ``session_username`` 列表（去重，最近出现优先）。
+        """
+        cap = max(1, min(int(limit or 500), 2000))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT session_username, MAX(id) AS last_id "
+                "FROM analysis_logs "
+                "WHERE session_username IS NOT NULL AND session_username != '' "
+                "GROUP BY session_username "
+                "ORDER BY last_id DESC LIMIT ?",
+                (cap,),
+            ).fetchall()
+        out: list[str] = []
+        for row in rows:
+            name = str(row[0] or "")
+            if name:
+                out.append(name)
+        return out
+
     def list_analysis_logs(self, *, page: int = 1, page_size: int = 20,
                            status: str = "", session: str = "",
-                           keyword: str = "") -> tuple[int, list[dict]]:
+                           keyword: str = "",
+                           session_in: Optional[list[str]] = None
+                           ) -> tuple[int, list[dict]]:
         """分析日志分页列表（id 倒序 = 时间倒序）。
 
         Args:
             status: ok/error/skipped/below_threshold；空串 = 全部。
             session: 会话筛选（session_username 模糊匹配）。
             keyword: 关键词筛选（input_text 模糊匹配）。
+            session_in: 精确命中的会话 username 列表（批次 6 需求 2：用户
+                输入的是显示名/群名，路由层先把它解析成 username 候选再传
+                进来）。为空/None 时保持原行为，不改变 SQL。
 
         Returns:
             (total, items)
@@ -918,8 +971,17 @@ class Database:
             where.append("status=?")
             params.append(status)
         if session:
-            where.append("session_username LIKE ?")
-            params.append(f"%{session}%")
+            names = [str(x) for x in (session_in or []) if str(x or "")]
+            if names:
+                # 占位符由参数个数生成，值一律绑定参数（禁止字符串拼接）
+                marks = ",".join("?" for _ in names)
+                where.append(
+                    f"(session_username LIKE ? OR session_username IN ({marks}))")
+                params.append(f"%{session}%")
+                params.extend(names)
+            else:
+                where.append("session_username LIKE ?")
+                params.append(f"%{session}%")
         if keyword:
             where.append("input_text LIKE ?")
             params.append(f"%{keyword}%")
@@ -1190,6 +1252,52 @@ class Database:
     # ------------------------------------------------------------------
     # 聚合查询（/api/status 用）
     # ------------------------------------------------------------------
+    def get_image_analysis(self, username: str,
+                           local_id: int) -> Optional[dict]:
+        """取单张图片的识别结果缓存；无记录返回 None。
+
+        Args:
+            username: 会话 username。
+            local_id: 消息 local_id（非法值按无记录处理）。
+
+        Returns:
+            缓存行 dict（含 is_vehicle_part/part_name/vin/model/error/
+            created_at）；未识别过返回 None。
+        """
+        try:
+            local_id_int = int(local_id)
+        except (TypeError, ValueError):
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT username, local_id, is_vehicle_part, part_name, vin, "
+                "model, error, created_at FROM image_analysis "
+                "WHERE username=? AND local_id=?",
+                (str(username or ""), local_id_int),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_image_analysis(self, username: str, local_id: int, *,
+                            is_vehicle_part: bool, part_name: str = "",
+                            vin: str = "", model: str = "",
+                            error: str = "") -> None:
+        """写入/覆盖一张图片的识别结果（INSERT OR REPLACE）。
+
+        同一条语音的转写缓存口径：按 (username, local_id) 唯一，重复识别
+        直接覆盖，不做历史留存。
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO image_analysis "
+                "(username, local_id, is_vehicle_part, part_name, vin, model, "
+                "error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(username or ""), int(local_id),
+                 1 if is_vehicle_part else 0, str(part_name or ""),
+                 str(vin or ""), str(model or ""), str(error or ""),
+                 now_iso()),
+            )
+            self._conn.commit()
+
     def count_pending_opportunities(self) -> int:
         """待处理商机数。"""
         with self._lock:

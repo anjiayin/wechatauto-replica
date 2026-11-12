@@ -51,6 +51,12 @@ def is_voice_type(type_name: str) -> bool:
     return norm in ("语音", "voice", "语音消息")
 
 
+def is_image_type(type_name: str) -> bool:
+    """是否图片消息（兼容「图片 / image / 图片消息」等写法）。"""
+    norm = _norm_type(type_name).lower()
+    return norm in ("图片", "image", "图片消息")
+
+
 def voice_needs_text(content: str) -> bool:
     """是否「只有占位、还没有转写文本」的语音内容（形如 ``[语音]``）。"""
     return str(content or "").strip() == "[语音]"

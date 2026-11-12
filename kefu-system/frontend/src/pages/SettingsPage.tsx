@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { Fragment, useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Alert,
@@ -36,6 +36,7 @@ import SearchIcon from '@mui/icons-material/Search'
 import AddIcon from '@mui/icons-material/Add'
 import EditIcon from '@mui/icons-material/Edit'
 import DeleteIcon from '@mui/icons-material/Delete'
+import HelpOutlineIcon from '@mui/icons-material/HelpOutline'
 import {
   apiDelete,
   apiGet,
@@ -52,6 +53,8 @@ import type {
   AsrStatus,
   BillingOut,
   CacheDirInfo,
+  ImageSettings,
+  ImageSettingsPayload,
   LastPurge,
   MonitorSettings,
   MonitorTarget,
@@ -823,6 +826,8 @@ function AiTab() {
   // 预筛正则 = 勾选的内置预设 + 自定义正则（保存时以 | 合并，存储格式不变）
   const [selectedPresets, setSelectedPresets] = useState<string[]>([])
   const [customRegex, setCustomRegex] = useState('')
+  // 「配件 OE 号」预设规则说明弹窗（批次 6 需求 7）
+  const [oeHelpOpen, setOeHelpOpen] = useState(false)
   const [mergeWindow, setMergeWindow] = useState(15)
   const [oppMergeWindow, setOppMergeWindow] = useState(180)
   // 过滤自己发送的消息（默认勾选：自己发的消息不进入商机分析，批次 5 需求 ⑤）
@@ -884,6 +889,29 @@ function AiTab() {
     onSuccess: () => {
       setError('')
       void queryClient.invalidateQueries({ queryKey: ['analysis-settings'] })
+    },
+    onError: (err: Error) => setError(err.message),
+  })
+
+  // 图片识别设置（批次 6 需求 5）：识别图片里的车辆/配件并按卖货处理
+  const [imageVisionEnabled, setImageVisionEnabled] = useState(true)
+  const [imageVisionModel, setImageVisionModel] = useState('')
+  const [imageLoaded, setImageLoaded] = useState(false)
+  const { data: imageSettings } = useQuery({
+    queryKey: ['image-settings'],
+    queryFn: () => apiGet<ImageSettings>('/api/settings/image'),
+  })
+  if (imageSettings && !imageLoaded) {
+    setImageVisionEnabled(imageSettings.enabled !== false)
+    setImageVisionModel(imageSettings.model ?? '')
+    setImageLoaded(true)
+  }
+  const saveImageMutation = useMutation({
+    mutationFn: (payload: ImageSettingsPayload) =>
+      apiPut<ImageSettings>('/api/settings/image', payload),
+    onSuccess: () => {
+      setError('')
+      void queryClient.invalidateQueries({ queryKey: ['image-settings'] })
     },
     onError: (err: Error) => setError(err.message),
   })
@@ -1178,18 +1206,31 @@ function AiTab() {
                 >
                   内置预设（可多选）
                 </Typography>
-                <Stack direction="row" spacing={1} sx={{ flexWrap: 'wrap' }} useFlexGap>
+                <Stack direction="row" spacing={1} sx={{ flexWrap: 'wrap' }} useFlexGap alignItems="center">
                   {PRESCREEN_PRESETS.map((p) => {
                     const selected = selectedPresets.includes(p.regex)
                     return (
-                      <Chip
-                        key={p.key}
-                        size="small"
-                        label={p.label}
-                        color={selected ? 'primary' : 'default'}
-                        variant={selected ? 'filled' : 'outlined'}
-                        onClick={() => togglePreset(p.regex)}
-                      />
+                      <Fragment key={p.key}>
+                        <Chip
+                          size="small"
+                          label={p.label}
+                          color={selected ? 'primary' : 'default'}
+                          variant={selected ? 'filled' : 'outlined'}
+                          onClick={() => togglePreset(p.regex)}
+                        />
+                        {/* OE 号规则说明入口（批次 6 需求 7）：预设正则不好读，给用户一份规则+示例 */}
+                        {p.key === 'oe' && (
+                          <Tooltip title="配件 OE 号匹配规则说明" arrow>
+                            <IconButton
+                              size="small"
+                              aria-label="配件 OE 号匹配规则说明"
+                              onClick={() => setOeHelpOpen(true)}
+                            >
+                              <HelpOutlineIcon fontSize="small" />
+                            </IconButton>
+                          </Tooltip>
+                        )}
+                      </Fragment>
                     )
                   })}
                 </Stack>
@@ -1246,6 +1287,43 @@ function AiTab() {
       </Stack>
 
       <Divider sx={{ my: 2 }} />
+      <Typography variant="subtitle2" sx={{ mb: 1 }}>图片识别</Typography>
+      <Stack spacing={2} sx={{ mb: 2 }}>
+        {/* 图片内容识别（批次 6 需求 5）：群里只发实拍配件图时，纯文本分析看不到内容 */}
+        <FormControlLabel
+          control={
+            <Switch
+              checked={imageVisionEnabled}
+              onChange={(e) => setImageVisionEnabled(e.target.checked)}
+            />
+          }
+          label="识别图片里的车辆/配件（发配件实拍图通常是在卖货，识别到即按「卖货」方向产出商机；同时尽力提取图片里的 17 位车架号）"
+        />
+        <TextField
+          label="视觉模型（留空则沿用上方 AI 模型）"
+          placeholder="留空则沿用上方 AI 模型"
+          sx={{ width: 360 }}
+          value={imageVisionModel}
+          onChange={(e) => setImageVisionModel(e.target.value)}
+          helperText="识别为车辆/汽车配件时按卖货处理；图片只发给你自己配置的 AI 网关，不经过任何第三方服务"
+        />
+        <Box>
+          <Button
+            variant="contained"
+            disabled={saveImageMutation.isPending}
+            onClick={() =>
+              saveImageMutation.mutate({
+                enabled: imageVisionEnabled,
+                model: imageVisionModel.trim(),
+              })
+            }
+          >
+            保存图片识别设置
+          </Button>
+        </Box>
+      </Stack>
+
+      <Divider sx={{ my: 2 }} />
       <Typography variant="subtitle2" sx={{ mb: 1 }}>通知</Typography>
       <Stack spacing={2}>
         <FormControlLabel
@@ -1296,6 +1374,48 @@ function AiTab() {
           </Typography>
         </Box>
       </Stack>
+
+      {/* 「配件 OE 号」预设规则说明（批次 6 需求 7）：
+          预设是正则，用户无法直接读懂，这里用规则分类 + 示例解释「什么会被命中」 */}
+      <Dialog open={oeHelpOpen} onClose={() => setOeHelpOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>「配件 OE 号」匹配规则</DialogTitle>
+        <DialogContent dividers>
+          <Typography variant="body2" sx={{ mb: 1.5 }}>
+            配件 OE 号预设共 5 类（命中任一即通过预筛，只影响是否送 AI，不影响最终判定）：
+          </Typography>
+          <Box component="ol" sx={{ pl: 2.5, m: 0, typography: 'body2' }}>
+            <li>
+              4~5 位数字-3~7 位字母数字（可再跟一段 2~4 位）：
+              <code>42431-0K090</code>、<code>04465-SZA-A020</code>、<code>31340-32080</code>
+            </li>
+            <li>
+              4 位字母数字-7 位数字-1 位字母：<code>9803-1234567-A</code>
+            </li>
+            <li>
+              1~3 位字母 + 2~3 位 + 3 位 + 1~3 位（可再 1~3 位），空格/中划线可省：
+              <code>A000 420 26 20</code>、<code>A0004202620</code>
+            </li>
+            <li>
+              连续 10~13 位数字：<code>83232208093</code>、<code>51117283323</code>
+              （注意：<b>手机号也是 11 位数字，同样会命中</b>，例如 <code>15887775311</code>）
+            </li>
+            <li>
+              含字母的 8~15 位字母数字组合：<code>A12345678</code>、<code>06K103171AB</code>
+            </li>
+          </Box>
+          <Typography variant="body2" sx={{ mt: 1.5, mb: 0.5 }}>
+            VIN 预设（单独一个）：17 位、排除 I / O / Q，例如 <code>LSGMJ5P578V016154</code>、
+            <code>LFV3A23C8K3123456</code>；17 位编号不会再被 OE 规则重复命中。
+          </Typography>
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1.5 }}>
+            预筛是「关键词 OR 正则」任一命中即通过：条件越宽召回越多、AI 调用费越高；
+            想只看 OE/VIN 就把关键词清空。
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setOeHelpOpen(false)}>知道了</Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   )
 }
@@ -1500,6 +1620,8 @@ function DataBillingTab() {
     onError: (e: Error) => setSnack(`保存失败：${e.message}`),
   })
 
+  // 单价单位文案（元 / 千 tokens 等）：只用于「单价」的说明，
+  // 费用金额本身的单位固定是「元」，两者不能混用（批次 6 需求 1）。
   const unitLabel = priceUnit === 'per_k' ? '元 / 千 tokens' : '元 / 百万 tokens'
 
   return (
@@ -1710,7 +1832,7 @@ function DataBillingTab() {
       <Divider sx={{ my: 2 }} />
       <Typography variant="subtitle2" sx={{ mb: 1 }}>AI 账单估算</Typography>
       <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
-        填写所用 AI 接口的输入/输出单价，系统按每次调用的实际 token 用量自动累计每日估算费用（仅本机估算，非官方账单）。
+        填写所用 AI 接口的输入/输出单价（当前单价单位：{unitLabel}），系统按每次调用的实际 token 用量自动累计每日估算费用（仅本机估算，非官方账单）。
         用量单独存档，清理分析日志不会影响账单历史；显示 ¥0.00 表示当天没有产生 AI 调用。
       </Typography>
       <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1.5 }} useFlexGap>
@@ -1753,7 +1875,8 @@ function DataBillingTab() {
             今日：{billing.today.calls} 次调用 ·
             输入 {billing.today.prompt_tokens.toLocaleString()} tokens ·
             输出 {billing.today.completion_tokens.toLocaleString()} tokens ·
-            估算费用 <b>¥{billing.today.cost.toFixed(4)}</b>（{unitLabel}）
+            {/* 费用单位是「元」；unitLabel 是单价单位（元/千 tokens），不能混用（批次 6 需求 1） */}
+            估算费用 <b>¥{billing.today.cost.toFixed(4)}</b>（元）
           </Typography>
           {billing.series.length > 0 && (
             <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>

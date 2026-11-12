@@ -20,6 +20,8 @@ class QueueStatus(BaseModel):
     size: int = 0
     max: int = 0
     dropped_total: int = 0
+    # 待识别的图片任务数（批次 6 需求 5 异步化；默认 0 以保持向后兼容）
+    vision_pending: int = 0
 
 
 class WorkerStatus(BaseModel):
@@ -205,6 +207,32 @@ class MonitorSettingsOut(BaseModel):
 
 class MonitorSettingsUpdate(BaseModel):
     max_targets: int = Field(ge=10, le=2000)
+
+
+# ---------------------------------------------------------------------------
+# 图片内容识别（批次 6 需求 5）
+# ---------------------------------------------------------------------------
+class ImageSettingsOut(BaseModel):
+    """图片识别设置：是否启用 + 视觉模型名（空 = 沿用 ai.model）。"""
+    enabled: bool = True
+    model: str = ""
+
+
+class ImageSettingsUpdate(BaseModel):
+    enabled: bool = True
+    model: str = Field(default="", max_length=120)
+
+
+class ImageAnalysisOut(BaseModel):
+    """单张图片的识别结果（含缓存兜底字段）。"""
+    username: str = ""
+    local_id: int = 0
+    is_vehicle_part: bool = False
+    part_name: str = ""
+    vin: str = ""
+    model: str = ""
+    error: str = ""
+    created_at: str = ""
 
 
 # ---------------------------------------------------------------------------

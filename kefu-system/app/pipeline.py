@@ -116,6 +116,25 @@ class Pipeline:
         """注入 @人 ID 还原函数 ``(session_username, text) -> text``。"""
         self._at_resolver = resolver
 
+    @staticmethod
+    def _apply_image_direction(unit: AnalysisUnit, result: dict) -> None:
+        """含「识别为车辆/汽车配件」的图片时，把 direction 覆盖为 sell。
+
+        用户口径（批次 6 需求 5）：群里发实拍配件/车辆图 = 在卖货。AI 只
+        看文本时经常判不出方向（``direction`` 为空甚至误判 buy），所以这里
+        以图片识别结论为准做覆盖——**只改 direction**，hit / type /
+        confidence / points / quote 一律不动。
+        """
+        if not getattr(unit, "has_image_sell", False):
+            return
+        before = str(result.get("direction") or "")
+        result["direction"] = "sell"
+        if before != "sell":
+            logger.info(
+                "[图片方向] %s/%s 命中含车辆/配件图片，direction 覆盖为 sell"
+                "（原：%s）", unit.session_name, unit.sender_name,
+                before or "空")
+
     def _ai_input_text(self, unit: AnalysisUnit, unit_text: str) -> str:
         """AI 判定的输入文本：群聊里把 @人 ID 还原为显示名（需求 ④）。
 
@@ -339,6 +358,8 @@ class Pipeline:
                 self._record_success()
                 latency_ms = int((time.monotonic() - started) * 1000)
                 base_log["e2e_ms"] = _elapsed_ms(time.time(), start_wall)
+                # 图片识别为车辆/配件 → direction 强制 sell（批次 6 需求 5）
+                self._apply_image_direction(unit, result)
                 logger.info(
                     "[分析返回] %s/%s AI %.2fs（%d token）| 端到端 %.2fs"
                     " | %s",
@@ -465,6 +486,8 @@ class Pipeline:
         }
         latency_ms = int((time.monotonic() - started) * 1000)
         base_log["e2e_ms"] = _elapsed_ms(time.time(), start_wall)
+        # 图片识别为车辆/配件 → direction 强制 sell（批次 6 需求 5）
+        self._apply_image_direction(unit, result)
         logger.info("[轻量筛选] %s/%s 命中 %s（未使用 AI，未调用接口）",
                     unit.session_name, unit.sender_name, "、".join(hits[:3]))
         self._on_result(unit, result, latency_ms, base_log, model="轻量筛选")

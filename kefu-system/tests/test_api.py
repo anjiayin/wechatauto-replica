@@ -238,7 +238,10 @@ class TestSystemContract:
                     "analysis_health"):
             assert key in body, f"缺少字段 {key}"
         assert set(body["wechat"]) == {"alive", "visible"}
-        assert set(body["queue"]) == {"size", "max", "dropped_total"}
+        # 批次 6 需求 5：queue 新增可选字段 vision_pending（图片识别队列积压）
+        assert set(body["queue"]) == {"size", "max", "dropped_total",
+                                      "vision_pending"}
+        assert body["queue"]["vision_pending"] == 0   # 替身无该属性 → 默认 0
         assert set(body["worker"]) == {"busy", "max"}
         # 监控配额（优化 2：/api/status 新增 monitor_quota）
         assert set(body["monitor_quota"]) == {"used", "max"}

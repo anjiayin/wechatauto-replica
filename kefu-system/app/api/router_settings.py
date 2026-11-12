@@ -6,6 +6,7 @@
 - POST    /api/settings/ai/test
 - GET/PUT /api/settings/analysis
 - GET/PUT /api/settings/monitor
+- GET/PUT /api/settings/image
 - PUT     /api/settings/notify
 """
 from __future__ import annotations
@@ -35,6 +36,8 @@ from app.config import (
     KEY_ANALYSIS_PRESCREEN_REGEX,
     KEY_ANALYSIS_STRICTNESS,
     KEY_COMPLIANCE_CONFIRMED,
+    KEY_IMAGE_VISION_ENABLED,
+    KEY_IMAGE_VISION_MODEL,
     KEY_MONITOR_MAX_TARGETS,
     KEY_NOTIFY_SOUND,
     MERGE_WINDOW_SEC_DEFAULT,
@@ -47,6 +50,8 @@ from app.schemas import (
     AITestResult,
     AnalysisSettingsOut,
     AnalysisSettingsUpdate,
+    ImageSettingsOut,
+    ImageSettingsUpdate,
     MonitorSettingsOut,
     MonitorSettingsUpdate,
     NotifyUpdate,
@@ -201,6 +206,34 @@ def update_monitor_settings(body: MonitorSettingsUpdate,
     db.set_setting(KEY_MONITOR_MAX_TARGETS, str(body.max_targets))
     logger.info("监控设置已保存（max_targets=%d）", body.max_targets)
     return get_monitor_settings(db)
+
+
+# ---------------------------------------------------------------------------
+# 图片内容识别（批次 6 需求 5：图片里的车辆/配件 → 按卖货产出商机）
+# ---------------------------------------------------------------------------
+def _image_out(db: Database) -> ImageSettingsOut:
+    """图片识别设置读取（模型空 = 沿用 ai.model，此处按实际生效值回显）。"""
+    return ImageSettingsOut(
+        enabled=db.get_setting(KEY_IMAGE_VISION_ENABLED, "1") != "0",
+        model=db.get_setting(KEY_IMAGE_VISION_MODEL, ""),
+    )
+
+
+@router.get("/image", response_model=ImageSettingsOut)
+def get_image_settings(db: Database = Depends(get_db)) -> ImageSettingsOut:
+    """图片识别设置读取。"""
+    return _image_out(db)
+
+
+@router.put("/image", response_model=ImageSettingsOut)
+def update_image_settings(body: ImageSettingsUpdate,
+                          db: Database = Depends(get_db)) -> ImageSettingsOut:
+    """保存图片识别开关与视觉模型（留空 = 沿用 ai.model）。"""
+    db.set_setting(KEY_IMAGE_VISION_ENABLED, "1" if body.enabled else "0")
+    db.set_setting(KEY_IMAGE_VISION_MODEL, body.model.strip())
+    logger.info("图片识别设置已保存（enabled=%s, model=%s）",
+                body.enabled, body.model.strip() or "沿用 ai.model")
+    return _image_out(db)
 
 
 # ---------------------------------------------------------------------------

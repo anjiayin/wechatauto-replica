@@ -42,7 +42,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是微信群聊/私聊消息的销售商机分�
 4. quote 必须是原文的逐字摘录。
 5. direction 判断商机方向：发送人表达"求购/找货/收货/谁有"等买入意向为 "buy"；表达"出售/供货/有货/低价处理"等卖出意向为 "sell"；无法判断或非商机时为 ""。
 6. 只输出一个 JSON 对象，不要输出任何其他文字或 Markdown 代码块标记。
-{group_at_block}{examples_block}
+{direction_block}{group_at_block}{examples_block}
 
 ## 输出 JSON 格式
 {{"hit": <bool>, "type": <string|null>, "points": <string[]>, "confidence": <0-100>, "quote": <string>, "direction": <"buy"|"sell"|"">}}"""
@@ -58,6 +58,32 @@ _EXAMPLES_HEADER = (
 # 报价/供货/询价，是商机判定的重要上下文线索（仅群聊注入 Prompt）。
 _GROUP_AT_GUIDANCE = """
 7. 群聊指引：消息中 @某人 通常意味着发送人在**回复被 @ 者此前的报价、供货、询价或求助内容**（如 "@某某 45一个出" 是对对方询价的报价回复），应结合上下文判断是否商机；被 @ 的人的名字（已还原为群昵称/备注）是重要的上下文线索，quote 保留原文中的 @ 部分。
+"""
+
+# 买卖方向判定独立小节（批次 6 需求 3）。
+# 背景：原判定原则第 5 条只有一句「求购= buy / 出售= sell」，模型容易把
+# 「留联系方式求货」判成卖货（实测「那个有车壳有的打电话15887775311」
+# 被判成 sell，实际是买货）。这里把方向判定升级为独立小节，给出正反例
+# 和明确的「联系方式≠卖货」约束。
+# 注意：本常量会被 _SYSTEM_PROMPT_TEMPLATE.format() 注入，正文里不能出现
+# 未转义的花括号，否则 format 会抛 KeyError。
+_DIRECTION_GUIDANCE = """
+## 买卖方向判定（direction）
+direction 表示**发送人自己想买还是想卖**，与消息里出现什么要素无关，只看发送人的意图动作：
+- 判定为 "buy"（发送人要求购/找货）：出现联系方式（手机号/电话/微信/私聊）+ 求货措辞（有的 / 有货的 / 谁有 / 联系我 / 打我电话 / 报价给我 / 私聊我）；或出现「有 / 谁有 / 求 / 求购 / 收 / 找 / 要 / 来一套 / 到货了吗」这类求入口吻。
+- 判定为 "sell"（发送人要出售/供货）：出现「出 / 卖 / 现货 / 大量 / 甩 / 处理 / 低价 / 可以发货 / 库存」这类供出口吻。
+- 只有图片、实物展示、库存照片且**没有任何求购措辞**时，判定为 "sell"。
+- 无法判断或非商机时输出空字符串 ""。
+- 关键约束：**联系方式只是联系渠道，不能因为出现手机号/电话/微信就判成卖货**。留电话往往正是「谁有货就打我电话」的求购信号，必须结合求货/供货措辞判断方向。
+
+正例（正确输出）：
+1. 「那个有车壳有的打电话15887775311」→ buy（发送人在求车壳，让有货的人打他电话；手机号是联系方式不是卖货证据）
+2. 「谁有 LSGMJ5P578V016154 这个发动机，报价给我」→ buy（谁有 + 报价给我 = 求购）
+3. 「42431-0K090 现货 200 个，低价处理，可以发货」→ sell（现货 + 低价处理 + 可以发货 = 供货）
+
+反例（易错，必须避免）：
+1. 「那个有车壳有的打电话15887775311」**不能**判成 sell —— 出现手机号就当成卖货是错的，这里是求购；正确是 buy。
+2. 「求购 31340-32080 减震，有的私聊我」**不能**判成 sell —— 求购 + 私聊我 是求对方联系自己，正确是 buy。
 """
 
 _STRICTNESS_LABELS = {
@@ -112,6 +138,7 @@ def build_system_prompt(types: List[dict], strictness: str = "balanced",
         types_block=types_block,
         strictness_label=_STRICTNESS_LABELS[strictness],
         strictness_rules=_STRICTNESS_RULES[strictness],
+        direction_block=_DIRECTION_GUIDANCE,
         group_at_block=_GROUP_AT_GUIDANCE if group_chat else "",
         examples_block=format_examples_block(examples),
     )

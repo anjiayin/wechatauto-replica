@@ -6,6 +6,7 @@
 - GET /api/sessions/search?keyword=&limit=20&kind=all
 - GET /api/messages/{username}?before_seq=&limit=50
 - GET /api/messages/{username}/images/{local_id}   图片解密（反馈 2）
+- GET /api/messages/{username}/images/{local_id}/analysis  图片识别结果（需求 5）
 - GET /api/messages/{username}/voice/{local_id}    语音播放 WAV（反馈 ⑧）
 - POST /api/wechat/jump                            跳转微信会话（反馈 ⑦）
 - GET /api/system/retention | POST /api/system/purge          历史数据（反馈 7）
@@ -48,6 +49,7 @@ from app.schemas import (
     CacheDirOut,
     CacheDirUpdate,
     CacheShardStatus,
+    ImageAnalysisOut,
     MessageOut,
     MonitorQuota,
     PurgeRequest,
@@ -121,7 +123,11 @@ def get_status(db: Database = Depends(get_db),
         wechat=WechatStatus(alive=svc.available,
                             visible=svc.probe_wechat_window()),
         queue=QueueStatus(size=pipeline.queue_size, max=pipeline.queue_max,
-                          dropped_total=pipeline.dropped_total),
+                          dropped_total=pipeline.dropped_total,
+                          # 图片识别队列积压（可选字段；服务替身/旧实现
+                          # 没有该属性时按 0 处理，保持向后兼容）
+                          vision_pending=int(
+                              getattr(svc, "vision_queue_size", 0) or 0)),
         worker=WorkerStatus(busy=pipeline.busy, max=2),
         monitor_quota=MonitorQuota(used=db.count_targets(),
                                    max=read_monitor_max_targets(db)),
@@ -207,6 +213,40 @@ def get_message_image(username: str, local_id: int,
     media_type = "image/png" if data[:4] == b"\x89PNG" else \
         "image/gif" if data[:3] == b"GIF" else "image/jpeg"
     return Response(content=data, media_type=media_type)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/messages/{username}/images/{local_id}/analysis   图片识别结果
+# ---------------------------------------------------------------------------
+@router.get("/api/messages/{username}/images/{local_id}/analysis",
+            response_model=ImageAnalysisOut)
+def get_image_analysis(username: str, local_id: int,
+                       db: Database = Depends(get_db)) -> ImageAnalysisOut:
+    """查询某张图片的识别结果（车辆/汽车配件 + 车架号）。
+
+    数据源是 ``image_analysis`` 表（分析链路识别后落库的缓存）——这里
+    只读业务库，**绝不**现场调视觉模型（那是按次计费且要几秒）。
+    没有记录时返回 404，前端静默不显示识别标签（图片很多，不能弹错误）。
+    """
+    try:
+        local_id_int = int(local_id)
+    except (TypeError, ValueError):     # 理论上 FastAPI 已拦截，兜底防御
+        raise HTTPException(status_code=422, detail="图片标识非法") from None
+    if local_id_int <= 0:
+        raise HTTPException(status_code=422, detail="图片标识非法")
+    row = db.get_image_analysis(username, local_id_int)
+    if not row:
+        raise HTTPException(status_code=404, detail="该图片尚未识别")
+    return ImageAnalysisOut(
+        username=str(row.get("username") or username),
+        local_id=int(row.get("local_id") or local_id_int),
+        is_vehicle_part=bool(row.get("is_vehicle_part")),
+        part_name=str(row.get("part_name") or ""),
+        vin=str(row.get("vin") or ""),
+        model=str(row.get("model") or ""),
+        error=str(row.get("error") or ""),
+        created_at=str(row.get("created_at") or ""),
+    )
 
 
 # ---------------------------------------------------------------------------

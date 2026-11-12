@@ -127,8 +127,15 @@ class TestGroupSenderResolution:
         assert WeChatService.extract_content_sender("") == ""
 
     def test_non_text_log_uses_authoritative_sender(self):
-        """非文本消息的 skipped 日志 sender_wxid 同步使用解析后的权威值。"""
+        """非文本消息的 skipped 日志 sender_wxid 同步使用解析后的权威值。
+
+        图片识别默认开启时图片消息改为异步入队（日志由 worker 线程写），
+        这里关掉开关走同步 skipped 分支：锁的仍是「日志里的发送人来自权威
+        解析值」这一点（异步分支的同一断言见 test_batch6_media.py）。
+        """
+        from app.config import KEY_IMAGE_VISION_ENABLED
         db = Database(":memory:")
+        db.set_setting(KEY_IMAGE_VISION_ENABLED, "0")
         svc = WeChatService(db, Aggregator(lambda u: None))
         svc._wxdb = SenderFakeWxDb()
         svc._on_message(make_group_msg("[图片]", mtype="图片",

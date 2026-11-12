@@ -44,6 +44,9 @@ class AnalysisUnit:
     lines: List[Tuple[str, str]] = field(default_factory=list)  # (HH:MM, 内容)
     # 与 lines 一一对应的消息 local_id（管线按需补转写语音消息，0 = 未知）
     local_ids: List[int] = field(default_factory=list)
+    # 本单元里是否包含「已识别为车辆/汽车配件」的图片：管线据此把
+    # direction 覆盖为 sell（批次 6 需求 5，用户口径：发配件图即卖货）
+    has_image_sell: bool = False
     # 时序诊断：消息首次进入缓冲的墙钟时间（time.time()）与入队时的
     # 单调时钟（time.monotonic()），用于拆分「合并等待」与「排队等待」
     first_seen_epoch: float = 0.0     # 缓冲创建墙钟（与 enqueued_epoch 同源）
@@ -68,6 +71,8 @@ class _Buffer:
     window_start_epoch: float = 0.0
     last_epoch: float = 0.0            # 最后一条消息时间（静默计时基准）
     first_seen_epoch: float = 0.0      # 缓冲创建墙钟时间（端到端计时起点）
+    # 缓冲里出现过「识别为车辆/配件」的图片（flush 时带给 AnalysisUnit）
+    has_image_sell: bool = False
 
     def count(self) -> int:
         return len(self.lines)
@@ -130,6 +135,10 @@ class Aggregator:
             buf.lines.append((hm, content))
             # local_id 与 lines 同序追加（语音补转写按索引对齐）
             buf.local_ids.append(int(msg.get("local_id") or 0))
+            # 图片识别为车辆/配件时上游会置 image_sell（批次 6 需求 5）：
+            # 只要窗口里出现一次，整个单元就按卖货方向产出
+            if msg.get("image_sell"):
+                buf.has_image_sell = True
             if buf.window_start_epoch == 0.0:
                 buf.window_start_epoch = epoch
             buf.last_epoch = max(buf.last_epoch, epoch)
@@ -205,6 +214,7 @@ class Aggregator:
                 merged_count=buf.count(),
                 lines=list(buf.lines),
                 local_ids=list(buf.local_ids),
+                has_image_sell=buf.has_image_sell,
                 first_seen_epoch=buf.first_seen_epoch,
             )
             try:

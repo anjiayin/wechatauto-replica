@@ -23,6 +23,48 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/analysis-logs", tags=["analysis-logs"])
 
+# 会话名筛选的候选上限：逐条解析显示名要走联系人/群查询，必须有上限保护，
+# 否则会话很多时会拖垮请求（批次 6 需求 2）。
+SESSION_CANDIDATE_LIMIT = 500
+
+
+def _match_log_sessions(db: Database, svc: WeChatService,
+                        keyword: str) -> list[str]:
+    """把用户输入的会话名/备注/群名解析成 ``session_username`` 候选列表。
+
+    匹配规则（大小写不敏感）：用户输入是显示名或 username 的子串即命中。
+    单条显示名解析失败只跳过该条（不能让整页 500），整体候选数有上限。
+
+    Args:
+        db: 数据库实例（提供 ``distinct_log_sessions``）。
+        svc: 微信服务实例（提供 ``get_display_name``）。
+        keyword: 用户输入的会话名或微信 ID 片段。
+
+    Returns:
+        命中的 ``session_username`` 列表（未命中返回空列表）。
+    """
+    key = str(keyword or "").strip().lower()
+    if not key:
+        return []
+    try:
+        candidates = db.distinct_log_sessions(limit=SESSION_CANDIDATE_LIMIT)
+    except Exception:
+        logger.exception("查询日志会话候选失败（退化为 username 模糊匹配）")
+        return []
+    hits: list[str] = []
+    for username in candidates[:SESSION_CANDIDATE_LIMIT]:
+        uid = str(username or "")
+        if not uid:
+            continue
+        try:
+            display = str(svc.get_display_name(uid) or "")
+        except Exception:
+            logger.warning("解析会话显示名失败（跳过该条）：%s", uid)
+            continue
+        if key in uid.lower() or key in display.lower():
+            hits.append(uid)
+    return hits
+
 
 @router.get("", response_model=AnalysisLogListOut)
 def list_analysis_logs(
@@ -37,12 +79,21 @@ def list_analysis_logs(
 ) -> AnalysisLogListOut:
     """分析日志分页列表（id 倒序；status 空为全部）。
 
-    - session：来源会话筛选（session_username 模糊匹配）；
+    - session：来源会话筛选，**支持会话名/备注/群名**（批次 6 需求 2）：
+      页面上「来源会话」列展示的是解析后的显示名，而库里存的是
+      ``session_username``，因此先用候选集把「显示名 → username」解析出来，
+      再把命中的 username 列表交给 DB 精确匹配；同时保留原 LIKE 路径，
+      保证直接贴 username 片段仍能命中；
     - keyword：消息内容筛选（input_text 模糊匹配）。
     """
+    session_q = session.strip()
+    session_in: list[str] = []
+    if session_q:
+        session_in = _match_log_sessions(db, svc, session_q)
     total, rows = db.list_analysis_logs(
         page=page, page_size=page_size, status=status,
-        session=session.strip(), keyword=keyword.strip())
+        session=session_q, keyword=keyword.strip(),
+        session_in=session_in)
     items: list[AnalysisLogOut] = []
     for row in rows:
         session_display, text_display = svc.build_log_displays(

@@ -35,13 +35,18 @@ from __future__ import annotations
 import ctypes
 import glob
 import hashlib
+import io
 import json
+import logging
 import os
 import re
 import struct
 import tempfile
+import threading
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
+
+logger = logging.getLogger(__name__)
 
 V1_MAGIC = b"\x07\x08\x05\x56\x02\x05"
 V2_MAGIC = b"\x07\x08\x56\x32\x08\x07"
@@ -56,6 +61,170 @@ def _jpeg_like(pt: bytes) -> bool:
         or pt[:4] in (b"\x89PNG", b"GIF8", b"RIFF")
         or pt[:4] == b"wxgf"  # 微信动画表情容器
     )
+
+
+# ---------------------------------------------------------------------------
+# 图片完整性 / 花屏校验（批次 6 待办 1）
+#
+# 背景（本机实测）：微信 4.x 的 .dat 经常只下载了一部分（尾部没有 JPEG
+# 结束符 FF D9），AES 解出来的头部是合法 JFIF，但尾部全是乱码；有时甚至
+# 头部正常、中间突然变成整片绿色。这类字节如果直接落盘缓存，用户就永远
+# 看到花图。所以解密结果必须先过两道校验：
+#   1) is_complete_image —— 有合法头 + 有结束标记（半截文件不算）；
+#   2) image_looks_broken —— 用 Pillow 解码 + 颜色分布判断「纯色占位/绿块」。
+# 只有两项都通过的图片才会被采用/落盘，宁缺勿花。
+# ---------------------------------------------------------------------------
+_TAIL_WINDOW = 2048              # 结束标记只在文件尾部这么多字节里找
+_MAX_THUMB_WIDTH = 64            # 颜色统计先等比缩到宽 ≤ 64（快且够用）
+_MIN_UNIQUE_COLORS = 16          # 整图颜色数少于此值 → 纯色占位图
+_BOTTOM_COLOR_RATIO = 0.97       # 底部 1/3 单一颜色占比超过此值 → 绿块/截断
+# 底部单色占比超阈值时的**豁免**判据：拆车件群大量「白底实拍」（配件在上、
+# 底部一片纯白）本身是正常商品图，直接按「单色占比」判坏会把好图误杀。
+_WHITE_MIN_CHANNEL = 240         # min(r,g,b) ≥ 该值 → 近白底，豁免
+_GRAY_SPREAD_MAX = 8             # 三通道最大差值 ≤ 该值（近中性灰）
+_GRAY_MIN_CHANNEL = 200          # 且 min(r,g,b) ≥ 该值 → 近浅灰底，豁免
+
+
+def is_complete_image(data: bytes) -> bool:
+    """图片字节是否完整（合法文件头 + 结束标记）。
+
+    支持 JPEG（FF D8 FF ... FF D9）、PNG（\\x89PNG ... IEND）、
+    GIF（GIF8 ... 0x3B）。其它格式（含微信 wxgf 容器）一律返回 False：
+    调用方应先把 wxgf 转成 JPEG 再校验。
+
+    Args:
+        data: 图片原始字节。
+
+    Returns:
+        完整返回 True；空数据、半截文件、未知格式返回 False。
+    """
+    if not data or len(data) < 16:
+        return False
+    tail = data[-_TAIL_WINDOW:]
+    if data[:3] == b"\xff\xd8\xff":                  # JPEG
+        return b"\xff\xd9" in tail
+    if data[:8] == b"\x89PNG\r\n\x1a\n":             # PNG
+        return b"IEND" in tail
+    if data[:4] == b"GIF8":                          # GIF
+        return data.rstrip(b"\x00")[-1:] == b"\x3b"
+    return False
+
+
+def _is_light_backdrop(color) -> bool:
+    """该底部主色是否属于「白底 / 近中性浅灰底」这类正常商品图背景。
+
+    白底实拍（配件在上、底部一片纯白）与近浅灰底在拆车件群里极其常见，
+    它们的底部单色占比天然接近 1.0，不能用「单色占比」判坏。真绿块
+    ``(0,135,0)`` 的 min 通道为 0，不会命中任何豁免。
+
+    Args:
+        color: Pillow ``getcolors()`` 返回的颜色元组（RGB 三元组）。
+
+    Returns:
+        True = 属于豁免的白/浅灰背景；False = 按原规则判定。
+    """
+    try:
+        r, g, b = (int(color[0]), int(color[1]), int(color[2]))
+    except (TypeError, IndexError, ValueError):
+        return False
+    low = min(r, g, b)
+    high = max(r, g, b)
+    if low >= _WHITE_MIN_CHANNEL:            # 近白（如 (255,255,255)）
+        return True
+    # 近中性浅灰（三通道几乎相等且都不暗），如 (235,235,238) / (210,210,212)
+    return (high - low) <= _GRAY_SPREAD_MAX and low >= _GRAY_MIN_CHANNEL
+
+
+def image_looks_broken(data: bytes) -> bool:
+    """图片是否「看起来是坏图」（解码失败 / 纯色占位 / 底部整片绿块）。
+
+    判据（与实测花图特征对齐）：
+    - Pillow 打不开或 ``load()`` 抛异常 → 坏图；
+    - 等比缩到宽 ≤ 64 后，整图唯一颜色数 < 16 → 纯色占位图；
+    - 底部 1/3 区域里单一颜色占比 > 0.97 → 「顶部一条真图 + 下面整片纯色」
+      这类半截/绿块图；但底部主色若是**近白 / 近中性浅灰**（白底商品图
+      的正常背景）则豁免，见 :func:`_is_light_backdrop`。
+
+    Pillow 不可用时**判为不坏**（宁可显示也不要把好图误判成坏图）；此时
+    仍受 :func:`is_complete_image` 的完整性约束。
+    """
+    try:
+        from PIL import Image
+    except Exception:            # 没装 Pillow：不做花屏判定
+        return False
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            im.load()
+            rgb = im.convert("RGB")
+        width, height = rgb.size
+        if width <= 0 or height <= 0:
+            return True
+        if width > _MAX_THUMB_WIDTH:
+            ratio = _MAX_THUMB_WIDTH / float(width)
+            rgb = rgb.resize((_MAX_THUMB_WIDTH, max(1, int(round(height * ratio)))))
+        colors = rgb.getcolors(maxcolors=1 << 16)
+        if not colors:
+            return True
+        if len(colors) < _MIN_UNIQUE_COLORS:
+            return True
+        width, height = rgb.size
+        band = max(1, height // 3)
+        top = height - band
+        bottom = rgb.crop((0, top, width, height))
+        total = width * band
+        if total <= 0:
+            return True
+        bottom_colors = bottom.getcolors(maxcolors=1 << 16) or []
+        if not bottom_colors:
+            return True
+        # Pillow 的 getcolors() 返回的是 [(count, color), ...]（count 在前）
+        most_count, most_color = max(bottom_colors, key=lambda item: item[0])
+        if (most_count / float(total)) <= _BOTTOM_COLOR_RATIO:
+            return False
+        # 单色占比很高：只有「非白、非浅灰的纯色」才判为花图/半截图。
+        # 白底/近浅灰底的实拍商品图底部本来就是整片背景色，必须豁免，
+        # 否则好图会被判坏并连缓存一起被清掉（真实语料里的白底配件图）。
+        return not _is_light_backdrop(most_color)
+    except Exception:
+        return True
+
+
+def is_usable_image(data: bytes) -> bool:
+    """图片是否可用于展示：格式完整且不像花屏（两项都过才算可用）。"""
+    return is_complete_image(data) and not image_looks_broken(data)
+
+
+# 进程内「已验证合格的缓存文件」集合：命中缓存不必每次重新解码，
+# 有上限防止长期运行后无限增长（超出直接清空，代价只是重新校验一次）。
+_VERIFIED_CACHE: Set[str] = set()
+_VERIFIED_LOCK = threading.Lock()
+_VERIFIED_MAX = 512
+
+
+def _remember_verified(path: str) -> None:
+    """把缓存文件标记为已验证合格（进程内）。"""
+    with _VERIFIED_LOCK:
+        if len(_VERIFIED_CACHE) >= _VERIFIED_MAX:
+            _VERIFIED_CACHE.clear()
+        _VERIFIED_CACHE.add(path)
+
+
+def is_path_verified(path: str) -> bool:
+    """该缓存文件是否已在本进程中验证过合格。"""
+    with _VERIFIED_LOCK:
+        return path in _VERIFIED_CACHE
+
+
+def forget_verified(path: str) -> None:
+    """把缓存文件移出已验证集合（文件被删/判定为坏图时调用）。"""
+    with _VERIFIED_LOCK:
+        _VERIFIED_CACHE.discard(path)
+
+
+def reset_verified_cache() -> None:
+    """清空已验证集合（测试用）。"""
+    with _VERIFIED_LOCK:
+        _VERIFIED_CACHE.clear()
 
 
 def aligned_aes_block_size(aes_size: int) -> int:
@@ -515,50 +684,208 @@ class MediaDownloader:
                     return m.group(1).decode().lower()
         return None
 
-    def download_image(self, user: str, local_id: int, save_dir: Optional[str] = None,
-                       aes_key: Optional[str] = None, xor_key: Optional[int] = None) -> Optional[str]:
-        """下载图片消息并解密为 jpg/png/gif，返回落盘路径"""
+    _IMAGE_EXTS = ("jpg", "png", "gif")
+
+    @staticmethod
+    def _image_ext(data: bytes) -> str:
+        """图片字节 → 落盘后缀（无法内嵌展示的格式返回 "img"）。"""
+        if data[:3] == b"\xff\xd8\xff":
+            return "jpg"
+        if data[:4] == b"\x89PNG":
+            return "png"
+        if data[:3] == b"GIF":
+            return "gif"
+        return "img"
+
+    @classmethod
+    def _cache_name(cls, user: str, local_id: int, ext: str,
+                    thumbnail: bool = False) -> str:
+        """缓存文件名：``<user>_<local_id>[_thumb].<ext>``。"""
+        return "%s_%s%s.%s" % (user, local_id,
+                               "_thumb" if thumbnail else "", ext)
+
+    def _cached_image(self, user: str, local_id: int,
+                      save_dir: Optional[str] = None) -> Optional[str]:
+        """查找**内容合格**的图片缓存；坏缓存改名为 ``.bak``（自愈）。
+
+        旧版本会把半截/花图写进缓存，命中后用户永远看到花图。这里即使
+        命中缓存也校验一次：已验证过的路径走进程内集合（不重复解码），
+        未验证的读出来校验，不合格就**改名 .bak 让调用方重新解密**。
+
+        注意：不直接删除。判坏规则（单色占比）对白底商品图存在理论误杀风险，
+        改名保留原件便于人工找回与规则复盘；下次访问会重新解密覆盖同名缓存。
+        """
+        directory = save_dir or self.save_dir
+        for thumbnail in (False, True):
+            for ext in self._IMAGE_EXTS:
+                path = os.path.join(
+                    directory, self._cache_name(user, local_id, ext, thumbnail))
+                if not os.path.isfile(path):
+                    continue
+                if is_path_verified(path):
+                    return path
+                try:
+                    with open(path, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    continue
+                if is_usable_image(data):
+                    _remember_verified(path)
+                    return path
+                forget_verified(path)
+                backup = path + ".bak"
+                try:
+                    os.replace(path, backup)
+                    logger.info("不合格的图片缓存已改名备份（花图自愈）：%s → %s",
+                                path, backup)
+                except OSError as exc:
+                    logger.warning("不合格的图片缓存改名失败（%s）：%s",
+                                   path, exc)
+        return None
+
+    def _write_image_cache(self, user: str, local_id: int, data: bytes,
+                           save_dir: Optional[str] = None,
+                           thumbnail: bool = False) -> Optional[str]:
+        """写图片缓存（``.part`` + 原子改名）；只接受合格内容。"""
+        ext = self._image_ext(data)
+        if ext == "img":
+            return None
+        directory = save_dir or self.save_dir
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as exc:
+            logger.warning("创建图片缓存目录失败（%s）：%s", directory, exc)
+            return None
+        out = os.path.join(directory,
+                           self._cache_name(user, local_id, ext, thumbnail))
+        tmp = out + ".part"
+        try:
+            with open(tmp, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, out)
+        except OSError as exc:
+            logger.warning("写图片缓存失败（%s）：%s", out, exc)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return None
+        _remember_verified(out)
+        return out
+
+    def _decode_usable_image(self, user: str, md5: str, create_time: int,
+                             aes_key: Optional[str],
+                             xor_key: Optional[int]
+                             ) -> Optional[Tuple[bytes, bool]]:
+        """逐候选解密并校验，返回 (图片字节, 是否来自缩略图)；全不合格返回 None。
+
+        候选顺序：原图 ``.dat`` → 原图高清 ``_h.dat`` → 缩略图 ``_t.dat``。
+        原图常因微信只下载了一部分而不完整（实测尾部缺 FF D9），此时回落
+        到缩略图——缩略图在群聊里总是完整的，尺寸小但至少是真图。
+        """
+        candidates: List[Tuple[str, bool]] = []
+        seen: Set[str] = set()
+        for path, thumbnail in (
+            (self._find_dat(user, md5, create_time), False),
+            (self._find_h_dat(user, md5), False),
+            (self._find_dat(user, md5, create_time, thumbnail=True), True),
+        ):
+            if path and path not in seen:
+                seen.add(path)
+                candidates.append((path, thumbnail))
+        for path, thumbnail in candidates:
+            try:
+                data = self.decrypt_image(path, aes_key, xor_key)
+            except Exception as exc:
+                logger.warning("图片解密失败（%s）：%s",
+                               os.path.basename(path), exc)
+                continue
+            if data[:4] == b"wxgf":
+                # HEVC 容器转码后同样要过校验（这条路径最容易出半截绿块）
+                jpg = self._wxgf_to_jpg(data)
+                if jpg is None:
+                    logger.info("wxgf 转码失败，跳过：%s",
+                                os.path.basename(path))
+                    continue
+                data = jpg
+            if is_usable_image(data):
+                if thumbnail:
+                    logger.info("原图不可用，已回退缩略图：%s %s",
+                                user, os.path.basename(path))
+                return data, thumbnail
+            logger.info("图片不完整或疑似花屏，跳过：%s（%d 字节）",
+                        os.path.basename(path), len(data))
+        return None
+
+    def load_image(self, user: str, local_id: int,
+                   save_dir: Optional[str] = None,
+                   aes_key: Optional[str] = None,
+                   xor_key: Optional[int] = None
+                   ) -> Tuple[Optional[bytes], Optional[str], str]:
+        """取一张图片消息的**内容合格**字节：命中缓存 → 原图 → 缩略图。
+
+        候选顺序固定为 ``原图(.dat) → _h.dat → _t.dat``，逐个做「完整性 +
+        花屏」双重校验，第一个合格的胜出；全都不合格返回 None（宁可让前端
+        显示占位，也不要花图）。
+
+        注意（本机现状）：原图解密出来的常是 ``wxgf`` 容器（微信自研 HEVC），
+        转码依赖 ffmpeg；本机未安装 ffmpeg / imageio_ffmpeg 时原图**必然**
+        回退到 ``_t.dat`` 缩略图（20KB 左右，清晰度足够看清配件与 VIN）。
+        这不是降级故障，装好 ffmpeg 后同一套代码会自动用上原图。
+
+        Args:
+            user: 会话 username。
+            local_id: 消息 local_id。
+            save_dir: 缓存目录（默认 ``self.save_dir``）。
+            aes_key: 图片 AES 密钥（None = 自动解析）。
+            xor_key: 单字节 XOR 密钥（None = 自动推导）。
+
+        Returns:
+            ``(图片字节, 缓存路径, 失败原因)``：成功时原因为空串；
+            失败时字节与路径为 None、原因为中文说明（可直接写日志/展示）。
+        """
         row = self.db.get_message_row(user, local_id)
         if not row or row["local_type"] != 3:
-            return None
+            return None, None, "不是图片消息"
         md5 = self._img_md5(row)
         if not md5:
+            return None, None, "消息里取不到图片 md5（无法定位 .dat）"
+        cached = self._cached_image(user, local_id, save_dir)
+        if cached:
+            try:
+                with open(cached, "rb") as f:
+                    data = f.read()
+            except OSError as exc:
+                logger.warning("读取图片缓存失败（%s）：%s", cached, exc)
+                forget_verified(cached)
+                data = b""
+            if data:
+                return data, cached, ""
+        decoded = self._decode_usable_image(
+            user, md5, row["create_time"], aes_key, xor_key)
+        if decoded is None:
+            return None, None, "原图与缩略图均不完整，返回占位"
+        data, thumbnail = decoded
+        path = self._write_image_cache(user, local_id, data, save_dir,
+                                       thumbnail)
+        return data, path, ""
+
+    def download_image(self, user: str, local_id: int, save_dir: Optional[str] = None,
+                       aes_key: Optional[str] = None, xor_key: Optional[int] = None) -> Optional[str]:
+        """下载图片消息并解密为 jpg/png/gif，返回落盘路径。
+
+        只返回**内容合格**的图片（批次 6 待办 1）：原图不完整/花屏时自动
+        回退缩略图；两者都不合格时返回 None，由调用方展示占位卡片
+        （宁可占位也不要花图）。具体流程见 :meth:`load_image`。
+        """
+        data, path, reason = self.load_image(
+            user, local_id, save_dir, aes_key, xor_key)
+        if data is None:
+            logger.info("图片下载失败（%s #%s）：%s", user, local_id, reason)
             return None
-        dat_path = self._find_dat(user, md5, row["create_time"])
-        thumb = False
-        if not dat_path:
-            # 群聊图片默认只有缩略图（原图未在微信中点开查看时不下发），回退缩略图
-            dat_path = self._find_dat(user, md5, row["create_time"], thumbnail=True)
-            if not dat_path:
-                return None
-            thumb = True
-        data = self.decrypt_image(dat_path, aes_key, xor_key)
-        suffix = "_thumb" if thumb else ""
-        if data[:3] == b"\xff\xd8\xff":
-            ext = "jpg"
-        elif data[:4] == b"\x89PNG":
-            ext = "png"
-        elif data[:3] == b"GIF":
-            ext = "gif"
-        elif data[:4] == b"wxgf":
-            # WXAM 格式：微信 4.x 普通图片也用 HEVC 编码存储（含动画表情）。
-            # 优先用 ffmpeg 转码为 jpg；不可用时把原始解密数据落盘为 .wxgf 兜底。
-            jpg = self._wxgf_to_jpg(data)
-            if jpg is not None:
-                out = self._out(save_dir, "%s_%s%s.%s" % (user, local_id, suffix, "jpg"))
-                with open(out, "wb") as f:
-                    f.write(jpg)
-                return out
-            out = self._out(save_dir, "%s_%s%s.wxgf" % (user, local_id, suffix))
-            with open(out, "wb") as f:
-                f.write(data)
-            return out
-        else:
-            ext = "img"
-        out = self._out(save_dir, "%s_%s%s.%s" % (user, local_id, suffix, ext))
-        with open(out, "wb") as f:
-            f.write(data)
-        return out
+        return path
 
     def download_voice(self, user: str, local_id: int, save_dir: Optional[str] = None) -> Optional[str]:
         """语音：media_*.db VoiceInfo.voice_data（SILK 二进制），落盘 .silk

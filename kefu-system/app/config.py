@@ -98,6 +98,12 @@ MAX_OPPORTUNITY_SPAN_SEC = 1800    # 单条商机最长时间跨度（window_sta
 AGGREGATOR_FORCE_FLUSH_FACTOR = 10  # 缓冲区首条消息年龄超过 微窗口×该倍数 时强制 flush（安全阀）
 QUEUE_MAX = 500                    # 有界分析队列长度（满则丢弃并计数告警）
 WORKER_COUNT = 2                   # 分析 worker 线程数
+# 图片识别队列（批次 6 需求 5 异步化）：视觉模型单张实测 10~15 秒（超时
+# 上限 60 秒），绝不能放在 Listener 回调线程里同步跑，否则后续文本消息的
+# 入库会被推迟几十秒。监听线程只入队，识别由独立 worker 并发完成。
+VISION_QUEUE_MAX = 200             # 图片识别队列上限（满则跳过识别并记日志，绝不阻塞监听）
+VISION_WORKERS = 2                 # 图片识别 worker 线程数（纯 I/O 等待，2 个足够且不吃 CPU）
+VISION_QUEUE_WARN = 50             # 队列积压告警阈值（超过时限频 warn 一次）
 CONTEXT_COUNT = 5                  # 商机详情上下文条数（前后各 N 条）
 WATERMARK_FLUSH_SEC = 30           # watermark 定期刷回间隔（秒）
 RETRY_TIMES = 2                    # AI 调用失败重试次数
@@ -139,6 +145,11 @@ KEY_NOTIFY_SOUND = "notify.sound_enabled"
 KEY_ASR_ENABLED = "asr.enabled"
 # 单条语音转写时长上限（秒）：超长语音直接放弃，避免长时间占用识别线程
 KEY_ASR_MAX_SECONDS = "asr.max_seconds"
+# 图片内容识别（视觉模型）：识别图片里的车辆/汽车配件，提取车架号，
+# 识别为车辆/配件时按「卖货」方向产出商机（批次 6 需求 5）
+KEY_IMAGE_VISION_ENABLED = "image.vision_enabled"
+# 视觉模型名（空 = 沿用 ai.model：多数多模态网关文本/视觉同一个模型）
+KEY_IMAGE_VISION_MODEL = "image.vision_model"
 KEY_MONITOR_MAX_TARGETS = "monitor.max_targets"  # 监控对象数量上限（10~2000，默认 200）
 KEY_COMPLIANCE_CONFIRMED = "compliance.confirmed"
 KEY_RUNTIME_WM_SAVED_AT = "runtime.watermark_saved_at"  # 内部键：最近 watermark 刷回时间
@@ -174,6 +185,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     KEY_NOTIFY_SOUND: "0",
     KEY_ASR_ENABLED: "1",          # 语音消息自动转文字（本地离线识别）
     KEY_ASR_MAX_SECONDS: "180",    # 单条语音转写时长上限（秒）
+    KEY_IMAGE_VISION_ENABLED: "1",  # 图片内容识别（视觉模型，默认开启）
+    KEY_IMAGE_VISION_MODEL: "",     # 空 = 沿用 ai.model
     KEY_MONITOR_MAX_TARGETS: str(MAX_MONITOR_TARGETS),
     KEY_COMPLIANCE_CONFIRMED: "0",
     KEY_RUNTIME_CACHE_DIR: "",     # 空 = 使用 CACHE_DIR_DEFAULT

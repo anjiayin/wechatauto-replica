@@ -6,6 +6,7 @@
 - 启停 Listener、注册/注销监控会话回调；
 - watermark 定期（30s）与退出时刷回 watermarks 表；
 - 会话搜索 / 历史消息查询（供 API 复用）；
+- 图片识别任务队列（监听线程只入队，独立 worker 跑视觉模型）；
 - 状态查询（/api/status 数据源）。
 
 wechatauto 只 import 调用，不做任何修改（硬约束）。
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import queue
 import re
 import shutil
 import sys
@@ -25,7 +27,9 @@ from typing import List, Optional
 from app import db as dbmod
 from app import content_format
 from app.content_format import SENDER_ID_STRICT_RE
+from app import vision
 from app import voice_asr
+from app.crypto import decrypt_api_key
 from app.aggregator import Aggregator
 from app.config import (
     CONTEXT_COUNT,
@@ -36,6 +40,9 @@ from app.config import (
     MSG_QUERY_RETRY_TIMES,
     SESSION_CACHE_TTL_SEC,
     SESSION_SEARCH_LIMIT_DEFAULT,
+    VISION_QUEUE_MAX,
+    VISION_QUEUE_WARN,
+    VISION_WORKERS,
     VOICE_CACHE_DIR,
     WATERMARK_FLUSH_SEC,
     KEY_ASR_ENABLED,
@@ -162,6 +169,17 @@ class WeChatService:
             on_success=self._on_voice_retry_success,
             on_failure=self._on_voice_retry_failure,
         )
+        # 图片识别任务队列（批次 6 需求 5 异步化）：视觉识别单张实测 13.6s、
+        # 超时上限 60s，在 Listener 回调线程里同步跑会把后续文本消息的入库
+        # 推迟几十秒。监听线程只做「开关判断 + 入队」，取图/识别/落库/聚合
+        # 全部由 VISION_WORKERS 个 worker 线程完成（有界队列 + 满则跳过）。
+        self._vision_queue: "queue.Queue" = queue.Queue(
+            maxsize=VISION_QUEUE_MAX)
+        self._vision_threads: List[threading.Thread] = []
+        self._vision_lock = threading.Lock()
+        self._vision_warn_ts: float = 0.0   # 积压告警限频时间戳（monotonic）
+        self._vision_ok: int = 0            # 已得出结论的任务数
+        self._vision_fail: int = 0          # 识别失败（坏图/网关异常）任务数
 
     # ------------------------------------------------------------------
     # 缓存目录（可配置；默认 kefu-system/data/wechat_cache）
@@ -248,6 +266,9 @@ class WeChatService:
         # 补转写队列独立于微信监听可用性：即使微信库暂时不可用也先跑起来，
         # 任务失败会自然耗尽重试（不占用监听线程）。
         self._voice_retry.start()
+        # 图片识别 worker 同理：与监听生命周期解耦，先起线程再拉监听，
+        # 避免监听刚启动就有图片消息却没人消费
+        self._start_vision_workers()
         with self._listener_lock:
             if self._listener is not None:
                 return
@@ -306,6 +327,10 @@ class WeChatService:
                 listener.stop()
             except Exception:
                 logger.exception("停止 Listener 异常")
+        # 先停监听再停 worker：停止过程中不会再有新任务入队。worker 会把
+        # 手头这一张跑完（视觉调用最长 60s，join 只等 5s，剩下交给 daemon
+        # 线程随进程退出，不阻塞退出流程）
+        self._stop_vision_workers()
         if self._flush_thread:
             self._flush_thread.join(timeout=5)
             self._flush_thread = None
@@ -397,6 +422,16 @@ class WeChatService:
                     # 转写成功：按文本消息继续走聚合窗口（音频不出本机）
                     msg["content"] = content_format.voice_text_content(
                         voice_text)
+                elif content_format.is_image_type(mtype):
+                    # 图片消息（批次 6 需求 5）：视觉识别单张实测 10~15 秒，
+                    # 同步跑会把 Listener 回调线程堵死，后续文本消息的入库
+                    # 被推迟几十秒。这里只做「开关判断 + 入队」后立刻返回，
+                    # 识别/落库/进聚合窗口全部交给独立 worker 线程池。
+                    self._enqueue_image_message(
+                        msg, username=username, kind=kind,
+                        sender_wxid=sender_wxid, sender_name=sender_name,
+                        mtype=mtype)
+                    return
                 else:
                     self._db.insert_analysis_log(
                         session_username=username,
@@ -417,6 +452,367 @@ class WeChatService:
             self._aggregator.add(msg, session_name, kind)
         except Exception:
             logger.exception("处理新消息回调异常（已忽略）")
+
+    # ------------------------------------------------------------------
+    # 图片内容识别（批次 6 需求 5：图片里的车辆/配件 → 按卖货产出商机）
+    #
+    # 异步化：视觉识别单张实测 13.6s、超时上限 60s，在 Listener 回调线程里
+    # 同步跑会把后续文本消息的入库推迟几十秒。监听线程只做「开关判断 +
+    # put_nowait 入队」并立即返回（见 ``_enqueue_image_message``），取图、
+    # 识别、落库、进聚合窗口全部由 ``kefu-vision-*`` worker 完成。
+    # ------------------------------------------------------------------
+    def _image_vision_settings(self) -> dict:
+        """图片识别配置（开关 / 视觉模型 / 网关 / Key 密文）。
+
+        读取失败按「关闭」处理：识别是增强能力，配置读不到时绝不能影响
+        监听线程，退回原有的「图片消息 skipped」行为。
+        """
+        try:
+            return vision.image_settings(self._db)
+        except Exception:
+            logger.exception("读取图片识别配置失败（按关闭处理）")
+            return {"enabled": False, "model": "", "base_url": "",
+                    "api_key_enc": "", "timeout_sec": 60}
+
+    def _log_image_skipped(self, username: str, sender_wxid: str, mtype: str,
+                           raw_content: str, reason: str,
+                           local_id: int = 0) -> None:
+        """图片消息跳过日志（input_text 存友好摘要，绝不存原始 XML）。
+
+        ``raw_content`` 用入队时带过来的原文：worker 线程里原始消息 dict
+        可能已被复用/回收，只带字符串最安全。
+
+        ``error`` 末尾统一追加「（会话 local_id=xxx）」：用户看到「这张图没
+        被识别」时，必须能自己定位到具体是哪张图（与「队列已满」那条口径
+        一致）。``input_text`` 保持 ``[图片]`` 之类的展示文本，不塞 ID。
+        """
+        try:
+            detail = f"{reason}（{username} local_id={local_id}）"
+            self._db.insert_analysis_log(
+                session_username=username,
+                sender_wxid=sender_wxid,
+                msg_count=1,
+                input_text=content_format.format_content(
+                    mtype, str(raw_content or ""))[:200],
+                status="skipped",
+                error=detail,
+            )
+        except Exception:
+            logger.exception("写入图片跳过日志失败（已忽略）")
+
+    @staticmethod
+    def _vision_error_text(text: str) -> str:
+        """把视觉模型的失败文案统一成「图片识别失败：…」前缀。
+
+        与「图片非车辆/汽车配件（AI 识别：…）」这**正常结论**区分开：分析
+        日志里一眼能看出是「模型没答应/额度/超时」还是「模型说不是配件」。
+        """
+        reason = str(text or "").strip() or "未知原因"
+        for prefix in ("图片识别失败", "图片识别未配置", "图片预处理失败"):
+            if reason.startswith(prefix):
+                return reason
+        return "图片识别失败：" + reason
+
+    def _save_image_analysis(self, username: str, local_id: int, *,
+                             is_vehicle_part: bool, part_name: str = "",
+                             vin: str = "", model: str = "",
+                             error: str = "") -> None:
+        """落库图片识别结果（**只用于成功拿到模型 JSON 的结论**）。
+
+        失败（额度/超时/Key/未配置/异常）一律**不落库**：缓存一旦写下
+        ``is_vehicle_part=0``，额度恢复后这张图会被永久当成「非配件」不再
+        识别（假阴性）。同一个 local_id 本来也不会重复投递，缓存的价值在
+        「重投/重试」而不是「记录失败」。
+        """
+        try:
+            self._db.save_image_analysis(
+                username, local_id, is_vehicle_part=is_vehicle_part,
+                part_name=part_name, vin=vin, model=model, error=error)
+        except Exception:
+            logger.exception("保存图片识别结果失败（已忽略）")
+
+    # ------------------------------------------------------------------
+    # 图片识别队列：监听线程侧（入队）与 worker 侧（取图/识别/聚合）
+    # ------------------------------------------------------------------
+    def _enqueue_image_message(self, msg: dict, *, username: str, kind: str,
+                               sender_wxid: str, sender_name: str,
+                               mtype: str) -> None:
+        """监听线程侧：构造任务并入队，**不做任何识别**（必须极快返回）。
+
+        开关关闭时保持历史行为：同步落一条 skipped 日志、文案逐字不变，
+        既不占队列也不花 token。
+
+        Args:
+            msg: Listener 原始消息 dict（只读取 content/local_id/create_time）。
+            username: 会话 username（群为 xxx@chatroom）。
+            kind: group / friend。
+            sender_wxid: 权威解析后的发送人 ID。
+            sender_name: 发送人显示名。
+            mtype: 原始消息类型（日志摘要用）。
+        """
+        settings = self._image_vision_settings()
+        raw_content = str(msg.get("content") or "")
+        try:
+            local_id = int(msg.get("local_id") or 0)
+        except (TypeError, ValueError):
+            local_id = 0
+        if not settings.get("enabled"):
+            self._log_image_skipped(
+                username, sender_wxid, mtype, raw_content,
+                f"非文本消息（{mtype or '未知类型'}），不分析", local_id)
+            return
+        task = {
+            "username": username,
+            "local_id": local_id,
+            "mtype": mtype,
+            "kind": kind,
+            # 会话显示名在监听线程里取（有缓存，足够快）；worker 里再取会多
+            # 一次微信库调用，还可能撞上冷分片
+            "session_name": self.get_display_name(username),
+            "sender_wxid": sender_wxid,
+            "sender_name": sender_name,
+            # 原始消息时间：合并窗口静默计时与「[HH:MM]」行时间都以它为准，
+            # 换成识别完成时刻会让图片串到别的窗口里
+            "create_time": msg.get("create_time"),
+            "content": raw_content,
+        }
+        try:
+            self._vision_queue.put_nowait(task)
+        except queue.Full:
+            # 背压：宁可少识别几张图，也不能阻塞监听线程或让队列无界增长
+            self._log_image_skipped(username, sender_wxid, mtype,
+                                    raw_content, "图片识别队列已满，跳过识别",
+                                    local_id)
+            logger.warning("图片识别队列已满（上限 %d），丢弃任务：%s "
+                           "local_id=%s", VISION_QUEUE_MAX, username, local_id)
+            return
+        self._warn_vision_backlog(self._vision_queue.qsize())
+
+    def _warn_vision_backlog(self, size: int) -> None:
+        """队列积压告警（限频 60 秒一次，避免逐条消息刷屏）。"""
+        if size <= VISION_QUEUE_WARN:
+            return
+        now = time.monotonic()
+        with self._vision_lock:
+            if now - self._vision_warn_ts < 60:
+                return
+            self._vision_warn_ts = now
+        logger.warning("图片识别队列积压 %d 条（上限 %d，worker %d 个），"
+                       "识别结果可能明显延迟", size, VISION_QUEUE_MAX,
+                       VISION_WORKERS)
+
+    def _start_vision_workers(self) -> None:
+        """启动图片识别 worker 线程（重复调用无副作用）。"""
+        with self._vision_lock:
+            alive = [t for t in self._vision_threads if t.is_alive()]
+            self._vision_threads = alive
+            started = 0
+            for idx in range(len(alive), VISION_WORKERS):
+                thread = threading.Thread(
+                    target=self._vision_worker_loop, args=(idx,),
+                    name=f"kefu-vision-{idx}", daemon=True)
+                thread.start()
+                self._vision_threads.append(thread)
+                started += 1
+        if started:
+            logger.info("图片识别队列已启动（worker %d 个，队列上限 %d）",
+                        VISION_WORKERS, VISION_QUEUE_MAX)
+
+    def _stop_vision_workers(self) -> None:
+        """停止 worker：先投哨兵再 join（每个最多等 5 秒）。
+
+        在途的那一张图最长可能跑到视觉超时上限（60s），join 只等 5 秒就把
+        剩余工作交给 daemon 线程随进程退出，避免拖慢停机流程。
+        """
+        with self._vision_lock:
+            threads = list(self._vision_threads)
+            self._vision_threads = []
+        if not threads:
+            return
+        for _ in threads:
+            try:
+                self._vision_queue.put_nowait(None)     # None = 停止哨兵
+            except queue.Full:
+                logger.warning("图片识别队列已满，停止哨兵投递失败")
+        for thread in threads:
+            thread.join(timeout=5)
+        remaining = self.vision_queue_size
+        if remaining:
+            logger.warning("图片识别队列停止时仍有 %d 条未处理", remaining)
+
+    def _vision_worker_loop(self, index: int) -> None:
+        """worker 主循环：取任务 → 处理 → 标记完成。
+
+        约定：**任何异常都不得终止线程**（与监听/补转写线程一致），否则
+        后续图片会静默堆积在队列里没人消费。
+        """
+        while True:
+            task = self._vision_queue.get()
+            if task is None:            # 停止哨兵
+                self._vision_queue.task_done()
+                logger.info("图片识别 worker %d 已退出", index)
+                return
+            ok = False
+            try:
+                ok = self._process_image_task(task)
+            except Exception:           # 理论上 _process_image_task 已兜住
+                logger.exception("图片识别 worker %d 处理任务异常（已忽略）",
+                                 index)
+            finally:
+                self._count_vision(ok)
+                self._vision_queue.task_done()
+
+    def _count_vision(self, ok: bool) -> None:
+        """累计识别任务计数（/api/status 可观测；失败不影响主流程）。"""
+        with self._vision_lock:
+            if ok:
+                self._vision_ok += 1
+            else:
+                self._vision_fail += 1
+
+    def _process_image_task(self, task: dict) -> bool:
+        """处理一张待识别图片：取图 → 识别 → 落库 → （车辆/配件）进聚合。
+
+        流程：
+        1. 命中 ``image_analysis`` 缓存 → 直接用（同一张图绝不重复识别）；
+        2. 取图（``get_image_bytes`` 已保证完整/不花屏）→ 调视觉模型；
+        3. 是车辆/配件 → 合成文本消息（``image_sell=True``）进聚合窗口；
+           不是 → 落 skipped 带 AI 原因；
+        4. **只有成功拿到模型 JSON 才写缓存**（无论结论是/不是配件）；
+        5. 任何失败（``MSG_INCOMPLETE`` / 额度 / 超时 / Key / 未配置 / 异常）
+           **一律不写缓存**，只落 skipped 日志：失败落库会把这张图永久钉成
+           「非配件」，额度恢复后也不会再识别（假阴性）。
+
+        Returns:
+            True = 已有结论（含「非车辆/配件」这种正常结论）；
+            False = 取图/识别失败（原因已落 skipped 日志）。
+        """
+        username = str(task.get("username") or "")
+        mtype = str(task.get("mtype") or "")
+        sender_wxid = str(task.get("sender_wxid") or "")
+        raw_content = str(task.get("content") or "")
+        try:
+            local_id = int(task.get("local_id") or 0)
+        except (TypeError, ValueError):
+            local_id = 0
+        try:
+            if local_id <= 0:
+                self._log_image_skipped(username, sender_wxid, mtype,
+                                        raw_content,
+                                        "图片消息缺少 local_id，未识别", 0)
+                return False
+            cached = None
+            try:
+                cached = self._db.get_image_analysis(username, local_id)
+            except Exception:
+                logger.exception("读取图片识别缓存失败（按未命中处理）")
+            if cached is not None:
+                # 缓存里只可能是「成功拿到模型 JSON」的结论（失败不落库）
+                if int(cached.get("is_vehicle_part") or 0):
+                    self._emit_image_sell(task, cached)
+                    return True
+                reason = str(cached.get("error") or "").strip()
+                if reason:
+                    text = f"图片非车辆/汽车配件（AI 识别：{reason}）"
+                else:
+                    text = "图片已识别，非车辆/汽车配件"
+                self._log_image_skipped(username, sender_wxid, mtype,
+                                        raw_content, text, local_id)
+                return True
+            data = self.get_image_bytes(username, local_id)
+            if not data:
+                self._log_image_skipped(
+                    username, sender_wxid, mtype, raw_content,
+                    "图片读取失败或不完整，未识别", local_id)
+                return False
+            settings = self._image_vision_settings()
+            model = str(settings.get("model") or "")
+            result = vision.analyze_image(
+                data,
+                base_url=str(settings.get("base_url") or ""),
+                api_key=decrypt_api_key(settings.get("api_key_enc") or ""),
+                model=model,
+                timeout_sec=int(settings.get("timeout_sec") or 60))
+            is_part = bool(result.get("is_vehicle_part"))
+            reason_text = str(result.get("reason") or "").strip()
+            if not is_part:
+                # 成功拿到 JSON 且判定「不是」：结论落库（带一句话原因），
+                # 下次命中缓存时能直接复用同一段原因，不必再问模型
+                self._save_image_analysis(
+                    username, local_id, is_vehicle_part=False,
+                    model=model, error=reason_text)
+                self._log_image_skipped(
+                    username, sender_wxid, mtype, raw_content,
+                    f"图片非车辆/汽车配件（AI 识别：{reason_text or '不确定'}）",
+                    local_id)
+                return True
+            self._save_image_analysis(
+                username, local_id, is_vehicle_part=True,
+                part_name=str(result.get("part_name") or ""),
+                vin=str(result.get("vin") or ""), model=model)
+            self._emit_image_sell(task, result)
+            return True
+        except vision.VisionError as exc:
+            text = str(exc)
+            if text == vision.MSG_INCOMPLETE:
+                # 微信可能还没下载完原图：不写缓存，下次消息/重试还能再识别
+                self._log_image_skipped(
+                    username, sender_wxid, mtype, raw_content,
+                    f"{text}，未识别（等微信下载完原图后可重试）", local_id)
+            else:
+                # 临时性失败（额度/限流/超时/Key/未配置）：**绝不落库**，
+                # 否则额度恢复后这张图会被永久判成「非配件」不再识别
+                self._log_image_skipped(
+                    username, sender_wxid, mtype, raw_content,
+                    self._vision_error_text(text), local_id)
+            return False
+        except Exception:
+            logger.exception("图片识别任务异常（%s local_id=%s）",
+                             username, local_id)
+            self._log_image_skipped(username, sender_wxid, mtype,
+                                    raw_content, "图片识别异常，未识别",
+                                    local_id)
+            return False
+
+    def _emit_image_sell(self, task: dict, row: dict) -> None:
+        """把「是车辆/配件」的图片合成一条文本消息送进聚合窗口。
+
+        合成 content 是关键：后续预筛、AI 提示词、商机原文都基于它，AI 才能
+        看见「[图片] 识别：车辆/汽车配件（发动机总成）车架号：…」这段线索；
+        同时置 ``image_sell`` 让管线强制 direction=sell。
+
+        ``create_time`` 用**原始消息时间**（入队时带的），不用识别完成时刻。
+        """
+        text = self._image_sell_text(row)
+        username = str(task.get("username") or "")
+        msg = {
+            "username": username,
+            "type": "文本",
+            "content": text,
+            "local_id": int(task.get("local_id") or 0),
+            "sender_username": str(task.get("sender_wxid") or ""),
+            "sender_display_name": str(task.get("sender_name") or ""),
+            "create_time": task.get("create_time"),
+            "image_sell": True,
+        }
+        self._aggregator.add(msg, str(task.get("session_name") or ""),
+                             str(task.get("kind") or "friend"))
+        logger.info("[图片识别] %s 的图片判定为车辆/配件（%s%s），按卖货处理",
+                    username, str(row.get("part_name") or "") or "未识别部件",
+                    f"，车架号 {row.get('vin')}"
+                    if str(row.get("vin") or "").strip() else "")
+
+    @staticmethod
+    def _image_sell_text(row: dict) -> str:
+        """识别结论 → 送进分析的文本（部件名与车架号缺失时省略）。"""
+        part = str(row.get("part_name") or "").strip()
+        vin = str(row.get("vin") or "").strip()
+        text = "[图片] 识别：车辆/汽车配件"
+        if part:
+            text += f"（{part}）"
+        if vin:
+            text += f" 车架号：{vin}"
+        return text
 
     # ------------------------------------------------------------------
     # 语音转写失败 → 延迟补转写
@@ -692,11 +1088,20 @@ class WeChatService:
           显示名 = 好友备注 → 群显示名 → 联系人备注/昵称 → 原 ID；
         - 私聊：发送人就是会话对方，与 sender_username 映射无关；
           sender_id ∈ (2, "2") 为自己发送（显示「我」，后续管线正常处理）。
+
+        批次 6 需求 6：群聊里自己发送的消息在微信 4.x 本地库中
+        ``real_sender_id = 2`` 且**正文没有发送者前缀**，因此走前缀解析
+        会拿到空串 → 被判成「未知用户」并当成别人发的商机。这里把
+        sender_id=2 提到最前面直接认定为自己（不依赖能否读到 self wxid，
+        老库/转发场景仍保留原前缀+wxid 比对路径）。
         """
         if kind != "group":
             if msg.get("sender_id") in (2, "2"):
                 return "", "我"
             return username, self.get_display_name(username)
+        # 群聊里 sender_id=2 = 当前登录账号自己发送：没有前缀，直接定性
+        if msg.get("sender_id") in (2, "2"):
+            return self._self_id() or "", "我"
         # 群聊：正文前缀优先，sender_username 映射仅作最终回退
         content = str(msg.get("content") or "")
         sender_id = self.extract_content_sender(content)
@@ -768,11 +1173,17 @@ class WeChatService:
         """该消息是否为当前登录账号自己发送。
 
         - 私聊：sender_id ∈ (2, "2") 即自己发送（微信原生标记）；
-        - 群聊：解析出的发送人 wxid（正文前缀权威解析结果）等于当前登录
+        - 群聊：sender_id ∈ (2, "2") 同样是自己发送（批次 6 需求 6：微信
+          4.x 群聊里自己发的消息 ``real_sender_id = 2`` 且正文无前缀，
+          老逻辑只比 wxid 判不出来，导致自己的消息被当商机分析）；其余
+          情况解析出的发送人 wxid（正文前缀权威解析结果）等于当前登录
           账号 wxid，或消息自带的 sender_username 等于当前登录账号。
         """
         if kind != "group":
             return msg.get("sender_id") in (2, "2")
+        # sender_id=2 是最可靠的「自己发送」标记，不依赖 _self_id() 是否读得到
+        if msg.get("sender_id") in (2, "2"):
+            return True
         self_id = self._self_id()
         if not self_id:
             return False
@@ -1246,6 +1657,10 @@ class WeChatService:
         （SenderName2Id 映射不可靠，反馈 6 群昵称错乱）。只有前缀能对上
         群成员（wxid 或群显示名）时才剥离，避免误伤「9:30 开会」这类正文；
         私聊发送人即会话对方，sender_id=2 为自己。
+
+        批次 6 需求 6：群聊里自己发送的消息 ``sender_id = 2`` 且正文**没有**
+        前缀，此前会落到 ``candidate or "未知用户"`` 分支显示「未知用户」。
+        这里最前面直接返回「我」，且不剥前缀（自己发的本来就没有前缀）。
         """
         text = str(content or "")
         if not username.endswith("@chatroom"):
@@ -1253,6 +1668,9 @@ class WeChatService:
                 return "我", text
             name = self.get_display_name(fallback_wxid) if fallback_wxid else "我"
             return name or "我", text
+        # 群聊里 sender_id=2 = 自己发送：无前缀，显示「我」
+        if sender_id in (2, "2"):
+            return "我", text
         names = self._get_group_member_names(username)
         candidate = self.extract_content_sender(text)
         reverse = self._group_member_reverse_names(username) if candidate else {}
@@ -1449,29 +1867,40 @@ class WeChatService:
         由 MediaDownloader 落盘到 IMG_CACHE_DIR（持久缓存，避免重复
         解密；目录在 data/ 下已被 git 忽略）。
 
-        仅接受可内嵌展示的格式（jpg/png/gif）；wxgf 转码失败等情况
-        返回 None，由前端回退占位卡片。
+        批次 6 待办 1：微信的 .dat 经常只下载了一部分，解出来是「顶部一条
+        真图 + 下面整片纯绿」的花图，且旧版本会把花图写进缓存让人永远看到
+        花图。现在整套链路只返回**内容合格**的图片（完整性 + 花屏双重校验，
+        见 ``wechatauto.media.load_image``）：原图不合格回退缩略图，两者都
+        不合格返回 None，由前端展示占位卡片——宁可占位也不要花图。
+
+        仅接受可内嵌展示的格式（jpg/png/gif）；失败原因写入 info 日志
+        （中文），便于用户在报障时直接看到「为什么这张图是空白」。
         """
         if self._wxdb is None:
+            logger.info("图片不可用（%s local_id=%s）：微信库未就绪",
+                        username, local_id)
             return None
         downloader = self._get_media_downloader()
         if downloader is None:
+            logger.info("图片不可用（%s local_id=%s）：媒体下载器不可用",
+                        username, local_id)
             return None
         try:
-            path = downloader.download_image(username, local_id)
+            data, _path, reason = downloader.load_image(username, local_id)
         except Exception as exc:
-            logger.warning("图片解密失败（%s local_id=%d）：%s",
+            logger.warning("图片解密失败（%s local_id=%s）：%s",
                            username, local_id, exc)
             return None
-        if not path:
+        if not data:
+            logger.info("图片不可用（%s local_id=%s）：%s",
+                        username, local_id, reason or "未知原因")
             return None
-        if not str(path).lower().endswith((".jpg", ".jpeg", ".png", ".gif")):
-            return None  # wxgf 等无法内嵌展示的格式
-        try:
-            with open(path, "rb") as f:
-                return f.read()
-        except OSError:
+        if not (data[:3] == b"\xff\xd8\xff" or data[:4] == b"\x89PNG"
+                or data[:3] == b"GIF"):
+            logger.info("图片不可用（%s local_id=%s）：格式无法内嵌展示",
+                        username, local_id)
             return None
+        return data
 
     def get_voice_wav(self, username: str, local_id: int) -> Optional[bytes]:
         """取一条语音消息的可播放 WAV 音频；失败返回 None（原因记日志）。
@@ -1667,6 +2096,29 @@ class WeChatService:
     def watermark_saved_at(self) -> str:
         """最近 watermark 刷回时间。"""
         return self._db.get_setting(KEY_RUNTIME_WM_SAVED_AT, "")
+
+    # ------------------------------------------------------------------
+    # 图片识别队列可观测指标（只读，/api/status 与排障用）
+    # ------------------------------------------------------------------
+    @property
+    def vision_queue_size(self) -> int:
+        """待识别的图片任务数（queue.vision_pending 数据源）。"""
+        try:
+            return int(self._vision_queue.qsize())
+        except Exception:       # 实测不会发生，防御性兜底
+            return 0
+
+    @property
+    def vision_processed_total(self) -> int:
+        """已处理完的图片任务总数（有结论 + 失败）。"""
+        with self._vision_lock:
+            return int(self._vision_ok + self._vision_fail)
+
+    @property
+    def vision_failed_total(self) -> int:
+        """识别失败（坏图 / 取图失败 / 网关异常）的任务数。"""
+        with self._vision_lock:
+            return int(self._vision_fail)
 
     def cache_status(self) -> list:
         """各消息分片解密缓存的健康度（只读，供 /api/status 展示）。

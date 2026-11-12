@@ -261,7 +261,8 @@ export default function AnalysisLogs() {
           <MenuItem value="below_threshold">低于门槛</MenuItem>
         </TextField>
         <TextField
-          label="来源会话（username）"
+          label="来源会话（会话名或微信 ID）"
+          placeholder="如：山东拆车件调货⑤群"
           sx={{ width: 240 }}
           value={sessionInput}
           onChange={(e) => {

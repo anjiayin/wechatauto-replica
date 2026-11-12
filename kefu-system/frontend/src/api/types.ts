@@ -158,6 +158,28 @@ export interface AnalysisSettings {
 
 export interface AnalysisSettingsPayload extends AnalysisSettings {}
 
+/** /api/settings/image（图片内容识别，批次 6 需求 5） */
+export interface ImageSettings {
+  enabled: boolean
+  /** 视觉模型名；空字符串 = 沿用 ai.model */
+  model: string
+}
+
+export interface ImageSettingsPayload extends ImageSettings {}
+
+/** /api/messages/{username}/images/{local_id}/analysis */
+export interface ImageAnalysis {
+  username: string
+  local_id: number
+  /** 是否汽车整车/汽车配件（True 时该消息按卖货处理） */
+  is_vehicle_part: boolean
+  part_name: string
+  vin: string
+  model: string
+  error: string
+  created_at: string
+}
+
 /** /api/opportunities */
 export interface OpportunityListItem {
   id: number

@@ -30,6 +30,7 @@ import PauseIcon from '@mui/icons-material/Pause'
 import { apiGet, apiPatch, apiPost } from '../api/client'
 import type {
   GroupMembers,
+  ImageAnalysis,
   OpportunityContextOut,
   OpportunityDetail,
   ReplyPayload,
@@ -66,6 +67,18 @@ function stageText(data: SendResultData): string {
 /** 上下文中的图片消息：尝试展示解密真图，加载失败回退占位文本（反馈 2）。 */
 function ContextImage(props: { username: string; localId: number; fallback: string }) {
   const [failed, setFailed] = useState(false)
+  // 图片识别结果（批次 6 需求 5）：是车辆/汽车配件就在图下方标出来。
+  // 未识别过（404）或接口失败一律静默——图片很多，不能弹错误。
+  const analysisQuery = useQuery({
+    queryKey: ['image-analysis', props.username, props.localId],
+    queryFn: () =>
+      apiGet<ImageAnalysis>(
+        `/api/messages/${encodeURIComponent(props.username)}/images/${props.localId}/analysis`,
+      ),
+    retry: false,
+    staleTime: 5 * 60 * 1000,
+  })
+  const analysis = analysisQuery.data
   if (failed) {
     return (
       <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
@@ -74,21 +87,34 @@ function ContextImage(props: { username: string; localId: number; fallback: stri
     )
   }
   return (
-    <Box
-      component="img"
-      src={`/api/messages/${encodeURIComponent(props.username)}/images/${props.localId}`}
-      alt="图片消息"
-      loading="lazy"
-      onError={() => setFailed(true)}
-      sx={{
-        maxWidth: 240,
-        maxHeight: 180,
-        display: 'block',
-        borderRadius: 1,
-        border: '1px solid #e0e0e0',
-        mt: 0.5,
-      }}
-    />
+    <Box>
+      <Box
+        component="img"
+        src={`/api/messages/${encodeURIComponent(props.username)}/images/${props.localId}`}
+        alt="图片消息"
+        loading="lazy"
+        onError={() => setFailed(true)}
+        sx={{
+          maxWidth: 240,
+          maxHeight: 180,
+          display: 'block',
+          borderRadius: 1,
+          border: '1px solid #e0e0e0',
+          mt: 0.5,
+        }}
+      />
+      {analysis?.is_vehicle_part && (
+        <Stack direction="row" spacing={0.5} sx={{ mt: 0.5, flexWrap: 'wrap' }} useFlexGap>
+          <Chip
+            size="small"
+            label={analysis.part_name ? `车辆/配件 · ${analysis.part_name}` : '车辆/配件'}
+          />
+          {analysis.vin && (
+            <Chip size="small" variant="outlined" label={`VIN ${analysis.vin}`} />
+          )}
+        </Stack>
+      )}
+    </Box>
   )
 }
 
@@ -129,24 +155,65 @@ function VoicePlayer(props: { username: string; localId: number; text: string })
       })
   }
   return (
-    <Stack direction="row" alignItems="center" spacing={0.5}>
-      <Tooltip title={failed ? '语音播放失败（可看下方转写文本）' : playing ? '暂停' : '播放语音'}>
-        <span>
-          <IconButton
-            size="small"
-            color={playing ? 'primary' : 'default'}
-            disabled={failed}
-            onClick={toggle}
-          >
-            {playing ? <PauseIcon fontSize="small" /> : <PlayArrowIcon fontSize="small" />}
-          </IconButton>
-        </span>
-      </Tooltip>
-      <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
-        {props.text || '[语音]'}
-      </Typography>
-    </Stack>
+    <Box>
+      <Stack direction="row" alignItems="center" spacing={0.5}>
+        <Tooltip title={failed ? '语音播放失败（可看下方转写文本）' : playing ? '暂停' : '播放语音'}>
+          <span>
+            <IconButton
+              size="small"
+              color={playing ? 'primary' : 'default'}
+              disabled={failed}
+              onClick={toggle}
+            >
+              {playing ? <PauseIcon fontSize="small" /> : <PlayArrowIcon fontSize="small" />}
+            </IconButton>
+          </span>
+        </Tooltip>
+        <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
+          {props.text || '[语音]'}
+        </Typography>
+      </Stack>
+      {/* 播放失败要「看得见」：只有 tooltip 的话用户不知道点了为什么没声音（批次 6 需求 4） */}
+      {failed && (
+        <Typography variant="caption" color="error" sx={{ display: 'block', pl: 0.5 }}>
+          语音加载失败，仅显示转写文字
+        </Typography>
+      )}
+    </Box>
   )
+}
+
+/** 原文行 → 语音纯文本（去时间前缀 / 群发送人前缀 / 语音标记）；非语音行返回空串。 */
+function voiceLineText(line: string): string {
+  if (!line.includes('[语音]')) return ''
+  let body = line.replace(/^\[\d{1,2}:\d{2}\]\s*/, '')
+  // 群消息行形如「张三: [语音] 文本」：仅当冒号后紧跟语音标记时才剥发送人
+  const withSender = body.match(/^[^:：]{1,64}[:：]\s*(\[语音\][\s\S]*)$/)
+  if (withSender) body = withSender[1]
+  return body.replace(/^\[语音\]\s*/, '').trim()
+}
+
+/**
+ * 原文行里能匹配到语音时返回其 local_id，否则 null。
+ *
+ * 先按「去前缀后的全文」精确匹配；不相等（换行/截断）时退化为包含匹配，
+ * 长文本优先，避免「好的」这类短句抢走别人的播放器。
+ */
+function matchVoiceLine(
+  line: string,
+  byText: Map<string, number>,
+  keysByLength: string[],
+): number | null {
+  const text = voiceLineText(line)
+  if (!text) return null
+  const exact = byText.get(text)
+  if (exact !== undefined) return exact
+  for (const key of keysByLength) {
+    if (key && key !== text && (text.includes(key) || key.includes(text))) {
+      return byText.get(key) ?? null
+    }
+  }
+  return null
 }
 
 /** 商机详情抽屉：原文/要点/上下文（独立加载）/回复框（@成员、引用）/操作。 */
@@ -189,6 +256,34 @@ export default function OpportunityDetail(props: {
       ),
     [contextQuery.data],
   )
+
+  // 原文（raw_text_display）里语音只是「[语音] 文本」纯文本，没有 local_id，
+  // 用户看不到播放按钮（批次 6 需求 4）。用上下文里 type='语音' 的条目按
+  // 「去掉 [语音] 前缀后的文本」建索引，匹配到的原文行就渲染成播放器。
+  const voiceIndex = useMemo(() => {
+    const byText = new Map<string, number>()
+    for (const m of contextItems) {
+      if (m.type !== '语音') continue
+      const key = m.content.replace(/^\[语音\]\s*/, '').trim()
+      // 同一句语音在窗口里出现多次时取第一条（不覆盖已有键）
+      if (!key || byText.has(key)) continue
+      byText.set(key, m.local_id)
+    }
+    // 兜底匹配用：长文本优先，避免短句抢走别人的播放器
+    const keysByLength = [...byText.keys()].sort((a, b) => b.length - a.length)
+    return { byText, keysByLength }
+  }, [contextItems])
+
+  const rawText = opp?.raw_text_display || opp?.raw_text || ''
+  const rawLines = useMemo(() => rawText.split('\n'), [rawText])
+  // 逐行尝试匹配语音；一行都匹配不到时保持原来的整段渲染（零行为变化）
+  const rawVoiceIds = useMemo(
+    () => rawLines.map(
+      (line) => matchVoiceLine(line, voiceIndex.byText, voiceIndex.keysByLength),
+    ),
+    [rawLines, voiceIndex],
+  )
+  const hasRawVoice = rawVoiceIds.some((localId) => localId !== null)
 
   // @ 群成员候选：群会话才有（后端按会话读微信库成员表，600s 缓存）
   const isGroup = (opp?.session_username ?? '').endsWith('@chatroom')
@@ -357,10 +452,38 @@ export default function OpportunityDetail(props: {
 
             <Typography variant="subtitle2">消息原文（合并窗口）</Typography>
             <Box sx={{ bgcolor: '#fbfbfb', border: '1px solid #eee', borderRadius: 1, p: 1.5, mb: 1.5 }}>
-              <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
-                {/* 群消息每行显示群昵称而非 wxid（后端已解析，反馈 6） */}
-                {opp.raw_text_display || opp.raw_text}
-              </Typography>
+              {hasRawVoice ? (
+                // 含语音：逐行渲染，语音行给播放按钮（文本与原文完全一致，仅多一个播放器）
+                <Box>
+                  {rawLines.map((line, idx) => {
+                    const localId = rawVoiceIds[idx]
+                    if (localId == null || !opp) {
+                      return (
+                        <Typography
+                          key={`raw-${idx}`}
+                          variant="body2"
+                          sx={{ whiteSpace: 'pre-wrap', minHeight: line ? undefined : '1em' }}
+                        >
+                          {line}
+                        </Typography>
+                      )
+                    }
+                    return (
+                      <VoicePlayer
+                        key={`raw-voice-${idx}-${localId}`}
+                        username={opp.session_username}
+                        localId={localId}
+                        text={voiceLineText(line)}
+                      />
+                    )
+                  })}
+                </Box>
+              ) : (
+                <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
+                  {/* 群消息每行显示群昵称而非 wxid（后端已解析，反馈 6） */}
+                  {opp.raw_text_display || opp.raw_text}
+                </Typography>
+              )}
             </Box>
 
             <Typography variant="subtitle2">上下文消息（最近 11 条，时间正序）</Typography>
