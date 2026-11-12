@@ -2433,6 +2433,61 @@ class WeChatDB:
             break
         return sessions
 
+    def get_session_row(self, username: str) -> Optional[dict]:
+        """读取单个会话的 SessionTable 行（kefu-system 群名片学习用）。
+
+        Returns:
+            {username, last_timestamp, last_msg_sender,
+             last_sender_display_name}；会话不存在返回 None。
+
+        ``last_sender_display_name`` 是微信客户端对最后一条消息发送者渲染
+        的名称快照（群聊里即「用户实际看见的」群昵称/备注），仅对每个
+        会话的最后一条消息有效——调用方须核对 last_msg_sender 与目标
+        消息发送者一致后再采纳，避免把 A 的名片记到 B 头上。
+        """
+        for rel, path, _ in self._db_files:
+            if os.path.basename(path) != "session.db":
+                continue
+            conn = self._open(rel)
+            try:
+                row = conn.execute(
+                    "SELECT username, last_timestamp, last_msg_sender, "
+                    "last_sender_display_name FROM SessionTable "
+                    "WHERE username=? LIMIT 1",
+                    (username,),
+                ).fetchone()
+            finally:
+                conn.close()
+            if row:
+                return {
+                    "username": row["username"],
+                    "last_timestamp": row["last_timestamp"],
+                    "last_msg_sender": row["last_msg_sender"],
+                    "last_sender_display_name": row["last_sender_display_name"],
+                }
+            break
+        return None
+
+    def get_session_times(self) -> Dict[str, int]:
+        """全部会话的 username → last_timestamp（搜索按近期活跃排序用）。"""
+        out: Dict[str, int] = {}
+        for rel, path, _ in self._db_files:
+            if os.path.basename(path) != "session.db":
+                continue
+            conn = self._open(rel)
+            try:
+                rows = conn.execute(
+                    "SELECT username, last_timestamp FROM SessionTable "
+                    "WHERE is_hidden=0"
+                ).fetchall()
+            finally:
+                conn.close()
+            for r in rows:
+                if r["username"]:
+                    out[r["username"]] = int(r["last_timestamp"] or 0)
+            break
+        return out
+
     def search_contact(self, keyword: str) -> List[dict]:
         """按昵称/备注/微信号搜索联系人"""
         results = []

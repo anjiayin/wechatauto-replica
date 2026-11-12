@@ -180,6 +180,8 @@ def create_app() -> FastAPI:
         sender.set_latest_lookup(wechat.get_latest_local_id)
         # 注入语音补转写（分析线程兜住历史上未转写的 [语音] 消息）
         pipeline.set_voice_lookup(wechat.transcribe_voice)
+        # 注入 @人 ID 还原（群聊 AI 判定上下文线索，批次 5 需求 ④）
+        pipeline.set_at_resolver(wechat.resolve_at_tokens)
         # 启动后台组件
         pipeline.start()
         sender.start()

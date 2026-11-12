@@ -6,6 +6,8 @@
 - GET /api/sessions/search?keyword=&limit=20&kind=all
 - GET /api/messages/{username}?before_seq=&limit=50
 - GET /api/messages/{username}/images/{local_id}   图片解密（反馈 2）
+- GET /api/messages/{username}/voice/{local_id}    语音播放 WAV（反馈 ⑧）
+- POST /api/wechat/jump                            跳转微信会话（反馈 ⑦）
 - GET /api/system/retention | POST /api/system/purge          历史数据（反馈 7）
 - GET /api/system/purge/last                                 上次清理留痕（本轮修复）
 - GET /api/system/billing                                     AI 账单（反馈 13）
@@ -27,6 +29,7 @@ from app.api.deps import (
     get_db,
     get_notifier,
     get_pipeline,
+    get_sender,
     get_wechat_service,
 )
 from app.config import (
@@ -56,10 +59,13 @@ from app.schemas import (
     StatusOut,
     VoiceRetryIn,
     VoiceRetryOut,
+    WechatJumpIn,
+    WechatJumpOut,
     WechatStatus,
     WorkerStatus,
 )
 from app.pipeline import Pipeline
+from app.sender import Sender
 from app.wechat_service import WeChatService
 
 logger = logging.getLogger(__name__)
@@ -201,6 +207,49 @@ def get_message_image(username: str, local_id: int,
     media_type = "image/png" if data[:4] == b"\x89PNG" else \
         "image/gif" if data[:3] == b"GIF" else "image/jpeg"
     return Response(content=data, media_type=media_type)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/wechat/jump   跳转微信（反馈 ⑦）
+# ---------------------------------------------------------------------------
+@router.post("/api/wechat/jump", response_model=WechatJumpOut)
+def jump_to_wechat(body: WechatJumpIn,
+                   sender: Sender = Depends(get_sender),
+                   ) -> WechatJumpOut:
+    """调起微信并打开指定会话的输入窗口（用户手动回复）。
+
+    与发送线程共用同一把 GUI 锁（``sender.jump_to_session`` 内部串行）：
+    正在发送时这里同步等待（最长 60s），成功/失败都返回 200 + 中文提示，
+    绝不 500。
+    """
+    ok, message = sender.jump_to_session(body.session_username,
+                                         body.session_name)
+    if not ok:
+        logger.info("跳转微信失败（%s / %s）：%s",
+                    body.session_username, body.session_name, message)
+    return WechatJumpOut(ok=ok, message=message)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/messages/{username}/voice/{local_id}   语音播放（反馈 ⑧）
+# ---------------------------------------------------------------------------
+@router.get("/api/messages/{username}/voice/{local_id}",
+            response_class=Response)
+def get_message_voice(username: str, local_id: int,
+                      svc: WeChatService = Depends(get_wechat_service),
+                      ) -> Response:
+    """返回指定语音消息的 WAV 音频（16kHz/16bit/单声道，本地解码）。
+
+    - 音频全程不出本机（与转写同一条取音频链路，只读本地微信库）；
+    - 解码结果落盘 voicecache/{username}_{local_id}.wav 复用；
+    - 不存在 / 解码失败 / 超过时长上限（与转写口径一致）回 404，
+      前端保持显示转写文本占位。
+    """
+    data = svc.get_voice_wav(username, local_id)
+    if not data:
+        raise HTTPException(status_code=404,
+                            detail="语音不存在、解码失败或超过时长上限")
+    return Response(content=data, media_type="audio/wav")
 
 
 # ---------------------------------------------------------------------------

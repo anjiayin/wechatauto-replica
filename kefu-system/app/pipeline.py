@@ -104,10 +104,34 @@ class Pipeline:
         # 用 setter 注入而不是构造参数：避免 pipeline ↔ wechat_service 循环依赖
         # （与 Sender.set_message_lookup 同一手法）。
         self._voice_lookup = None
+        # @人 ID → 群内显示名还原（批次 5 需求 ④，main.py 注入
+        # wechat_service.resolve_at_tokens；None = 不还原）。
+        self._at_resolver = None
 
     def set_voice_lookup(self, lookup) -> None:
         """注入语音补转写函数 ``(username, local_id) -> (text, error)``。"""
         self._voice_lookup = lookup
+
+    def set_at_resolver(self, resolver) -> None:
+        """注入 @人 ID 还原函数 ``(session_username, text) -> text``。"""
+        self._at_resolver = resolver
+
+    def _ai_input_text(self, unit: AnalysisUnit, unit_text: str) -> str:
+        """AI 判定的输入文本：群聊里把 @人 ID 还原为显示名（需求 ④）。
+
+        发送人前缀已在 Aggregator 入缓冲时剥离（需求 ①）；这里只处理
+        正文中的 ``@wxid_xxx`` 等 token——裸删会丢失「回复谁的报价」这条
+        上下文线索，还原为群昵称/备注后 AI 才能利用。还原失败（未注入
+        resolver / 私聊）原样返回。
+        """
+        if unit.session_kind != "group" or self._at_resolver is None:
+            return unit_text
+        try:
+            return str(self._at_resolver(unit.session_username, unit_text))
+        except Exception:
+            logger.exception("@人 ID 还原失败（按原文继续分析）：%s",
+                             unit.session_username)
+            return unit_text
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -262,11 +286,13 @@ class Pipeline:
                 model="", **base_log)
             return
         unit_text = unit.merged_text()
-        # 轻量预筛（可选）
+        # 轻量预筛（可选）：匹配文本先剔除 @人微信 ID token（批次 5 需求 ①
+        # ——筛选只匹配消息内容本身；剔除只影响匹配，不影响展示/落库文本）
         if analysis_cfg.get("prescreen_enabled"):
-            if not analyzer.prescreen(unit_text,
-                                      analysis_cfg.get("prescreen_keywords", ""),
-                                      analysis_cfg.get("prescreen_regex", "")):
+            if not analyzer.prescreen(
+                    content_format.strip_at_id_tokens(unit_text),
+                    analysis_cfg.get("prescreen_keywords", ""),
+                    analysis_cfg.get("prescreen_regex", "")):
                 base_log["e2e_ms"] = _elapsed_ms(time.time(), start_wall)
                 self._db.insert_analysis_log(status="skipped",
                                              error="预筛未命中", model="",
@@ -304,7 +330,8 @@ class Pipeline:
             try:
                 started = time.monotonic()
                 result = analyzer.analyze_unit(
-                    client, unit_text, unit.session_name, unit.session_kind,
+                    client, self._ai_input_text(unit, unit_text),
+                    unit.session_name, unit.session_kind,
                     unit.sender_name, unit.sender_wxid, unit.merged_count,
                     types, analysis_cfg.get("strictness", "balanced"),
                     examples=analysis_cfg.get("correction_examples") or [],
@@ -410,7 +437,10 @@ class Pipeline:
             logger.warning("未使用 AI 且未配置轻量筛选规则，分析单元被跳过："
                            "%s/%s", unit.session_name, unit.sender_name)
             return
-        hits = analyzer.prescreen_hits(unit_text, keywords, regex)
+        # 匹配文本剔除 @人微信 ID token（批次 5 需求 ①）：只匹配消息内容本身，
+        # 剔除只影响匹配判定，不影响落库展示文本与要点摘录
+        hits = analyzer.prescreen_hits(
+            content_format.strip_at_id_tokens(unit_text), keywords, regex)
         if not hits:
             base_log["e2e_ms"] = _elapsed_ms(time.time(), start_wall)
             self._db.insert_analysis_log(

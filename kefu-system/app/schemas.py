@@ -176,6 +176,8 @@ class AnalysisSettingsOut(BaseModel):
     merge_window_sec: int = 15         # 分析微窗口：发送人静默 N 秒即触发 AI 分析
     opp_merge_window_sec: int = 180    # 商机合并窗口：同一人 N 秒内再次命中合并为一条
     correction_examples: List[str] = Field(default_factory=list)  # 漏判修正示例（最多 20 条）
+    # 过滤自己发送的消息（默认 True：自己发的消息不进入商机分析，仅记 skipped 日志）
+    filter_self_messages: bool = True
 
 
 class AnalysisSettingsUpdate(BaseModel):
@@ -188,6 +190,8 @@ class AnalysisSettingsUpdate(BaseModel):
     opp_merge_window_sec: int = Field(default=180, ge=30, le=1800)
     # None = 不变更（防止部分更新的旧调用把已有示例意外清空）；[] = 显式清空
     correction_examples: Optional[List[str]] = None
+    # 过滤自己发送的消息（默认 True）
+    filter_self_messages: bool = True
 
 
 class NotifyUpdate(BaseModel):
@@ -295,6 +299,26 @@ class VoiceRetryOut(BaseModel):
     ok: bool = False
     text: str = ""
     error: str = ""
+
+
+class WechatJumpIn(BaseModel):
+    """「跳转微信」请求（反馈 ⑦）：调起微信并打开该会话的输入窗口。
+
+    - ``session_username``：会话 wxid（预留校验/日志用）；
+    - ``session_name``：会话显示名，open_chat 是 UIA 文本匹配，必须传。
+    """
+    session_username: str = ""
+    session_name: str
+
+
+class WechatJumpOut(BaseModel):
+    """跳转结果：``ok=False`` 时 ``message`` 为中文原因（前端弹 toast）。
+
+    跳转是 UIA 自动化（0.5~5s），同步等待；失败返回 200 + ok=False，
+    绝不 500。
+    """
+    ok: bool = False
+    message: str = ""
 
 
 class PurgeResult(BaseModel):

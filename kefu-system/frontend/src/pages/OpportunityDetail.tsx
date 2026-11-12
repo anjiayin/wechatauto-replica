@@ -24,12 +24,16 @@ import TaskAltIcon from '@mui/icons-material/TaskAlt'
 import UndoIcon from '@mui/icons-material/Undo'
 import SendIcon from '@mui/icons-material/Send'
 import FormatQuoteIcon from '@mui/icons-material/FormatQuote'
+import OpenInNewIcon from '@mui/icons-material/OpenInNew'
+import PlayArrowIcon from '@mui/icons-material/PlayArrow'
+import PauseIcon from '@mui/icons-material/Pause'
 import { apiGet, apiPatch, apiPost } from '../api/client'
 import type {
   GroupMembers,
   OpportunityContextOut,
   OpportunityDetail,
   ReplyPayload,
+  WechatJumpResult,
 } from '../api/types'
 
 interface SendResultData {
@@ -85,6 +89,63 @@ function ContextImage(props: { username: string; localId: number; fallback: stri
         mt: 0.5,
       }}
     />
+  )
+}
+
+/** 上下文中的语音消息：播放/暂停按钮（HTML5 audio）+ 转写文本（反馈 ⑧）。 */
+function VoicePlayer(props: { username: string; localId: number; text: string }) {
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+  const [playing, setPlaying] = useState(false)
+  const [failed, setFailed] = useState(false)
+  // 卸载时停掉音频，避免抽屉关闭后还在出声
+  useEffect(() => () => {
+    audioRef.current?.pause()
+    audioRef.current = null
+  }, [])
+  const toggle = () => {
+    if (playing) {
+      audioRef.current?.pause()
+      setPlaying(false)
+      return
+    }
+    if (!audioRef.current) {
+      const audio = new Audio(
+        `/api/messages/${encodeURIComponent(props.username)}/voice/${props.localId}`,
+      )
+      audio.onended = () => setPlaying(false)
+      audio.onpause = () => setPlaying(false)
+      audio.onerror = () => {
+        setPlaying(false)
+        setFailed(true)
+      }
+      audioRef.current = audio
+    }
+    audioRef.current
+      .play()
+      .then(() => setPlaying(true))
+      .catch(() => {
+        setPlaying(false)
+        setFailed(true)
+      })
+  }
+  return (
+    <Stack direction="row" alignItems="center" spacing={0.5}>
+      <Tooltip title={failed ? '语音播放失败（可看下方转写文本）' : playing ? '暂停' : '播放语音'}>
+        <span>
+          <IconButton
+            size="small"
+            color={playing ? 'primary' : 'default'}
+            disabled={failed}
+            onClick={toggle}
+          >
+            {playing ? <PauseIcon fontSize="small" /> : <PlayArrowIcon fontSize="small" />}
+          </IconButton>
+        </span>
+      </Tooltip>
+      <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
+        {props.text || '[语音]'}
+      </Typography>
+    </Stack>
   )
 }
 
@@ -226,6 +287,17 @@ export default function OpportunityDetail(props: {
     replyMutation.mutate(payload)
   }
 
+  // 跳转微信（反馈 ⑦）：调起微信并打开该会话的输入窗口（用户手动回复）
+  const jumpMutation = useMutation({
+    mutationFn: () =>
+      apiPost<WechatJumpResult>('/api/wechat/jump', {
+        session_username: opp?.session_username ?? '',
+        session_name: opp?.session_name ?? '',
+      }),
+    onSuccess: (resp) => setSnack({ ok: resp.ok, message: resp.message }),
+    onError: (err: Error) => setSnack({ ok: false, message: err.message }),
+  })
+
   /** 引用某条上下文消息（再点一次取消）。 */
   const toggleQuote = (localId: number) => {
     setQuoteLocalId((cur) => (cur === localId ? null : localId))
@@ -242,6 +314,19 @@ export default function OpportunityDetail(props: {
           <Typography variant="subtitle1" sx={{ flexGrow: 1 }}>
             {opp ? `${opp.type_name} · ${opp.session_name}` : '商机详情'}
           </Typography>
+          {opp && (
+            <Tooltip title="跳转微信：打开该会话的输入窗口（手动回复）">
+              <span>
+                <IconButton
+                  size="small"
+                  disabled={jumpMutation.isPending}
+                  onClick={() => jumpMutation.mutate()}
+                >
+                  <OpenInNewIcon fontSize="small" />
+                </IconButton>
+              </span>
+            </Tooltip>
+          )}
           <IconButton onClick={onClose} size="small">
             <CloseIcon />
           </IconButton>
@@ -339,6 +424,13 @@ export default function OpportunityDetail(props: {
                       username={opp.session_username}
                       localId={m.local_id}
                       fallback={m.content}
+                    />
+                  ) : m.type === '语音' && opp ? (
+                    // 语音消息（反馈 ⑧）：播放按钮 + 转写文本（去掉「[语音]」前缀）
+                    <VoicePlayer
+                      username={opp.session_username}
+                      localId={m.local_id}
+                      text={m.content.replace(/^\[语音\]\s*/, '')}
                     />
                   ) : (
                     <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>

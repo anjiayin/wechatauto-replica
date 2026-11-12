@@ -545,6 +545,86 @@ def _extract_text(stream) -> str:
     return str(text or "")
 
 
+# ---------------------------------------------------------------------------
+# 语音播放（反馈 ⑧）：SILK → WAV（16kHz/16bit/单声道）
+# ---------------------------------------------------------------------------
+def pcm_to_wav_bytes(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
+    """裸 PCM（16bit 单声道小端）加 44 字节标准 WAV 头。
+
+    与解码产物严格对应：``silk_v3_decoder -Fs_API 16000`` 输出
+    16kHz/16bit/mono 裸 PCM（见模块文档），这里只补头不改数据。
+    """
+    import struct
+    channels = 1
+    bits = 16
+    block_align = channels * bits // 8          # 2：一帧采样字节数
+    byte_rate = sample_rate * block_align       # 每秒字节数
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", 36 + len(pcm), b"WAVE",
+        b"fmt ", 16,                            # fmt 块大小（PCM 固定 16）
+        1, channels,                            # PCM / 单声道
+        sample_rate, byte_rate, block_align, bits,
+        b"data", len(pcm),
+    )
+    return header + bytes(pcm)
+
+
+def _write_wav_cache(target: Path, data: bytes) -> None:
+    """把 WAV 落盘缓存（先写 .part 再原子改名，避免半截文件被复用）。"""
+    part = target.with_name(target.name + ".part")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(part, "wb") as fh:
+            fh.write(data)
+        os.replace(part, target)
+    except OSError:
+        logger.debug("写入 WAV 缓存失败（已忽略）：%s", target, exc_info=True)
+        _discard_file(part)
+
+
+def silk_to_wav(silk_path: str, wav_path: Optional[Path] = None,
+                max_seconds: int = 0) -> tuple[Optional[bytes], str]:
+    """把 .silk 解码为 WAV 字节，可选落盘缓存；失败返回 (None, 中文原因)。
+
+    供语音播放接口（GET /api/messages/{username}/voice/{local_id}）使用：
+    只依赖 SILK 解码器，**不加载识别模型**（播放不需要识别）。时长上限
+    与转写口径一致（``max_seconds``>0 时超长直接拒绝）。
+
+    Args:
+        silk_path: SILK 原始文件路径。
+        wav_path: 可选缓存落盘路径（voicecache/{username}_{local_id}.wav）。
+        max_seconds: 播放时长上限（秒），0 = 不限制（与转写一致应传上限）。
+
+    Returns:
+        (WAV 字节, 失败原因)。成功时原因为空串；**任何异常都在内部
+        转成中文原因，绝不抛给调用方**（HTTP 层据此回结构化 404）。
+    """
+    transcriber = get_transcriber()
+    if not transcriber._decoder_path.is_file():
+        return None, "缺少 SILK 解码器 tools/silk_v3_decoder.exe，无法解码语音"
+    path = Path(str(silk_path or ""))
+    if not path.is_file():
+        return None, "语音文件不存在或已被清理"
+    try:
+        pcm = transcriber._decode_silk(path)
+    except _AsrError as exc:
+        return None, str(exc)
+    except Exception as exc:  # 防御：解码链路意外异常
+        logger.exception("语音解码异常（播放）：%s", path)
+        return None, f"语音解码失败：{exc}"
+    duration_sec = len(pcm) / 2.0 / SAMPLE_RATE
+    if duration_sec <= 0.05:
+        return None, "语音内容为空或解码结果异常"
+    if max_seconds and duration_sec > max_seconds:
+        return None, (f"语音过长（约 {duration_sec:.0f} 秒，超过上限 "
+                      f"{max_seconds} 秒），不支持播放")
+    wav = pcm_to_wav_bytes(pcm)
+    if wav_path is not None:
+        _write_wav_cache(Path(wav_path), wav)
+    return wav, ""
+
+
 # SenseVoice 输出可能带 <|zh|><|NEUTRAL|><|Speech|> 这类标签，展示前剥掉
 _LABEL_RE = re.compile(r"<\|[^|]*\|>")
 

@@ -25,6 +25,7 @@ from app.config import (
     KEY_ANALYSIS_MERGE_WINDOW,
     KEY_ANALYSIS_OPP_MERGE_WINDOW,
     KEY_ANALYSIS_CORRECTION_EXAMPLES,
+    KEY_ANALYSIS_FILTER_SELF,
     KEY_ANALYSIS_MIN_CONFIDENCE,
     KEY_ANALYSIS_PRESCREEN_ENABLED,
     KEY_ANALYSIS_PRESCREEN_KEYWORDS,
@@ -162,6 +163,20 @@ DDL_STATEMENTS: tuple[str, ...] = (
       username   TEXT PRIMARY KEY,
       sort_seq   INTEGER NOT NULL,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+    """,
+    # 群成员「微信端实际显示名」学习缓存（批次 5 需求 ②）：微信 4.x 本地库
+    # 不存群名片（contact.nick_name 是全局昵称），而 session.db 的
+    # last_sender_display_name 是微信客户端渲染的发送者名称（群内即群昵称/
+    # 备注）。消息到达时按 (群, 成员) 落入本表，供发送人显示名解析优先采用，
+    # 与用户在微信里看见的名字保持一致。持久化：重启后已学习到的名片不丢。
+    """
+    CREATE TABLE IF NOT EXISTS group_cards (
+      chatroom   TEXT NOT NULL,
+      member     TEXT NOT NULL,
+      card       TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+      PRIMARY KEY (chatroom, member)
     )
     """,
     # 语音消息转写结果缓存：同一条语音会在商机上下文/消息列表里被反复读到，
@@ -1073,6 +1088,42 @@ class Database:
             self._conn.commit()
 
     # ------------------------------------------------------------------
+    # 群名片学习缓存 DAO（group_cards，批次 5 需求 ②）
+    # ------------------------------------------------------------------
+    def get_group_cards(self, chatroom: str) -> dict[str, str]:
+        """读取一个群已学习到的成员微信端显示名（username → 群名片）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT member, card FROM group_cards WHERE chatroom=?",
+                (str(chatroom or ""),),
+            ).fetchall()
+        return {r["member"]: r["card"] for r in rows if r["card"]}
+
+    def save_group_card(self, chatroom: str, member: str, card: str) -> None:
+        """写入/覆盖一条群名片学习结果（INSERT OR REPLACE）。
+
+        注意：名片可能随时被成员改掉，但新消息到达时会持续覆盖更新，
+        最终一致；不做 TTL 失效（名片过期只影响显示，不影响判定）。
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO group_cards "
+                "(chatroom, member, card, updated_at) VALUES (?, ?, ?, ?)",
+                (str(chatroom or ""), str(member or ""), str(card or ""),
+                 now_iso()),
+            )
+            self._conn.commit()
+
+    def delete_group_cards(self, chatroom: str) -> int:
+        """删除一个群的全部学习名片（成员退出群等场景预留）。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM group_cards WHERE chatroom=?", (str(chatroom or ""),)
+            )
+            self._conn.commit()
+            return int(cur.rowcount)
+
+    # ------------------------------------------------------------------
     # 语音转写缓存 DAO（voice_texts）
     # ------------------------------------------------------------------
     def get_voice_text(self, username: str, local_id: int) -> Optional[dict]:
@@ -1200,6 +1251,8 @@ def read_analysis_settings(db: Database) -> dict[str, Any]:
         "opp_merge_window_sec": db.get_int(KEY_ANALYSIS_OPP_MERGE_WINDOW, 180),
         "correction_examples": read_correction_examples(db),
         "compliance_confirmed": db.get_bool(KEY_COMPLIANCE_CONFIRMED),
+        # 过滤自己发送的消息（默认 True：自己发的消息不进入商机分析）
+        "filter_self_messages": db.get_setting(KEY_ANALYSIS_FILTER_SELF, "1") != "0",
     }
 
 

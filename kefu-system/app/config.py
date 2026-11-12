@@ -132,6 +132,8 @@ KEY_ANALYSIS_PRESCREEN_REGEX = "analysis.prescreen_regex"
 KEY_ANALYSIS_MERGE_WINDOW = "analysis.merge_window_sec"
 KEY_ANALYSIS_OPP_MERGE_WINDOW = "analysis.opp_merge_window_sec"
 KEY_ANALYSIS_CORRECTION_EXAMPLES = "analysis.correction_examples"  # JSON 数组字符串
+# 是否过滤自己发送的消息（默认 "1"=过滤：不进入商机分析，仅记 skipped 日志）
+KEY_ANALYSIS_FILTER_SELF = "analysis.filter_self_messages"
 KEY_NOTIFY_SOUND = "notify.sound_enabled"
 # 语音消息自动转文字（本地离线识别，音频绝不上传外部服务）
 KEY_ASR_ENABLED = "asr.enabled"
@@ -168,6 +170,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     KEY_ANALYSIS_MERGE_WINDOW: str(MERGE_WINDOW_SEC_DEFAULT),
     KEY_ANALYSIS_OPP_MERGE_WINDOW: str(OPP_MERGE_WINDOW_SEC_DEFAULT),
     KEY_ANALYSIS_CORRECTION_EXAMPLES: "[]",
+    KEY_ANALYSIS_FILTER_SELF: "1",   # 过滤自己发送的消息（默认开启）
     KEY_NOTIFY_SOUND: "0",
     KEY_ASR_ENABLED: "1",          # 语音消息自动转文字（本地离线识别）
     KEY_ASR_MAX_SECONDS: "180",    # 单条语音转写时长上限（秒）

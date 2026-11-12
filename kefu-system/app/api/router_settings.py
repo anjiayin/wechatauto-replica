@@ -26,6 +26,7 @@ from app.config import (
     KEY_AI_TEMPERATURE,
     KEY_AI_TIMEOUT_SEC,
     KEY_ANALYSIS_CORRECTION_EXAMPLES,
+    KEY_ANALYSIS_FILTER_SELF,
     KEY_ANALYSIS_MERGE_WINDOW,
     KEY_ANALYSIS_OPP_MERGE_WINDOW,
     KEY_ANALYSIS_MIN_CONFIDENCE,
@@ -140,6 +141,7 @@ def _analysis_out(db: Database) -> AnalysisSettingsOut:
                                     MERGE_WINDOW_SEC_DEFAULT),
         opp_merge_window_sec=db.get_int(KEY_ANALYSIS_OPP_MERGE_WINDOW, 180),
         correction_examples=read_correction_examples(db),
+        filter_self_messages=db.get_setting(KEY_ANALYSIS_FILTER_SELF, "1") != "0",
     )
 
 
@@ -165,6 +167,9 @@ def update_analysis_settings(body: AnalysisSettingsUpdate,
     db.set_setting(KEY_ANALYSIS_MERGE_WINDOW, str(body.merge_window_sec))
     db.set_setting(KEY_ANALYSIS_OPP_MERGE_WINDOW,
                    str(body.opp_merge_window_sec))
+    # 过滤自己发送的消息（批次 5 需求 ⑤，默认开启）
+    db.set_setting(KEY_ANALYSIS_FILTER_SELF,
+                   "1" if body.filter_self_messages else "0")
     # 漏判修正示例：None = 不变更（防部分更新误清空）；列表 = 全量替换
     #（服务端钳制：去空 + 截断 200 字/条 + 最多 20 条 FIFO 淘汰最旧）
     if body.correction_examples is not None:

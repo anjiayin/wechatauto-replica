@@ -5,6 +5,7 @@ import {
   Box,
   Button,
   Chip,
+  CircularProgress,
   Dialog,
   DialogActions,
   DialogContent,
@@ -32,6 +33,7 @@ import EditIcon from '@mui/icons-material/Edit'
 import DeleteIcon from '@mui/icons-material/Delete'
 import AddIcon from '@mui/icons-material/Add'
 import ReplayIcon from '@mui/icons-material/Replay'
+import RefreshIcon from '@mui/icons-material/Refresh'
 import { apiGet, apiPost, apiPut, qs } from '../api/client'
 import type {
   AnalysisLogItem,
@@ -149,7 +151,7 @@ export default function AnalysisLogs() {
     [page, pageSize, status, session, keyword],
   )
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, refetch } = useQuery({
     queryKey: ['analysis-logs', query],
     queryFn: () => apiGet<AnalysisLogListOut>(query),
   })
@@ -276,6 +278,19 @@ export default function AnalysisLogs() {
             setKeywordInput(e.target.value)
           }}
         />
+        {/* 刷新（反馈 ⑨）：按当前筛选条件重新拉取列表，加载时按钮转圈 */}
+        <Tooltip title="按当前筛选条件刷新" arrow>
+          <span>
+            <IconButton
+              aria-label="刷新分析日志"
+              disabled={isLoading}
+              onClick={() => refetch()}
+              sx={{ mt: 0.5 }}
+            >
+              {isLoading ? <CircularProgress size={20} /> : <RefreshIcon />}
+            </IconButton>
+          </span>
+        </Tooltip>
       </Stack>
 
       <Paper variant="outlined">

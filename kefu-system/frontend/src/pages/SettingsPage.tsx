@@ -825,6 +825,8 @@ function AiTab() {
   const [customRegex, setCustomRegex] = useState('')
   const [mergeWindow, setMergeWindow] = useState(15)
   const [oppMergeWindow, setOppMergeWindow] = useState(180)
+  // 过滤自己发送的消息（默认勾选：自己发的消息不进入商机分析，批次 5 需求 ⑤）
+  const [filterSelf, setFilterSelf] = useState(true)
   const [analysisLoaded, setAnalysisLoaded] = useState(false)
   if (analysis && !analysisLoaded) {
     setStrictness(analysis.strictness)
@@ -836,6 +838,7 @@ function AiTab() {
     setCustomRegex(parsed.customRegex)
     setMergeWindow(analysis.merge_window_sec)
     setOppMergeWindow(analysis.opp_merge_window_sec)
+    setFilterSelf(analysis.filter_self_messages !== false)
     setAnalysisLoaded(true)
   }
 
@@ -875,6 +878,7 @@ function AiTab() {
         prescreen_regex: mergePrescreen(selectedPresets, customRegex),
         merge_window_sec: mergeWindow,
         opp_merge_window_sec: oppMergeWindow,
+        filter_self_messages: filterSelf,
         correction_examples: analysis?.correction_examples ?? [],
       }),
     onSuccess: () => {
@@ -1105,6 +1109,16 @@ function AiTab() {
       <Divider sx={{ my: 2 }} />
       <Typography variant="subtitle2" sx={{ mb: 1 }}>分析判定</Typography>
       <Stack spacing={2} sx={{ mb: 2 }}>
+        {/* 过滤自己发送的消息（批次 5 需求 ⑤，默认勾选） */}
+        <FormControlLabel
+          control={
+            <Switch
+              checked={filterSelf}
+              onChange={(e) => setFilterSelf(e.target.checked)}
+            />
+          }
+          label="过滤自己发送的消息（推荐开启）：自己在监控会话里发出的消息不进入商机分析，只在分析日志中留痕；关闭后自己发送的消息照常分析"
+        />
         <TextField
           select
           label="判定严格度"

@@ -42,7 +42,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是微信群聊/私聊消息的销售商机分�
 4. quote 必须是原文的逐字摘录。
 5. direction 判断商机方向：发送人表达"求购/找货/收货/谁有"等买入意向为 "buy"；表达"出售/供货/有货/低价处理"等卖出意向为 "sell"；无法判断或非商机时为 ""。
 6. 只输出一个 JSON 对象，不要输出任何其他文字或 Markdown 代码块标记。
-{examples_block}
+{group_at_block}{examples_block}
 
 ## 输出 JSON 格式
 {{"hit": <bool>, "type": <string|null>, "points": <string[]>, "confidence": <0-100>, "quote": <string>, "direction": <"buy"|"sell"|"">}}"""
@@ -53,6 +53,12 @@ _EXAMPLES_HEADER = (
     "以下是用户确认过的真实商机消息示例，与此相似的消息"
     "（尤其包含配件 OE 号、车型、配件名称、价格、数量等交易要素的）应判定为商机："
 )
+
+# 群聊 @人判定指引（批次 5 需求 ④）：群聊消息 @某人 通常是回复对方先前的
+# 报价/供货/询价，是商机判定的重要上下文线索（仅群聊注入 Prompt）。
+_GROUP_AT_GUIDANCE = """
+7. 群聊指引：消息中 @某人 通常意味着发送人在**回复被 @ 者此前的报价、供货、询价或求助内容**（如 "@某某 45一个出" 是对对方询价的报价回复），应结合上下文判断是否商机；被 @ 的人的名字（已还原为群昵称/备注）是重要的上下文线索，quote 保留原文中的 @ 部分。
+"""
 
 _STRICTNESS_LABELS = {
     "lenient": "宽松（lenient）",
@@ -82,13 +88,16 @@ def format_examples_block(examples: Optional[List[str]]) -> str:
 
 
 def build_system_prompt(types: List[dict], strictness: str = "balanced",
-                        examples: Optional[List[str]] = None) -> str:
+                        examples: Optional[List[str]] = None,
+                        group_chat: bool = False) -> str:
     """构造系统提示词。
 
     Args:
         types: 启用的商机类型 dict 列表（name/description）。
         strictness: lenient / balanced / strict。
         examples: 用户确认过的真实商机消息示例（漏判修正，最多注入 20 条）。
+        group_chat: 是否群聊会话（群聊注入「@某人 = 回复对方」的判定指引，
+            批次 5 需求 ④）。
     """
     strictness = strictness if strictness in _STRICTNESS_LABELS else "balanced"
     if types:
@@ -103,6 +112,7 @@ def build_system_prompt(types: List[dict], strictness: str = "balanced",
         types_block=types_block,
         strictness_label=_STRICTNESS_LABELS[strictness],
         strictness_rules=_STRICTNESS_RULES[strictness],
+        group_at_block=_GROUP_AT_GUIDANCE if group_chat else "",
         examples_block=format_examples_block(examples),
     )
 
@@ -513,7 +523,8 @@ def analyze_unit(client: AIClient, unit_text: str, session_name: str,
     Raises:
         AIError: 调用或解析失败。
     """
-    system_prompt = build_system_prompt(types, strictness, examples=examples)
+    system_prompt = build_system_prompt(types, strictness, examples=examples,
+                                        group_chat=(session_kind == "group"))
     user_message = build_user_message(
         unit_text, session_name, session_kind, sender_name, sender_wxid, msg_count
     )

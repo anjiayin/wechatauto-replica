@@ -152,6 +152,8 @@ export interface AnalysisSettings {
   opp_merge_window_sec: number
   /** 漏判修正：用户确认过的真实商机消息示例（最多 20 条） */
   correction_examples: string[]
+  /** 过滤自己发送的消息（默认 true：自己发的消息不进入商机分析） */
+  filter_self_messages: boolean
 }
 
 export interface AnalysisSettingsPayload extends AnalysisSettings {}
@@ -344,4 +346,11 @@ export interface AsrStatus {
 export interface WsEvent {
   event: string
   data: unknown
+}
+
+/** POST /api/wechat/jump：跳转微信（调起微信并打开该会话输入窗口） */
+export interface WechatJumpResult {
+  ok: boolean
+  /** 中文提示（成功/失败原因，直接展示） */
+  message: string
 }

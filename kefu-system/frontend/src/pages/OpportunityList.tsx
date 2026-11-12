@@ -7,6 +7,7 @@ import {
   IconButton,
   MenuItem,
   Paper,
+  Snackbar,
   Stack,
   Table,
   TableBody,
@@ -23,12 +24,14 @@ import ReplyIcon from '@mui/icons-material/Reply'
 import TaskAltIcon from '@mui/icons-material/TaskAlt'
 import ContentCopyIcon from '@mui/icons-material/ContentCopy'
 import CheckIcon from '@mui/icons-material/Check'
+import OpenInNewIcon from '@mui/icons-material/OpenInNew'
 import { apiGet, apiPatch, apiPost, qs } from '../api/client'
 import { consumePendingOpportunity } from '../hooks/pendingOpportunity'
 import type {
   OpportunityListOut,
   OpportunityType,
   StatusOut,
+  WechatJumpResult,
 } from '../api/types'
 import OpportunityDetail from './OpportunityDetail'
 
@@ -178,6 +181,15 @@ export default function OpportunityList() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['status'] })
     },
+  })
+
+  // 跳转微信（反馈 ⑦）：调起微信并打开该会话的输入窗口（用户手动回复）
+  const [jumpSnack, setJumpSnack] = useState<{ ok: boolean; message: string } | null>(null)
+  const jumpMutation = useMutation({
+    mutationFn: (payload: { session_username: string; session_name: string }) =>
+      apiPost<WechatJumpResult>('/api/wechat/jump', payload),
+    onSuccess: (resp) => setJumpSnack({ ok: resp.ok, message: resp.message }),
+    onError: (err: Error) => setJumpSnack({ ok: false, message: err.message }),
   })
 
   const items = data?.items ?? []
@@ -422,6 +434,22 @@ export default function OpportunityList() {
                       <ReplyIcon fontSize="small" />
                     </IconButton>
                   </Tooltip>
+                  <Tooltip title="跳转微信：打开该会话的输入窗口（手动回复）">
+                    <span>
+                      <IconButton
+                        size="small"
+                        disabled={jumpMutation.isPending}
+                        onClick={() =>
+                          jumpMutation.mutate({
+                            session_username: o.session_username,
+                            session_name: o.session_name,
+                          })
+                        }
+                      >
+                        <OpenInNewIcon fontSize="small" />
+                      </IconButton>
+                    </span>
+                  </Tooltip>
                   <Tooltip title="标记非商机">
                     <IconButton
                       size="small"
@@ -462,6 +490,16 @@ export default function OpportunityList() {
       </Paper>
 
       <OpportunityDetail id={detailId} onClose={() => setDetailId(null)} />
+
+      {/* 跳转微信结果 toast（UIA 操作 0.5~5s，成功/失败都要给反馈） */}
+      <Snackbar
+        open={jumpSnack !== null}
+        autoHideDuration={6000}
+        onClose={() => setJumpSnack(null)}
+        message={jumpSnack?.message}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+        ContentProps={{ sx: { bgcolor: jumpSnack?.ok ? 'success.main' : 'error.main' } }}
+      />
     </Box>
   )
 }

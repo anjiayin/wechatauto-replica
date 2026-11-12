@@ -28,6 +28,16 @@ _TAG_RE = re.compile(r"<[^>]+>")
 _TYPE_SEP_RE = re.compile(r"[\s/／、,，·]+")
 # 群消息正文首部的发送者前缀行（"wxid_xxx:" / "群昵称:"，独占首行）
 _SENDER_LINE_RE = re.compile(r"^([^\s:：/]{2,64})\s*[:：]\s*$")
+# 群消息正文首部的发送者 ID（与 wechat_service.extract_content_sender 同一口径）：
+# - ID 字符集排除 "/"（URL 路径字符）；
+# - 冒号后紧跟 "//" 视为 URL scheme（如 http://...），不提取（BUG-3）。
+# 该正则同时被 wechat_service 复用（发送者提取与剥离的唯一权威口径）。
+SENDER_ID_STRICT_RE = re.compile(r"^([^\s:：/]{2,64})\s*:(?!//)\s*")
+# @人微信 ID 形 token：@wxid_xxx / @xxx@chatroom / @xxx@openim 等
+# （预筛匹配前剔除用，只影响匹配，不影响展示文本）
+_AT_ID_TOKEN_RE = re.compile(
+    r"@(?:wxid_[0-9A-Za-z_-]{5,}"
+    r"|[0-9A-Za-z_.-]{1,64}@(?:chatroom|openim))")
 
 
 def _norm_type(type_name: str) -> str:
@@ -63,6 +73,36 @@ def _strip_sender_prefix(content: str) -> str:
     if sep and _SENDER_LINE_RE.match(first.strip()):
         return rest.lstrip("\n")
     return content
+
+
+def strip_group_sender_prefix(content: str) -> str:
+    """去掉群消息正文首部的发送者前缀（共享口径，供 Aggregator 等调用）。
+
+    与 :func:`wechat_service.WeChatService.extract_content_sender` 使用同一
+    严格正则（:data:`SENDER_ID_STRICT_RE`）。微信 4.x 原生格式为
+    ``ID:\\n正文``（前缀独占首行）：先按换行切分，首行命中前缀即整行剥离；
+    未命中保持原样返回，避免误吃「9:30 开会」「注意：明天开会」
+    「http://...」这类无前缀正文（同行的「ID: 正文」形态仅用于发送者
+    提取，不做剥离——正文可能是任何带冒号的话）。
+
+    用途：分析输入（合并文本/预筛/AI prompt）只匹配消息内容本身，
+    不匹配发送人微信 ID（批次 5 需求 ①）。
+    """
+    body = str(content or "").lstrip()
+    first, sep, rest = body.partition("\n")
+    if sep and SENDER_ID_STRICT_RE.match(first):
+        return rest.lstrip("\n")
+    return content
+
+
+def strip_at_id_tokens(text: str) -> str:
+    """剔除文本中的 @人微信 ID 形 token（仅用于匹配，不影响展示）。
+
+    形态：``@wxid_xxx``、``@xxx@chatroom``、``@xxx@openim``。群聊里 @人
+    的 token 属于「对话对象标记」而非业务内容，预筛关键词/正则匹配前
+    剔除，避免 ``@wxid_采购`` 这类 ID 恰好含关键词造成误命中。
+    """
+    return _AT_ID_TOKEN_RE.sub("", str(text or ""))
 
 
 def _xml_parse(text: str) -> Optional[ET.Element]:

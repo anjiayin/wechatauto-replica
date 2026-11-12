@@ -22,6 +22,7 @@ from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 from app.config import AGGREGATOR_FORCE_FLUSH_FACTOR
+from app import content_format
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +99,14 @@ class Aggregator:
         Args:
             msg: Listener 回调消息 dict（content/sender_username/create_time）。
         """
-        content = (msg.get("content") or "").strip()
+        # 群消息正文首部带「发送者ID:\n」前缀（微信 4.x 原生格式）：入缓冲
+        # 前剥离，使合并文本/预筛匹配/AI 输入只含消息内容本身，不匹配
+        # 发送人微信 ID（批次 5 需求 ①）。发送人身份由 wechat_service
+        # 权威解析后另行携带（sender_username/sender_display_name）。
+        content = str(msg.get("content") or "")
+        if session_kind == "group":
+            content = content_format.strip_group_sender_prefix(content)
+        content = content.strip()
         if not content:
             return False
         epoch = float(msg.get("create_time") or 0) or datetime.now().timestamp()

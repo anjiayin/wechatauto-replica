@@ -24,6 +24,7 @@ from typing import List, Optional
 
 from app import db as dbmod
 from app import content_format
+from app.content_format import SENDER_ID_STRICT_RE
 from app import voice_asr
 from app.aggregator import Aggregator
 from app.config import (
@@ -39,6 +40,7 @@ from app.config import (
     WATERMARK_FLUSH_SEC,
     KEY_ASR_ENABLED,
     KEY_ASR_MAX_SECONDS,
+    KEY_ANALYSIS_FILTER_SELF,
     KEY_RUNTIME_CACHE_DIR,
     KEY_RUNTIME_WM_SAVED_AT,
     CACHE_DIR_DEFAULT,
@@ -64,14 +66,19 @@ MSG_ASR_NO_VOICE = "微信尚未下载该语音（在微信里点开播放一次
 # 原生格式为 "发送者ID:\n正文"；sender_id 映射不可靠，此前缀为权威发送者。
 # 显示渲染侧用（逐行处理，行内无换行，$ 锚点安全）：
 _SENDER_PREFIX_RE = re.compile(r"^([^\s:：]{2,64})\s*:\s*(.*)$")
-# 发送者提取侧用（严格版）：
+# 发送者提取/剥离用严格正则统一收敛到 content_format.SENDER_ID_STRICT_RE
+# （与 Aggregator 剥前缀共享同一口径，批次 5 需求 ①）：
 # - ID 字符集排除 "/"（URL 路径字符）；
 # - 冒号后紧跟 "//" 视为 URL scheme（如 http://...），不提取（BUG-3）；
 # - 提取时先按换行切分仅取首行，避免多行正文匹配失败回退到不可靠
 #   sender_username 映射（BUG-1，见 extract_content_sender）。
-_SENDER_ID_STRICT_RE = re.compile(r"^([^\s:：/]{2,64})\s*:(?!//)\s*")
 # 合并文本行首的 "[HH:MM] " 时间前缀（Aggregator.merged_text 系统加的）
 _TIME_PREFIX_RE = re.compile(r"^\[\d{1,2}:\d{2}\]\s*")
+# 群聊消息里的 @人微信 ID token（AI 输入还原显示名用，需求 ④）：
+# @wxid_xxx / @xxx@chatroom / @xxx@openim
+_AT_ID_TOKEN_RE = re.compile(
+    r"@(?:wxid_[0-9A-Za-z_-]{5,}"
+    r"|[0-9A-Za-z_.-]{1,64}@(?:chatroom|openim))")
 
 # 微信内置系统会话 / 占位账号：不对应真人或真实群，参与监控毫无意义，
 # 但它们在 contact/session 表里与普通联系人同形，且按 username 排序时
@@ -130,6 +137,12 @@ class WeChatService:
         # 群成员显示名缓存（chatroom → (timestamp, {username: 显示名})，TTL 600s）
         self._group_members_cache: dict[str, tuple[float, dict[str, str], bool]] = {}
         self._group_members_lock = threading.Lock()
+        # 会话最后消息时间缓存（username → last_timestamp，搜索按近期活跃
+        # 排序用；与联系人列表缓存同 TTL，构建时一并失效）
+        self._session_times: dict[str, int] = {}
+        self._session_times_ts: float = 0.0
+        # 当前登录账号 wxid（过滤自己发送的消息用，懒加载缓存）
+        self._self_wxid: str = ""
         # 媒体下载器懒加载单例（MediaDownloader 首次使用会解密媒体库，约 13s，
         # 不能每条消息/每张图片都新建一个）。图片与语音共用同一实例。
         self._media_downloader = None
@@ -345,6 +358,30 @@ class WeChatService:
             mtype = str(msg.get("type") or "")
             kind = "group" if username.endswith("@chatroom") else "friend"
             sender_wxid, sender_name = self._resolve_sender(username, kind, msg)
+            # 过滤自己发送的消息（批次 5 需求 ⑤，设置默认开启）：
+            # 自己发的消息不进入商机分析，仅落一条 skipped 日志留痕，
+            # 也不进入漏判修正候选（skipped 状态不参与修正示例挑选）。
+            if self._filter_self_enabled() and self._is_self_message(
+                    kind, msg, sender_wxid):
+                # 日志留痕文本与管线口径一致：群消息剥发送人前缀（需求 ①）
+                content = str(msg.get("content") or "")
+                if kind == "group":
+                    content = content_format.strip_group_sender_prefix(content)
+                self._db.insert_analysis_log(
+                    session_username=username,
+                    sender_wxid=sender_wxid,
+                    msg_count=1,
+                    input_text=content_format.format_content(
+                        mtype, content)[:200],
+                    status="skipped",
+                    error="自己发送的消息已过滤（设置 → 分析判定）",
+                )
+                return
+            # 群消息到达即学习「微信端实际显示的发送者名称」（群名片，
+            # 批次 5 需求 ②）：session.db 的 last_sender_display_name 是
+            # 微信客户端自己渲染的名字，落库后供显示名解析优先采用。
+            if kind == "group" and sender_wxid:
+                self._learn_group_card(username, sender_wxid)
             if mtype != "文本":
                 if content_format.is_voice_type(mtype):
                     local_id = int(msg.get("local_id") or 0)
@@ -550,20 +587,23 @@ class WeChatService:
           ``http://...`` 开头的无前缀正文）不提取——BUG-3。
         """
         first_line = str(content or "").lstrip().split("\n", 1)[0]
-        match = _SENDER_ID_STRICT_RE.match(first_line)
+        match = SENDER_ID_STRICT_RE.match(first_line)
         return match.group(1) if match else ""
 
     def _get_group_member_names(self, chatroom: str) -> dict[str, str]:
-        """群成员 username → 显示名映射（好友备注优先，缓存 TTL 600s）。
+        """群成员 username → 显示名映射（缓存 TTL 600s）。
 
         wechatauto.get_group_members 返回字段：username / nick_name /
-        remark / is_owner。显示名优先级（与产品口径一致）：
+        remark / is_owner。显示名优先级（批次 5 需求 ②：与用户在微信里
+        实际看见的名字一致）：
 
-        1. ``remark``：我对该成员的好友备注（好友场景，如群内昵称被对方
-           自定义为花名时仍显示备注）；
-        2. ``nick_name``：contact 表昵称——对群内非好友，微信会把其
-           群内显示名同步为 contact 昵称（实测 nickname 即群名片）；
-        3. 回退成员 username。
+        1. ``group_cards`` 学习到的微信端显示名（session.db 的
+           last_sender_display_name，即微信客户端渲染的群昵称/备注；
+           微信 4.x 本地库不存群名片，contact.nick_name 是全局昵称，
+           实测与群名片经常不同——这是此前显示错乱的根因）；
+        2. ``remark``：我对该成员的好友备注；
+        3. ``nick_name``：contact 表昵称（全局昵称）；
+        4. 回退成员 username。
 
         读取失败回退空映射，但失败结果只缓存 15 秒（避免微信写库期
         读取抖动把空映射钉死 600 秒，导致整段时间内发送人显示错误）。
@@ -588,6 +628,16 @@ class WeChatService:
                 ok = True
             except Exception as exc:
                 logger.warning("读取群成员列表失败（%s）：%s", chatroom, exc)
+        # 叠加学习到的微信端显示名（群名片优先于全局昵称/备注：它就是
+        # 微信 UI 渲染出来的名字；成员不在群成员表时忽略，防离群残留）
+        if names:
+            try:
+                for uid, card in (self._db.get_group_cards(chatroom)
+                                  or {}).items():
+                    if uid in names and card:
+                        names[uid] = card
+            except Exception:
+                logger.exception("读取群名片缓存失败（按无名片处理）")
         with self._group_members_lock:
             self._group_members_cache[chatroom] = (time.monotonic(), names, ok)
         return names
@@ -687,6 +737,130 @@ class WeChatService:
         if not display:
             return ""
         return self._group_member_reverse_names(chatroom).get(display, "")
+
+    # ------------------------------------------------------------------
+    # 过滤自己发送的消息（批次 5 需求 ⑤）
+    # ------------------------------------------------------------------
+    def _filter_self_enabled(self) -> bool:
+        """设置「过滤自己发送的消息」是否开启（analysis.filter_self_messages，
+        默认 "1"=开启）。设置读取失败按开启处理（与出厂默认一致）。"""
+        try:
+            return self._db.get_setting(KEY_ANALYSIS_FILTER_SELF, "1") != "0"
+        except Exception:
+            logger.exception("读取过滤自己消息设置失败（按开启处理）")
+            return True
+
+    def _self_id(self) -> str:
+        """当前登录账号 wxid（懒加载缓存；读取失败返回空串 = 不过滤群聊）。"""
+        if self._self_wxid:
+            return self._self_wxid
+        getter = getattr(self._wxdb, "get_self_info", None) \
+            if self._wxdb is not None else None
+        if callable(getter):
+            try:
+                self._self_wxid = str((getter() or {}).get("username") or "")
+            except Exception:
+                logger.exception("读取当前登录账号失败（按空处理）")
+        return self._self_wxid
+
+    def _is_self_message(self, kind: str, msg: dict,
+                         sender_wxid: str) -> bool:
+        """该消息是否为当前登录账号自己发送。
+
+        - 私聊：sender_id ∈ (2, "2") 即自己发送（微信原生标记）；
+        - 群聊：解析出的发送人 wxid（正文前缀权威解析结果）等于当前登录
+          账号 wxid，或消息自带的 sender_username 等于当前登录账号。
+        """
+        if kind != "group":
+            return msg.get("sender_id") in (2, "2")
+        self_id = self._self_id()
+        if not self_id:
+            return False
+        return (sender_wxid == self_id
+                or str(msg.get("sender_username") or "") == self_id)
+
+    # ------------------------------------------------------------------
+    # 群名片学习（批次 5 需求 ②：发送人显示名与微信一致）
+    # ------------------------------------------------------------------
+    def _learn_group_card(self, chatroom: str, sender_uid: str) -> None:
+        """从 session.db 学习群成员的微信端显示名（群名片）并落库。
+
+        微信 4.x 本地库不存群名片（``contact.nick_name`` 是全局昵称，
+        实测成员「赵宇」在群里的名片是「513猎在于狩-宁静致远」），而
+        SessionTable.last_sender_display_name 是微信客户端对最后一条消息
+        发送者渲染的名称。群消息到达时若会话行的最后发送者就是本条消息
+        的发送者，即把该显示名按 (群, 成员) 存入 group_cards 表，
+        供 :meth:`_get_group_member_names` 优先采用。
+
+        防张冠李戴：监听轮询间隙可能有他人消息先写进 session 表，
+        ``last_msg_sender`` 与本条消息发送者不一致时不采纳。
+        """
+        wxdb = self._wxdb
+        getter = getattr(wxdb, "get_session_row", None) \
+            if wxdb is not None else None
+        if not callable(getter):
+            return
+        try:
+            row = getter(chatroom)
+        except Exception:
+            logger.exception("读取会话行失败（跳过群名片学习）：%s", chatroom)
+            return
+        if not row:
+            return
+        display = str(row.get("last_sender_display_name") or "").strip()
+        if not display:
+            return
+        last_sender = str(row.get("last_msg_sender") or "")
+        if last_sender and last_sender != sender_uid:
+            return  # 会话行的最后发送者不是本条消息发送者：不采纳
+        member = last_sender or sender_uid
+        if not member or display == member:
+            return
+        try:
+            self._db.save_group_card(chatroom, member, display)
+        except Exception:
+            logger.exception("保存群名片失败（已忽略）：%s/%s", chatroom, member)
+            return
+        # 群成员显示名缓存立即失效，下一次解析直接用上新名片
+        with self._group_members_lock:
+            self._group_members_cache.pop(chatroom, None)
+
+    # ------------------------------------------------------------------
+    # @人 ID 还原为显示名（批次 5 需求 ④：AI 上下文线索）
+    # ------------------------------------------------------------------
+    def resolve_at_tokens(self, chatroom: str, text: str) -> str:
+        """把群聊文本里的 @人微信 ID token 还原为群内显示名。
+
+        ``@wxid_xxx`` / ``@xxx@chatroom`` 等token 是 AI 判断「回复谁的
+        报价/询价」的关键线索（批次 5 需求 ④）：裸删会丢上下文，这里
+        用群成员映射把 ID 换成用户看得见的显示名（解析失败保留原 token，
+        绝不篡改正文其它部分）。非群会话原样返回。
+        """
+        text = str(text or "")
+        if not chatroom.endswith("@chatroom") or "@" not in text:
+            return text
+        names = self._get_group_member_names(chatroom)
+        reverse = self._group_member_reverse_names(chatroom)
+
+        def _sub(match: "re.Match[str]") -> str:
+            token = match.group(0)[1:]          # 去掉前导 @
+            # @xxx@chatroom / @xxx@openim 形态先剥后缀再查映射
+            body = token
+            for suffix in ("@chatroom", "@openim"):
+                if body.endswith(suffix):
+                    body = body[: -len(suffix)]
+                    break
+            display = (names.get(body)
+                       or self.resolve_group_member_display(chatroom, body))
+            if not display or display == body:
+                # 显示名解析失败：尝试反查（token 可能是显示名本身）
+                uid = reverse.get(body)
+                if uid:
+                    display = names.get(uid, body)
+            return f"@{display}" if display and display != token \
+                else match.group(0)
+
+        return _AT_ID_TOKEN_RE.sub(_sub, text)
 
     # ------------------------------------------------------------------
     # 分析日志展示字段（来源会话/消息内容的显示名渲染）
@@ -957,17 +1131,41 @@ class WeChatService:
         # 有关键词：先收集全部命中，按匹配质量排序后再按 limit 截断。
         # 好友基数很大（本机约 3 万条），若边收集边截断，会出现
         # 「名字完全一致的联系人」被一堆昵称含同字的账号挤出前 50 条。
-        hits: list[tuple[int, int, dict]] = []
+        # 同一匹配质量内按「最后消息时间倒序」排序（批次 5 需求 ③）：
+        # 近期有过消息的会话排前面，无消息的最后（保持 _match_rank 主排序不变）。
+        times = self._get_session_time_map()
+        hits: list[tuple[int, int, int, dict]] = []
         for order, item in enumerate(items):
             if kind != "all" and item["kind"] != kind:
                 continue
             name = item["display_name"]
             if kw not in name and kw not in item["username"]:
                 continue
+            ts = times.get(item["username"], 0)
             hits.append((self._match_rank(name, item["username"], kw),
-                         order, item))
-        hits.sort(key=lambda t: (t[0], t[1]))
-        return [dict(t[2]) for t in hits[:limit]]
+                         0 if ts else 1, -ts, order, item))
+        hits.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
+        return [dict(t[4]) for t in hits[:limit]]
+
+    def _get_session_time_map(self) -> dict[str, int]:
+        """会话最后消息时间映射（username → last_timestamp，TTL 与联系人缓存一致）。
+
+        数据源：wechatauto.get_session_times（session.db 全量会话行）；
+        读取失败或替身未实现该方法时返回空映射（调用方按「无消息」处理）。
+        """
+        now = time.monotonic()
+        if self._session_times and now - self._session_times_ts \
+                < SESSION_CACHE_TTL_SEC:
+            return self._session_times
+        getter = getattr(self._wxdb, "get_session_times", None) \
+            if self._wxdb is not None else None
+        if callable(getter):
+            try:
+                self._session_times = dict(getter() or {})
+                self._session_times_ts = now
+            except Exception as exc:
+                logger.warning("读取会话最后消息时间失败（按无时间处理）：%s", exc)
+        return self._session_times
 
     @staticmethod
     def _match_rank(name: str, username: str, kw: str) -> int:
@@ -1066,7 +1264,7 @@ class WeChatService:
                 resolved = reverse[candidate]
         if resolved:
             display = self.resolve_group_member_display(username, resolved)
-            clean = _SENDER_ID_STRICT_RE.sub("", text, count=1).lstrip("\n")
+            clean = SENDER_ID_STRICT_RE.sub("", text, count=1).lstrip("\n")
             return display or resolved, clean
         if fallback_wxid:
             display = self.resolve_group_member_display(username, fallback_wxid)
@@ -1274,6 +1472,48 @@ class WeChatService:
                 return f.read()
         except OSError:
             return None
+
+    def get_voice_wav(self, username: str, local_id: int) -> Optional[bytes]:
+        """取一条语音消息的可播放 WAV 音频；失败返回 None（原因记日志）。
+
+        与转写共用同一条取音频链路（``_download_voice_silk``），解码用
+        :func:`voice_asr.silk_to_wav`（只跑 SILK 解码器，不加载识别模型）。
+        解码结果落盘 ``voicecache/{username}_{local_id}.wav``，下次直接
+        读缓存。时长上限与转写口径一致（``asr.max_seconds``），超长不播。
+
+        音频不出本机：只读本地微信库并通过本地接口返回。
+        """
+        try:
+            local_id_int = int(local_id or 0)
+        except (TypeError, ValueError):
+            return None
+        username = str(username or "")
+        if not username or local_id_int <= 0:
+            return None
+        if self._wxdb is None:
+            return None
+        # 1) WAV 缓存命中（写缓存时已按 .part + 原子改名保证完整）
+        wav_path = VOICE_CACHE_DIR / ("%s_%d.wav" % (username, local_id_int))
+        try:
+            if wav_path.is_file() and wav_path.stat().st_size > 44:
+                return wav_path.read_bytes()
+        except OSError:
+            logger.exception("读取 WAV 播放缓存失败（%s）", wav_path)
+        # 2) 取 SILK → 解码为 WAV（含时长上限校验）
+        silk_path = self._download_voice_silk(username, local_id_int)
+        if not silk_path:
+            return None
+        try:
+            limit = voice_asr.get_transcriber().max_seconds()
+        except Exception:  # 上限读取失败不影响播放能力
+            limit = voice_asr.MAX_SECONDS_DEFAULT
+        wav, err = voice_asr.silk_to_wav(silk_path, wav_path=wav_path,
+                                         max_seconds=limit)
+        if not wav:
+            logger.info("语音播放取音频失败（%s local_id=%d）：%s",
+                        username, local_id_int, err)
+            return None
+        return wav
 
     # ------------------------------------------------------------------
     # 语音消息离线转写（本地识别，音频绝不上传外部服务）

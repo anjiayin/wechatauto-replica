@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 QUOTE_SNIPPET_MAX = 24
 # 无可识别文字的占位内容（图片/文件/小程序等），无法靠文本定位消息行
 _PLACEHOLDER_RE = re.compile(r"^\[[^\]]{1,12}\]")
+# GUI 操作互斥锁等待上限（秒）：发送线程与「跳转微信」API 线程共用同一把
+# 锁，同一时刻只允许一个流程动微信窗口。发送全程（含打开会话、DB 回读
+# 确认）实测 5~20s，60s 足够覆盖慢网/慢机场景。
+GUI_LOCK_TIMEOUT_SEC = 60
 
 
 class QuoteTargetUnavailable(Exception):
@@ -87,6 +91,10 @@ class Sender:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._gui = None              # WeChatGUI 实例（仅本线程创建/使用）
+        # GUI 操作互斥锁：发送线程与「跳转微信」API 线程共用。UIA 自动化
+        # 全程共享一个微信窗口，两个流程并发操作会互相把对方的窗口状态
+        # （当前会话、焦点、置顶）打乱，必须串行化。
+        self._gui_lock = threading.Lock()
         self._message_lookup = None   # 注入：按 local_id 取消息
         self._latest_lookup = None    # 注入：取会话最新消息 local_id
 
@@ -150,8 +158,23 @@ class Sender:
     # 任务处理
     # ------------------------------------------------------------------
     def _process(self, task: SendTask) -> None:
-        """执行一次完整发送（三重校验），并记录每段耗时。"""
+        """执行一次完整发送（三重校验），并记录每段耗时。
+
+        GUI 操作全程持 ``_gui_lock``：与「跳转微信」API 互斥，等待超时按
+        发送失败处理（前端可重试），绝不与跳转流程并发操作微信窗口。
+        """
         stage = _Stages()
+        if not self._gui_lock.acquire(timeout=GUI_LOCK_TIMEOUT_SEC):
+            self._fail(task, "微信窗口正被其他操作占用（可能正在跳转会话），"
+                             "请稍后重试", stage)
+            return
+        try:
+            self._process_locked(task, stage)
+        finally:
+            self._gui_lock.release()
+
+    def _process_locked(self, task: SendTask, stage: _Stages) -> None:
+        """发送主流程（调用方已持 ``_gui_lock``）。"""
         gui = self._ensure_gui()
         stage.mark("init")
         if gui is None:
@@ -313,6 +336,55 @@ class Sender:
             return int(lookup(username) or 0)
         except Exception:
             return 0
+
+    # ------------------------------------------------------------------
+    # 跳转微信（POST /api/wechat/jump）：调起微信并打开指定会话输入窗口
+    # ------------------------------------------------------------------
+    def jump_to_session(self, session_username: str,
+                        session_name: str) -> tuple[bool, str]:
+        """把微信带到前台并打开指定会话（不发送任何消息）。
+
+        与发送线程共用 ``_gui_lock``：正在发送时这里同步等待（最长
+        :data:`GUI_LOCK_TIMEOUT_SEC` 秒），避免两个流程并发操作窗口。
+
+        Args:
+            session_username: 会话 wxid（预留：与发送链路同源校验用）。
+            session_name: 会话显示名（open_chat 是 UIA 文本匹配，必须传）。
+
+        Returns:
+            (是否成功, 用户可读中文提示)。**绝不抛异常**：HTTP 层直接把
+            提示回给前端弹 toast，失败也不能变成 500。
+        """
+        name = str(session_name or "").strip()
+        if not name:
+            return False, "缺少会话名称，无法跳转"
+        if not self._gui_lock.acquire(timeout=GUI_LOCK_TIMEOUT_SEC):
+            return False, ("微信窗口正被其他操作占用（可能正在发送消息），"
+                           "请稍后再试")
+        try:
+            gui = self._ensure_gui()
+            if gui is None:
+                return False, "微信自动化组件不可用，无法跳转"
+            # 与 _process_locked 同款三步：存活 → 前置可见 → 打开会话
+            if not gui.is_alive():
+                return False, "微信未登录或窗口不存在，请检查后重试"
+            try:
+                gui.bring_to_front()
+            except Exception:
+                logger.debug("bring_to_front 异常（继续尝试 ensure_visible）")
+            if not gui.ensure_visible():
+                return False, "微信窗口不可见（可能被遮挡或锁屏），请检查后重试"
+            if not gui.open_chat(name):
+                return False, (f"无法定位会话：{name}，"
+                               "请确认微信会话列表中存在该会话")
+            logger.info("跳转微信完成：已打开会话 %s（username=%s）",
+                        name, session_username)
+            return True, f"已在微信中打开会话：{name}"
+        except Exception as exc:  # UIA 偶发异常：结构化返回，不 500
+            logger.exception("跳转微信异常（%s）", name)
+            return False, f"跳转微信失败：{exc}"
+        finally:
+            self._gui_lock.release()
 
     # ------------------------------------------------------------------
     # GUI 实例

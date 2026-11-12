@@ -154,8 +154,14 @@ class TestPrivateSenderResolution:
         assert msg["sender_display_name"] == "李四(备注)"  # get_nickname 备注优先
 
     def test_private_own_message_shows_me(self):
-        """sender_id=2 为自己发送：显示「我」，wxid 置空。"""
+        """sender_id=2 为自己发送：显示「我」，wxid 置空。
+
+        批次 5 需求 ⑤ 默认过滤自己发送的消息（不进管线），本测试锁的是
+        「不过滤时」的显示行为，故显式关闭过滤开关。
+        """
+        from app.config import KEY_ANALYSIS_FILTER_SELF
         svc = make_sender_svc()
+        svc._db.set_setting(KEY_ANALYSIS_FILTER_SELF, "0")
         msg = make_group_msg("我方回复内容", sender_username="andyyu",
                              sender_id=2, username="wxid_li")
         svc._on_message(msg)

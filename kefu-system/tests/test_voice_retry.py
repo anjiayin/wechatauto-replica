@@ -266,10 +266,14 @@ class TestQueue:
 
 class TestServiceIntegration:
     def _svc(self, db: Database):
+        from app.config import KEY_ANALYSIS_FILTER_SELF
         units: List[AnalysisUnit] = []
         agg = Aggregator(lambda u: units.append(u))
         svc = WeChatService(db, agg)
         svc._wxdb = object()      # 通过「微信库不可用」检查（不碰真实微信）
+        # 语音链路测试的消息 sender_id=2（自己发送）；批次 5 需求 ⑤ 默认
+        # 过滤自己消息，会拦截这些消息进不了语音转写分支——这里显式关闭。
+        db.set_setting(KEY_ANALYSIS_FILTER_SELF, "0")
         return svc, units, agg
 
     def test_no_voice_failure_enqueues_and_records_local_id(self, monkeypatch):
