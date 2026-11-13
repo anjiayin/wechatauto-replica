@@ -50,6 +50,16 @@ def get_wechat_service() -> WeChatService:
     return _require(_wechat, "微信服务")
 
 
+def get_wechat_service_optional() -> WeChatService | None:
+    """微信服务单例（未注入时返回 None，不抛异常）。
+
+    给「有更好、没有也能用」的场景（如商机列表的企业名补齐）：列表接口
+    的核心数据只来自业务库，补显示名是附加增强，绝不能因为微信服务没
+    起来就让整页 500。
+    """
+    return _wechat
+
+
 def get_pipeline() -> Pipeline:
     """分析管线单例。"""
     return _require(_pipeline, "分析管线")

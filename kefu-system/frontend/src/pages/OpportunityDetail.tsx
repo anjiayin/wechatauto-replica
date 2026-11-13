@@ -8,11 +8,13 @@ import {
   Chip,
   Divider,
   Drawer,
+  FormControlLabel,
   IconButton,
   LinearProgress,
   Skeleton,
   Snackbar,
   Stack,
+  Switch,
   TextField,
   Tooltip,
   Typography,
@@ -41,6 +43,8 @@ interface SendResultData {
   opportunity_id: number
   ok: boolean
   message: string
+  /** 人工确认模式：内容只填进了输入框，还没真正发出 */
+  manual?: boolean
   /** 发送链路分段耗时（毫秒）：init/front/open/send */
   stages?: Record<string, number>
   total_ms?: number
@@ -232,6 +236,10 @@ export default function OpportunityDetail(props: {
   const [replyText, setReplyText] = useState('')
   const [atMembers, setAtMembers] = useState<string[]>([])
   const [quoteLocalId, setQuoteLocalId] = useState<number | null>(null)
+  // 人工确认（用户反馈：存在发错人的情况——同名联系人/企业微信身份/操作失败）。
+  // 默认开启：只把回复内容填进微信输入框，由用户在微信里核对收件人后
+  // 自己点发送；关掉才是「自动发送 + 数据库确认」。
+  const [manualConfirm, setManualConfirm] = useState(true)
   const [snack, setSnack] = useState<{ ok: boolean; message: string } | null>(null)
   // 发送中耗时（202 受理后要等微信 GUI 操作，必须让用户看到进度）
   const [sendingSince, setSendingSince] = useState<number | null>(null)
@@ -407,6 +415,7 @@ export default function OpportunityDetail(props: {
     const payload: ReplyPayload = {
       text: replyText.trim(),
       at: atMembers,
+      manual_confirm: manualConfirm,
     }
     if (quoteLocalId !== null) {
       payload.quote = { local_id: quoteLocalId }
@@ -420,7 +429,7 @@ export default function OpportunityDetail(props: {
     mutationFn: () =>
       apiPost<WechatJumpResult>('/api/wechat/jump', {
         session_username: opp?.session_username ?? '',
-        session_name: opp?.session_name ?? '',
+        session_name: opp?.session_display || opp?.session_name || '',
       }),
     onSuccess: (resp) => setSnack({ ok: resp.ok, message: resp.message }),
     onError: (err: Error) => setSnack({ ok: false, message: err.message }),
@@ -440,7 +449,7 @@ export default function OpportunityDetail(props: {
       <Box sx={{ width: 560, p: 2 }}>
         <Stack direction="row" alignItems="center" sx={{ mb: 1 }}>
           <Typography variant="subtitle1" sx={{ flexGrow: 1 }}>
-            {opp ? `${opp.type_name} · ${opp.session_name}` : '商机详情'}
+            {opp ? `${opp.type_name} · ${opp.session_display || opp.session_name}` : '商机详情'}
           </Typography>
           {opp && (
             <Tooltip title="跳转微信：打开该会话的输入窗口（手动回复）">
@@ -465,7 +474,7 @@ export default function OpportunityDetail(props: {
           <>
             <Box sx={{ bgcolor: '#f7f7f7', p: 1.5, borderRadius: 1, mb: 1.5 }}>
               <Stack direction="row" spacing={1} sx={{ mb: 1, flexWrap: 'wrap' }} useFlexGap>
-                <Chip size="small" label={`发送人：${opp.sender_name}`} />
+                <Chip size="small" label={`发送人：${opp.sender_display || opp.sender_name}`} />
                 {opp.sender_wxid && <Chip size="small" label={`wxid：${opp.sender_wxid}`} />}
                 <Chip size="small" label={`窗口：${opp.window_start.replace('T', ' ')} ~ ${opp.window_end.replace('T', ' ')}`} />
                 <Chip size="small" label={`合并 ${opp.merged_count} 条`} />
@@ -637,20 +646,39 @@ export default function OpportunityDetail(props: {
             <Divider sx={{ mb: 1.5 }} />
 
             <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
-              回复目标：{opp.session_name}
+              回复目标：{opp.session_display || opp.session_name}
               {opp.status === 'replied' && '（已回复过，可继续发送）'}
             </Typography>
             <TextField
               fullWidth
               multiline
               minRows={3}
-              placeholder="输入回复内容（Ctrl+Enter 发送）"
+              placeholder={manualConfirm
+                ? '输入要填入微信输入框的内容（Ctrl+Enter 填入）'
+                : '输入回复内容（Ctrl+Enter 发送）'}
               value={replyText}
               onChange={(e) => setReplyText(e.target.value)}
               onKeyDown={(e) => {
                 if (e.ctrlKey && e.key === 'Enter') handleSend()
               }}
               sx={{ mb: 1 }}
+            />
+            {/* 人工确认开关（默认开启）：发送前让人看一眼收件人，专治同名
+                联系人 / 企业微信身份 / 操作失败导致发错人的情况 */}
+            <FormControlLabel
+              control={
+                <Switch
+                  size="small"
+                  checked={manualConfirm}
+                  onChange={(e) => setManualConfirm(e.target.checked)}
+                />
+              }
+              label={
+                <Typography variant="body2">
+                  手动确认（只填入微信输入框，由你在微信里核对后点发送）
+                </Typography>
+              }
+              sx={{ mb: 1, alignItems: 'flex-start', '& .MuiFormControlLabel-label': { pt: 0.5 } }}
             />
             <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1, flexWrap: 'wrap' }} useFlexGap>
               {isGroup && (
@@ -716,18 +744,36 @@ export default function OpportunityDetail(props: {
                 }
               >
                 已受理，正在操作微信窗口（{(sendingMs / 1000).toFixed(1)}s）…
+                {manualConfirm
+                  ? '会把内容填进微信输入框，填完请在微信里核对后点发送；'
+                  : ''}
                 首次发送需初始化自动化组件，通常 3~8 秒；若超过 30 秒请检查微信窗口是否被遮挡。
               </Alert>
             )}
-            <Stack direction="row" spacing={1}>
+            <Stack direction="row" spacing={1} sx={{ flexWrap: 'wrap' }} useFlexGap>
               <Button
                 variant="contained"
                 startIcon={<SendIcon />}
                 disabled={replyMutation.isPending || sendingSince !== null || !replyText.trim()}
                 onClick={handleSend}
               >
-                {sendingSince !== null ? '发送中…' : '发送回复'}
+                {sendingSince !== null
+                  ? (manualConfirm ? '填入中…' : '发送中…')
+                  : (manualConfirm ? '填入微信输入框' : '发送回复')}
               </Button>
+              {/* 只跳转、不发消息：用户想直接在微信里自己处理（弹窗点进来时最常用）。
+                  与右上角的跳转图标功能相同，这里放在操作行更好找（原图标保留）。 */}
+              <Tooltip title="只跳转到消息来源会话（不发送任何消息），在微信里自己处理">
+                <span>
+                  <Button
+                    startIcon={<OpenInNewIcon />}
+                    disabled={jumpMutation.isPending}
+                    onClick={() => jumpMutation.mutate()}
+                  >
+                    跳转微信会话
+                  </Button>
+                </span>
+              </Tooltip>
               {opp.status !== 'ignored' ? (
                 <Button
                   startIcon={<VisibilityOffIcon />}

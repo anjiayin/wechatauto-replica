@@ -220,7 +220,10 @@ LIST_ITEM_KEYS = {"id", "session_username", "session_name", "sender_wxid",
                   # 会出现「合并 3 条只显示 1 条」的错觉
                   "raw_text", "merged_count",
                   # 反馈 9：行内「未读」标识（内存态，默认 False）
-                  "unread"}
+                  "unread",
+                  # 第 13 批需求 1/2：来源列与发送人列合并后，展示名单独给字段
+                  # （企业微信联系人补成「昵称@企业简称」，存量商机也能补全）
+                  "session_display", "sender_display"}
 # 契约变更（体验优化 4）：详情与上下文拆分 —— 详情接口不再返回 context 字段，
 # 上下文由独立接口 GET /api/opportunities/{id}/context 提供（items + error）
 DETAIL_EXTRA_KEYS = {"window_start", "merged_count", "raw_text", "key_quote",
@@ -910,10 +913,12 @@ class TestReplyEndpoint:
         assert env.sender.tasks == []
 
     def test_reply_accepted_202_and_task_fields(self, env):
+        """自动发送模式（manual_confirm=false）：@/引用 原样带到发送任务。"""
         opp = self._prepare(env)
         resp = env.client.post(f"/api/opportunities/{opp['id']}/reply", json={
             "text": "  您好，这个订单我们可以做  ",
-            "at": ["张三", " "], "quote": {"local_id": 1234}})
+            "at": ["张三", " "], "quote": {"local_id": 1234},
+            "manual_confirm": False})
         assert resp.status_code == 202
         body = resp.json()
         assert body["ok"] is True
@@ -926,6 +931,25 @@ class TestReplyEndpoint:
         assert task.text == "您好，这个订单我们可以做"  # 已 strip
         assert task.at == ["张三"]  # 空白项被过滤
         assert task.quote_local_id == 1234
+        assert task.manual_confirm is False
+
+    def test_reply_default_is_manual_confirm(self, env):
+        """默认人工确认（第 13 批需求 5）：只填入输入框，不自动发送。
+
+        带 @/引用 时把它们丢掉（人工确认模式无法只插入不发送），并在受理
+        文案里讲清楚，绝不在用户不知情的情况下自动发出去。
+        """
+        opp = self._prepare(env)
+        resp = env.client.post(f"/api/opportunities/{opp['id']}/reply", json={
+            "text": "收到，明天发货", "at": ["张三"],
+            "quote": {"local_id": 1234}})
+        assert resp.status_code == 202
+        body = resp.json()
+        assert body["ok"] is True
+        assert "填入" in body["message"]
+        task = env.sender.tasks[0]
+        assert task.manual_confirm is True
+        assert task.at == [] and task.quote_local_id is None
 
     def test_reply_not_blocked_by_compliance(self, env):
         """设计文档 9.4：合规确认只约束分析管线；回复不受其阻断。"""
@@ -995,7 +1019,10 @@ class TestAnalysisLogsContract:
                                  "input_text_display", "result", "status",
                                  "error", "model", "latency_ms",
                                  "agg_wait_ms", "queue_wait_ms", "e2e_ms",
-                                 "voice_local_id"}
+                                 "voice_local_id",
+                                 # 第 13 批需求 7：图片消息标识（图片漏识别时
+                                 # 前端「重新识别」按 会话+local_id 定位那张图）
+                                 "image_local_id"}
 
     def test_list_filters(self, env):
         self._insert_logs(env.db)

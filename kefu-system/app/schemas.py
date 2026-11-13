@@ -331,6 +331,19 @@ class VoiceRetryOut(BaseModel):
     error: str = ""
 
 
+class ImageRetryIn(BaseModel):
+    """手动补识别一张图片（分析日志「重新识别」按钮，图片行）。"""
+    username: str
+    local_id: int
+
+
+class ImageRetryOut(BaseModel):
+    """补识别受理结果：``ok=False`` 时 ``error`` 为中文原因（可直接展示）。"""
+    ok: bool = False
+    message: str = ""
+    error: str = ""
+
+
 class WechatJumpIn(BaseModel):
     """「跳转微信」请求（反馈 ⑦）：调起微信并打开该会话的输入窗口。
 
@@ -404,6 +417,11 @@ class OpportunityListItem(BaseModel):
     created_at: str = ""
     # 未读标识（内存态：新商机进入即未读，打开详情或点击行内「未读」后清除）
     unread: bool = False
+    # 展示用显示名：企业微信联系人为「昵称@企业简称」，其余与上面同名字段
+    # 完全一致。存量商机的 session_name 只存了昵称，读取时按 username 补齐
+    # 企业名（用户反馈：来源列看起来只有前半截）。
+    session_display: str = ""
+    sender_display: str = ""
 
 
 class OpportunityListOut(BaseModel):
@@ -448,6 +466,10 @@ class ReplyRequest(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
     at: List[str] = Field(default_factory=list)
     quote: Optional[QuoteRef] = None
+    # 人工确认（用户反馈：怕发错人）：True = 只把内容填进微信输入框，由用户
+    # 自己核对后点发送；False = 自动发送并按数据库确认。默认 True —— 误发到
+    # 同名联系人的代价远大于多一次人工点击。
+    manual_confirm: bool = True
 
 
 class ReplyAccepted(BaseModel):
@@ -494,6 +516,9 @@ class AnalysisLogOut(BaseModel):
     # 语音消息标识（非语音为 None）：语音转写失败的行带此值，前端据此提供
     # 「重新识别」（微信语音是异步落库的，首次转写常因音频未下载而失败）
     voice_local_id: Optional[int] = None
+    # 图片消息标识（非图片为 None）：原图未下载完/缩略图不完整时带此值，
+    # 前端据此提供「重新识别」（用户在微信里点开那张图触发原图下载后再点）
+    image_local_id: Optional[int] = None
 
 
 class AnalysisLogListOut(BaseModel):

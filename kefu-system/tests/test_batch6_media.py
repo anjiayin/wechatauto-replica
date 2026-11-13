@@ -661,8 +661,8 @@ class TestVisionQueueAsync:
     def test_listener_does_not_block_on_vision(self, monkeypatch):
         """视觉调用睡 0.5s，``_on_message`` 必须在 0.1s 内返回且队列 +1。"""
         svc, _db = make_svc()
-        monkeypatch.setattr(svc, "get_image_bytes",
-                            lambda u, l: _complete_jpeg())
+        monkeypatch.setattr(svc, "get_image_bytes_with_reason",
+                            lambda u, l: (_complete_jpeg(), ""))
 
         def _slow(data, **kw):
             time.sleep(0.5)
@@ -681,8 +681,8 @@ class TestVisionQueueAsync:
         units: list = []
         svc, db = make_svc(units)
         original_ts = time.time() - 3600           # 1 小时前：便于校验行时间
-        monkeypatch.setattr(svc, "get_image_bytes",
-                            lambda u, l: _complete_jpeg())
+        monkeypatch.setattr(svc, "get_image_bytes_with_reason",
+                            lambda u, l: (_complete_jpeg(), ""))
         monkeypatch.setattr(vision, "analyze_image",
                             lambda data, **kw: vehicle_result())
         with vision_workers(svc):
@@ -706,8 +706,8 @@ class TestVisionQueueAsync:
     def test_worker_non_vehicle_skipped(self, monkeypatch):
         units: list = []
         svc, db = make_svc(units)
-        monkeypatch.setattr(svc, "get_image_bytes",
-                            lambda u, l: _complete_jpeg())
+        monkeypatch.setattr(svc, "get_image_bytes_with_reason",
+                            lambda u, l: (_complete_jpeg(), ""))
         monkeypatch.setattr(vision, "analyze_image", lambda data, **kw: {
             "is_vehicle_part": False, "part_name": "", "vin": "",
             "reason": "聊天截图"})
@@ -758,8 +758,8 @@ class TestVisionQueueAsync:
                 raise RuntimeError("网关返回了意料之外的东西")
             return vehicle_result(part="前大灯", vin="", reason="大灯实拍")
 
-        monkeypatch.setattr(svc, "get_image_bytes",
-                            lambda u, l: _complete_jpeg())
+        monkeypatch.setattr(svc, "get_image_bytes_with_reason",
+                            lambda u, l: (_complete_jpeg(), ""))
         monkeypatch.setattr(vision, "analyze_image", _flaky)
         with vision_workers(svc):
             svc._on_message(image_msg(2467))
@@ -831,12 +831,17 @@ class TestVisionQueueAsync:
 
     def test_image_read_failure_skipped(self, monkeypatch):
         svc, db = make_svc()
-        monkeypatch.setattr(svc, "get_image_bytes", lambda u, l: None)
+        monkeypatch.setattr(
+            svc, "get_image_bytes_with_reason",
+            lambda u, l: (None, "原图与缩略图均不完整"))
         with vision_workers(svc):
             svc._on_message(image_msg())
             assert wait_processed(svc)
         logs = skipped_logs(db)
-        assert logs[0]["error"].startswith("图片读取失败或不完整，未识别")
+        # 需求 7：文案必须带上真实原因（原图/缩略图都缺），只说「读取失败」
+        # 用户无从判断「再等等」还是「永远不会好」
+        assert logs[0]["error"].startswith("图片读取失败或不完整（")
+        assert "原图与缩略图均不完整" in logs[0]["error"]
         assert "local_id=2467" in logs[0]["error"]
         assert svc._aggregator.pending_count() == 0
         assert svc.vision_failed_total == 1
@@ -848,8 +853,8 @@ class TestVisionQueueAsync:
         def _raise(data, **kw):
             raise vision.VisionError(vision.MSG_INCOMPLETE)
 
-        monkeypatch.setattr(svc, "get_image_bytes",
-                            lambda u, l: _complete_jpeg())
+        monkeypatch.setattr(svc, "get_image_bytes_with_reason",
+                            lambda u, l: (_complete_jpeg(), ""))
         monkeypatch.setattr(vision, "analyze_image", _raise)
         with vision_workers(svc):
             svc._on_message(image_msg())
@@ -872,8 +877,8 @@ class TestVisionQueueAsync:
                 raise vision.VisionError("图片识别失败：额度不足或触发限流")
             return vehicle_result(part="车壳", vin="")
 
-        monkeypatch.setattr(svc, "get_image_bytes",
-                            lambda u, l: _complete_jpeg())
+        monkeypatch.setattr(svc, "get_image_bytes_with_reason",
+                            lambda u, l: (_complete_jpeg(), ""))
         monkeypatch.setattr(vision, "analyze_image", _flaky)
         with vision_workers(svc):
             # 第 1 次投递：额度不足 → 不落库
@@ -900,8 +905,8 @@ class TestVisionQueueAsync:
         def _raise(data, **kw):
             raise vision.VisionError("图片识别失败：Key 无效或无权限")
 
-        monkeypatch.setattr(svc, "get_image_bytes",
-                            lambda u, l: _complete_jpeg())
+        monkeypatch.setattr(svc, "get_image_bytes_with_reason",
+                            lambda u, l: (_complete_jpeg(), ""))
         monkeypatch.setattr(vision, "analyze_image", _raise)
         with vision_workers(svc):
             svc._on_message(image_msg())
@@ -919,8 +924,8 @@ class TestVisionQueueAsync:
         def _raise(data, **kw):
             raise vision.VisionError("图片预处理失败：cannot identify image")
 
-        monkeypatch.setattr(svc, "get_image_bytes",
-                            lambda u, l: _complete_jpeg())
+        monkeypatch.setattr(svc, "get_image_bytes_with_reason",
+                            lambda u, l: (_complete_jpeg(), ""))
         monkeypatch.setattr(vision, "analyze_image", _raise)
         with vision_workers(svc):
             svc._on_message(image_msg())

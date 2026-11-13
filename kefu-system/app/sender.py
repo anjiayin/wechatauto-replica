@@ -79,6 +79,9 @@ class SendTask:
     text: str
     at: List[str] = field(default_factory=list)   # @群成员昵称（仅群会话）
     quote_local_id: Optional[int] = None          # 引用回复的消息 local_id
+    # 人工确认模式（用户反馈：怕发错人）：True = 只把内容填进微信输入框，
+    # 由用户自己在微信里核对收件人后点发送；False = 自动发送并按数据库确认。
+    manual_confirm: bool = False
 
 
 class Sender:
@@ -194,16 +197,40 @@ class Sender:
                 return
             stage.mark("front")
             # 校验②：定位并打开目标会话（open_chat 内部有 _chat_open_confirmed）
-            if not gui.open_chat(task.session_name):
-                self._fail(task, f"无法定位会话：{task.session_name}，"
-                                 "请确认微信会话列表中存在该会话", stage)
+            who = self._chat_name(task)
+            openim = self._is_openim(task.session_username)
+            if openim:
+                # 企业微信联系人：按昵称搜索并强制选中「企业微信」那条，
+                # 避免与同名普通好友混淆（曾把消息发给同名好友）
+                opener = getattr(gui, "open_chat_prefer_openim", None)
+                corp = self._corp_hint(task.session_name)
+                if callable(opener):
+                    try:
+                        opened = bool(opener(who, corp))
+                    except TypeError:   # 旧签名（只接 name）
+                        opened = bool(opener(who))
+                else:
+                    opened = bool(gui.open_chat(who))
+            else:
+                opened = bool(gui.open_chat(who))
+            if not opened:
+                hint = ""
+                if openim:
+                    hint = ("（该联系人是企业微信身份，若微信里存在同名普通"
+                            "好友，可能被误开；已取消发送以免发错人）")
+                self._fail(task, f"无法定位会话：{task.session_name}{hint}",
+                           stage)
                 return
             # 会话已确认打开：后续输入/引用/发送都不必再重复「搜索打开」
             time.sleep(0.5)  # 等会话面板渲染稳定（与 wechatauto 内部节奏一致）
             stage.mark("open")
+            # 人工确认模式：只填进输入框，由用户在微信里点发送
+            if task.manual_confirm:
+                self._fill_only(gui, task, who, stage)
+                return
             # 校验③：发送 + 数据库回读确认（verify=True）
             try:
-                resp = self._do_send(gui, task)
+                resp = self._do_send(gui, task, who)
             except QuoteTargetUnavailable as exc:
                 self._fail(task, str(exc), stage)
                 return
@@ -232,34 +259,105 @@ class Sender:
             logger.exception("发送任务执行异常（商机 #%d）", task.opportunity_id)
             self._fail(task, f"发送失败：{exc}", stage)
 
-    def _do_send(self, gui, task: SendTask):
+    # ------------------------------------------------------------------
+    # 会话名 / 企业微信身份
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_openim(username: str) -> bool:
+        """会话是否企业微信/客服账号（@openim / @kefu）。"""
+        u = (username or "").strip().lower()
+        return u.endswith("@openim") or "@kefu" in u
+
+    @staticmethod
+    def _corp_hint(session_name: str) -> str:
+        """「昵称@企业名」里的企业名（非企业微信显示名返回空串）。"""
+        name = str(session_name or "")
+        if "@" not in name:
+            return ""
+        return name.split("@", 1)[1].strip()
+
+    @classmethod
+    def _chat_name(cls, task: SendTask) -> str:
+        """open_chat 用的搜索关键词。
+
+        企业微信联系人的显示名按微信习惯拼成「昵称@企业简称」，但这个
+        后缀**不是**微信搜索框能命中的文本（搜「安佳胤@我的车车」只会
+        搜出空结果，白等一轮重试），所以搜索时只取 @ 之前的昵称，身份
+        由 :meth:`open_chat_prefer_openim` 在结果里区分。
+        """
+        name = str(task.session_name or "").strip() or task.session_username
+        if cls._is_openim(task.session_username) and "@" in name:
+            return name.split("@", 1)[0].strip() or name
+        return name
+
+    def _fill_only(self, gui, task: SendTask, who: str, stage: _Stages) -> None:
+        """人工确认模式：把内容填进输入框即结束（不按发送键）。
+
+        不写 ``replied`` 状态、不置「已回复」——消息还没发出去，状态必须
+        保持待处理，否则用户会以为已经回过了（漏回复比多发一次更常见）。
+        """
+        filler = getattr(gui, "input_only", None)
+        if not callable(filler):
+            self._fail(task, "当前微信自动化组件不支持「只填入不发送」，"
+                             "请改用自动发送或手动跳转到微信", stage)
+            return
+        try:
+            resp = filler(task.text, who=who,
+                          who_username=task.session_username)
+        except Exception as exc:
+            logger.exception("填入输入框异常（商机 #%d）", task.opportunity_id)
+            self._fail(task, f"填入输入框失败：{exc}", stage)
+            return
+        stage.mark("send")
+        ok = bool(getattr(resp, "is_success", False))
+        message = str(resp.get("message") or "") if isinstance(resp, dict) else ""
+        if not ok:
+            self._fail(task, f"填入输入框失败：{message or '未知原因'}", stage)
+            return
+        self._notifier.broadcast("send_result", {
+            "opportunity_id": task.opportunity_id,
+            "ok": True,
+            "manual": True,
+            "message": message or f"已填入微信输入框（{task.session_name}），"
+                                  "请在微信里核对后点发送",
+            "stages": stage.ms,
+            "total_ms": stage.total_ms(),
+        })
+        logger.info("[已填入输入框] 商机 #%d → %s（人工确认模式）| %s",
+                    task.opportunity_id, task.session_name, stage.summary())
+
+    def _do_send(self, gui, task: SendTask, who: Optional[str] = None):
         """按 @成员 / 引用 / 普通文本选择发送接口（全部 verify=True 回读确认）。
 
         who_username 传会话 wxid：数据库回读直查，跳过显示名模糊搜索
         （既慢，同名联系人时还可能确认失败导致白等 8s 轮询）。
         UIA 会话比较仍用显示名（who），两者互不影响。
+
+        Args:
+            who: 搜索/校验用的会话名（与企业微信账号已剥离 @企业名 后缀）。
         """
+        chat = who or self._chat_name(task)
         if task.at:
             members = [m.strip() for m in task.at if m.strip()]
             # 新版一次 @ 多个成员（同一条消息）；旧版按「逐个 @」兜底
             if hasattr(gui, "at_members"):
                 return gui.at_members(members, task.text,
-                                      who=task.session_name, verify=True,
+                                      who=chat, verify=True,
                                       who_username=task.session_username)
             resp = None
             for i, member in enumerate(members):
                 text = task.text if i == len(members) - 1 else ""
-                resp = gui.at_member(member, text, who=task.session_name,
+                resp = gui.at_member(member, text, who=chat,
                                      verify=True,
                                      who_username=task.session_username)
             return resp
         if task.quote_local_id:
             target_text = self._quote_target_text(task)
-            return gui.quote_msg(task.text, who=task.session_name,
+            return gui.quote_msg(task.text, who=chat,
                                  target_text=target_text, verify=True,
                                  assume_open=True,
                                  who_username=task.session_username)
-        return gui.send_msg(task.text, who=task.session_name, verify=True,
+        return gui.send_msg(task.text, who=chat, verify=True,
                             assume_open=True,
                             who_username=task.session_username)
 
@@ -358,6 +456,12 @@ class Sender:
         name = str(session_name or "").strip()
         if not name:
             return False, "缺少会话名称，无法跳转"
+        # 企业微信联系人的显示名带「@企业名」后缀，不是搜索框能命中的文本；
+        # 跳转同样按昵称搜索，并优先选中企业微信那条（同名好友不会串）
+        keyword = name
+        openim = self._is_openim(session_username)
+        if openim and "@" in keyword:
+            keyword = keyword.split("@", 1)[0].strip() or keyword
         if not self._gui_lock.acquire(timeout=GUI_LOCK_TIMEOUT_SEC):
             return False, ("微信窗口正被其他操作占用（可能正在发送消息），"
                            "请稍后再试")
@@ -374,7 +478,19 @@ class Sender:
                 logger.debug("bring_to_front 异常（继续尝试 ensure_visible）")
             if not gui.ensure_visible():
                 return False, "微信窗口不可见（可能被遮挡或锁屏），请检查后重试"
-            if not gui.open_chat(name):
+            if openim:
+                opener = getattr(gui, "open_chat_prefer_openim", None)
+                corp = self._corp_hint(name)
+                if callable(opener):
+                    try:
+                        opened = bool(opener(keyword, corp))
+                    except TypeError:
+                        opened = bool(opener(keyword))
+                else:
+                    opened = bool(gui.open_chat(keyword))
+            else:
+                opened = bool(gui.open_chat(keyword))
+            if not opened:
                 return False, (f"无法定位会话：{name}，"
                                "请确认微信会话列表中存在该会话")
             logger.info("跳转微信完成：已打开会话 %s（username=%s）",

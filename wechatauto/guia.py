@@ -1268,6 +1268,106 @@ class WeChatGUI:
                 return True
         return False
 
+    # ------------------------------------------------------------------
+    # 企业微信联系人（同名好友消歧）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_openim_id(username: Optional[str]) -> bool:
+        """username 是否企业微信/客服账号（@openim / @kefu）。"""
+        u = (username or "").strip().lower()
+        return u.endswith("@openim") or "@kefu" in u
+
+    def is_openim_chat(self) -> Optional[bool]:
+        """当前打开的会话是否企业微信/客服身份（True/False/None=探测不到）。"""
+        uia = self._get_uia()
+        if uia is None:
+            return None
+        try:
+            return uia.is_openim_chat()
+        except Exception:
+            return None
+
+    def open_chat_prefer_openim(self, name: str, corp: str = "") -> bool:
+        """打开**企业微信身份**的会话（同名普通好友存在时不会开错）。
+
+        背景（用户实机反馈）：「安佳胤@我的车车」是企业微信联系人，本机还有
+        一个同名普通好友「安佳胤」。按显示名搜「安佳胤」时两条结果同名，
+        原实现取第一条 → 打开的是普通好友，消息就发给了错的人（还白等
+        8 秒数据库确认）。
+
+        策略：搜索时优先企业微信分区/带「企业微信」副标题的结果；打开后
+        再用「企业名标签」验证身份，不一致直接返回 False（**绝不发消息**），
+        由调用方把「可能是同名好友」讲给用户听。
+
+        Args:
+            name: 搜索关键词（必须是昵称，不含「@企业名」后缀——那个后缀
+                不是微信搜索框能命中的文本）。
+            corp: 企业简称（「昵称@企业名」里 @ 后面那段），用于在搜索结果
+                副标题只渲染企业名时认出企业微信那条。
+
+        Returns:
+            True = 已打开且确认是企业微信会话；False = 没找到或开成了普通好友。
+        """
+        uia = self._get_uia()
+        if uia is not None:
+            if uia.same_chat(uia.current_chat(), name) and \
+                    uia.is_openim_chat():
+                self._current_chat = name
+                return True
+            if uia.open_chat(name, prefer_openim=True, openim_hint=corp):
+                got = uia.is_openim_chat()
+                if got is False:
+                    wxlog.warning('同名会话身份不符：%s 打开后不是企业微信会话，'
+                                  '已放弃（避免把消息发给同名好友）', name)
+                    return False
+                self._current_chat = name
+                return True
+            return False
+        # 无 UIA（OCR 兜底）时无法识别企业名标签，退回普通打开逻辑
+        return self.open_chat(name)
+
+    def input_only(self, text: str, who: Optional[str] = None,
+                   who_username: Optional[str] = None) -> WxResponse:
+        """把回复内容填进微信输入框，但**不发送**（人工确认模式）。
+
+        用户在页面上点「填入微信输入框」后，由他自己在微信里核对收件人、
+        再点发送。这条路专治「同名联系人/企业微信身份」这类自动发送无法
+        百分百确定目标的场景：宁可多一次人工点击，也不能把消息发错人。
+
+        Args:
+            text: 要填入的内容。
+            who: 目标会话显示名（None = 当前已打开会话）。
+            who_username: 目标会话 username；企业微信账号会走消歧打开。
+
+        Returns:
+            WxResponse；成功时消息明确写「已填入输入框，请在微信里点发送」。
+        """
+        if not text.strip():
+            return WxResponse.failure('填入内容为空')
+        uia = self._get_uia()
+        if uia is None:
+            # OCR 兜底路径的输入法组合会在无候选窗时按 Enter 直接发出，
+            # 人工确认模式绝不能冒这个险
+            return WxResponse.failure(
+                '当前微信版本不支持「只填入不发送」，请改用自动发送或手动跳转')
+        if not self.ensure_visible():
+            return WxResponse.failure('微信窗口不可见（可能锁屏或会话断开）')
+        if who:
+            openim = self._is_openim_id(who_username)
+            corp = who.split("@", 1)[1].strip() if "@" in (who or "") else ""
+            opened = (self.open_chat_prefer_openim(who, corp) if openim
+                      else (uia.same_chat(uia.current_chat(), who)
+                            or uia.open_chat(who)))
+            if not opened:
+                return WxResponse.failure(f'无法打开会话：{who}')
+            self._current_chat = who
+            time.sleep(0.3)
+        if not uia.fill_text(text):
+            return WxResponse.failure('填入输入框失败，请在微信里手动粘贴')
+        return WxResponse.success(
+            f'已填入微信输入框（{who or "当前会话"}），请在微信里核对后点发送',
+            data={'content': text, 'manual': True})
+
     def _chat_open_confirmed(self, name: str) -> bool:
         """点击会话后轮询确认已打开。
 
@@ -1680,6 +1780,7 @@ class WeChatGUI:
             return WxResponse.success(f'消息已发送：{text}', data={'content': text})
         # UIA 路径：热激活后可直接输入+回车发送，无 OCR 抖动，最快。
         uia = self._get_uia()
+        openim = self._is_openim_id(who_username)
         if uia is not None:
             if who:
                 # open_chat 刚成功时 _current_chat 已是目标会话：直接复用，
@@ -1690,7 +1791,7 @@ class WeChatGUI:
                     already_open = uia.same_chat(uia.current_chat(), who)
             else:
                 already_open = True
-            if already_open or uia.open_chat(who):
+            if already_open or uia.open_chat(who, prefer_openim=openim):
                 if already_open:
                     time.sleep(0.2)   # 已在前台：无需等面板切换
                 if who:

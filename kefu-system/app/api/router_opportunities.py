@@ -16,7 +16,8 @@ from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from app.api.deps import get_db, get_notifier, get_sender, get_wechat_service
+from app.api.deps import (get_db, get_notifier, get_sender,
+                          get_wechat_service, get_wechat_service_optional)
 from app.config import CONTEXT_COUNT
 from app.db import Database
 from app.schemas import (
@@ -67,6 +68,64 @@ def _parse_raw_refs(raw: Any) -> List[dict]:
     return [x for x in parsed if isinstance(x, dict)]
 
 
+def _is_openim(username: Any) -> bool:
+    """会话是否企业微信/客服账号（@openim / @kefu）。"""
+    u = str(username or "").strip().lower()
+    return u.endswith("@openim") or "@kefu" in u
+
+
+def _display_with_corp(svc: Any, username: str, stored: str) -> str:
+    """把「只存了昵称」的企业微信显示名补成「昵称@企业简称」。
+
+    存量商机的 ``session_name`` 是监听当时用 ``get_display_name`` 写的，
+    企业微信联系人只有昵称（与微信界面上的「安佳胤@我的车车」不一致）。
+    这里按 username 现算一次带企业名的显示名；任何一步失败都原样返回
+    已存值——列表页绝不能因为补个名字就报错或变慢（企业简称表在服务内
+    已整表缓存 10 分钟）。
+
+    Args:
+        svc: 微信服务（可能为 None，或测试替身缺方法）。
+        username: 会话/发送人 username。
+        stored: 库里已存的显示名。
+
+    Returns:
+        展示用显示名。
+    """
+    name = str(stored or "")
+    if not name or not _is_openim(username) or "@" in name:
+        return name
+    resolver = getattr(svc, "display_name_with_corp", None)
+    if not callable(resolver):
+        return name
+    try:
+        got = str(resolver(str(username)) or "").strip()
+    except Exception:      # 显示名是增强项：失败就用已存名字
+        logger.debug("补齐企业名失败（沿用已存显示名）：%s", username)
+        return name
+    return got or name
+
+
+def _with_displays(items: List[dict], svc: Any) -> List[dict]:
+    """给一批商机行补 ``session_display`` / ``sender_display``（就地返回拷贝）。"""
+    out: List[dict] = []
+    for row in items:
+        item = dict(row)
+        session_username = str(item.get("session_username") or "")
+        item["session_display"] = _display_with_corp(
+            svc, session_username, item.get("session_name", ""))
+        sender_wxid = str(item.get("sender_wxid") or "")
+        sender = str(item.get("sender_name") or "")
+        # 私聊（含企业微信）的发送人就是会话对端：直接复用补好的来源名，
+        # 免得同一个名字在「来源」「发送人」两处显示不一致
+        if sender_wxid and sender_wxid == session_username:
+            item["sender_display"] = item["session_display"]
+        else:
+            item["sender_display"] = _display_with_corp(
+                svc, sender_wxid, sender)
+        out.append(item)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 列表
 # ---------------------------------------------------------------------------
@@ -84,14 +143,17 @@ def list_opportunities(
 ) -> OpportunityListOut:
     """商机列表（时间倒序；status 为空时排除已忽略项；direction 买卖货筛选）。
 
-    每行附加 ``unread`` 未读标识（内存态，供列表页行内展示 + 点击消除）。
+    每行附加 ``unread`` 未读标识（内存态，供列表页行内展示 + 点击消除），
+    以及 ``session_display`` / ``sender_display``（企业微信显示「昵称@企业名」，
+    见 :func:`_display_with_corp`）。
     """
     total, rows = db.list_opportunities(
         page=page, page_size=page_size, session=session,
         type_id=type_id, status=status, keyword=keyword, direction=direction)
     unread_ids = get_notifier().unread_ids()
+    svc = get_wechat_service_optional()
     items = [OpportunityListItem(**r, unread=r["id"] in unread_ids)
-             for r in rows]
+             for r in _with_displays(rows, svc)]
     return OpportunityListOut(total=total, items=items)
 
 
@@ -139,6 +201,8 @@ def get_opportunity(opp_id: int, db: Database = Depends(get_db),
     # raw_refs 在库里是 JSON 字符串，要解析成数组交给前端（解析失败容错为 []）
     detail = dict(opp)
     detail["raw_refs"] = _parse_raw_refs(opp.get("raw_refs"))
+    # 企业微信显示名补齐（存量商机只存了昵称）
+    detail = _with_displays([detail], svc)[0]
     return OpportunityDetailOut(
         **detail, unread=False, raw_text_display=raw_display)
 
@@ -239,6 +303,10 @@ def reply_opportunity(opp_id: int, body: ReplyRequest,
     """人工回复：入队 GUI 串行发送，结果经 WS ``send_result`` 事件送达。
 
     目标校验①：会话须存在于监控对象或微信联系人库。
+
+    ``manual_confirm=True``（默认）时只把内容填进微信输入框、不按发送键：
+    同名联系人与企业微信身份无法百分百确定收件人的场景下，把最后一步交给
+    用户在微信里核对，避免发错人（商机状态保持待处理，不置「已回复」）。
     """
     opp = db.get_opportunity(opp_id)
     if not opp:
@@ -251,17 +319,37 @@ def reply_opportunity(opp_id: int, body: ReplyRequest,
             status_code=400,
             detail=f"目标会话不存在或已失效：{opp['session_name']}，"
                    "请确认微信仍在使用该会话")
+    # 会话显示名：企业微信联系人为「昵称@企业简称」（展开发送时会剥离后缀再搜索）
+    session_name = opp["session_name"] or opp["session_username"]
+    if _is_openim(session_username) and "@" not in session_name:
+        session_name = _display_with_corp(svc, session_username, session_name)
+    extra_note = ""
+    manual = bool(body.manual_confirm)
+    if manual and (body.at or body.quote is not None):
+        # 人工确认模式下只做「清空输入框 + 填入正文」，@ 弹层与引用卡片都
+        # 需要发送动作配合才能成型。丢弃它们比强行自动发送安全：这一步本来
+        # 就是让用户在微信里自己收尾，@ 与引用在微信里点一下即可。
+        extra_note = "（人工确认模式未包含 @成员/引用，请在微信里自行补上）"
+        logger.info("人工确认模式忽略 @/引用（商机 #%d）", opp_id)
     task = SendTask(
         opportunity_id=opp_id,
         session_username=session_username,
-        session_name=opp["session_name"] or opp["session_username"],
+        session_name=session_name,
         text=body.text.strip(),
-        at=[a.strip() for a in body.at if a.strip()],
-        quote_local_id=body.quote.local_id if body.quote else None,
+        at=[] if manual else [a.strip() for a in body.at if a.strip()],
+        quote_local_id=None if manual else (
+            body.quote.local_id if body.quote else None),
+        manual_confirm=manual,
     )
     if not task.text:
         raise HTTPException(status_code=422, detail="回复内容不能为空")
     if not get_sender().submit(task):
         raise HTTPException(status_code=500, detail="发送队列不可用，请稍后重试")
-    logger.info("回复任务已受理（商机 #%d → %s）", opp_id, task.session_name)
-    return ReplyAccepted(ok=True, message="已加入发送队列，发送结果将在页面提示")
+    action = "填入输入框" if task.manual_confirm else "自动发送"
+    logger.info("回复任务已受理（商机 #%d → %s，%s）", opp_id, task.session_name,
+                action)
+    return ReplyAccepted(
+        ok=True,
+        message=(f"已加入队列：将把内容填入「{session_name}」的微信输入框，"
+                 f"请在微信里核对后点发送{extra_note}" if task.manual_confirm
+                 else "已加入发送队列，发送结果将在页面提示"))

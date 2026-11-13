@@ -64,6 +64,14 @@ SESSION_LIST_AID = "session_list"
 SEARCH_LIST_AID = "search_list"
 RESULT_AID_PREFIX = "search_item_"                 # 真实可打开结果的 aid 前缀
 CHAT_INPUT_AID = "chat_input_field"                # 输入框；其 .Name == 当前聊天对象
+# 聊天标题栏里的「企业名」标签：**只有企业微信/客服会话才有**这个控件。
+# 打开会话后靠它判断「当前这个会话是不是企业微信身份的那一个」——同名
+# 好友与企业微信联系人（如「安佳胤」与「安佳胤@我的车车」）在搜索框里
+# 名字完全一样，只看标题无法区分，误开就会把消息发给错的人。
+OPENIM_NAME_AID = ("top_content_h_view.top_spacing_v_view.top_left_info_v_view"
+                   ".big_title_line_h_view.current_chat_openim_name")
+# 搜索结果里企业微信联系人的分区名（微信 4.x 单列一个分区）
+OPENIM_SECTIONS = {"企业微信联系人", "企业微信"}
 DEFAULT_EXE = r"C:\Program Files\Tencent\Weixin\Weixin.exe"
 
 # 搜索结果分区标题（aid 为空且名字命中此集合的才算分区头，其余空 aid 视为建议项）
@@ -770,8 +778,35 @@ class WeChatUIA:
             time.sleep(0.2)
         return None
 
-    def _collect_results(self, keyword: str, settle: float = 1.5) -> List[dict]:
-        """采集去重后的候选 [{name, section, aid, cell}]。"""
+    @staticmethod
+    def _is_openim_result(r: dict, hint: str = "") -> bool:
+        """搜索结果条目是否企业微信/客服身份。
+
+        三个证据（任一命中即认）：
+        1. 分区标题为企业微信联系人（微信 4.x 单列一个分区）；
+        2. 副标题含「企业微信」标签；
+        3. 副标题含企业名（调用方从显示名「昵称@企业名」里带过来）。
+        副标题在微信里可能只渲染企业名（没有「企业微信」字样），所以第 3
+        条是必要的，否则同名好友与企业微信会同时被判为「都不是」。
+        """
+        sub = str(r.get("sub") or "")
+        if (r.get("section") or "") in OPENIM_SECTIONS:
+            return True
+        if "企业微信" in sub:
+            return True
+        return bool(hint) and hint in sub
+
+    def _collect_results(self, keyword: str, settle: float = 1.5,
+                         prefer_openim: bool = False,
+                         openim_hint: str = "") -> List[dict]:
+        """采集去重后的候选 [{name, section, aid, cell}]。
+
+        Args:
+            prefer_openim: 目标确定是企业微信联系人时置 True：在候选里优先
+                保留企业微信身份那一条，避免同名好友抢占。
+            openim_hint: 企业简称（从「昵称@企业名」里拆出来），用于在
+                副标题里认出企业微信那条。
+        """
         lst = self._find_search_list()
         if lst is None:
             return []
@@ -809,6 +844,15 @@ class WeChatUIA:
         matched = [r for r in raw if r["name"] == kw]
         if not matched:
             matched = raw[:]
+        # 企业微信身份优先（必须在「精确同名」筛选之后、去重之前做）：
+        # 同名好友与企业微信联系人两条同名结果，精确筛选会两条都留下；
+        # 若企业微信那条在搜索里显示成「昵称@企业名」，精确筛选只留下
+        # 普通好友，此时必须回到全量候选里把企业微信那条找回来。
+        if prefer_openim:
+            pool = matched if len(matched) > 1 else raw
+            wx = [r for r in pool if self._is_openim_result(r, openim_hint)]
+            if wx:
+                matched = wx
 
         # 最常使用/最近使用中重复出现的同一 aid 去重
         non_freq = {r["aid"] for r in matched
@@ -860,11 +904,22 @@ class WeChatUIA:
         return candidates
 
     def open_chat(self, keyword: str, index: Optional[int] = None,
-                  section: Optional[str] = None, retries: int = 2) -> bool:
+                  section: Optional[str] = None, retries: int = 2,
+                  prefer_openim: bool = False,
+                  openim_hint: str = "") -> bool:
         """搜索并打开联系人/群聊，成功后校验输入框 Name。返回是否成功。
 
         传入 username/wxid 时自动映射为昵称/备注/微信号再搜索（微信搜索框
         不认 wxid）。搜索框残留会影响命中，每次打开前先清空重试。
+
+        Args:
+            prefer_openim: 目标确定是企业微信/客服联系人时置 True。同名好友
+                与企业微信身份在搜索结果里名字完全一样（如「安佳胤」与
+                「安佳胤@我的车车」），默认取第一条会开成普通好友，消息就
+                发给了错的人；置 True 后优先选企业微信分区/带「企业微信」
+                副标题的那一条。
+            openim_hint: 企业简称（「昵称@企业名」里 @ 后面那段），副标题
+                只渲染企业名时靠它认出企业微信那条。
         """
         if not self.ensure_window():
             return False
@@ -881,7 +936,9 @@ class WeChatUIA:
             for attempt in range(max(1, retries)):
                 self._paste_into(box, kw, clear=True)
                 time.sleep(0.8)
-                got = self._collect_results(kw)
+                got = self._collect_results(
+                    kw, prefer_openim=prefer_openim,
+                    openim_hint=openim_hint)
                 if got:
                     break
                 time.sleep(0.4)
@@ -908,12 +965,15 @@ class WeChatUIA:
             if exact:
                 results = exact
         # 企业微信/客服联系人常与普通好友同名（同一个人的两个身份），
-        # 搜索结果里只靠名称无法区分；此时优先副标题标注「企业微信」的
-        # 那一条。副标题缺失或都不含该字样时保持原有取第一条行为。
+        # 搜索结果里只靠名称无法区分；此时优先企业微信分区/副标题标注
+        # 「企业微信」的那一条。副标题缺失或都不命中时保持原有取第一条行为。
+        # 触发条件有两类：① 调用方直接传了 @openim/@kefu 账号；② 调用方
+        # 明确告知 prefer_openim（发送链路用显示名搜索时走这条）。
         low_kw = (keyword or "").strip().lower()
-        if len(results) > 1 and (low_kw.endswith("@openim")
-                                or "@kefu" in low_kw):
-            wx = [r for r in results if "企业微信" in (r.get("sub") or "")]
+        want_openim = bool(prefer_openim) or low_kw.endswith("@openim") \
+            or "@kefu" in low_kw
+        if len(results) > 1 and want_openim:
+            wx = [r for r in results if self._is_openim_result(r, openim_hint)]
             if wx:
                 results = wx
 
@@ -928,6 +988,48 @@ class WeChatUIA:
                      or self.same_chat(name, used_kw)):
             return True
         return False
+
+    def fill_text(self, text: str) -> bool:
+        """把文字填进输入框但**不发送**（人工确认模式下用）。返回是否成功。
+
+        与 :meth:`send_text` 的唯一区别是不按 Enter：消息留在输入框里，
+        由用户在微信窗口里自己核对、自己点发送。发送动作不可撤回，误发到
+        同名联系人的代价远大于多一次人工点击，所以「先填后确认」必须是
+        独立动作，不能靠调用方及时打断。
+        """
+        if not self.ensure_window():
+            return False
+        e = self._chat_input()
+        if e is None:
+            return False
+        self._paste_into(e, text, clear=True)
+        time.sleep(0.2)
+        # 回读输入框内容确认真的填进去了（粘贴偶发失败时要报错，否则用户
+        # 以为文字已在输入框里等着，实际空的）。注意：输入框的 .Name 是
+        # 「当前会话名 + 语音输入提示语」而不是正文，只能走 ValuePattern；
+        # 该控件不支持取内容时按成功处理（不能因读不到就判失败）。
+        head = (text.strip().splitlines() or [""])[0][:12]
+        try:
+            value = e.GetValuePattern().Value
+        except Exception:
+            return True
+        return (not head) or (head in str(value or ""))
+
+    def is_openim_chat(self) -> Optional[bool]:
+        """当前打开的会话是否企业微信/客服身份。
+
+        Returns:
+            True = 有企业名标签（企业微信/客服会话）；False = 明确没有该
+            标签（普通好友/群）；None = 探测失败（控件树不可用），调用方
+            不应据此拦截发送。
+        """
+        if not self.ensure_window():
+            return None
+        try:
+            ctrl = self._win.TextControl(AutomationId=OPENIM_NAME_AID)
+            return bool(ctrl.Exists(0, 0))
+        except Exception:
+            return None
 
     def send_text(self, text: str) -> bool:
         """在已打开会话的输入框发送文本。返回是否成功。"""

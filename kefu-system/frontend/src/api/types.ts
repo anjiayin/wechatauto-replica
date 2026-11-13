@@ -204,6 +204,10 @@ export interface OpportunityListItem {
   created_at: string
   /** 未读标识（内存态；打开详情或点击行内「未读」后清除） */
   unread: boolean
+  /** 展示用会话名：企业微信联系人为「昵称@企业简称」（其余与 session_name 相同） */
+  session_display?: string
+  /** 展示用发送人：企业微信联系人为「昵称@企业简称」 */
+  sender_display?: string
 }
 
 export interface OpportunityListOut {
@@ -274,12 +278,24 @@ export interface AnalysisLogItem {
    * 语音是异步落库的，转写失败的行带回该值，用于「重新识别」。
    */
   voice_local_id?: number | null
+  /**
+   * 图片消息在微信会话内的 local_id（非图片为 null）。
+   * 图片原图/缩略图没下载完时带回该值，用于「重新识别」。
+   */
+  image_local_id?: number | null
 }
 
 /** POST /api/voice/retry：手动补转写一条语音 */
 export interface VoiceRetryResult {
   ok: boolean
   text: string
+  error: string
+}
+
+/** POST /api/images/retry：手动补识别一张图片 */
+export interface ImageRetryResult {
+  ok: boolean
+  message: string
   error: string
 }
 
@@ -293,6 +309,11 @@ export interface ReplyPayload {
   text: string
   at: string[]
   quote?: { local_id: number }
+  /**
+   * 人工确认（默认 true）：只把内容填进微信输入框，由用户在微信里核对
+   * 收件人后自己点发送。false = 自动发送并按数据库确认。
+   */
+  manual_confirm?: boolean
 }
 
 /** /api/opportunities/{id}/members：@ 群成员候选（name 为群内显示名） */
@@ -361,6 +382,24 @@ export interface CacheDirInfo {
   active_dir: string
   active: boolean
   legacy_dirs: string[]
+}
+
+/** /api/settings/server：启动端口设置（保存值 + 当前进程实际监听值） */
+export interface ServerSettings {
+  /** 已保存 / 下次启动生效的监听地址 */
+  host: string
+  /** 已保存 / 下次启动生效的端口 */
+  port: number
+  /** 当前进程实际监听地址（探测不到为空串） */
+  running_host: string
+  /** 当前进程实际监听端口（0 = 未知） */
+  running_port: number
+  /** 保存值与运行值不一致 → 需要重启服务才生效 */
+  restart_required: boolean
+  /** 默认端口（「恢复默认」用） */
+  default_port: number
+  /** 下次启动后的访问地址 */
+  address: string
 }
 
 /** /api/system/asr（语音消息本地离线转写状态） */

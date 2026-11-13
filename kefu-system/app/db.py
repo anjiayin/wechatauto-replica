@@ -146,7 +146,8 @@ DDL_STATEMENTS: tuple[str, ...] = (
       agg_wait_ms      INTEGER,
       queue_wait_ms    INTEGER,
       e2e_ms           INTEGER,
-      voice_local_id   INTEGER
+      voice_local_id   INTEGER,
+      image_local_id   INTEGER
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_logs_created ON analysis_logs (created_at DESC)",
@@ -329,6 +330,9 @@ class Database:
             # 供补转写成功后回填日志、以及前端「重新识别」按 (会话, local_id)
             # 精确定位那条语音（消息正文里没有可用标识）
             ("analysis_logs", "voice_local_id", "INTEGER"),
+            # 图片消息标识：图片「原图未下载完/缩略图不完整」时的重试与
+            # 手动补识别都要按 (会话, local_id) 精确定位那张图
+            ("analysis_logs", "image_local_id", "INTEGER"),
         )
         with self._lock:
             for table, column, col_type in plans:
@@ -897,7 +901,8 @@ class Database:
                             agg_wait_ms: Optional[int] = None,
                             queue_wait_ms: Optional[int] = None,
                             e2e_ms: Optional[int] = None,
-                            voice_local_id: Optional[int] = None) -> int:
+                            voice_local_id: Optional[int] = None,
+                            image_local_id: Optional[int] = None) -> int:
         """写入一条分析日志（ok/error/skipped/below_threshold）。
 
         prompt_tokens/completion_tokens：AI 调用 token 用量（反馈 13
@@ -911,6 +916,10 @@ class Database:
 
         ``voice_local_id``：语音消息在微信会话内的 local_id（非语音消息为
         None）。语音转写失败时靠它做延迟重试回填与前端手动重试。
+
+        ``image_local_id``：图片消息在微信会话内的 local_id（非图片为
+        None）。原图/缩略图没下载完时靠它在补识别队列与「重新识别」按钮里
+        精确定位那张图。
         """
         with self._lock:
             cur = self._conn.execute(
@@ -918,14 +927,15 @@ class Database:
                 "msg_count, input_text, result, status, error, model, "
                 "latency_ms, opportunity_id, prompt_tokens, completion_tokens, "
                 "agg_wait_ms, queue_wait_ms, e2e_ms, voice_local_id, "
-                "created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "image_local_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
                 "datetime('now','localtime'))",
                 (session_username, sender_wxid, msg_count, input_text, result,
                  status, error, model, latency_ms, opportunity_id,
                  prompt_tokens, completion_tokens,
                  agg_wait_ms, queue_wait_ms, e2e_ms,
-                 int(voice_local_id) if voice_local_id else None),
+                 int(voice_local_id) if voice_local_id else None,
+                 int(image_local_id) if image_local_id else None),
             )
             # 同一事务里镜像到 ai_usage：账单只认这张表，即使之后分析日志
             # 被「历史清理」删掉，用量与费用统计也不会出现空洞。
@@ -1113,7 +1123,7 @@ class Database:
                 "SELECT id, created_at, session_username, sender_wxid, "
                 "msg_count, input_text, result, status, error, model, "
                 "latency_ms, agg_wait_ms, queue_wait_ms, e2e_ms, "
-                "voice_local_id "
+                "voice_local_id, image_local_id "
                 "FROM analysis_logs"
                 f"{where_sql} ORDER BY id DESC LIMIT ? OFFSET ?",
                 [*params, page_size, (max(page, 1) - 1) * page_size],
@@ -1416,6 +1426,22 @@ class Database:
                  now_iso()),
             )
             self._conn.commit()
+
+    def delete_image_analysis(self, username: str, local_id: int) -> int:
+        """删除一张图片的识别结论缓存（手动「重新识别」前清空）。返回删除行数。
+
+        为什么需要删：缓存只存「已拿到模型结论」的行；用户在微信里点开原图
+        让微信把原图下载下来后，希望用更高清的图重新识别一次。不先删缓存，
+        worker 会直接命中旧结论（当时可能只有 136x180 的缩略图），重识别
+        等于什么都没做。
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM image_analysis WHERE username=? AND local_id=?",
+                (str(username or ""), int(local_id)),
+            )
+            self._conn.commit()
+            return int(cur.rowcount or 0)
 
     def count_pending_opportunities(self) -> int:
         """待处理商机数。"""

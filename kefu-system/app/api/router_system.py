@@ -14,6 +14,7 @@
 - GET /api/system/billing                                     AI 账单（反馈 13）
 - GET/PUT /api/system/asr | POST /api/system/asr/download      语音转写（本地离线）
 - POST /api/voice/retry                                       语音补转写（手动重试）
+- POST /api/images/retry                                      图片补识别（手动重试）
 - WS  /ws/events
 """
 from __future__ import annotations
@@ -50,6 +51,8 @@ from app.schemas import (
     CacheDirUpdate,
     CacheShardStatus,
     ImageAnalysisOut,
+    ImageRetryIn,
+    ImageRetryOut,
     MessageOut,
     MonitorQuota,
     PurgeRequest,
@@ -537,6 +540,30 @@ def retry_voice(body: VoiceRetryIn,
     if text:
         return VoiceRetryOut(ok=True, text=text)
     return VoiceRetryOut(ok=False, error=error or "语音转写失败")
+
+
+# ---------------------------------------------------------------------------
+# POST /api/images/retry
+# ---------------------------------------------------------------------------
+@router.post("/api/images/retry", response_model=ImageRetryOut)
+def retry_image(body: ImageRetryIn,
+                wechat: WeChatService = Depends(get_wechat_service),
+                ) -> ImageRetryOut:
+    """手动补识别一张图片（分析日志图片行的「重新识别」）。
+
+    背景：微信的原图是按需下载的（用户点开那张图 / 联网时后台自动下载），
+    很多群图长期只有半个缩略图，自动补识别 4 次后放弃。用户在微信里点开
+    那张图后再点这里，就用刚下载好的原图重跑一次识别。原图仍没下载时
+    立即返回中文原因，不占队列也不白等视觉超时。
+    """
+    try:
+        ok, message = wechat.retry_image(body.username, body.local_id)
+    except Exception:      # 兜底：任何异常都不该让前端只看到 500
+        logger.exception("手动补识别异常（%s/%s）", body.username, body.local_id)
+        return ImageRetryOut(ok=False, error="补识别失败，请稍后再试")
+    if ok:
+        return ImageRetryOut(ok=True, message=message)
+    return ImageRetryOut(ok=False, error=message or "补识别失败")
 
 
 # ---------------------------------------------------------------------------

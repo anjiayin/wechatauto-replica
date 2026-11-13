@@ -165,8 +165,50 @@ function QuoteCell(props: { opp: OpportunityListItem }) {
   )
 }
 
-/** 商机列表页：筛选栏、未读角标联动、行内快捷操作、详情抽屉。 */
-export default function OpportunityList() {
+/**
+ * 「来源」单元格：会话 + 发送人合并展示（来源列与发送人列合并）。
+ *
+ * 背景（用户反馈）：加了「发送人」一列后表格太宽，操作列四个按钮被挤到
+ * 换行。两列信息高度相关（谁在哪个会话说的），合并成一列最省横向空间：
+ * - 群消息：第一行群名称，第二行发送人（不显示微信 ID，ID 放悬浮提示）；
+ * - 私聊：只显示对方名字（企业微信联系人为「昵称@企业简称」）。
+ * 悬浮提示里给出会话 username / 发送人 wxid，排查时仍能拿到原始标识。
+ */
+function SourceCell(props: { opp: OpportunityListItem }) {
+  const { opp } = props
+  const isGroup = (opp.session_username || '').endsWith('@chatroom')
+  const sessionName = opp.session_display || opp.session_name || opp.session_username
+  const senderName = opp.sender_display || opp.sender_name
+  const tip = [
+    `会话：${sessionName}`,
+    opp.session_username && opp.session_username !== sessionName
+      ? `会话 ID：${opp.session_username}`
+      : '',
+    isGroup && senderName ? `发送人：${senderName}` : '',
+    isGroup && opp.sender_wxid ? `发送人 ID：${opp.sender_wxid}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
+  return (
+    <Box sx={{ display: 'flex', alignItems: 'flex-start', maxWidth: 200 }}>
+      <Tooltip title={tip} placement="top" arrow>
+        <Box sx={{ minWidth: 0, flex: 1 }}>
+          <Typography variant="body2" noWrap>
+            {sessionName}
+          </Typography>
+          {isGroup && senderName && (
+            <Typography variant="caption" color="text.secondary" noWrap display="block">
+              发送人：{senderName}
+            </Typography>
+          )}
+        </Box>
+      </Tooltip>
+      <CopyButton text={sessionName} label={isGroup ? '群名' : '会话名'} />
+    </Box>
+  )
+}
+
+/** 商机列表页：筛选栏、未读角标联动、行内快捷操作、详情抽屉。 */export default function OpportunityList() {
   const queryClient = useQueryClient()
   const [status, setStatus] = useState('')
   const [typeId, setTypeId] = useState('')
@@ -369,8 +411,7 @@ export default function OpportunityList() {
             <TableRow>
               <TableCell width={52}>未读</TableCell>
               <TableCell>类型</TableCell>
-              <TableCell>来源</TableCell>
-              <TableCell>发送人</TableCell>
+              <TableCell>来源（会话 / 发送人）</TableCell>
               <TableCell>时间</TableCell>
               <TableCell>消息原文</TableCell>
               <TableCell>AI 要点摘要</TableCell>
@@ -382,12 +423,12 @@ export default function OpportunityList() {
           <TableBody>
             {isLoading && (
               <TableRow>
-                <TableCell colSpan={10}>加载中…</TableCell>
+                <TableCell colSpan={9}>加载中…</TableCell>
               </TableRow>
             )}
             {!isLoading && items.length === 0 && (
               <TableRow>
-                <TableCell colSpan={10}>
+                <TableCell colSpan={9}>
                   <Typography color="text.secondary" align="center" sx={{ py: 4 }}>
                     暂无商机。请确认：① 设置页已配置监控对象与商机类型；② AI 接口可用（或在设置里改用轻量筛选）；③ 新消息在发送人停止发言（默认 15 秒）后即触发分析并产生商机。
                   </Typography>
@@ -434,21 +475,7 @@ export default function OpportunityList() {
                   </Stack>
                 </TableCell>
                 <TableCell>
-                  <Box sx={{ display: 'flex', alignItems: 'center' }}>
-                    <span>{o.session_name}</span>
-                    <CopyButton text={o.session_name} label="群名/会话名" />
-                  </Box>
-                </TableCell>
-                <TableCell>
-                  <Box sx={{ display: 'flex', alignItems: 'center' }}>
-                    <span>{o.sender_name}</span>
-                    <CopyButton text={o.sender_name} label="发送人" />
-                  </Box>
-                  {o.sender_wxid && (
-                    <Typography variant="caption" display="block" color="text.secondary">
-                      {o.sender_wxid}
-                    </Typography>
-                  )}
+                  <SourceCell opp={o} />
                 </TableCell>
                 <TableCell sx={{ whiteSpace: 'nowrap' }}>{o.window_end.replace('T', ' ')}</TableCell>
                 <TableCell sx={{ maxWidth: 300, minWidth: 180 }}>
@@ -467,7 +494,7 @@ export default function OpportunityList() {
                 <TableCell>
                   <Chip size="small" color={STATUS_COLORS[o.status]} label={STATUS_LABELS[o.status]} />
                 </TableCell>
-                <TableCell align="right" onClick={(e) => e.stopPropagation()}>
+                <TableCell align="right" onClick={(e) => e.stopPropagation()} sx={{ whiteSpace: 'nowrap' }}>
                   <Tooltip title="去回复">
                     <IconButton size="small" onClick={() => openDetail(o.id)}>
                       <ReplyIcon fontSize="small" />
@@ -481,7 +508,7 @@ export default function OpportunityList() {
                         onClick={() =>
                           jumpMutation.mutate({
                             session_username: o.session_username,
-                            session_name: o.session_name,
+                            session_name: o.session_display || o.session_name,
                           })
                         }
                       >

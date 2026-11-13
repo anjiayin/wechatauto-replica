@@ -60,6 +60,11 @@ from app.voice_retry import VoiceRetryQueue
 
 logger = logging.getLogger(__name__)
 
+# 企业微信「昵称@企业简称」所需的企业简称表缓存时长（秒）。
+# 企业简称几乎不变（只有新增企业微信联系人才会变），10 分钟足够新；
+# 读失败时另按 30 秒短缓存重试，见 WeChatService.openim_corp_map。
+CORP_MAP_CACHE_TTL_SEC = 600.0
+
 # 微信库读取失败的用户可读提示（前端展示 + 重新加载按钮）
 MSG_DB_BUSY_ERROR = "微信数据库正忙（微信客户端正在写入），请稍后点击重新加载"
 # 微信服务未接入时的提示
@@ -133,6 +138,10 @@ class WeChatService:
         self._stop = threading.Event()
         self._name_cache: dict[str, str] = {}   # username → display name 缓存
         self._name_cache_lock = threading.Lock()
+        # 企业微信联系人 → 企业简称（整张表缓存：读 contact.db 解密很慢，
+        # 商机/日志一页几十行逐行读会把接口拖到秒级）
+        self._corp_map_cache: tuple[float, dict, bool] = (0.0, None, False)
+        self._corp_map_lock = threading.Lock()
         # 全量联系人/会话列表缓存（TTL 60s；会话搜索改为缓存 + 内存过滤，
         # 避免每次搜索都撞微信库冷分片/解密导致的秒级等待）
         self._contact_cache: list[dict] = []
@@ -188,7 +197,8 @@ class WeChatService:
         # 哪张图被丢了，批次 7 QA-P3-2）。
         self._image_retry = ImageRetryQueue(
             handler=self._retry_image_task,
-            on_drop=self._on_image_retry_dropped)
+            on_drop=self._on_image_retry_dropped,
+            on_give_up=self._on_image_retry_given_up)
 
     # ------------------------------------------------------------------
     # 缓存目录（可配置；默认 kefu-system/data/wechat_cache）
@@ -461,7 +471,9 @@ class WeChatService:
                         error=f"非文本消息（{mtype or '未知类型'}），不分析",
                     )
                     return
-            session_name = self.get_display_name(username)
+            # 企业微信联系人按微信 UI 习惯显示「昵称@企业简称」：只存昵称
+            # 会让商机列表的「来源」看起来只有前半截，同名好友也无法区分
+            session_name = self.display_name_with_corp(username)
             # 发送人已用可靠数据源解析（群=正文前缀 / 私聊=会话对方），
             # 覆盖 msg 中不可靠的 sender_username 供 Aggregator/管线透传
             msg["sender_username"] = sender_wxid
@@ -513,6 +525,9 @@ class WeChatService:
                     mtype, str(raw_content or ""))[:200],
                 status="skipped",
                 error=detail,
+                # 带 local_id 落库：前端「重新识别」要按 (会话, local_id)
+                # 精确定位这张图（日志正文里没有可用标识）
+                image_local_id=local_id or None,
             )
         except Exception:
             logger.exception("写入图片跳过日志失败（已忽略）")
@@ -601,7 +616,7 @@ class WeChatService:
             "kind": kind,
             # 会话显示名在监听线程里取（有缓存，足够快）；worker 里再取会多
             # 一次微信库调用，还可能撞上冷分片
-            "session_name": self.get_display_name(username),
+            "session_name": self.display_name_with_corp(username),
             "sender_wxid": sender_wxid,
             "sender_name": sender_name,
             # 原始消息时间：合并窗口静默计时与「[HH:MM]」行时间都以它为准，
@@ -770,17 +785,19 @@ class WeChatService:
                                         "图片识别开关已关闭，跳过识别",
                                         local_id)
                 return False
-            data = self.get_image_bytes(username, local_id)
+            data, reason = self.get_image_bytes_with_reason(
+                username, local_id)
             if not data:
-                # 实测这是「原图还没下载完」的**主路径**：load_image 取不到
+                # 实测这是「图片还没下载好」的**主路径**：load_image 取不到
                 # 完整图片时直接返回 None，根本走不到视觉调用，也就不会有
                 # VisionError(MSG_INCOMPLETE)。所以这里同样要排队补识别，
-                # 否则微信稍后才下载完原图的那张图永远漏识别。
-                self._queue_image_retry(task, username=username,
-                                        sender_wxid=sender_wxid, mtype=mtype,
-                                        raw_content=raw_content,
-                                        local_id=local_id,
-                                        reason="图片读取失败或不完整，未识别")
+                # 否则微信稍后才下载完的图永远漏识别。
+                self._queue_image_retry(
+                    task, username=username,
+                    sender_wxid=sender_wxid, mtype=mtype,
+                    raw_content=raw_content, local_id=local_id,
+                    reason=f"图片读取失败或不完整（{reason or '原因未知'}），"
+                           "未识别")
                 return False
             settings = self._image_vision_settings()
             model = str(settings.get("model") or "")
@@ -896,6 +913,40 @@ class WeChatService:
         except Exception:
             logger.exception("写图片补识别队列丢弃日志失败（已忽略）")
 
+    def _on_image_retry_given_up(self, username: str, local_id: int,
+                                 task: dict, attempts: int) -> None:
+        """补识别把退避次数用尽时，落一条用户可见的 skipped 终态日志。
+
+        此前用尽后只在服务日志里留一行 ``info``，用户在页面上看到的最后一
+        条还是「第 4 次重试：图片仍未就绪（…），继续等待后自动补识别」，
+        于是会一直等下去。实际上微信原图是**按需下载**的：群图长期只有半截
+        缩略图（``_t.dat`` 尾部没有 JPEG 的 ``FF D9``），不去微信里点开就
+        永远不会就绪，自动重试到天荒地老也没用。
+
+        所以这里写一条明确的终态：告诉用户「不会自己好了」，并给出唯一有效
+        的补救动作——在微信里点开这张图，再回来点「重新识别」（对应
+        ``POST /api/images/retry``）。
+
+        Args:
+            username: 会话 username（群为 ``xxx@chatroom``）。
+            local_id: 该图片消息在会话内的 local_id。
+            task: 入队时的原始任务 dict（取发送人/类型/原文写日志）。
+            attempts: 实际尝试次数（退避序列长度）。
+        """
+        payload = dict(task or {})
+        try:
+            sender_wxid = str(payload.get("sender_wxid") or "")
+            mtype = str(payload.get("mtype") or "")
+            raw_content = str(payload.get("content") or "")
+            self._log_image_skipped(
+                str(username or payload.get("username") or ""),
+                sender_wxid, mtype, raw_content,
+                f"已自动重试 {int(attempts)} 次仍取不到原图，已放弃自动补识别"
+                "（微信原图按需下载，需在微信里点开该图片后再点「重新识别」）",
+                local_id)
+        except Exception:
+            logger.exception("写图片补识别最终失败日志失败（已忽略）")
+
     def _retry_image_task(self, task: dict) -> str:
         """补识别队列的 handler：再取一次图并识别。
 
@@ -963,13 +1014,16 @@ class WeChatService:
                                         local_id)
             return "done"
 
-        # b. 取图：取不到 = 微信原图还没下载完，继续等
-        data = self.get_image_bytes(username, local_id)
+        # b. 取图：取不到 = 微信还没下载好这张图，继续等
+        data, reason = self.get_image_bytes_with_reason(username, local_id)
         if not data:
+            # 写清到底缺什么（原图没下载 / 缩略图不完整 / 解密失败）：
+            # 只说「原图仍未就绪」会让用户误以为再等等就好，实际很多图
+            # 微信永远不会自动下载原图（见 media.load_image 的候选顺序）
             self._log_image_skipped(
                 username, sender_wxid, mtype, raw_content,
-                f"{tag}原图仍未就绪（微信尚未下载完），继续等待后自动补识别",
-                local_id)
+                f"{tag}图片仍未就绪（{reason or '原因未知'}），"
+                "继续等待后自动补识别", local_id)
             return "retry"
 
         # c/d/e. 识别
@@ -1144,7 +1198,7 @@ class WeChatService:
         msg["sender_username"] = payload.get("sender_wxid") or ""
         msg["sender_display_name"] = payload.get("sender_name") or ""
         # 语音消息的原始 local_id 已在 msg 中（快照保留），聚合器按需对齐
-        self._aggregator.add(msg, self.get_display_name(username),
+        self._aggregator.add(msg, self.display_name_with_corp(username),
                              payload.get("kind") or "friend")
 
     def _on_voice_retry_failure(self, username: str, local_id: int, error: str,
@@ -1194,11 +1248,72 @@ class WeChatService:
                     username, kind, msg)
                 msg["sender_username"] = sender_wxid
                 msg["sender_display_name"] = sender_name
-                self._aggregator.add(msg, self.get_display_name(username),
+                self._aggregator.add(msg, self.display_name_with_corp(username),
                                      kind)
             except Exception:
                 logger.exception("手动重试后重新纳入分析失败（已忽略）")
         return text, ""
+
+    # ------------------------------------------------------------------
+    # 图片手动补识别（分析日志「重新识别」）
+    # ------------------------------------------------------------------
+    def retry_image(self, username: str, local_id: int
+                    ) -> tuple[bool, str]:
+        """手动补识别一张图片：清掉旧结论后重新入图片识别队列。
+
+        使用场景（用户实机反馈）：微信只在「用户点开那张图」或联网时后台
+        自动下载原图，很多群图永远只有半个缩略图，自动补识别 4 次（约 7
+        分钟）后放弃。用户看到日志后在微信里点开那张图，原图就落到本地了，
+        这时点「重新识别」即可用原图重跑一次。
+
+        Args:
+            username: 会话 username。
+            local_id: 图片消息在会话内的 local_id。
+
+        Returns:
+            ``(是否已受理, 用户可读中文提示)``。**绝不抛异常**。
+        """
+        username = str(username or "")
+        try:
+            lid = int(local_id)
+        except (TypeError, ValueError):
+            return False, "图片标识非法，无法重新识别"
+        if not username or lid <= 0:
+            return False, "缺少会话或图片标识，无法重新识别"
+        try:
+            if not self._image_vision_settings().get("enabled"):
+                return False, "图片识别开关已关闭（设置 → AI 接口 → 图片识别）"
+        except Exception:
+            logger.exception("读取图片识别开关失败（按已关闭处理）")
+            return False, "读取图片识别设置失败，请稍后重试"
+        try:
+            self._db.delete_image_analysis(username, lid)
+        except Exception:
+            logger.exception("清除图片识别缓存失败（继续按新图识别）")
+        # 先探一次图：拿不到就直接告诉用户「微信还没下载原图」，别让他
+        # 盯着一个注定失败的任务等 60 秒视觉超时
+        data, reason = self.get_image_bytes_with_reason(username, lid)
+        if not data:
+            return False, (f"这张图仍未就绪：{reason or '原因未知'}。"
+                           "请在微信里点开这张图（触发原图下载）后再试")
+        task = {
+            "username": username,
+            "local_id": lid,
+            "mtype": "图片",
+            "kind": "group" if username.endswith("@chatroom") else "friend",
+            "session_name": self.display_name_with_corp(username),
+            "sender_wxid": "",
+            "sender_name": "手动重新识别",
+            "create_time": 0,
+            "content": "[图片]",
+        }
+        try:
+            self._vision_queue.put_nowait(task)
+        except queue.Full:
+            return False, "图片识别队列已满，请稍后再试"
+        self._warn_vision_backlog(self._vision_queue.qsize())
+        logger.info("图片手动补识别已受理（%s local_id=%d）", username, lid)
+        return True, "已开始重新识别（约 10~20 秒），结果会出现在分析日志里"
 
     def _rebuild_voice_msg(self, username: str, local_id: int,
                            shown: str) -> Optional[dict]:
@@ -1543,7 +1658,7 @@ class WeChatService:
         """
         session_username = str(session_username or "")
         input_text = str(input_text or "")
-        session_display = self.get_display_name(session_username) \
+        session_display = self.display_name_with_corp(session_username) \
             or session_username
         if not session_username.endswith("@chatroom"):
             return session_display, input_text
@@ -1638,6 +1753,51 @@ class WeChatService:
             self._name_cache[username] = name
         return name
 
+    # ------------------------------------------------------------------
+    # 企业微信联系人的显示名（昵称@企业简称）
+    # ------------------------------------------------------------------
+    def openim_corp_map(self) -> dict:
+        """企业微信联系人 → 企业简称（进程内缓存 600 秒）。
+
+        底层 ``get_openim_corp_names`` 要读 contact.db（解密 + 查 openim_wording
+        表），商机列表一页 20 行逐行调用会把接口拖垮，所以这里缓存整张表。
+        读失败返回空字典并只缓存 30 秒，避免一次抖动把空表钉死 10 分钟。
+        """
+        now = time.monotonic()
+        with self._corp_map_lock:
+            ts, cached, ok = self._corp_map_cache
+            if cached is not None and now - ts < (
+                    CORP_MAP_CACHE_TTL_SEC if ok else 30.0):
+                return cached
+        if self._wxdb is None:
+            return {}
+        try:
+            corp = self._wxdb.get_openim_corp_names() or {}
+            ok = True
+        except Exception as exc:
+            logger.warning("读取企业微信企业简称失败（显示名退化为昵称）：%s", exc)
+            corp, ok = {}, False
+        with self._corp_map_lock:
+            self._corp_map_cache = (now, corp, ok)
+        return corp
+
+    def display_name_with_corp(self, username: str) -> str:
+        """username → 显示名；企业微信联系人拼成「昵称@企业简称」。
+
+        为什么需要它（用户实机反馈）：微信 UI 里企业微信联系人就显示为
+        「安佳胤@我的车车」，而本地库只能查到昵称「安佳胤」，于是商机来源
+        列、发送人列看起来像「只有前半截」，同名好友与企业微信身份也分不清。
+        非企业微信账号、取不到企业名时行为与 :meth:`get_display_name` 完全一致。
+        """
+        username = str(username or "")
+        if not username:
+            return ""
+        name = self.get_display_name(username)
+        if not self.is_openim(username):
+            return name
+        corp_map = self.openim_corp_map()
+        return self._with_corp(name, str(corp_map.get(username) or ""))
+
     @staticmethod
     def is_openim(username: str) -> bool:
         """是否企业微信/客服类会话（@openim、@kefu.openim 等）。
@@ -1714,12 +1874,8 @@ class WeChatService:
         return items
 
     def _openim_corp_map(self) -> dict[str, str]:
-        """企业微信联系人 → 企业简称（读取失败返回空字典，不影响列表构建）。"""
-        try:
-            return self._wxdb.get_openim_corp_names()
-        except Exception as exc:
-            logger.warning("读取企业微信企业名失败：%s", exc)
-            return {}
+        """企业微信联系人 → 企业简称（经整表缓存的 :meth:`openim_corp_map`）。"""
+        return self.openim_corp_map()
 
     @staticmethod
     def _with_corp(name: str, corp: str) -> str:
@@ -2119,6 +2275,16 @@ class WeChatService:
     def get_image_bytes(self, username: str, local_id: int) -> Optional[bytes]:
         """解密会话中指定图片消息，返回图片字节；失败返回 None。
 
+        与 :meth:`get_image_bytes_with_reason` 同一条链路，只是丢掉原因。
+        """
+        data, _reason = self.get_image_bytes_with_reason(username, local_id)
+        return data
+
+    def get_image_bytes_with_reason(self, username: str,
+                                    local_id: int
+                                    ) -> tuple[Optional[bytes], str]:
+        """取图片字节，并返回**可直接展示给用户**的失败原因。
+
         底层用 wechatauto.media.MediaDownloader 定位并解密 .dat
         （群聊原图未点开时只有缩略图缓存，自动回退缩略图）。解密结果
         由 MediaDownloader 落盘到 IMG_CACHE_DIR（持久缓存，避免重复
@@ -2136,28 +2302,29 @@ class WeChatService:
         if self._wxdb is None:
             logger.info("图片不可用（%s local_id=%s）：微信库未就绪",
                         username, local_id)
-            return None
+            return None, "微信库未就绪"
         downloader = self._get_media_downloader()
         if downloader is None:
             logger.info("图片不可用（%s local_id=%s）：媒体下载器不可用",
                         username, local_id)
-            return None
+            return None, "媒体下载器不可用"
         try:
             data, _path, reason = downloader.load_image(username, local_id)
         except Exception as exc:
             logger.warning("图片解密失败（%s local_id=%s）：%s",
                            username, local_id, exc)
-            return None
+            return None, f"图片解密失败：{exc}"
         if not data:
+            reason = reason or "未知原因"
             logger.info("图片不可用（%s local_id=%s）：%s",
-                        username, local_id, reason or "未知原因")
-            return None
+                        username, local_id, reason)
+            return None, reason
         if not (data[:3] == b"\xff\xd8\xff" or data[:4] == b"\x89PNG"
                 or data[:3] == b"GIF"):
             logger.info("图片不可用（%s local_id=%s）：格式无法内嵌展示",
                         username, local_id)
-            return None
-        return data
+            return None, "图片格式无法内嵌展示（非 jpg/png/gif）"
+        return data, ""
 
     def get_voice_wav(self, username: str, local_id: int) -> Optional[bytes]:
         """取一条语音消息的可播放 WAV 音频；失败返回 None（原因记日志）。

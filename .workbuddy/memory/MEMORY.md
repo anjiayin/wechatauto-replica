@@ -6,8 +6,8 @@
 - 用户偏好：简体中文；重视真实数据/实机验证，不接受只凭推断的结论。
 
 ## 当前交接入口
-- **2026-11-12 交接文档：`D:/Git/wechatauto-replica/HANDOVER-2026-11-12.md`**（第五批 9 项需求 8 完成 1 未完成，全部未提交）。
-- 基线 `HEAD=87a6b91`；测试基线 475 passed。
+- **2026-11-13 第 13 批：`D:/Git/wechatauto-replica/HANDOVER-2026-11-13-batch13.md`**（7 项全完成，未提交）；前序 `HANDOVER-2026-11-13.md`（第 8~12 批，已提交）。
+- 基线 `HEAD=89fd98a`；测试基线 **924 passed**（全量约 7.4 分钟）。
 
 ## 铁律 / 常踩的坑
 - pytest 必须 `--basetemp=D:/tmp/...`（本机 safe-delete 守卫会拦临时目录清理）；全量约 4~5 分钟。
@@ -23,6 +23,8 @@
 - 微信 4.x 输入框 Accessibility Name 可能拼上 UI 提示语（如「文件传输助手长按鼠标 语音输入」）；会话校验必须用 `same_chat` 宽松匹配，严格相等会误判失败并落入 OCR 兜底（曾导致发送全链路 56.6s）。
 - 企业微信联系人 `local_type=5/6/7`、username 形如 `xxx@openim`；企业简称在 `contact.db` 的 `openim_wording` 表。
 - .dat 图片 V2 格式：`[6B magic][4B aes_size][4B xor_size][1B pad][AES 密文][raw 明文][XOR 密文]`；key 由 cfg_dword + wxid 派生（详见 media.py）。
+- **微信原图按需下载**：`<md5>.dat`（原图）只有用户点开/后台下过才落盘，群图长期只有半截 `_t.dat`（尾部无 `FF D9`）。实测一个群 38 张图 34 张无原图。"就绪" = 用户在微信里点开过，程序无法代劳（模拟点击会动用户微信）。
+- **企业微信显示名不能直接当搜索词**：「昵称@企业简称」是展示名，`_resolve_search_keyword` 只剥 `@openim` 真实 ID。发消息必须 `_chat_name()` 剥后缀 + `open_chat_prefer_openim` 分区优先 + 打开后验 `current_chat_openim_name` 标题栏标签，不一致拒发（否则会发给同名普通好友，曾实操发错）。
 
 ## 历史批次（已提交，勿重做）
 - `c6045c5` AI 账单/清理修复；`036c17e` 企业微信好友搜索；`633f27f` 离线语音转写；`87a6b91` 语音补转写队列 + 发送链路性能修复。

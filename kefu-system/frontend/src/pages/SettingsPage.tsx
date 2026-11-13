@@ -61,6 +61,7 @@ import type {
   OpportunityType,
   PurgeResult,
   RetentionSettings,
+  ServerSettings,
   SessionItem,
   StatusOut,
 } from '../api/types'
@@ -1558,6 +1559,33 @@ function DataBillingTab() {
     }
   }, [cacheInfo, cacheLoaded])
 
+  // 启动端口（设置页直接改，重启服务后生效）
+  const { data: serverInfo } = useQuery({
+    queryKey: ['server-settings'],
+    queryFn: () => apiGet<ServerSettings>('/api/settings/server'),
+  })
+  const [serverPort, setServerPort] = useState('')
+  const [serverLoaded, setServerLoaded] = useState(false)
+  useEffect(() => {
+    if (serverInfo && !serverLoaded) {
+      setServerPort(String(serverInfo.port))
+      setServerLoaded(true)
+    }
+  }, [serverInfo, serverLoaded])
+
+  const saveServerMutation = useMutation({
+    mutationFn: (port: number) =>
+      apiPut<ServerSettings>('/api/settings/server', { port }),
+    onSuccess: (info) => {
+      void queryClient.invalidateQueries({ queryKey: ['server-settings'] })
+      setServerPort(String(info.port))
+      setSnack(info.restart_required
+        ? `端口已保存为 ${info.port}，重启服务后生效`
+        : '端口已保存（与当前运行端口一致）')
+    },
+    onError: (e: Error) => setSnack(`保存失败：${e.message}`),
+  })
+
   const saveCacheDirMutation = useMutation({
     mutationFn: (dir: string) =>
       apiPut<CacheDirInfo>('/api/system/cache', { dir }),
@@ -1782,6 +1810,69 @@ function DataBillingTab() {
             检测到旧版临时目录缓存：{cacheInfo.legacy_dirs.join('、')}
             。确认新目录运行正常后可手动删除以释放空间（密钥缓存已自动复制到新目录）。
           </Alert>
+        )}
+      </Stack>
+
+      <Divider sx={{ my: 2 }} />
+      <Typography variant="subtitle2" sx={{ mb: 1 }}>启动端口</Typography>
+      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
+        控制台监听的端口（默认 8765）。改完需<strong>重启服务</strong>才生效：关掉当前窗口后重新运行
+        「启动服务」，或用命令行 <code>python run.py --port 端口号</code> 临时指定。
+        命令行/环境变量（KEFU_PORT）的优先级高于这里的保存值。
+      </Typography>
+      <Stack spacing={1.5}>
+        <Stack direction="row" spacing={1} alignItems="center" useFlexGap>
+          <TextField
+            size="small"
+            sx={{ width: 150 }}
+            label="端口"
+            value={serverPort}
+            placeholder={String(serverInfo?.default_port ?? 8765)}
+            onChange={(e) => setServerPort(e.target.value.replace(/[^0-9]/g, ''))}
+            error={Boolean(serverPort) && (Number(serverPort) < 1 || Number(serverPort) > 65535)}
+            helperText={
+              serverPort && (Number(serverPort) < 1 || Number(serverPort) > 65535)
+                ? '端口需为 1~65535'
+                : ' '
+            }
+          />
+          <Button
+            variant="contained"
+            disabled={
+              saveServerMutation.isPending
+              || !serverPort
+              || Number(serverPort) < 1
+              || Number(serverPort) > 65535
+            }
+            onClick={() => saveServerMutation.mutate(Number(serverPort))}
+          >
+            保存
+          </Button>
+          <Button
+            disabled={saveServerMutation.isPending || !serverInfo}
+            onClick={() => {
+              setServerPort(String(serverInfo?.default_port ?? 8765))
+              saveServerMutation.mutate(serverInfo?.default_port ?? 8765)
+            }}
+          >
+            恢复默认 {serverInfo?.default_port ?? 8765}
+          </Button>
+        </Stack>
+        {serverInfo && (
+          <Box>
+            <Typography variant="caption" color="text.secondary" component="div">
+              当前进程实际监听：{serverInfo.running_port
+                ? `http://${serverInfo.running_host || '127.0.0.1'}:${serverInfo.running_port}`
+                : '未探测到'}
+              {' · '}保存值：{serverInfo.address}
+            </Typography>
+            {serverInfo.restart_required && (
+              <Alert severity="warning" sx={{ mt: 0.5, py: 0.5 }}>
+                已保存 {serverInfo.port}，但当前仍运行在 {serverInfo.running_port}：
+                重启服务后生效（重启后请用新地址 http://127.0.0.1:{serverInfo.port} 打开控制台）。
+              </Alert>
+            )}
+          </Box>
         )}
       </Stack>
 

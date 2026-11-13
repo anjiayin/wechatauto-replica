@@ -678,8 +678,8 @@ class TestImageRetryService:
         def _raise(data, **kw):
             raise vision.VisionError(vision.MSG_INCOMPLETE)
 
-        monkeypatch.setattr(svc, "get_image_bytes",
-                            lambda u, l: _complete_jpeg())
+        monkeypatch.setattr(svc, "get_image_bytes_with_reason",
+                            lambda u, l: (_complete_jpeg(), ""))
         monkeypatch.setattr(vision, "analyze_image", _raise)
         with vision_workers(svc):
             svc._on_message(image_msg())
@@ -694,13 +694,16 @@ class TestImageRetryService:
     def test_image_read_failure_enqueues_retry(self, monkeypatch):
         """取不到图（原图未下载完的主路径）同样要排队，不能永久漏识别。"""
         svc, db = make_svc()
-        monkeypatch.setattr(svc, "get_image_bytes", lambda u, l: None)
+        monkeypatch.setattr(
+            svc, "get_image_bytes_with_reason",
+            lambda u, l: (None, "原图与缩略图均不完整"))
         with vision_workers(svc):
             svc._on_message(image_msg())
             assert wait_processed(svc)
         assert svc.image_retry_pending == 1
         error = skipped_logs(db)[0]["error"]
-        assert error.startswith("图片读取失败或不完整，未识别")
+        assert error.startswith("图片读取失败或不完整（")
+        assert "原图与缩略图均不完整" in error
         assert "已排入重试队列" in error
 
     def test_retry_eventually_succeeds(self, monkeypatch):
@@ -716,8 +719,8 @@ class TestImageRetryService:
                 raise vision.VisionError(vision.MSG_INCOMPLETE)
             return vehicle_result(part="发动机总成", vin="LSGMJ5P578V016154")
 
-        monkeypatch.setattr(svc, "get_image_bytes",
-                            lambda u, l: _complete_jpeg())
+        monkeypatch.setattr(svc, "get_image_bytes_with_reason",
+                            lambda u, l: (_complete_jpeg(), ""))
         monkeypatch.setattr(vision, "analyze_image", _flaky)
         svc._image_retry = _fast_retry(svc)
         retry = svc._image_retry
@@ -754,8 +757,8 @@ class TestImageRetryService:
                 raise vision.VisionError(vision.MSG_INCOMPLETE)
             raise vision.VisionError("图片识别失败：额度不足或触发限流")
 
-        monkeypatch.setattr(svc, "get_image_bytes",
-                            lambda u, l: _complete_jpeg())
+        monkeypatch.setattr(svc, "get_image_bytes_with_reason",
+                            lambda u, l: (_complete_jpeg(), ""))
         monkeypatch.setattr(vision, "analyze_image", _flaky)
         retry = _fast_retry(svc)
         retry.start()
@@ -785,7 +788,9 @@ class TestImageRetryService:
             called["n"] += 1
             return vehicle_result()
 
-        monkeypatch.setattr(svc, "get_image_bytes", lambda u, l: None)
+        monkeypatch.setattr(
+            svc, "get_image_bytes_with_reason",
+            lambda u, l: (None, "原图与缩略图均不完整"))
         monkeypatch.setattr(vision, "analyze_image", _never)
         assert svc._retry_image_task(_task(2467)) == "done"
         assert called["n"] == 0
@@ -794,7 +799,9 @@ class TestImageRetryService:
     def test_read_failure_returns_retry(self, monkeypatch):
         """取不到图 → "retry"（等微信下载完原图）。"""
         svc, db = make_svc()
-        monkeypatch.setattr(svc, "get_image_bytes", lambda u, l: None)
+        monkeypatch.setattr(
+            svc, "get_image_bytes_with_reason",
+            lambda u, l: (None, "原图与缩略图均不完整"))
         assert svc._retry_image_task(_task(2467)) == "retry"
         assert "第 1 次重试" in skipped_logs(db)[0]["error"]
 
@@ -808,8 +815,8 @@ class TestImageRetryService:
             called["n"] += 1
             return vehicle_result()
 
-        monkeypatch.setattr(svc, "get_image_bytes",
-                            lambda u, l: _complete_jpeg())
+        monkeypatch.setattr(svc, "get_image_bytes_with_reason",
+                            lambda u, l: (_complete_jpeg(), ""))
         monkeypatch.setattr(vision, "analyze_image", _never)
         assert svc._retry_image_task(_task(2467)) == "abort"
         assert called["n"] == 0
@@ -818,8 +825,8 @@ class TestImageRetryService:
     def test_unexpected_exception_returns_abort(self, monkeypatch):
         """非 VisionError 的异常 → "abort"（不把异常抛回调度线程）。"""
         svc, db = make_svc()
-        monkeypatch.setattr(svc, "get_image_bytes",
-                            lambda u, l: _complete_jpeg())
+        monkeypatch.setattr(svc, "get_image_bytes_with_reason",
+                            lambda u, l: (_complete_jpeg(), ""))
 
         def _boom(data, **kw):
             raise RuntimeError("网关返回了意料之外的东西")
@@ -893,8 +900,8 @@ class TestImageSwitchOff:
             called["n"] += 1
             return vehicle_result()
 
-        monkeypatch.setattr(svc, "get_image_bytes",
-                            lambda u, l: _complete_jpeg())
+        monkeypatch.setattr(svc, "get_image_bytes_with_reason",
+                            lambda u, l: (_complete_jpeg(), ""))
         monkeypatch.setattr(vision, "analyze_image", _fake)
         db.set_setting(KEY_IMAGE_VISION_ENABLED, "0")
         svc._on_message(image_msg(2467))         # 关闭 → 不入队
@@ -917,8 +924,8 @@ class TestImageSwitchOff:
             called["n"] += 1
             return vehicle_result()
 
-        monkeypatch.setattr(svc, "get_image_bytes",
-                            lambda u, l: _complete_jpeg())
+        monkeypatch.setattr(svc, "get_image_bytes_with_reason",
+                            lambda u, l: (_complete_jpeg(), ""))
         monkeypatch.setattr(vision, "analyze_image", _never)
         # 模拟「任务已经排进识别队列」
         svc._vision_queue.put_nowait(_task(2467))

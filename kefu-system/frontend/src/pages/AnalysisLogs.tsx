@@ -39,6 +39,7 @@ import type {
   AnalysisLogItem,
   AnalysisLogListOut,
   AnalysisSettings,
+  ImageRetryResult,
   VoiceRetryResult,
 } from '../api/types'
 
@@ -405,6 +406,9 @@ function LogRow(props: {
   // 语音转写失败（音频是微信异步下载的，首次转写常因「还没落库」失败）
   const isVoiceFail =
     !!log.voice_local_id && log.error.includes('语音转写失败')
+  // 图片「还没下载好/不完整」：图片原图是按需下载的，很多群图长期只有半个
+  // 缩略图。用户在微信里点开那张图后再点「重新识别」即可用原图重跑。
+  const isImageFail = !isVoiceFail && !!log.image_local_id
   const correctable = isCorrectable(log) && !isVoiceFail
   // ③ 语音「重新识别」：用户先在微信里播放一次，再点这里补转写
   const retryVoice = useMutation({
@@ -420,6 +424,22 @@ function LogRow(props: {
         props.onNotify(`已识别：${resp.text}`, 'success')
       } else {
         props.onNotify(resp.error || '语音转写失败', 'error')
+      }
+    },
+    onError: (err: Error) => props.onNotify(err.message, 'error'),
+  })
+  // ④ 图片「重新识别」（图片行）：原图未下载/缩略图不完整时的补识别入口
+  const retryImage = useMutation({
+    mutationFn: () =>
+      apiPost<ImageRetryResult>('/api/images/retry', {
+        username: log.session_username,
+        local_id: log.image_local_id,
+      }),
+    onSuccess: (resp) => {
+      if (resp.ok) {
+        props.onNotify(resp.message || '已开始重新识别', 'success')
+      } else {
+        props.onNotify(resp.error || '补识别失败', 'error')
       }
     },
     onError: (err: Error) => props.onNotify(err.message, 'error'),
@@ -523,6 +543,21 @@ function LogRow(props: {
                 onClick={() => retryVoice.mutate()}
               >
                 {retryVoice.isPending ? '识别中…' : '重新识别'}
+              </Button>
+            </span>
+          </Tooltip>
+        ) : isImageFail ? (
+          <Tooltip
+            title="微信原图是按需下载的：在微信里点开这张图（触发原图下载）后再点此重新识别"
+          >
+            <span>
+              <Button
+                size="small"
+                startIcon={<ReplayIcon />}
+                disabled={retryImage.isPending}
+                onClick={() => retryImage.mutate()}
+              >
+                {retryImage.isPending ? '识别中…' : '重新识别'}
               </Button>
             </span>
           </Tooltip>

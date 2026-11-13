@@ -84,16 +84,23 @@ class ImageRetryQueue:
             丢弃最旧任务时回调（批次 7 QA-P3-2）。仅靠 ``logger.warning`` 用户
             在页面上看不到「哪张图被丢了」，交由调用方落一条可见日志；回调异常
             一律吞掉，绝不影响入队。默认 None（不回调）。
+        on_give_up: ``(username: str, local_id: int, task: dict, attempts: int)
+            -> None``，**重试用尽**时回调（第 13 批需求 7）。此前用尽后只在
+            服务日志里留一行，用户看到最后一条「继续等待后自动补识别」会一直
+            等下去；有了这个回调可以落一条「已放弃 + 怎么手动补」的可见日志。
+            ``abort``（额度/Key 之类不值得重试）不走它，那条路径自己已落日志。
     """
 
     def __init__(self,
                  handler: Callable[[dict], str],
                  delays: Tuple[float, ...] = DEFAULT_DELAYS,
                  max_pending: int = MAX_PENDING,
-                 on_drop: Optional[Callable[[str, int, dict], None]] = None
+                 on_drop: Optional[Callable[[str, int, dict], None]] = None,
+                 on_give_up: Optional[Callable[[str, int, dict, int], None]] = None
                  ) -> None:
         self._handler = handler
         self._on_drop = on_drop
+        self._on_give_up = on_give_up
         self._delays = tuple(max(0.1, float(d)) for d in delays) or (10.0,)
         self._max_pending = max(1, int(max_pending))
         self._jobs: List[_Job] = []
@@ -275,6 +282,10 @@ class ImageRetryQueue:
             logger.info("图片补识别最终失败（%s local_id=%d，共尝试 %d 次）："
                         "原图始终未就绪", job.username, job.local_id,
                         job.attempts)
+            if self._on_give_up is not None:
+                # 回调放锁外：调用方要写 analysis_logs（磁盘 IO）
+                self._safe_call(self._on_give_up, job.username, job.local_id,
+                                dict(job.payload or {}), job.attempts)
             return
         if self._stop.is_set():
             logger.info("服务停止，放弃图片补识别（%s local_id=%d，已尝试 "
