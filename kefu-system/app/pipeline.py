@@ -202,6 +202,58 @@ class Pipeline:
             picked_type)
 
     @staticmethod
+    def _build_raw_refs(unit: AnalysisUnit) -> str:
+        """把本单元的图片行整理成 ``raw_refs`` JSON 数组字符串。
+
+        背景（批次 11 需求 1）：详情页「消息原文」里图片只有一行合成文本，
+        看不到真图。图片消息在进窗口时已由 wechat_service 带上 ``local_id``
+        （``image_sell`` 标记），只要把「哪一行是图」记下来，详情页就能
+        按行取图。
+
+        设计（关键）：``line`` 存该行**完整原文（含 ``[HH:MM] `` 前缀）**，
+        不用行号——商机合并时新批次是追加到 raw_text 末尾的，行号会整体
+        偏移，而「原文严格相等」的匹配与顺序天然稳定，也不需要基于旧快照
+        回写（保持 db.merge_opportunity 的防丢失更新语义）。
+
+        只收录 ``kind == "image"`` 且 ``local_id > 0`` 的行：文本行不入库
+        （省空间），拿不到 local_id 的行也跳过（取不到图，记了没用）。
+
+        ``line_kinds`` 缺失（外部直接构造 AnalysisUnit 的旧调用/单测）时，
+        退化为「单元含图片卖货标记 + 该行是图片识别结论文本」判定，避免
+        这类路径静默丢图。
+
+        Returns:
+            JSON 数组字符串；没有图片行时返回 ``"[]"``。
+        """
+        refs: list[dict] = []
+        kinds = list(getattr(unit, "line_kinds", None) or [])
+        local_ids = list(unit.local_ids or [])
+        has_image_sell = bool(getattr(unit, "has_image_sell", False))
+        for idx, (hm, text) in enumerate(unit.lines):
+            if idx < len(kinds):
+                kind = kinds[idx]
+            else:
+                kind = "image" if (has_image_sell
+                                   and str(text or "").startswith(IMAGE_TAG)) \
+                    else "text"
+            if kind != "image":
+                continue
+            try:
+                local_id = int(local_ids[idx]) if idx < len(local_ids) else 0
+            except (TypeError, ValueError):
+                local_id = 0
+            if local_id <= 0:
+                continue
+            refs.append({
+                "line": f"[{hm}] {text}",
+                "local_id": local_id,
+                "kind": "image",
+            })
+        if not refs:
+            return "[]"
+        return json.dumps(refs, ensure_ascii=False)
+
+    @staticmethod
     def _image_quote(unit: AnalysisUnit) -> str:
         """取本单元里「图片识别」那一行作为 quote（没有则退回第一行）。
 
@@ -701,6 +753,7 @@ class Pipeline:
             window_end=unit.window_end,
             merged_count=unit.merged_count,
             raw_text=unit.merged_text(),
+            raw_refs=Pipeline._build_raw_refs(unit),
             type_id=type_id,
             type_name=type_name,
             summary=analyzer.summarize_points(result.get("points", [])),
@@ -795,6 +848,7 @@ class Pipeline:
             confidence=int(result["confidence"]),
             type_id=type_id,
             type_name=type_name,
+            raw_refs_append=Pipeline._build_raw_refs(unit),
         )
         if opp is None:  # 已回复/已忽略/已删除/并发状态变化：退回新建
             logger.warning("合并目标商机 #%d 已非 pending，改为新建商机",
@@ -841,6 +895,7 @@ class Pipeline:
             window_end=unit.window_end,
             merged_count=unit.merged_count,
             raw_text=unit.merged_text(),
+            raw_refs=Pipeline._build_raw_refs(unit),
             type_id=type_id,
             type_name=type_name,
             summary=analyzer.summarize_points(result.get("points", [])),

@@ -418,6 +418,11 @@ class OpportunityDetailOut(OpportunityListItem):
     raw_text: str = ""
     # 原文展示版：群消息每行发送者 ID 已替换为显示名（前端展示用）
     raw_text_display: str = ""
+    # 原文行里的图片引用（批次 11 需求 1）：每项
+    # {"line": "[20:32] [图片] 识别：…", "local_id": 131, "kind": "image"}
+    # line 是该行完整原文（含 [HH:MM] 前缀），前端按「顺序消费指针」逐行
+    # 匹配后渲染真图；存量商机为空列表（行为与旧版一致）。
+    raw_refs: List[dict] = Field(default_factory=list)
     key_quote: str = ""
     reply_content: Optional[str] = None
     replied_at: Optional[str] = None
@@ -472,6 +477,9 @@ class AnalysisLogOut(BaseModel):
     session_username: str = ""
     session_display: str = ""          # 来源会话显示名（备注/昵称优先，失败回退原值）
     sender_wxid: str = ""
+    # 发送人显示名（批次 11 需求 2）：群昵称（group_cards）> 联系人昵称 >
+    # wxid 本身；群聊私聊都返回，前端在「来源会话」列下加一行小字展示。
+    sender_display: str = ""
     msg_count: int = 0
     input_text: str = ""
     input_text_display: str = ""       # 消息内容展示版（群消息发送者前缀已解析为显示名）

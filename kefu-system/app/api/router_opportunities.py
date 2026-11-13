@@ -10,8 +10,9 @@
 """
 from __future__ import annotations
 
+import json
 import logging
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -36,6 +37,34 @@ from app.wechat_service import WeChatService
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/opportunities", tags=["opportunities"])
+
+
+def _parse_raw_refs(raw: Any) -> List[dict]:
+    """把库里的 ``raw_refs`` JSON 字符串解析成引用列表（批次 11 需求 1）。
+
+    存量商机该列为 ``'[]'``，手改库/异常写入也可能是空串、NULL 或坏 JSON；
+    这里一律容错成空列表——详情页只是少显示几张图，绝不能 500。
+
+    Args:
+        raw: DB 取出的原始值（通常是 JSON 字符串）。
+
+    Returns:
+        合法引用字典列表（非 dict 元素被丢弃）。
+    """
+    if isinstance(raw, list):
+        return [x for x in raw if isinstance(x, dict)]
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        logger.warning("商机 raw_refs 不是合法 JSON（已按空处理）：%s", text[:120])
+        return []
+    if not isinstance(parsed, list):
+        logger.warning("商机 raw_refs 不是数组（已按空处理）：%s", text[:120])
+        return []
+    return [x for x in parsed if isinstance(x, dict)]
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +121,9 @@ def get_opportunity(opp_id: int, db: Database = Depends(get_db),
 
     ``raw_text_display``：群消息原文每行的发送者 ID 换成显示名（发送人昵称
     已由 wechat_service 解析，失败时原样返回，绝不影响详情加载速度）。
+
+    ``raw_refs``：原文行里的图片引用（解析失败容错为空列表），前端据此把
+    对应的原文行渲染成真图（批次 11 需求 1）。
     """
     opp = db.get_opportunity(opp_id)
     if not opp:
@@ -104,7 +136,11 @@ def get_opportunity(opp_id: int, db: Database = Depends(get_db),
     except Exception:  # 显示名解析失败不影响详情
         logger.exception("商机 #%d 原文显示名解析失败（回退原始文本）", opp_id)
         raw_display = str(opp.get("raw_text") or "")
-    return OpportunityDetailOut(**opp, unread=False, raw_text_display=raw_display)
+    # raw_refs 在库里是 JSON 字符串，要解析成数组交给前端（解析失败容错为 []）
+    detail = dict(opp)
+    detail["raw_refs"] = _parse_raw_refs(opp.get("raw_refs"))
+    return OpportunityDetailOut(
+        **detail, unread=False, raw_text_display=raw_display)
 
 
 # ---------------------------------------------------------------------------

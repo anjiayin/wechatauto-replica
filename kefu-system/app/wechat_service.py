@@ -1055,9 +1055,15 @@ class WeChatService:
 
     @staticmethod
     def _image_sell_text(row: dict) -> str:
-        """识别结论 → 送进分析的文本（部件名与车架号缺失时省略）。"""
-        part = str(row.get("part_name") or "").strip()
-        vin = str(row.get("vin") or "").strip()
+        """识别结论 → 送进分析的文本（部件名与车架号缺失时省略）。
+
+        连续空白（含换行/全角空格）归一成单个半角空格：视觉模型偶发在
+        部件名里返回换行（如「前保险杠\\n（左）」），而这条文本会整行进
+        聚合窗口与商机原文——带换行会把一行拆成多行，商机详情按行匹配
+        图片引用（raw_refs）时就永远对不上，图片无法显示（批次 11 M1）。
+        """
+        part = re.sub(r"\s+", " ", str(row.get("part_name") or "")).strip()
+        vin = re.sub(r"\s+", " ", str(row.get("vin") or "")).strip()
         text = "[图片] 识别：车辆/汽车配件"
         if part:
             text += f"（{part}）"

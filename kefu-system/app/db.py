@@ -75,6 +75,12 @@ _OPPORTUNITIES_COLUMNS = """
       window_end       TEXT NOT NULL,
       merged_count     INTEGER NOT NULL DEFAULT 1,
       raw_text         TEXT NOT NULL,
+      -- 原文行里的图片引用（批次 11 需求 1）：JSON 数组，元素形如
+      -- {"line": "[20:32] [图片] 识别：车辆/汽车配件（前保险杠）",
+      --  "local_id": 131, "kind": "image"}
+      -- line 存该行**完整原文（含 [HH:MM] 前缀）**而不是行号：合并追加时
+      -- 不需要任何偏移换算，也不必基于旧快照回写，重复文本也能按顺序对上。
+      raw_refs         TEXT NOT NULL DEFAULT '[]',
       type_id          INTEGER REFERENCES opportunity_types(id) ON DELETE SET NULL,
       type_name        TEXT NOT NULL,
       summary          TEXT NOT NULL,
@@ -311,6 +317,8 @@ class Database:
         """
         plans = (
             ("opportunities", "direction", "TEXT NOT NULL DEFAULT ''"),
+            # 原文图片引用（批次 11 需求 1）：JSON 数组字符串，默认 '[]'
+            ("opportunities", "raw_refs", "TEXT NOT NULL DEFAULT '[]'"),
             ("analysis_logs", "prompt_tokens", "INTEGER"),
             ("analysis_logs", "completion_tokens", "INTEGER"),
             # 时序诊断（收消息→合并→排队→AI）：定位「延迟到底花在哪一段」
@@ -397,9 +405,21 @@ class Database:
                     "DROP TABLE IF EXISTS opportunities_new")
                 self._conn.execute(
                     "CREATE TABLE opportunities_new (%s)" % _OPPORTUNITIES_COLUMNS)
+                # 按「旧新共有的列」复制数据，而不是 SELECT *：旧库可能比
+                # 当前 DDL 少若干列（direction / raw_refs 等是后续批次新增的），
+                # 列数不一致时 SELECT * 会直接报错导致升级中断。缺失列由
+                # 之后的 _migrate_add_columns 补齐（带默认值，幂等）。
+                old_cols = [r["name"] for r in self._conn.execute(
+                    "PRAGMA table_info(opportunities)").fetchall()]
+                new_cols = {r["name"] for r in self._conn.execute(
+                    "PRAGMA table_info(opportunities_new)").fetchall()}
+                shared = [c for c in old_cols if c in new_cols]
+                if not shared:  # pragma: no cover - 结构异常时不做数据复制
+                    raise RuntimeError("opportunities 表结构异常：无共有列")
+                cols_sql = ", ".join(shared)
                 self._conn.execute(
-                    "INSERT INTO opportunities_new "
-                    "SELECT * FROM opportunities")
+                    f"INSERT INTO opportunities_new ({cols_sql}) "
+                    f"SELECT {cols_sql} FROM opportunities")
                 self._conn.execute("DROP TABLE opportunities")
                 self._conn.execute(
                     "ALTER TABLE opportunities_new RENAME TO opportunities")
@@ -646,18 +666,25 @@ class Database:
                            type_id: Optional[int], type_name: str,
                            summary: str, key_quote: str,
                            confidence: int,
-                           direction: str = "") -> dict:
-        """插入一条商机并返回完整记录。"""
+                           direction: str = "",
+                           raw_refs: str = "[]") -> dict:
+        """插入一条商机并返回完整记录。
+
+        Args:
+            raw_refs: 原文行里的图片引用 JSON 数组字符串（批次 11 需求 1，
+                由 pipeline 用 ``json.dumps(..., ensure_ascii=False)`` 生成）。
+        """
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO opportunities (session_username, session_name, "
                 "sender_wxid, sender_name, window_start, window_end, merged_count, "
-                "raw_text, type_id, type_name, summary, key_quote, confidence, "
-                "direction, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "raw_text, raw_refs, type_id, type_name, summary, key_quote, "
+                "confidence, direction, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
                 "datetime('now','localtime'))",
                 (session_username, session_name, sender_wxid, sender_name,
-                 window_start, window_end, merged_count, raw_text, type_id,
+                 window_start, window_end, merged_count, raw_text,
+                 str(raw_refs or "[]"), type_id,
                  type_name, summary, key_quote, confidence,
                  direction if direction in ("buy", "sell") else ""),
             )
@@ -759,7 +786,8 @@ class Database:
                           summary_append: str, window_end: str,
                           merged_count_delta: int, key_quote: str,
                           confidence: int, type_id: Optional[int],
-                          type_name: str) -> Optional[dict]:
+                          type_name: str, raw_refs_append: str = "[]"
+                          ) -> Optional[dict]:
         """原子合并新批次进既有商机，返回合并后的完整记录。
 
         修复 BUG-1/BUG-2（丢失更新竞态）：合并动作在单条 SQL 内完成——
@@ -768,6 +796,13 @@ class Database:
         ``WHERE id=? AND status='pending'`` 复检状态。find 返回快照后
         商机被回复/删除/并发合并时 UPDATE 不生效，rowcount=0 返回 None，
         由调用方走新建兜底（新命中内容不被吞）。
+
+        ``raw_refs_append``（批次 11 需求 1）：新批次的图片引用 JSON 数组。
+        同样在 SQL 端做「数组拼接」（去掉旧值末尾的 ``]`` 与新值开头的
+        ``[`` 后用逗号相连），保证拼完仍是合法 JSON 数组，因此合并时
+        不需要读旧快照、也不会因为快照过期丢引用。``''`` / ``'[]'`` /
+        NULL 三种边界都按「无内容」处理（不产生 ``[,`` / ``[]`` 之类的
+        非法片段）。
         """
         with self._lock:
             cur = self._conn.execute(
@@ -778,6 +813,19 @@ class Database:
                 "summary = CASE WHEN :summary_append = '' THEN summary "
                 "  WHEN summary IS NULL OR summary = '' THEN :summary_append "
                 "  ELSE summary || char(10) || :summary_append END, "
+                # raw_refs：SQL 端 JSON 数组拼接（见 docstring）
+                "raw_refs = CASE "
+                "  WHEN :refs_append IS NULL OR trim(:refs_append) IN ('', '[]') "
+                "    THEN COALESCE(NULLIF(trim(raw_refs), ''), '[]') "
+                "  WHEN raw_refs IS NULL OR trim(raw_refs) IN ('', '[]') "
+                "    THEN trim(:refs_append) "
+                "  WHEN substr(trim(raw_refs), 1, 1) = '[' "
+                "   AND substr(trim(raw_refs), -1) = ']' "
+                "   AND substr(trim(:refs_append), 1, 1) = '[' "
+                "   AND substr(trim(:refs_append), -1) = ']' "
+                "    THEN substr(trim(raw_refs), 1, length(trim(raw_refs)) - 1) "
+                "         || ',' || substr(trim(:refs_append), 2) "
+                "  ELSE trim(:refs_append) END, "
                 "window_end = :window_end, "
                 "merged_count = merged_count + :count_delta, "
                 "key_quote = :key_quote, "
@@ -786,6 +834,7 @@ class Database:
                 "WHERE id = :opp_id AND status = 'pending'",
                 {"raw_append": raw_text_append,
                  "summary_append": summary_append,
+                 "refs_append": str(raw_refs_append or "[]"),
                  "window_end": window_end,
                  "count_delta": merged_count_delta,
                  "key_quote": key_quote,
@@ -951,10 +1000,62 @@ class Database:
                 out.append(name)
         return out
 
+    def distinct_log_sender_pairs(self, limit: int = 500
+                                  ) -> list[tuple[str, str]]:
+        """分析日志中出现过的 (发送人 wxid, 所属会话 username) 组合。
+
+        批次 11 需求 2：日志表只存 ``sender_wxid``，而页面要展示发送人昵称。
+        群昵称（group_cards）是按「群 + 成员」记录的，只有拿到会话 username
+        才能解析出与微信里一致的显示名；因此候选集必须带上会话。
+
+        Args:
+            limit: 最多返回多少条候选（上限保护，避免大表全表扫描）。
+
+        Returns:
+            ``[(sender_wxid, session_username), ...]``，去重、最近出现优先。
+        """
+        cap = max(1, min(int(limit or 500), 2000))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT sender_wxid, session_username, MAX(id) AS last_id "
+                "FROM analysis_logs "
+                "WHERE sender_wxid IS NOT NULL AND sender_wxid != '' "
+                "GROUP BY sender_wxid, session_username "
+                "ORDER BY last_id DESC LIMIT ?",
+                (cap,),
+            ).fetchall()
+        out: list[tuple[str, str]] = []
+        for row in rows:
+            wxid = str(row[0] or "")
+            if not wxid:
+                continue
+            out.append((wxid, str(row[1] or "")))
+        return out
+
+    def distinct_log_senders(self, limit: int = 500) -> list[str]:
+        """分析日志中出现过的发送人 wxid（去重，按最近出现倒序）。
+
+        与 :meth:`distinct_log_sessions` 同构；路由层用它把用户输入的
+        「昵称 / wxid 片段」解析成 wxid 候选（批次 11 需求 2）。
+
+        Args:
+            limit: 最多返回多少条候选（上限保护）。
+
+        Returns:
+            非空 ``sender_wxid`` 列表（去重，最近出现优先）。
+        """
+        seen: list[str] = []
+        for wxid, _session in self.distinct_log_sender_pairs(limit=limit):
+            if wxid not in seen:
+                seen.append(wxid)
+        return seen
+
     def list_analysis_logs(self, *, page: int = 1, page_size: int = 20,
                            status: str = "", session: str = "",
                            keyword: str = "",
-                           session_in: Optional[list[str]] = None
+                           session_in: Optional[list[str]] = None,
+                           sender: str = "",
+                           sender_in: Optional[list[str]] = None
                            ) -> tuple[int, list[dict]]:
         """分析日志分页列表（id 倒序 = 时间倒序）。
 
@@ -965,6 +1066,9 @@ class Database:
             session_in: 精确命中的会话 username 列表（批次 6 需求 2：用户
                 输入的是显示名/群名，路由层先把它解析成 username 候选再传
                 进来）。为空/None 时保持原行为，不改变 SQL。
+            sender: 发送人筛选（sender_wxid 模糊匹配；批次 11 需求 2）。
+            sender_in: 精确命中的发送人 wxid 列表（用户输入的是昵称，路由层
+                先解析成 wxid 候选）。为空/None 时只走 LIKE。
 
         Returns:
             (total, items)
@@ -986,6 +1090,17 @@ class Database:
             else:
                 where.append("session_username LIKE ?")
                 params.append(f"%{session}%")
+        if sender:
+            senders = [str(x) for x in (sender_in or []) if str(x or "")]
+            if senders:
+                marks = ",".join("?" for _ in senders)
+                where.append(
+                    f"(sender_wxid LIKE ? OR sender_wxid IN ({marks}))")
+                params.append(f"%{sender}%")
+                params.extend(senders)
+            else:
+                where.append("sender_wxid LIKE ?")
+                params.append(f"%{sender}%")
         if keyword:
             where.append("input_text LIKE ?")
             params.append(f"%{keyword}%")

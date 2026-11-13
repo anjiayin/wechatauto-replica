@@ -291,6 +291,33 @@ export default function OpportunityDetail(props: {
   )
   const hasRawVoice = rawVoiceIds.some((localId) => localId !== null)
 
+  // 原文里的图片行（批次 11 需求 1）：后端把「该行完整原文 + local_id」落进
+  // raw_refs，这里用**顺序消费指针**逐行对齐——refs 与原文行都按时间正序，
+  // 同一句话重复出现也能各自对上（不靠文本哈希去重）。
+  // 展示行(raw_text_display)与原始行(raw_text)一一对应（只换发送人前缀），
+  // 两个都比一次，避免「群昵称替换后行文本不再与 refs 相等」而漏图。
+  const rawSourceLines = useMemo(
+    () => (opp?.raw_text || '').split('\n'),
+    [opp?.raw_text],
+  )
+  const rawImageIds = useMemo(() => {
+    const refs = opp?.raw_refs ?? []
+    const ids: (number | null)[] = rawLines.map(() => null)
+    let cursor = 0
+    for (let idx = 0; idx < rawLines.length && cursor < refs.length; idx += 1) {
+      const ref = refs[cursor]
+      if (!ref || typeof ref.line !== 'string') break
+      if (rawLines[idx] !== ref.line && rawSourceLines[idx] !== ref.line) continue
+      const localId = Number(ref.local_id)
+      if (Number.isFinite(localId) && localId > 0) ids[idx] = localId
+      cursor += 1 // 匹配成功才前进：该行消费掉对应的 ref
+    }
+    return ids
+  }, [opp?.raw_refs, rawLines, rawSourceLines])
+  const hasRawImage = rawImageIds.some((localId) => localId !== null)
+  // 有语音或有图片才需要逐行渲染；两者都没有时保持原来的整段渲染
+  const needLineRender = hasRawVoice || hasRawImage
+
   // @ 群成员候选：群会话才有（后端按会话读微信库成员表，600s 缓存）
   const isGroup = (opp?.session_username ?? '').endsWith('@chatroom')
   const membersQuery = useQuery({
@@ -458,10 +485,32 @@ export default function OpportunityDetail(props: {
 
             <Typography variant="subtitle2">消息原文（合并窗口）</Typography>
             <Box sx={{ bgcolor: '#fbfbfb', border: '1px solid #eee', borderRadius: 1, p: 1.5, mb: 1.5 }}>
-              {hasRawVoice ? (
-                // 含语音：逐行渲染，语音行给播放按钮（文本与原文完全一致，仅多一个播放器）
+              {needLineRender ? (
+                // 含语音/图片：逐行渲染，语音行给播放按钮、图片行给真图
+                // （其余文本与原文完全一致，仅多出播放器/图片）
                 <Box>
                   {rawLines.map((line, idx) => {
+                    const imageId = rawImageIds[idx]
+                    if (imageId != null && opp) {
+                      // 图片行：渲染真图，并保留原文本小字说明（识别结论
+                      // 就写在那行里，如「[图片] 识别：车辆/汽车配件（…）」）
+                      return (
+                        <Box key={`raw-image-${idx}-${imageId}`} sx={{ mb: 1 }}>
+                          <ContextImage
+                            username={opp.session_username}
+                            localId={imageId}
+                            fallback={line}
+                          />
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            sx={{ display: 'block', whiteSpace: 'pre-wrap', mt: 0.5 }}
+                          >
+                            {line}
+                          </Typography>
+                        </Box>
+                      )
+                    }
                     const localId = rawVoiceIds[idx]
                     if (localId == null || !opp) {
                       return (

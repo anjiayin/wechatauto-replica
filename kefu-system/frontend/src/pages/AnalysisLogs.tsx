@@ -125,6 +125,9 @@ export default function AnalysisLogs() {
   const [session, setSession] = useState('')
   const [keywordInput, setKeywordInput] = useState('')
   const [keyword, setKeyword] = useState('')
+  // 发送人筛选（批次 11 需求 2）：支持昵称/群昵称/微信 ID 片段
+  const [senderInput, setSenderInput] = useState('')
+  const [sender, setSender] = useState('')
   const [page, setPage] = useState(0)
   const [pageSize, setPageSize] = useState(20)
   const [snack, setSnack] = useState<{ msg: string; severity: 'success' | 'error' } | null>(null)
@@ -135,9 +138,10 @@ export default function AnalysisLogs() {
     const t = window.setTimeout(() => {
       setSession(sessionInput.trim())
       setKeyword(keywordInput.trim())
+      setSender(senderInput.trim())
     }, 300)
     return () => window.clearTimeout(t)
-  }, [sessionInput, keywordInput])
+  }, [sessionInput, keywordInput, senderInput])
 
   const query = useMemo(
     () =>
@@ -146,9 +150,10 @@ export default function AnalysisLogs() {
         page_size: pageSize,
         status,
         session,
+        sender,
         keyword,
       })}`,
-    [page, pageSize, status, session, keyword],
+    [page, pageSize, status, session, sender, keyword],
   )
 
   const { data, isLoading, refetch } = useQuery({
@@ -268,6 +273,16 @@ export default function AnalysisLogs() {
           onChange={(e) => {
             setPage(0)
             setSessionInput(e.target.value)
+          }}
+        />
+        <TextField
+          label="发送人（昵称或微信 ID）"
+          placeholder="如：张三 / wxid_zhang"
+          sx={{ width: 220 }}
+          value={senderInput}
+          onChange={(e) => {
+            setPage(0)
+            setSenderInput(e.target.value)
           }}
         />
         <TextField
@@ -433,10 +448,25 @@ function LogRow(props: {
         />
       </TableCell>
       <TableCell>
-        <Tooltip title={log.session_username} placement="top">
-          <Typography variant="body2" noWrap sx={{ maxWidth: 140 }}>
-            {log.session_display || log.session_username}
-          </Typography>
+        <Tooltip
+          title={
+            log.sender_wxid
+              ? `${log.session_username} · 发送人 ${log.sender_display || log.sender_wxid}（${log.sender_wxid}）`
+              : log.session_username
+          }
+          placement="top"
+        >
+          <Box sx={{ maxWidth: 160 }}>
+            <Typography variant="body2" noWrap>
+              {log.session_display || log.session_username}
+            </Typography>
+            {/* 发送人（批次 11 需求 2）：群聊私聊都显示，让「谁说的」一眼可见 */}
+            {log.sender_display && (
+              <Typography variant="caption" color="text.secondary" noWrap display="block">
+                发送人：{log.sender_display}
+              </Typography>
+            )}
+          </Box>
         </Tooltip>
       </TableCell>
       <TableCell align="right">{log.msg_count}</TableCell>

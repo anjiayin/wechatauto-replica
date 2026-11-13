@@ -44,6 +44,11 @@ class AnalysisUnit:
     lines: List[Tuple[str, str]] = field(default_factory=list)  # (HH:MM, 内容)
     # 与 lines 一一对应的消息 local_id（管线按需补转写语音消息，0 = 未知）
     local_ids: List[int] = field(default_factory=list)
+    # 与 lines 一一对应的行类型："text" / "image"（批次 11 需求 1）。
+    # 图片行由上游合成文本（"[图片] 识别：车辆/汽车配件（…）"）进入窗口，
+    # 文本本身不含 local_id，管线据此把该行原文与 local_id 一起落进
+    # opportunities.raw_refs，详情页才能按行取真图。
+    line_kinds: List[str] = field(default_factory=list)
     # 本单元里是否包含「已识别为车辆/汽车配件」的图片：管线据此把
     # direction 覆盖为 sell（批次 6 需求 5，用户口径：发配件图即卖货）
     has_image_sell: bool = False
@@ -68,6 +73,9 @@ class _Buffer:
     lines: List[Tuple[str, str]] = field(default_factory=list)
     # 与 lines 同序的 local_id（语音消息补转写用）
     local_ids: List[int] = field(default_factory=list)
+    # 与 lines 同序的行类型（"text" / "image"）：图片行需要连同 local_id
+    # 落进商机 raw_refs，详情页才能还原真图（批次 11 需求 1）
+    line_kinds: List[str] = field(default_factory=list)
     window_start_epoch: float = 0.0
     last_epoch: float = 0.0            # 最后一条消息时间（静默计时基准）
     first_seen_epoch: float = 0.0      # 缓冲创建墙钟时间（端到端计时起点）
@@ -132,9 +140,20 @@ class Aggregator:
                     first_seen_epoch=time.time(),
                 )
                 self._buffers[key] = buf
+            # local_id 必须在任何 append 之前完成整数转换（批次 11 L1）：
+            # 若转换放在 append 之后，异常会把 lines 多留一条而
+            # local_ids/line_kinds 没跟上，三数组永久错位——图片会挂到
+            # 下一张图的 local_id 上（张冠李戴比漏图更糟）。转换失败兜 0。
+            try:
+                line_local_id = int(msg.get("local_id") or 0)
+            except (TypeError, ValueError):
+                line_local_id = 0
             buf.lines.append((hm, content))
             # local_id 与 lines 同序追加（语音补转写按索引对齐）
-            buf.local_ids.append(int(msg.get("local_id") or 0))
+            buf.local_ids.append(line_local_id)
+            # 行类型与 lines 同序追加：图片行（视觉识别为车辆/配件后合成的
+            # 文本）要单独标记，管线据此把原文 + local_id 落进 raw_refs
+            buf.line_kinds.append("image" if msg.get("image_sell") else "text")
             # 图片识别为车辆/配件时上游会置 image_sell（批次 6 需求 5）：
             # 只要窗口里出现一次，整个单元就按卖货方向产出
             if msg.get("image_sell"):
@@ -214,6 +233,7 @@ class Aggregator:
                 merged_count=buf.count(),
                 lines=list(buf.lines),
                 local_ids=list(buf.local_ids),
+                line_kinds=list(buf.line_kinds),
                 has_image_sell=buf.has_image_sell,
                 first_seen_epoch=buf.first_seen_epoch,
             )

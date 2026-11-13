@@ -211,12 +211,26 @@ export interface OpportunityListOut {
   items: OpportunityListItem[]
 }
 
+/**
+ * 原文行里的图片引用（批次 11 需求 1）。
+ *
+ * `line` 是该行**完整原文（含 `[HH:MM] ` 前缀）**，不是行号——商机合并时
+ * 新批次追加到原文末尾，行号会整体偏移，而「原文严格相等 + 顺序消费」稳定。
+ */
+export interface RawRef {
+  line: string
+  local_id: number
+  kind: string
+}
+
 export interface OpportunityDetail extends OpportunityListItem {
   window_start: string
   merged_count: number
   raw_text: string
   /** 原文展示版：群消息每行发送者 ID 已替换为群昵称（反馈 6） */
   raw_text_display: string
+  /** 原文里的图片引用（存量商机为空数组）：匹配到的行渲染成真图 */
+  raw_refs?: RawRef[]
   key_quote: string
   reply_content: string | null
   replied_at: string | null
@@ -237,6 +251,8 @@ export interface AnalysisLogItem {
   /** 来源会话显示名（备注/昵称优先，解析失败回退 session_username） */
   session_display: string
   sender_wxid: string
+  /** 发送人显示名（群昵称 > 联系人昵称 > wxid；批次 11 需求 2） */
+  sender_display: string
   msg_count: number
   input_text: string
   /** 消息内容展示版（群消息发送者前缀已解析为显示名） */

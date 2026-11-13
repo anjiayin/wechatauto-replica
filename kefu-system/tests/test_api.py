@@ -226,7 +226,10 @@ LIST_ITEM_KEYS = {"id", "session_username", "session_name", "sender_wxid",
 DETAIL_EXTRA_KEYS = {"window_start", "merged_count", "raw_text", "key_quote",
                      "reply_content", "replied_at",
                      # 反馈 6：群消息原文的发送者显示名版（不再显示 wxid）
-                     "raw_text_display"}
+                     "raw_text_display",
+                     # 批次 11 需求 1：原文行里的图片引用（line/local_id/kind）
+                     # 详情页据此把图片行渲染成真图；列表页不含该字段
+                     "raw_refs"}
 
 
 # ---------------------------------------------------------------------------
@@ -986,6 +989,8 @@ class TestAnalysisLogsContract:
         for item in body["items"]:
             assert set(item) == {"id", "created_at", "session_username",
                                  "session_display", "sender_wxid",
+                                 # 批次 11 需求 2：发送人显示名（群昵称优先）
+                                 "sender_display",
                                  "msg_count", "input_text",
                                  "input_text_display", "result", "status",
                                  "error", "model", "latency_ms",
