@@ -48,6 +48,7 @@ import os
 import platform
 import re
 import tempfile
+import threading
 import time
 from ctypes import wintypes
 from typing import Dict, List, Optional, Tuple
@@ -420,6 +421,9 @@ class WeChatGUI:
         self._last_input_box = None  # 最近一次成功发送的输入框位置，连续发送复用
         self._uia = None  # UIA 引擎（惰性创建，仅当可用时启用）
         self._uia_tried = False
+        # 最近一次「打开企业微信会话」失败的原因码，供上层拼用户可读提示
+        # （tree_not_ready / identity_mismatch / corp_mismatch / ""）
+        self._last_open_error = ''
         # 布局校准：显式 calibrate=True 强制重校准；否则加载本机已校准配置，
         # 没有配置则自动校准一次（OCR 可用时），实现「跑一次永久兼容」。
         if not calibrate:
@@ -1287,6 +1291,47 @@ class WeChatGUI:
         except Exception:
             return None
 
+    def last_open_error(self) -> str:
+        """最近一次打开会话失败的原因码（给上层拼用户可读提示）。
+
+        Returns:
+            ``"tree_not_ready"`` 控件树还没物化（微信刚被唤醒，需等）；
+            ``"identity_mismatch"`` 打开的是同名普通好友/群（无企业名标签）；
+            ``"corp_mismatch"`` 打开的是另一家企业的同名联系人；
+            ``""`` 其它（没搜到等）。
+        """
+        return self._last_open_error
+
+    @staticmethod
+    def _corp_matches(label: str, corp: str) -> bool:
+        """标题区企业名标签是否对得上目标企业。
+
+        ``corp`` 为空（调用方没拿到企业简称）时只要求「有标签」，不再苛求
+        具体企业名——多一层限制只会把能发的人拦住。
+        """
+        if not corp:
+            return True
+        return corp.strip() in (label or "")
+
+    def warmup(self, timeout: float = 30.0) -> bool:
+        """预热：把微信 UIA 控件树唤醒到可用，避免用户第一次发送干等 30 秒。
+
+        实测（2026-11-13 19:01 日志）：微信窗口已在前台，但从「点发送」到
+        「开始往搜索框里打字」中间有 25 秒在等控件树物化——这段耗时与用户
+        操作无关，纯属微信的 UIA 树被回收后重建。放到服务启动后的后台线程
+        里做掉，用户点发送时就直接进入搜索点击（约 1~3 秒）。
+        """
+        uia = self._get_uia()
+        if uia is None:
+            return False
+        try:
+            ok = uia.warm_tree(timeout)
+        except Exception:
+            wxlog.debug('预热控件树异常（忽略）', exc_info=True)
+            return False
+        wxlog.info('微信控件树预热%s', '完成' if ok else '失败（发送时会再试）')
+        return ok
+
     def open_chat_prefer_openim(self, name: str, corp: str = "") -> bool:
         """打开**企业微信身份**的会话（同名普通好友存在时不会开错）。
 
@@ -1308,20 +1353,42 @@ class WeChatGUI:
         Returns:
             True = 已打开且确认是企业微信会话；False = 没找到或开成了普通好友。
         """
+        self._last_open_error = ''
         uia = self._get_uia()
         if uia is not None:
-            if uia.same_chat(uia.current_chat(), name) and \
-                    uia.is_openim_chat():
-                self._current_chat = name
-                return True
+            if uia.same_chat(uia.current_chat(), name):
+                # 已经是目标会话：确认它确实是「这家企业的」那条才复用，
+                # 否则（同名好友 / 别家企业同名）继续往下走正规搜索
+                label = uia.openim_label()
+                if label and self._corp_matches(label, corp):
+                    self._current_chat = name
+                    return True
             if uia.open_chat(name, prefer_openim=True, openim_hint=corp):
-                got = uia.is_openim_chat()
-                if got is False:
+                label = uia.openim_label()
+                if label == '':
+                    # 标题区在、但**没有** @企业名 标签 = 同名普通好友/群
                     wxlog.warning('同名会话身份不符：%s 打开后不是企业微信会话，'
                                   '已放弃（避免把消息发给同名好友）', name)
+                    self._last_open_error = 'identity_mismatch'
                     return False
+                if label and corp and not self._corp_matches(label, corp):
+                    wxlog.warning('打开的企业微信身份不匹配：期望 %s，实际标签 %s，'
+                                  '已放弃', corp, label)
+                    self._last_open_error = 'corp_mismatch'
+                    return False
+                if label is None:
+                    # 控件树过期/标题区读不到：无法确认身份，但也无法否认。
+                    # 已按「企业名标签」逐个点开核对过，这里放行并留痕。
+                    wxlog.warning('企业名标签读取失败（控件树可能未就绪）：%s，'
+                                  '按已打开的企业微信会话处理', name)
                 self._current_chat = name
                 return True
+            if not uia.is_ready():
+                self._last_open_error = 'tree_not_ready'
+            else:
+                # 树是好的，就是没搜到「这家企业」的同名联系人：微信里只存在
+                # 同名普通好友（或别家企业的同名），已逐个点开核对过标签。
+                self._last_open_error = 'identity_mismatch'
             return False
         # 无 UIA（OCR 兜底）时无法识别企业名标签，退回普通打开逻辑
         return self.open_chat(name)

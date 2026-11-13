@@ -68,8 +68,28 @@ CHAT_INPUT_AID = "chat_input_field"                # 输入框；其 .Name == �
 # 打开会话后靠它判断「当前这个会话是不是企业微信身份的那一个」——同名
 # 好友与企业微信联系人（如「安佳胤」与「安佳胤@我的车车」）在搜索框里
 # 名字完全一样，只看标题无法区分，误开就会把消息发给错的人。
-OPENIM_NAME_AID = ("top_content_h_view.top_spacing_v_view.top_left_info_v_view"
-                   ".big_title_line_h_view.current_chat_openim_name")
+#
+# 微信 4.1.x（2026-11-13 本机实测）把整个标题区从 ``top_content_h_view``
+# 搬到了 ``content_view.top_content_view.title_h_view``：控件名
+# ``current_chat_openim_name`` 还在，但父链全变了。只认旧路径的后果是
+# **所有企业微信联系人都发不出去**——校验永远返回「不是企业微信会话」，
+# 日志表现为「同名会话身份不符：xx 打开后不是企业微信会话，已放弃」。
+# 因此这里存多套路径逐个试，顺序 = 新版本优先。
+OPENIM_NAME_AIDS = (
+    # 微信 4.1.x 起（本机实测，安佳胤@我的车车 可命中）
+    "content_view.top_content_view.title_h_view.left_v_view"
+    ".left_content_v_view.left_ui_.openim_name_view.current_chat_openim_name",
+    # 微信 4.0.x 旧布局（保留兼容）
+    "top_content_h_view.top_spacing_v_view.top_left_info_v_view"
+    ".big_title_line_h_view.current_chat_openim_name",
+)
+# 兼容旧引用（历史上按单个常量使用过）
+OPENIM_NAME_AID = OPENIM_NAME_AIDS[0]
+# 标题区容器 AID（新旧版本都在）：取不到说明控件树还没物化
+TITLE_VIEW_AID = "content_view.top_content_view.title_h_view"
+# 控件树是否已物化的判定锚点：微信 4.x 主视图（Qt 外壳阶段只有 2 个子控件，
+# 此时任何 EditControl/TextControl 查找都会超时，表现为「会话打不开」）
+MAIN_VIEW_AID = "MainView"
 # 搜索结果里企业微信联系人的分区名（微信 4.x 单列一个分区）
 OPENIM_SECTIONS = {"企业微信联系人", "企业微信"}
 DEFAULT_EXE = r"C:\Program Files\Tencent\Weixin\Weixin.exe"
@@ -606,19 +626,35 @@ class WeChatUIA:
             time.sleep(0.8)
         raise UIATimeout("等待微信主窗口超时（客户端未就绪）。")
 
-    def ensure_window(self, wake: bool = True, timeout: Optional[float] = None) -> bool:
-        """确保可访问的主窗口存在并置前，返回是否成功。
+    def ensure_window(self, wake: bool = True, timeout: Optional[float] = None,
+                      require_ready: bool = True) -> bool:
+        """确保可访问的主窗口存在且控件树可用，并置前。
 
         优先 ControlFromHandle 按句柄锚定拿 mmui 树；若树未物化（只剩 Qt
-        外壳）则对当前 Weixin 进程热激活，不重启微信。任一环节失败返回
-        False，由调用方降级到 OCR。
+        外壳：2 个子控件、所有查找都超时）则对当前 Weixin 进程热激活并等
+        它物化，不重启微信。任一环节失败返回 False，由调用方降级到 OCR。
+
+        Args:
+            require_ready: 默认 True。**必须校验控件树可用**——只看到窗口
+                就返回 True 会让上层以为「窗口在」，随后 search_box /
+                chat_input 全部返回 None，最后报成「无法定位会话」，
+                用户看到的却是微信明明已经打开。实测未物化时首次要等
+                15~30 秒，这段等待应当显式发生并打日志。
         """
         timeout = timeout or self.timeout
         w = self._find_main()
         if w is not None:
             self._win = w
+            if not require_ready or self.is_ready():
+                self._activate(w)
+                return True
+            # 窗口在但控件树没物化：等它（不重启微信）
+            if wake and self._wake_and_wait_ready(max(timeout, 30.0)):
+                if self._win is not None:
+                    self._activate(self._win)
+                return True
             self._activate(w)
-            return True
+            return False
         if not wake:
             return False
         try:
@@ -798,7 +834,8 @@ class WeChatUIA:
 
     def _collect_results(self, keyword: str, settle: float = 1.5,
                          prefer_openim: bool = False,
-                         openim_hint: str = "") -> List[dict]:
+                         openim_hint: str = "",
+                         keep_freq: bool = False) -> List[dict]:
         """采集去重后的候选 [{name, section, aid, cell}]。
 
         Args:
@@ -806,6 +843,12 @@ class WeChatUIA:
                 保留企业微信身份那一条，避免同名好友抢占。
             openim_hint: 企业简称（从「昵称@企业名」里拆出来），用于在
                 副标题里认出企业微信那条。
+            keep_freq: 保留「最常使用/最近使用」分区里与普通分区 aid 重复的
+                条目。**企业微信同名联系人只能靠这里救回来**：实测搜「安佳胤」
+                得到『最常使用/安佳胤』（企业微信，标题带 @我的车车）与
+                『联系人/安佳胤』（普通好友）两条，两者的 name 与
+                AutomationId 完全相同，旧的「aid 去重」会把『最常使用』那条
+                删掉，于是永远只剩普通好友 → 发送被拒或发错人。
         """
         lst = self._find_search_list()
         if lst is None:
@@ -855,11 +898,14 @@ class WeChatUIA:
                 matched = wx
 
         # 最常使用/最近使用中重复出现的同一 aid 去重
-        non_freq = {r["aid"] for r in matched
-                    if r["section"] not in ("最常使用", "最近使用")}
-        pruned = [r for r in matched
-                  if not (r["section"] in ("最常使用", "最近使用")
-                          and r["aid"] in non_freq)]
+        if keep_freq:
+            pruned = list(matched)
+        else:
+            non_freq = {r["aid"] for r in matched
+                        if r["section"] not in ("最常使用", "最近使用")}
+            pruned = [r for r in matched
+                      if not (r["section"] in ("最常使用", "最近使用")
+                              and r["aid"] in non_freq)]
         for i, r in enumerate(pruned):
             r["index"] = i
         return pruned
@@ -938,7 +984,8 @@ class WeChatUIA:
                 time.sleep(0.8)
                 got = self._collect_results(
                     kw, prefer_openim=prefer_openim,
-                    openim_hint=openim_hint)
+                    openim_hint=openim_hint,
+                    keep_freq=prefer_openim)
                 if got:
                     break
                 time.sleep(0.4)
@@ -978,6 +1025,15 @@ class WeChatUIA:
                 results = wx
 
         chosen = results[0]
+        if want_openim and openim_hint:
+            # 同名多条时**只有点开才能分辨**：实测搜「安佳胤」得到
+            # 『最常使用/安佳胤』（企业微信，标题带 @我的车车）与
+            # 『联系人/安佳胤』（普通好友）两条，name 与 AutomationId 完全
+            # 相同；靠分区名或副标题都会判错（一条都没标「企业微信」）。
+            # 因此逐个点开读「@企业名」标签，读到匹配的那条才算命中。
+            if self._open_matching_openim(results, openim_hint):
+                return True
+            return False
         chosen["cell"].Click()
         time.sleep(0.7)
 
@@ -988,6 +1044,43 @@ class WeChatUIA:
                      or self.same_chat(name, used_kw)):
             return True
         return False
+
+    def _open_matching_openim(self, results: List[dict], corp: str) -> bool:
+        """逐个候选点开，用标题栏的「@企业名」标签确认是不是企业微信那条。
+
+        只在「目标确定是企业微信联系人」且知道企业简称时使用。逐条点开的
+        代价是每条约 0.6~1.0 秒，但这是唯一可靠的判别方式——同名普通好友与
+        企业微信联系人在搜索结果里的 name / AutomationId 完全相同。
+
+        排序上优先「最常使用/最近使用」：企业微信会话通常是刚处理过的那个，
+        多半一次就中，实测总耗时 1~2 秒。
+
+        点开只切换会话，**不输入、不发送**，即使点错了也不会误发消息。
+        """
+        ordered = sorted(
+            results,
+            key=lambda r: 0 if r["section"] in ("最常使用", "最近使用") else 1)
+        for r in ordered:
+            try:
+                r["cell"].Click()
+            except Exception:
+                continue
+            time.sleep(0.6)
+            label = self.openim_label()
+            if label and self._corp_in_label(label, corp):
+                wxlog.debug("企业微信身份已确认：%s 标签=%s（候选 %s）",
+                            r["name"], label, r["section"] or "-")
+                return True
+        return False
+
+    @staticmethod
+    def _corp_in_label(label: str, corp: str) -> bool:
+        """「@企业名」标签是否指向目标企业（容忍后缀/空格差异）。"""
+        lab = str(label or "").lstrip("@").strip()
+        c = str(corp or "").strip()
+        if not lab or not c:
+            return False
+        return lab == c or c in lab or lab in c
 
     def fill_text(self, text: str) -> bool:
         """把文字填进输入框但**不发送**（人工确认模式下用）。返回是否成功。
@@ -1015,6 +1108,65 @@ class WeChatUIA:
             return True
         return (not head) or (head in str(value or ""))
 
+    def openim_label(self) -> Optional[str]:
+        """当前会话标题栏的企业名标签文本（如 ``'@我的车车'``）。
+
+        这是「这条会话到底是不是企业微信身份」的唯一可靠依据：同名好友与
+        企业微信联系人的标题、输入框 Name 都是同一个昵称，只有这里多一个
+        ``@企业名`` 标签。
+
+        Returns:
+            ``'@企业名'`` = 确认是企业微信/客服会话；
+            ``''`` = 标题区存在但**没有**该标签（同名普通好友/群）；
+            ``None`` = 探测失败（控件树未物化），调用方不应据此拦截发送。
+        """
+        if not self.ensure_window():
+            return None
+        win = self._win
+        if win is None:
+            return None
+        # ① 按已知 AID 直取（新版本在前，旧版本在后）
+        for aid in OPENIM_NAME_AIDS:
+            try:
+                ctrl = win.TextControl(AutomationId=aid)
+                if ctrl.Exists(0, 0):
+                    return (ctrl.Name or "").strip() or "@"
+            except Exception:
+                continue
+        # ② AID 又变了也能认出来：标题区子树里找「以 @ 开头的文本」。
+        #    微信改父链是常事（4.0→4.1 就整段搬家），但「企业名带 @ 前缀」
+        #    是产品文案，稳定性远高于控件路径。
+        try:
+            title = win.GroupControl(AutomationId=TITLE_VIEW_AID)
+            if not title.Exists(0.5, 0.1):
+                # 连标题区都拿不到 = 控件树没物化，不能断言「不是企业微信」
+                return None
+            return self._find_at_label(title, depth=6) or ""
+        except Exception:
+            return None
+
+    @staticmethod
+    def _find_at_label(ctl, depth: int = 6) -> str:
+        """在控件子树里找第一个以 ``'@'`` 开头的文本（企业名标签）。"""
+        if depth <= 0:
+            return ""
+        try:
+            kids = ctl.GetChildren()
+        except Exception:
+            return ""
+        for k in kids:
+            try:
+                name = (k.Name or "").strip()
+            except Exception:
+                name = ""
+            if name.startswith("@"):
+                return name
+        for k in kids:
+            got = WeChatUIA._find_at_label(k, depth - 1)
+            if got:
+                return got
+        return ""
+
     def is_openim_chat(self) -> Optional[bool]:
         """当前打开的会话是否企业微信/客服身份。
 
@@ -1023,13 +1175,67 @@ class WeChatUIA:
             标签（普通好友/群）；None = 探测失败（控件树不可用），调用方
             不应据此拦截发送。
         """
-        if not self.ensure_window():
+        label = self.openim_label()
+        if label is None:
             return None
+        return bool(label)
+
+    def is_ready(self) -> bool:
+        """控件树是否已物化（微信把 UIA 树放出来了）。
+
+        未物化时 ``_find_main`` 仍能拿到 Qt 外壳窗口（只有 2 个子控件），
+        随后任何 ``EditControl``/``TextControl`` 查找都会超时，表现为
+        「搜索框找不到 → 无法定位会话」。这里用主视图 MainView 判断，
+        与 ``_chat_input`` 走同一套查找机制，命中时约几十毫秒。
+        """
+        win = self._win
+        if win is None:
+            return False
         try:
-            ctrl = self._win.TextControl(AutomationId=OPENIM_NAME_AID)
-            return bool(ctrl.Exists(0, 0))
+            return bool(win.GroupControl(
+                AutomationId=MAIN_VIEW_AID).Exists(0.4, 0.1))
         except Exception:
-            return None
+            return False
+
+    def warm_tree(self, timeout: float = 30.0) -> bool:
+        """预热控件树：只要求可访问性树就绪，**不激活窗口、不动前后台**。
+
+        微信 4.x 的 UIA 树在被系统/微信自己回收后要重新物化，实测首次
+        需要 15~30 秒。这段时间如果压在用户点「发送」上，用户只会看到
+        「微信到前台后半天没动静」。放到服务启动的后台线程里做掉，用户
+        第一次发送就只剩搜索+点击的几秒。
+        """
+        w = self._find_main()
+        if w is None:
+            return False
+        self._win = w
+        if self.is_ready():
+            return True
+        return self._wake_and_wait_ready(timeout)
+
+    def _wake_and_wait_ready(self, timeout: float = 30.0) -> bool:
+        """热激活并等待控件树就绪（不激活窗口）。"""
+        t0 = time.time()
+        wxlog.info("微信控件树尚未就绪，正在热激活（首次约 15~30 秒，请稍等）")
+        self._wake_accessibility()
+        deadline = time.time() + max(timeout, 15.0)
+        while time.time() < deadline:
+            w = self._find_main()
+            if w is None:
+                # 微信被关掉/退回登录态：没必要干等满 30 秒
+                if not self._wechat_hwnds():
+                    wxlog.warning("等待控件树期间微信窗口消失，放弃本次预热")
+                    return False
+            else:
+                self._win = w
+                if self.is_ready():
+                    wxlog.info("微信控件树已就绪（耗时 %.1fs）",
+                               time.time() - t0)
+                    return True
+            time.sleep(0.4)
+        wxlog.warning("微信控件树唤醒超时（已等 %.0fs），本次跳过",
+                      time.time() - t0)
+        return False
 
     def send_text(self, text: str) -> bool:
         """在已打开会话的输入框发送文本。返回是否成功。"""

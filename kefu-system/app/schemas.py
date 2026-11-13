@@ -80,6 +80,9 @@ class SessionItemOut(BaseModel):
     kind: str                          # group / friend
     openim: bool = False               # 企业微信/客服联系人（一对一同为 friend）
     corp: str = ""                     # 企业微信所属企业简称（显示名「昵称@企业」）
+    # 「给自己发消息」的会话：username 就是当前登录账号 wxid。微信 4.x 里
+    # 它是一个普通会话（不是文件传输助手），不标出来会和同名好友混淆。
+    is_self: bool = False
 
 
 # ---------------------------------------------------------------------------

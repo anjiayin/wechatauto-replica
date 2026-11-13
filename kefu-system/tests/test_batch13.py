@@ -77,6 +77,9 @@ class FakeGui:
         self.send_ok = send_ok
         self.fill_ok = fill_ok
         self.calls: list[tuple] = []
+        # guia.last_open_error() 的替身：tree_not_ready / identity_mismatch /
+        # corp_mismatch / ""（见 wechatauto.guia.open_chat_prefer_openim）
+        self.open_error = ""
         if not openim_capable:
             # 模拟旧版 wechatauto：没有消歧方法，调用方应退回 open_chat
             self.open_chat_prefer_openim = None  # type: ignore[assignment]
@@ -100,6 +103,9 @@ class FakeGui:
     def open_chat_prefer_openim(self, name: str, corp: str = "") -> bool:
         self.calls.append(("open_openim", name, corp))
         return self.openim_ok
+
+    def last_open_error(self) -> str:
+        return self.open_error
 
     def send_msg(self, text: str, who: str | None = None, verify: bool = False,
                  **kwargs):
@@ -543,3 +549,46 @@ class TestImageRetryGiveUp:
         finally:
             queue.stop()
         assert seen == []
+
+
+class TestOpenFailureMessages:
+    """打开会话失败的用户可见文案（批次 13 追加，实机 19:01 反馈）。
+
+    现场：微信已经打开到「安佳胤@我的车车」，但提示「无法定位会话」，
+    而且从微信到前台到开始打字之间空转 25 秒。根因是控件树未物化 +
+    老版本标题区 AID 失效，两类失败必须给出不同、可操作的提示。
+    """
+
+    def _run(self, gui):
+        sender, db = make_sender(gui)
+        opp = seed_opp(db, session_username="wxid_ajy@openim",
+                       session_name="安佳胤@我的车车")
+        sender._process(SendTask(opportunity_id=opp["id"],
+                                 session_username="wxid_ajy@openim",
+                                 session_name="安佳胤@我的车车", text="有货"))
+        return sender._notifier.of("send_result")[0]["message"]
+
+    def test_tree_not_ready_says_waiting_not_missing(self):
+        """控件树没就绪 ≠ 会话不存在：不能报「无法定位会话」让人以为发错人。"""
+        gui = FakeGui(openim_ok=False)
+        gui.open_error = "tree_not_ready"
+        msg = self._run(gui)
+        assert "控件树" in msg and "30 秒" in msg
+        assert "无法定位会话" not in msg
+
+    def test_identity_mismatch_explains_plain_friend(self):
+        gui = FakeGui(openim_ok=False)
+        gui.open_error = "identity_mismatch"
+        msg = self._run(gui)
+        assert "普通好友" in msg and "手动打开" in msg
+
+    def test_corp_mismatch_is_reported(self):
+        gui = FakeGui(openim_ok=False)
+        gui.open_error = "corp_mismatch"
+        msg = self._run(gui)
+        assert "不属于该企业微信" in msg
+
+    def test_generic_openim_failure_keeps_warning(self):
+        gui = FakeGui(openim_ok=False)          # open_error 为空 = 没搜到
+        msg = self._run(gui)
+        assert "无法定位会话" in msg and "同名" in msg

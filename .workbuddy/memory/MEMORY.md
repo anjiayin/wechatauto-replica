@@ -7,7 +7,7 @@
 
 ## 当前交接入口
 - **2026-11-13 第 13 批：`D:/Git/wechatauto-replica/HANDOVER-2026-11-13-batch13.md`**（7 项全完成，未提交）；前序 `HANDOVER-2026-11-13.md`（第 8~12 批，已提交）。
-- 基线 `HEAD=89fd98a`；测试基线 **924 passed**（全量约 7.4 分钟）。
+- 基线 `HEAD=89fd98a`；测试基线 **973 passed**（全量约 5.7 分钟）。
 
 ## 铁律 / 常踩的坑
 - pytest 必须 `--basetemp=D:/tmp/...`（本机 safe-delete 守卫会拦临时目录清理）；全量约 4~5 分钟。
@@ -24,7 +24,15 @@
 - 企业微信联系人 `local_type=5/6/7`、username 形如 `xxx@openim`；企业简称在 `contact.db` 的 `openim_wording` 表。
 - .dat 图片 V2 格式：`[6B magic][4B aes_size][4B xor_size][1B pad][AES 密文][raw 明文][XOR 密文]`；key 由 cfg_dword + wxid 派生（详见 media.py）。
 - **图片「未就绪」有两个原因，别只归咎微信**：①原图 `<md5>.dat` 确实按需下载（点开过/后台下过才有；`_h.dat` = "查看原图"高清版）；②**缩略图 `_t.dat` 本身就是完整小 JPEG**，多数图不点开也能识别（实测某群 62 张：42 张靠缩略图、1 张靠 `_h.dat` 成功，18 张报未就绪）。这 18 张真因不是没下载完，而是**单字节 XOR 密钥按账号固定（本机 0xF9），逐文件尾字节反推在"尾部带填充"的文件上会推出假密钥**（40 张样本 35 对 5 错）→ JPEG 头正常、之后全乱码 → 误判半截/花屏。已在 `media.py` 加第二轮：账号密钥投票+实测兜底，实测 18/18 救回。
-- **企业微信显示名不能直接当搜索词**：「昵称@企业简称」是展示名，`_resolve_search_keyword` 只剥 `@openim` 真实 ID。发消息必须 `_chat_name()` 剥后缀 + `open_chat_prefer_openim` 分区优先 + 打开后验 `current_chat_openim_name` 标题栏标签，不一致拒发（否则会发给同名普通好友，曾实操发错）。
+- **企业微信显示名不能直接当搜索词**：「昵称@企业简称」是展示名，`_resolve_search_keyword` 只剥 `@openim` 真实 ID。发消息必须 `_chat_name()` 剥后缀 + 打开后验标题栏企业名标签，不一致拒发（否则会发给同名普通好友，曾实操发错）。
+- **企业微信同名联系人只能靠「逐个点开验标签」识别**（2026-11-13 实机点开验证）：搜「安佳胤」返回『最常使用/安佳胤』(标签 `@我的车车`=企业微信) 与『联系人/安佳胤』(标签空=普通好友) 两条，两者 `Name` 和 `AutomationId`（`search_item_<昵称>`）**完全相同**，分区里也**没有**「企业微信」字样——`_is_openim_result()` 靠分区/副标题判身份在本机**全部失效**。且旧「最常使用 aid 去重」恰好把企业微信那条删掉。现用 `_collect_results(keep_freq=True)` 保两条 + `_open_matching_openim()` 逐个点开读 `openim_label()`（只切会话不输入）+ `_corp_in_label()` 双向包含。改这块前先实机点开看一眼，别信分区名。
+- **标题栏企业名标签 AID 会随微信版本整段搬家**（2026-11-13 实测踩坑）：微信 4.1 起从
+  `top_content_h_view...current_chat_openim_name` 搬到
+  `content_view.top_content_view.title_h_view.left_v_view.left_content_v_view.left_ui_.openim_name_view.current_chat_openim_name`。
+  写死旧路径的后果不是「报错」，而是 `is_openim_chat()` 恒 False → **所有企业微信联系人被当同名好友拒发**。
+  现用 `OPENIM_NAME_AIDS` 新旧两套 + `openim_label()` 三态（@企业名/''/None）+ `title_h_view` 子树扫「@ 开头文本」兜底。改微信版本后先跑一次 `openim_label()` 自检。
+- **微信 UIA 树会被回收，`_find_main()` 仍能拿到只剩 Qt 外壳的窗口**（`MMUIRenderSubWindowHW`+`QWidget` 两子控件）；此时任何 Edit/Text 查找都超时，表现成「无法定位会话」。判定锚点用 `MainView`（`is_ready()`），首次物化实测 15~30 秒。
+- **不要并发操作微信 UIA**（2026-11-13 实测）：`ControlFromHandle`/`Exists` 打到微信单线程 UIA provider，两个线程同时查会互相排队——启动预热线程 + 发送线程并发实测把一次发送拖到 **68 秒且全程无日志**（预热线程自己卡在 `_find_main()`，连「预热完成」都没打）。已取消 `main.py` 的 `prewarm=True`；`_prewarm()` 保留但必须持 `_gui_lock`。任何新的后台 UIA 线程都要走这把锁。
 
 ## 历史批次（已提交，勿重做）
 - `c6045c5` AI 账单/清理修复；`036c17e` 企业微信好友搜索；`633f27f` 离线语音转写；`87a6b91` 语音补转写队列 + 发送链路性能修复。

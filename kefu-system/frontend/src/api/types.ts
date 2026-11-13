@@ -76,6 +76,8 @@ export interface SessionItem {
   openim?: boolean
   /** 企业微信所属企业简称（display_name 为「昵称@企业」时非空） */
   corp?: string
+  /** 「给自己发消息」的会话：username 就是本账号 wxid */
+  is_self?: boolean
 }
 
 /** 消息（历史/上下文） */

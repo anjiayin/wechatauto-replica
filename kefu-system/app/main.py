@@ -184,6 +184,10 @@ def create_app() -> FastAPI:
         pipeline.set_at_resolver(wechat.resolve_at_tokens)
         # 启动后台组件
         pipeline.start()
+        # 不预热：UIA 控件树探查（ControlFromHandle + Exists）每 0.4s 一轮，
+        # 与发送线程的搜索/点击抢微信 UI 线程，实测会把首次发送拖到 60s+
+        # 且全程无日志（预热线程自己也会卡在 _find_main 里）。第一次发送时
+        # ensure_window(require_ready=True) 会显式等待并打日志，更可诊断。
         sender.start()
         aggregator.start()
         # 微信初始化（密钥提取）可能耗时十几秒：放后台线程，避免阻塞事件循环

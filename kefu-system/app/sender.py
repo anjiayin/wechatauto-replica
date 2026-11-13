@@ -92,6 +92,7 @@ class Sender:
         self._notifier = notifier
         self._queue: "queue.Queue[Optional[SendTask]]" = queue.Queue()
         self._thread: Optional[threading.Thread] = None
+        self._prewarm_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._gui = None              # WeChatGUI 实例（仅本线程创建/使用）
         # GUI 操作互斥锁：发送线程与「跳转微信」API 线程共用。UIA 自动化
@@ -104,8 +105,14 @@ class Sender:
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
-    def start(self) -> None:
-        """启动发送线程。"""
+    def start(self, prewarm: bool = False) -> None:
+        """启动发送线程。
+
+        Args:
+            prewarm: 是否在后台预热微信 UIA 控件树。服务启动时传 True：
+                微信的 UIA 树被回收后重新物化实测要 15~30 秒，这段耗时
+                压在用户点「发送」上就是「微信到前台后半天没动静」。
+        """
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
@@ -113,6 +120,42 @@ class Sender:
             target=self._run, name="kefu-sender", daemon=True)
         self._thread.start()
         logger.info("发送线程已启动")
+        if prewarm:
+            self._start_prewarm()
+
+    def _start_prewarm(self) -> None:
+        """后台预热微信控件树（不阻塞服务启动、不动微信前后台）。"""
+        if self._prewarm_thread and self._prewarm_thread.is_alive():
+            return
+        self._prewarm_thread = threading.Thread(
+            target=self._prewarm, name="kefu-sender-prewarm", daemon=True)
+        self._prewarm_thread.start()
+
+    def _prewarm(self) -> None:
+        """预热 UIA 控件树。失败无所谓，真正发送时会再试一次。
+
+        **必须与发送线程互斥**：微信的 UIA provider 是单线程的，两个线程同时
+        做 ``ControlFromHandle``/``Exists`` 会互相排队，实测能把一次发送拖到
+        60 秒以上且期间一条日志都没有（看起来像「微信到前台后就不动了」）。
+        拿不到锁就直接放弃——预热只是优化，永远不该影响正常发送。
+        """
+        try:
+            from wechatauto.uia_driver import WeChatUIA
+        except Exception as exc:      # 依赖未装（如 linux CI）
+            logger.debug("跳过微信控件树预热：%s", exc)
+            return
+        if not self._gui_lock.acquire(timeout=0.2):
+            logger.debug("发送正在占用微信窗口，跳过控件树预热")
+            return
+        try:
+            ok = WeChatUIA().warm_tree(timeout=20.0)
+        except Exception:
+            logger.debug("微信控件树预热异常（忽略）", exc_info=True)
+            return
+        finally:
+            self._gui_lock.release()
+        logger.info("微信控件树预热%s", "完成（发送可立即开始）"
+                    if ok else "未完成（微信可能未启动，发送时会再试）")
 
     def stop(self) -> None:
         """停止发送线程。"""
@@ -214,10 +257,42 @@ class Sender:
             else:
                 opened = bool(gui.open_chat(who))
             if not opened:
+                reason = ""
+                try:
+                    getter = getattr(gui, "last_open_error", None)
+                    if callable(getter):
+                        reason = str(getter() or "")
+                except Exception:
+                    reason = ""
+                if reason == "tree_not_ready":
+                    # 微信 UIA 控件树被回收后重新物化实测要 15~30 秒，这期间
+                    # 搜索框根本找不到。不能说「无法定位会话」——会话其实在。
+                    self._fail(
+                        task,
+                        "微信控件树正在唤醒（首次约 15~30 秒），请稍后重试；"
+                        "若反复出现请确认微信窗口未被最小化", stage)
+                    return
+                if openim and reason == "identity_mismatch":
+                    self._fail(
+                        task,
+                        f"无法定位企业微信会话：{task.session_name}"
+                        "（微信搜索里同名的那几个都不是这家企业的联系人——"
+                        "只有同名普通好友；已取消发送以免发错人。可先在微信里"
+                        "手动打开该企业微信会话再重试，当前会话已经是它时会"
+                        "直接复用）",
+                        stage)
+                    return
+                if openim and reason == "corp_mismatch":
+                    self._fail(
+                        task,
+                        f"无法定位会话：{task.session_name}"
+                        "（打开的同名联系人不属于该企业微信，已取消发送）",
+                        stage)
+                    return
                 hint = ""
                 if openim:
-                    hint = ("（该联系人是企业微信身份，若微信里存在同名普通"
-                            "好友，可能被误开；已取消发送以免发错人）")
+                    hint = ("（未找到该企业微信会话；若微信里存在同名普通"
+                            "好友，不排除被误开，已取消发送以免发错人）")
                 self._fail(task, f"无法定位会话：{task.session_name}{hint}",
                            stage)
                 return

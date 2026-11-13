@@ -496,6 +496,16 @@ function TargetsTab() {
                         sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.75 }}
                       >
                         {s.display_name}
+                        {s.is_self && (
+                          <Chip
+                            label="我自己"
+                            size="small"
+                            color="secondary"
+                            variant="outlined"
+                            sx={{ height: 18, fontSize: 11 }}
+                            title="给自己发消息：微信里 username 就是本账号，消息由你自己发出，适合测试"
+                          />
+                        )}
                         {showWxTag && (
                           <Chip
                             label="企业微信"

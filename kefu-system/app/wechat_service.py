@@ -413,8 +413,13 @@ class WeChatService:
             # 过滤自己发送的消息（批次 5 需求 ⑤，设置默认开启）：
             # 自己发的消息不进入商机分析，仅落一条 skipped 日志留痕，
             # 也不进入漏判修正候选（skipped 状态不参与修正示例挑选）。
-            if self._filter_self_enabled() and self._is_self_message(
-                    kind, msg, sender_wxid):
+            # 例外：与**自己**对话的会话（「给自己发消息」的 self 会话 /
+            # 文件传输助手）里每条消息的 sender_id 都是 2，若一并过滤，
+            # 这条通道会整体失效——而它恰恰是用户手工喂给系统的输入，
+            # 本意就是让系统分析，所以不走「自己发的」过滤。
+            if self._filter_self_enabled() \
+                    and not self._is_self_chat(username) \
+                    and self._is_self_message(kind, msg, sender_wxid):
                 # 日志留痕文本与管线口径一致：群消息剥发送人前缀（需求 ①）
                 content = str(msg.get("content") or "")
                 if kind == "group":
@@ -1527,6 +1532,25 @@ class WeChatService:
             logger.exception("读取过滤自己消息设置失败（按开启处理）")
             return True
 
+    # 与「自己」对话的会话：微信 4.x 的「给自己发消息」会话 username 就是
+    # 自己的 wxid；文件传输助手同样是「自己发给自己」。这两类会话里每条
+    # 消息的 sender_id 都是 2（自己），必须与「我在别人会话里发言」区分开。
+    _SELF_CHAT_USERNAMES = ("filehelper",)
+
+    def is_self_username(self, username: str) -> bool:
+        """username 是否当前登录账号自己（微信「给自己发消息」的会话）。"""
+        u = (username or "").strip()
+        return bool(u) and u == self._self_id()
+
+    def _is_self_chat(self, username: str) -> bool:
+        """该会话是否「自己和自己对话」（给自己发消息 / 文件传输助手）。"""
+        u = (username or "").strip()
+        if not u:
+            return False
+        if u.lower() in self._SELF_CHAT_USERNAMES:
+            return True
+        return self.is_self_username(u)
+
     def _self_id(self) -> str:
         """当前登录账号 wxid（懒加载缓存；读取失败返回空串 = 不过滤群聊）。"""
         if self._self_wxid:
@@ -1826,6 +1850,10 @@ class WeChatService:
         所属企业时显示名按微信端习惯拼成「昵称@企业简称」。
         """
         corp_map = self._openim_corp_map()
+        # 当前登录账号 wxid：微信 4.x 的「给自己发消息」是一个**普通会话**，
+        # username 就是自己的 wxid（实测 wxid_xxx 会话里有自己发的消息），
+        # 需要标记出来，否则在候选列表里和同名好友长得一模一样。
+        self_id = self._self_id()
         items: list[dict] = []
         seen: set[str] = set()
         for s in self._wxdb.get_sessions(limit=100):
@@ -1840,7 +1868,8 @@ class WeChatService:
                               self.get_display_name(username), corp),
                           "kind": "group" if username.endswith("@chatroom")
                                   else "friend",
-                          "openim": openim, "corp": corp})
+                          "openim": openim, "corp": corp,
+                          "is_self": bool(self_id) and username == self_id})
             seen.add(username)
         # wechatauto.get_contacts 的群聊取值为 "chatroom"（不是 "group"）；
         # openim 为企业微信/客服联系人，按一对一私聊归入 friend
@@ -1866,7 +1895,8 @@ class WeChatService:
                               "display_name": name, "kind": item_kind,
                               "openim": c_kind == "openim"
                                         or self.is_openim(username),
-                              "corp": corp})
+                              "corp": corp,
+                              "is_self": bool(self_id) and username == self_id})
                 seen.add(username)
         logger.info("联系人列表构建完成：%d 条（群/好友/企业微信合并去重后，"
                     "其中 %d 个企业微信联系人有企业名）",
