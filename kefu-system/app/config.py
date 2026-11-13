@@ -14,6 +14,9 @@ DB_PATH = DATA_DIR / "kefu.sqlite3"                        # 业务 SQLite
 SECRET_KEY_PATH = DATA_DIR / "secret.key"                  # Fernet 密钥文件
 LOG_PATH = DATA_DIR / "kefu.log"                           # 滚动日志
 IMG_CACHE_DIR = DATA_DIR / "imgcache"                      # 图片解密缓存（反馈 2）
+# 授权许可证（服务端签发的签名文件）与本地状态（last_ok_at / max_seen_ts）
+LICENSE_FILE = DATA_DIR / "license.json"
+LICENSE_STATE_FILE = DATA_DIR / "license.state.json"
 # 语音消息落盘缓存（微信 SILK 原始文件，转写前临时解码）
 VOICE_CACHE_DIR = DATA_DIR / "voicecache"
 # 离线语音识别模型目录（SenseVoice-Small：model.int8.onnx + tokens.txt）
@@ -122,6 +125,19 @@ MONITOR_MAX_TARGETS_MAX = 2000     # monitor.max_targets 允许上限
 AI_DISABLE_THINKING_DEFAULT = True
 
 # ---------------------------------------------------------------------------
+# 版本号（授权接口会带上，便于服务端按客户端版本下发策略）
+# ---------------------------------------------------------------------------
+APP_VERSION = "1.0.0"
+
+# ---------------------------------------------------------------------------
+# 授权（license）相关常量
+# ---------------------------------------------------------------------------
+# 模拟授权服务器默认地址（真实环境用 license.server_url 或环境变量覆盖）
+DEFAULT_LICENSE_SERVER_URL = "http://127.0.0.1:8799"
+LICENSE_DEFAULT_GRACE_DAYS = 7        # 离线宽限默认天数
+LICENSE_DEFAULT_REFRESH_HOURS = 6     # 联网确认默认间隔（小时）
+
+# ---------------------------------------------------------------------------
 # settings 表配置键（共享约定，前端与后端共同遵守）
 # ---------------------------------------------------------------------------
 KEY_AI_BASE_URL = "ai.base_url"
@@ -163,6 +179,26 @@ KEY_RUNTIME_CACHE_DIR = "runtime.cache_dir"
 # 内部键：最近一次手动清理记录（JSON：table/deleted/keep_days/cutoff/at）。
 # 落库留痕，不依赖日志文件——日志轮转失败时仍能查出「数据是被谁清理掉的」。
 KEY_RUNTIME_LAST_PURGE = "runtime.last_purge"
+# 电脑授权（license）：**默认强制启用**（机器码绑定 + 到期校验）。
+# 取值只有两种语义（v2，fail-closed）：
+#   - 等于厂商测试口令（明文不随程序分发，代码里只存 SHA256）→ 测试模式，
+#     关闭授权校验，界面显示醒目横幅；
+#   - 其它任何值（"1" / "0" / "false" / 空）→ 一律需要授权。
+#     改数据库/配置文件为 0 不再能绕过授权。
+# 交付脚本建议再加 `--license`（写入环境变量 KEFU_LICENSE_MODE=enforce），
+# 这样连测试口令都失效，只能走正规激活。
+# ⚠️ 改这里只影响**新建**的数据库：DEFAULT_SETTINGS 是 INSERT OR IGNORE 播种，
+# 已有库里那行 license.enabled 会一直盖住代码默认值。切模式请用
+# `python run.py --license-on` / `--license-dev`。
+KEY_LICENSE_ENABLED = "license.enabled"
+# 授权服务器地址（真实后台部署后改这里；环境变量 KEFU_LICENSE_SERVER 优先）
+KEY_LICENSE_SERVER_URL = "license.server_url"
+# 预置激活码（批量部署时可由部署脚本写入，客户无需手输；空 = 界面输入）
+KEY_LICENSE_ACTIVATION_CODE = "license.activation_code"
+# 联网确认间隔（小时）：距上次成功确认超过该值即后台静默刷新一次
+KEY_LICENSE_REFRESH_INTERVAL = "license.refresh_interval_hours"
+# 本地兜底离线宽限天数（许可证 payload 带 grace_days 时以许可证为准）
+KEY_LICENSE_GRACE_DAYS = "license.grace_days"
 
 # ---------------------------------------------------------------------------
 # 默认配置值
@@ -191,6 +227,13 @@ DEFAULT_SETTINGS: dict[str, str] = {
     KEY_COMPLIANCE_CONFIRMED: "0",
     KEY_RUNTIME_CACHE_DIR: "",     # 空 = 使用 CACHE_DIR_DEFAULT
     KEY_RUNTIME_LAST_PURGE: "",    # 空 = 尚未执行过手动清理（JSON 字符串）
+    # 授权：默认值只对新建数据库（settings 表）生效；已有库用 --license /
+    # 环境变量 KEFU_LICENSE_ENABLED=1 覆盖，或改 settings 表里的 license.enabled。
+    KEY_LICENSE_ENABLED: "1",
+    KEY_LICENSE_SERVER_URL: DEFAULT_LICENSE_SERVER_URL,
+    KEY_LICENSE_ACTIVATION_CODE: "",
+    KEY_LICENSE_REFRESH_INTERVAL: str(LICENSE_DEFAULT_REFRESH_HOURS),
+    KEY_LICENSE_GRACE_DAYS: str(LICENSE_DEFAULT_GRACE_DAYS),
 }
 
 # 判定严格度取值

@@ -437,3 +437,42 @@ export interface WechatJumpResult {
   /** 中文提示（成功/失败原因，直接展示） */
   message: string
 }
+
+/** 授权状态（GET /api/license/status 等接口统一返回体） */
+export interface LicenseStatusOut {
+  /** 是否启用授权校验（false = 厂商测试模式，仅在配置了口令时出现） */
+  enabled: boolean
+  /** 状态机：disabled/active/offline_grace/unlicensed/expired/offline_expired/invalid/revoked/clock_rollback */
+  state: string
+  /** 是否可用；false 时后端已拦截全部业务接口 */
+  ok: boolean
+  /** 厂商测试模式：授权校验被口令关闭（界面显示红色横幅提醒） */
+  dev_mode?: boolean
+  machine_code: string
+  license_id: string
+  customer: string
+  edition: string
+  issued_at: string
+  expires_at: string
+  days_left: number | null
+  grace_days: number
+  last_ok_at: string
+  offline: boolean
+  server_url: string
+  /** 中文状态说明（直接展示） */
+  message: string
+  /** 最近一次联网确认失败的原因（成功即清空）；非空说明本地许可证可能已过期 */
+  last_error: string
+  /** 授权开关来源：env（环境变量）/ db（数据库设置）/ default（代码默认值） */
+  enabled_source?: string
+}
+
+/** GET /api/license/machine-code 返回（deep=1 时带 WMI 明细） */
+export interface MachineCodeOut {
+  ok: boolean
+  machine_code: string
+  platform: string
+  components: string[]
+  wmi?: Record<string, unknown>
+  wmi_note?: string
+}

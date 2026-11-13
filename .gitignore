@@ -33,3 +33,6 @@ COMMIT_MSG.txt
 
 # sibling repo
 WeChatBot-new/
+
+# 模拟授权服务器的联调数据（含激活码/许可证，不入库）
+kefu-system/tools/mock_license_data.json

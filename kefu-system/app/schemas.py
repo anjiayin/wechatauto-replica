@@ -527,3 +527,33 @@ class AnalysisLogOut(BaseModel):
 class AnalysisLogListOut(BaseModel):
     total: int
     items: List[AnalysisLogOut]
+
+
+# ---------------------------------------------------------------------------
+# 电脑授权（license）
+# ---------------------------------------------------------------------------
+class LicenseStatusOut(BaseModel):
+    """授权状态（`/api/license/status` 等接口统一返回体）。"""
+    enabled: bool = False
+    state: str = "disabled"            # 见 app/license.py 状态机
+    ok: bool = True                    # False 时后端拦截全部业务接口
+    dev_mode: bool = False             # 厂商测试模式（授权校验被口令关闭）
+    machine_code: str = ""
+    license_id: str = ""
+    customer: str = ""
+    edition: str = ""
+    issued_at: str = ""
+    expires_at: str = ""
+    days_left: Optional[int] = None
+    grace_days: int = 7
+    last_ok_at: str = ""
+    offline: bool = False
+    server_url: str = ""
+    message: str = ""
+    last_error: str = ""               # 最近一次联网确认失败的原因（成功即清空）
+    enabled_source: str = ""           # 授权开关来源：env / db / default
+
+
+class LicenseActivateIn(BaseModel):
+    """激活请求（激活码可空：批量部署时由配置预置）。"""
+    activation_code: str = ""

@@ -70,8 +70,9 @@ import {
   mergePrescreen,
   parsePrescreen,
 } from '../constants/prescreen'
+import { LicenseSettingsTab } from './LicensePanel'
 
-/** 设置页：监控对象 / 商机类型 / AI 接口 / 数据与账单 四 tab。 */
+/** 设置页：监控对象 / 商机类型 / AI 接口 / 数据与账单 / 授权 五 tab。 */
 export default function SettingsPage() {
   const [tab, setTab] = useState(0)
   return (
@@ -81,11 +82,13 @@ export default function SettingsPage() {
         <Tab label="商机类型" />
         <Tab label="AI 接口" />
         <Tab label="数据与账单" />
+        <Tab label="授权" />
       </Tabs>
       {tab === 0 && <TargetsTab />}
       {tab === 1 && <TypesTab />}
       {tab === 2 && <AiTab />}
       {tab === 3 && <DataBillingTab />}
+      {tab === 4 && <LicenseSettingsTab />}
     </Paper>
   )
 }

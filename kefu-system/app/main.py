@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import IO, Optional
@@ -23,7 +24,9 @@ from fastapi.staticfiles import StaticFiles
 from app.aggregator import Aggregator
 from app.api import deps
 from app.api import ALL_ROUTERS
+from app.api.license_guard import make_license_guard
 from app.config import (
+    APP_VERSION,
     DATA_DIR,
     FRONTEND_DIST,
     LOG_BACKUP_COUNT,
@@ -34,6 +37,7 @@ from app.config import (
     WORKER_COUNT,
 )
 from app.db import Database, read_analysis_settings
+from app import license as license_mod
 from app.notifier import Notifier
 from app.pipeline import Pipeline
 from app.sender import Sender
@@ -125,14 +129,41 @@ def setup_logging() -> None:
         LOG_MAX_BYTES / 1024 / 1024, LOG_BACKUP_COUNT)
 
 
+def _license_heartbeat_loop(client, check_interval_sec: float = 300.0) -> None:
+    """后台静默联网确认授权（续费、吊销、换到期日都能自动生效）。
+
+    每 5 分钟看一次「距上次成功确认是否超过配置间隔」（默认 6 小时），到期就
+    向授权服务器确认一次。全部失败只记日志，不弹错误——真正的提示由
+    ``/api/license/status`` 的状态机和前端横幅负责，避免断网时刷屏。
+
+    Args:
+        client: :class:`app.license.LicenseClient`。
+        check_interval_sec: 轮询粒度（秒）。
+    """
+    while True:
+        time.sleep(check_interval_sec)
+        try:
+            if not client.needs_refresh():
+                continue
+            status = client.refresh()
+            logger.info("授权后台确认完成：%s（到期 %s）",
+                        status.state, status.expires_at or "-")
+        except Exception:            # 线程绝不能因异常退出
+            logger.exception("授权后台确认异常（已忽略，稍后重试）")
+
+
 def create_app() -> FastAPI:
     """创建 FastAPI 应用。"""
     setup_logging()
     app = FastAPI(
         title="微信商机监测与客服系统",
-        version="1.0.0",
+        version=APP_VERSION,
         description="基于 wechatauto 的本地商机监测与客服闭环系统",
     )
+    # 授权拦截（必须在 CORS 之前注册：Starlette 中间件是后加的先执行，
+    # 这样 CORS 位于外层，403 响应也能带上跨域头）
+    app.middleware("http")(make_license_guard(
+        lambda: deps.get_license_client().status()))
     app.add_middleware(
         CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
         allow_headers=["*"],
@@ -169,8 +200,12 @@ def create_app() -> FastAPI:
                             queue_max=QUEUE_MAX)
         sender = Sender(db, notifier)
         wechat = WeChatService(db, aggregator)
+        # 授权客户端：绑定数据库读配置，注入 deps 供 API / 拦截中间件共用
+        license_client = license_mod.LicenseClient(db=db)
+        license_mod.set_client(license_client)
         deps.configure(db=db, wechat=wechat, pipeline=pipeline,
-                       sender=sender, notifier=notifier)
+                       sender=sender, notifier=notifier,
+                       license_client=license_client)
         # 全局引用（供闭包/查找使用）
         globals()["_db"] = db
         globals()["_pipeline"] = pipeline
@@ -182,22 +217,54 @@ def create_app() -> FastAPI:
         pipeline.set_voice_lookup(wechat.transcribe_voice)
         # 注入 @人 ID 还原（群聊 AI 判定上下文线索，批次 5 需求 ④）
         pipeline.set_at_resolver(wechat.resolve_at_tokens)
-        # 启动后台组件
-        pipeline.start()
-        # 不预热：UIA 控件树探查（ControlFromHandle + Exists）每 0.4s 一轮，
-        # 与发送线程的搜索/点击抢微信 UI 线程，实测会把首次发送拖到 60s+
-        # 且全程无日志（预热线程自己也会卡在 _find_main 里）。第一次发送时
-        # ensure_window(require_ready=True) 会显式等待并打日志，更可诊断。
-        sender.start()
-        aggregator.start()
-        # 微信初始化（密钥提取）可能耗时十几秒：放后台线程，避免阻塞事件循环
-        wx_start = threading.Thread(target=wechat.start,
-                                    name="kefu-wx-start", daemon=True)
-        wx_start.start()
-        globals()["_wx_start_thread"] = wx_start
-        logger.info("kefu-system 启动完成（前端 dist：%s）",
+
+        def _start_runtime() -> None:
+            """启动抓取 / 分析 / 发送（授权通过后才会被调用）。"""
+            pipeline.start()
+            # 不预热：UIA 控件树探查（ControlFromHandle + Exists）每 0.4s 一轮，
+            # 与发送线程的搜索/点击抢微信 UI 线程，实测会把首次发送拖到 60s+
+            # 且全程无日志（预热线程自己也会卡在 _find_main 里）。第一次发送时
+            # ensure_window(require_ready=True) 会显式等待并打日志，更可诊断。
+            sender.start()
+            aggregator.start()
+            # 微信初始化（密钥提取）可能耗时十几秒：放后台线程，避免阻塞事件循环
+            wx_start = threading.Thread(target=wechat.start,
+                                        name="kefu-wx-start", daemon=True)
+            wx_start.start()
+            globals()["_wx_start_thread"] = wx_start
+
+        # 授权通过后（含「首次激活」）由 deps 回调现场拉起运行时，无需重启程序
+        deps.configure_runtime(_start_runtime)
+        lic_status = license_client.status(touch=True)
+        if lic_status.ok:
+            deps.mark_runtime_started()
+            _start_runtime()
+            if lic_status.enabled:
+                logger.info("授权校验通过：状态 %s，到期 %s（剩余 %s 天）",
+                            lic_status.state, lic_status.expires_at or "-",
+                            lic_status.days_left if lic_status.days_left
+                            is not None else "-")
+            else:
+                # 测试模式（厂商自己调试用）：日志里必须显眼，否则交付件忘了
+                # 切回来就是一整批客户都能白用。
+                logger.warning(
+                    "⚠ 授权校验处于【厂商测试模式】：本机无需激活即可使用全部"
+                    "功能。交付客户前务必执行 python run.py --license-on")
+        else:
+            logger.warning(
+                "授权不可用（%s）：%s。已暂停微信抓取与分析，请在界面完成激活"
+                "（机器码 %s）；历史数据未做任何改动。",
+                lic_status.state, lic_status.message, lic_status.machine_code)
+        # 授权启用时：后台线程按间隔静默联网确认（续费/吊销能及时生效）
+        if lic_status.enabled:
+            lic_thread = threading.Thread(
+                target=_license_heartbeat_loop, args=(license_client,),
+                name="kefu-license-heartbeat", daemon=True)
+            lic_thread.start()
+            globals()["_license_thread"] = lic_thread
+        logger.info("kefu-system 启动完成（前端 dist：%s，版本 %s）",
                     "已托管" if (FRONTEND_DIST / "index.html").exists()
-                    else "未构建")
+                    else "未构建", APP_VERSION)
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:

@@ -35,8 +35,12 @@
 - **微信 UIA 树会被回收，`_find_main()` 仍能拿到只剩 Qt 外壳的窗口**（`MMUIRenderSubWindowHW`+`QWidget` 两子控件）；此时任何 Edit/Text 查找都超时，表现成「无法定位会话」。判定锚点用 `MainView`（`is_ready()`），首次物化实测 15~30 秒。
 - **商机类型能否命中，八成取决于该类型的 `description`，不是 Prompt 模板**（2026-11-13 实测）：`build_system_prompt` 的总纲是「是否表达明确的业务合作意向（采购/委托/询价/求供）」+ balanced「有标的物+意向动作」+ 原则「闲聊一律 hit=false」+ points 只收标的/数量/价格 + direction 只有 buy/sell——非交易型类型（投诉/售后/求助）在这套范式里**天然落空**。只把旧类型描述扩成「命中特征词清单 + 豁免句（如『没有报价/数量/标的物不影响命中』）+ 字段约定（type/points/direction 怎么填）」，实测 7 条投诉全命中、6 条闲聊全不命中、配件交易仍归「汽车配件」，无需改代码。新加类型别再只写「判断是否有 X」。
 
+- **授权开关 v2 是 fail-closed**：`license.enabled` 任何取值都需要授权，只有等于厂商测试口令（明文或 SHA256 指纹）才关闭校验；`KEFU_LICENSE_MODE=enforce`（env，`run.py --license` 设它）优先级最高、无视口令。切模式只用 `python run.py --license-dev 口令`（必须现场出示，客户拿到程序也关不掉）/ `--license-on`。口令明文不写进 kefu-system/ 任何文件，代码里只有 `DEV_TOKEN_SHA256`。别再把 `0/false/空` 当关闭开关。
+- **授权（license）机器码不能用 WMI**（2026-11-13 实测）：本机 WMI 仓库已损坏（`Win32_BaseBoard` 报「无效类」），而 WMI 被系统更新打坏并不罕见——一旦 WMI 参与机器码哈希，坏一次全体客户授权同时失效。现用注册表 `MachineGuid` + Win32 `GetVolumeInformationW` 卷序列号（<10ms、不落盘缓存），WMI 只作排障展示。许可证用 Ed25519 签名（私钥只在服务端，客户端内置公钥表 `PUBLIC_KEYS`），离线宽限 7 天靠 `last_ok_at`，防时钟回拨靠 `max_seen_ts`。接口契约见 `kefu-system/docs/授权服务接口文档.md`，模拟服务器 `tools/mock_license_server.py`（管理台 /admin）。
+
 - **不要并发操作微信 UIA**（2026-11-13 实测）：`ControlFromHandle`/`Exists` 打到微信单线程 UIA provider，两个线程同时查会互相排队——启动预热线程 + 发送线程并发实测把一次发送拖到 **68 秒且全程无日志**（预热线程自己卡在 `_find_main()`，连「预热完成」都没打）。已取消 `main.py` 的 `prewarm=True`；`_prewarm()` 保留但必须持 `_gui_lock`。任何新的后台 UIA 线程都要走这把锁。
 
 ## 历史批次（已提交，勿重做）
 - `c6045c5` AI 账单/清理修复；`036c17e` 企业微信好友搜索；`633f27f` 离线语音转写；`87a6b91` 语音补转写队列 + 发送链路性能修复。
 - 详见 `.workbuddy/memory/2026-11-10.md`、`2026-11-11.md`。
+- **Ctrl+C 卡在 "Shutting down" 的两个默认值**（2026-11-13 实测）：① uvicorn 的 `timeout_graceful_shutdown` 默认 None = 无限等未完成请求，且在 `lifespan.shutdown()` **之前**——一个卡住的同步请求就让停监听/刷 watermark/关库全不执行，微信轮询照旧（控制台还在刷 poll）；② 解释器退出还要等 **non-daemon 的 AnyIO 线程池 worker**，卡在 `threading._shutdown()`。`run.py` 已修：graceful=5s + `_KefuServer` 挂 20s 看门狗（抓全线程栈→`data/shutdown-dump-*.log`→`os._exit(130)`）+ 收尾 `os._exit`。别再用 `uvicorn.run()` 裸跑。

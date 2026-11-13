@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { NavLink, Route, Routes, useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import {
@@ -28,6 +28,13 @@ import { setPendingOpportunity } from './hooks/pendingOpportunity'
 import OpportunityList from './pages/OpportunityList'
 import AnalysisLogs from './pages/AnalysisLogs'
 import SettingsPage from './pages/SettingsPage'
+import {
+  LicenseBlocker,
+  LicenseChip,
+  LicenseDialog,
+  LicenseNotice,
+  useLicenseStatus,
+} from './pages/LicensePanel'
 
 const DRAWER_WIDTH = 200
 
@@ -57,6 +64,18 @@ export default function App() {
     queryFn: () => apiGet<StatusOut>('/api/status'),
     refetchInterval: 5000,
   })
+
+  // 授权状态（未启用授权时 enabled=false，界面完全不打扰）
+  const { data: license } = useLicenseStatus()
+  const [licenseOpen, setLicenseOpen] = useState(false)
+  const licenseAutoOpened = useRef(false)
+  useEffect(() => {
+    // 未授权/过期时自动弹一次激活框（用户关掉后回到遮罩，仍可从顶栏再打开）
+    if (license?.enabled && !license.ok && !licenseAutoOpened.current) {
+      licenseAutoOpened.current = true
+      setLicenseOpen(true)
+    }
+  }, [license])
 
   // 全局提示音（设置页保存后写入 localStorage；opportunity_new 时由 useEvents 派发事件）。
   // 提示音经 Web Audio 合成；首次交互解锁以绕过浏览器自动播放策略。
@@ -170,6 +189,8 @@ export default function App() {
               ? `监听运行中 · 监控 ${status.monitored_count} 个会话`
               : '监听未运行'}
           </Typography>
+          {/* 授权状态（点击查看机器码/激活码/到期时间） */}
+          <LicenseChip status={license} onClick={() => setLicenseOpen(true)} />
           {/* 今日 AI 估算费用（反馈 13；未配置单价时为 0 不展示） */}
           {(status?.today_cost ?? 0) > 0 && (
             <Tooltip title="今日 AI 估算费用（按设置中的单价与实际 token 用量计算）">
@@ -217,6 +238,16 @@ export default function App() {
       </Drawer>
 
       <Box component="main" sx={{ flexGrow: 1, p: 2, mt: 5 }}>
+        {/* 授权提醒：离线宽限期 / 7 天内到期（不阻塞操作） */}
+        <LicenseNotice status={license} onOpen={() => setLicenseOpen(true)} />
+        {/* 强制授权已上线：这里只为「厂商自己的测试模式」留一个显眼提示，
+            交付件里出现这条横幅 = 忘了执行 run.py --license-on */}
+        {license?.dev_mode && (
+          <Alert severity="error" sx={{ mb: 2 }}>
+            当前是<b>厂商测试模式</b>：授权校验已关闭，本机无需激活即可使用。
+            交付客户前请执行 <code>python run.py --license-on</code> 后重启。
+          </Alert>
+        )}
         {banner && (
           <Alert severity={banner.severity} sx={{ mb: 2 }}>
             {banner.text}
@@ -270,6 +301,16 @@ export default function App() {
           {aiErrorSnack}
         </Alert>
       </Snackbar>
+
+      {/* 未授权 / 到期：全屏遮罩（业务接口此时已被后端拦截，数据不受影响） */}
+      <LicenseBlocker status={license} onOpen={() => setLicenseOpen(true)} />
+
+      {/* 授权详情/激活对话框 */}
+      <LicenseDialog
+        open={licenseOpen}
+        status={license}
+        onClose={() => setLicenseOpen(false)}
+      />
     </Box>
   )
 }
