@@ -528,6 +528,15 @@ function TargetsTab() {
                 />
               </ListItem>
             )}
+            {/* 只有搜到自己时才提示：这是「给自己发消息」的通道 */}
+            {candidates.some((s) => s.is_self) && (
+              <ListItem dense>
+                <Typography variant="caption" color="text.secondary">
+                  「我自己」= 在微信里给自己发消息（不会打扰任何人），
+                  适合测试；加入监控后它发的内容也会进入 AI 分析。
+                </Typography>
+              </ListItem>
+            )}
           </List>
           <Button
             variant="contained"
@@ -994,7 +1003,7 @@ function AiTab() {
         // 授权成功后立即弹一条测试通知，用户可直观确认效果
         try {
           const n = new Notification('系统通知已开启', {
-            body: '页面不在前台时收到新商机，将通过系统通知提醒',
+            body: '页面不在前台时收到新的商机/投诉提醒，将通过系统通知弹出',
           })
           n.onclick = () => {
             window.focus()
@@ -1374,7 +1383,7 @@ function AiTab() {
                 onChange={(e) => toggleSystemNotify(e.target.checked)}
               />
             }
-            label="系统通知（页面不在前台时收到新商机，系统弹窗提醒）"
+            label="系统通知（页面不在前台时收到新的商机/投诉提醒，系统弹窗提醒）"
           />
           {showAuthButton && (
             <Button

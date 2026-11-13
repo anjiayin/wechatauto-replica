@@ -34,6 +34,8 @@ const DRAWER_WIDTH = 200
 /** 新商机 toast 数据（useEvents 派发 kefu-opportunity-toast） */
 interface OppToastData {
   id: number
+  /** 提醒标题（随商机类型变化，如「收到新的客户投诉」） */
+  title?: string
   session_name: string
   summary: string
 }
@@ -90,6 +92,7 @@ export default function App() {
   // 新商机到达提醒（右上角 toast，点击跳转商机详情；全局任何页面生效）
   const [oppToast, setOppToast] = useState<{
     id: number
+    title: string
     content: string
   } | null>(null)
   useEffect(() => {
@@ -102,6 +105,7 @@ export default function App() {
           .find(Boolean) ?? ''
       setOppToast({
         id: d.id,
+        title: d.title || '收到新商机',
         content: [d.session_name, firstLine].filter(Boolean).join('：'),
       })
     }
@@ -245,7 +249,7 @@ export default function App() {
           onClick={() => oppToast && openOpportunity(oppToast.id)}
         >
           <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
-            发现新商机
+            {oppToast?.title ?? '收到新商机'}
           </Typography>
           <Typography variant="body2">{oppToast?.content}</Typography>
         </Alert>

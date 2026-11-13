@@ -1869,7 +1869,8 @@ class WeChatService:
                           "kind": "group" if username.endswith("@chatroom")
                                   else "friend",
                           "openim": openim, "corp": corp,
-                          "is_self": bool(self_id) and username == self_id})
+                          "is_self": bool(self_id)
+                                     and username == self_id})
             seen.add(username)
         # wechatauto.get_contacts 的群聊取值为 "chatroom"（不是 "group"）；
         # openim 为企业微信/客服联系人，按一对一私聊归入 friend
@@ -1896,7 +1897,8 @@ class WeChatService:
                               "openim": c_kind == "openim"
                                         or self.is_openim(username),
                               "corp": corp,
-                              "is_self": bool(self_id) and username == self_id})
+                              "is_self": bool(self_id)
+                                         and username == self_id})
                 seen.add(username)
         logger.info("联系人列表构建完成：%d 条（群/好友/企业微信合并去重后，"
                     "其中 %d 个企业微信联系人有企业名）",

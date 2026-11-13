@@ -82,8 +82,14 @@ def create_target(body: MonitorTargetCreate,
                     or svc.get_display_name(username) or username)
     # 「给自己发消息」的会话 username 就是本账号 wxid，在候选/监控列表里
     # 与同名好友长得一样，落库时补后缀标出来（只在新增时补一次）。
-    if svc.is_self_username(username) and "（我自己）" not in display_name:
-        display_name = f"{display_name}（我自己）"
+    # 用 getattr 探测：测试/降级场景的服务替身可能没实现这个方法。
+    is_self_check = getattr(svc, "is_self_username", None)
+    if callable(is_self_check) and "（我自己）" not in display_name:
+        try:
+            if is_self_check(username):
+                display_name = f"{display_name}（我自己）"
+        except Exception:
+            logger.debug("判定「给自己发消息」会话失败（忽略）", exc_info=True)
     # 配额上限从 settings 读取（monitor.max_targets，无键时用常量兜底）
     max_targets = read_monitor_max_targets(db)
     # 原子「配额校验 + 插入」（BUG-3 修复：check-then-insert 并发越界）

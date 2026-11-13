@@ -20,6 +20,20 @@ interface OpportunityNewData {
   id?: number
   session_name?: string
   summary?: string
+  /** 命中类型名（汽车配件 / 客户投诉 …），用于提醒标题 */
+  type_name?: string | null
+}
+
+/**
+ * 新到提醒标题：与商机类型保持一致（用户反馈：投诉类也弹「新商机」语义不符）。
+ *
+ * 有类型名 → 「收到新的{类型名}」（如「收到新的客户投诉」）；
+ * 无类型名（历史数据 / AI 未给类型）→ 回落「收到新商机」。
+ */
+export function opportunityAlertTitle(typeName?: string | null): string {
+  const name = String(typeName ?? '').trim()
+  if (!name || name === '未知类型') return '收到新商机'
+  return `收到新的${name}`
 }
 
 interface AnalysisErrorData {
@@ -50,7 +64,11 @@ function isSystemNotifyEnabled(): boolean {
 }
 
 /** 系统通知（应用开关开启 + 已授权 + 页面不可见时）：点击 → 回焦并打开详情。 */
-function showSystemNotification(id: number, body: string): void {
+function showSystemNotification(
+  id: number,
+  title: string,
+  body: string,
+): void {
   try {
     if (
       typeof Notification === 'undefined' ||
@@ -59,7 +77,7 @@ function showSystemNotification(id: number, body: string): void {
     ) {
       return
     }
-    const notification = new Notification('发现新商机', {
+    const notification = new Notification(title, {
       body,
       tag: `kefu-opp-${id}`, // 同一商机只弹一个通知
     })
@@ -110,11 +128,13 @@ export function useEvents(): boolean {
         switch (msg.event) {
           case 'opportunity_new': {
             const d = (msg.data ?? {}) as OpportunityNewData
+            const alertTitle = opportunityAlertTitle(d.type_name)
             if (typeof d.id === 'number') {
               window.dispatchEvent(
                 new CustomEvent('kefu-opportunity-toast', {
                   detail: {
                     id: d.id,
+                    title: alertTitle,
                     session_name: d.session_name ?? '',
                     summary: d.summary ?? '',
                   },
@@ -126,6 +146,7 @@ export function useEvents(): boolean {
             if (document.hidden && typeof d.id === 'number') {
               showSystemNotification(
                 d.id,
+                alertTitle,
                 [d.session_name ?? '', firstLine(d.summary)]
                   .filter(Boolean)
                   .join('：'),

@@ -249,6 +249,34 @@ True**，`current_chat='安佳胤'`、`openim_label='@我的车车'`。
 **实测**：同一台机器、同一微信状态下，`WeChatGUI()` 构造 + 打开会话合计
 < 2s；`open_chat("文件传输助手")` 4.29s（含搜索 + 点击 + 校验）。
 
+### 10. 补丁 3：给自己发消息完全收不到（20:05 实机反馈）
+
+现场：给自己的微信（昵称「安佳胤」）发消息，PC 端和手机端都发了，**分析日志
+里一条都没有**。
+
+只读探查（未改动微信数据）拿到结论：
+
+- 微信 4.x 的「给自己发消息」是一个**普通会话**，username 就是当前登录账号的
+  wxid（本机 `wxid_hu7azjb674f721`），**不是**文件传输助手；
+- 该会话里的消息**确实落库**：`local_id` 1~5（`111` / `我要桶机油` 17:33 /
+  `我要机油` 19:58 / 语音 20:00），`get_new_messages(since_seq=…)` 能正常读出；
+- 而系统只轮询 `monitor_targets` 里注册过的会话——这个会话从未被加入监控列表，
+  所以一个字节都没读过，日志自然为空。
+
+修复（三处，都是「让这条通道可用且认得出」）：
+
+1. 会话候选标记 `is_self`（`_build_contact_list` + `SessionItemOut` + 前端
+   Chip「我自己」+ 搜到时的说明），否则它和同名好友在列表里一模一样；
+2. `_is_self_chat()`：**自己↔自己**的会话（self 会话 / 文件传输助手）不受
+   「过滤自己发送的消息」影响——这两类会话里每条消息 `sender_id` 都是 2，
+   开关默认开启会让整条通道失效；别人会话里我发的消息仍按原逻辑过滤；
+3. `create_target` 给自己会话的显示名补「（我自己）」（用 `getattr` 探测，
+   测试/降级场景的服务替身不受影响）。
+
+实测（只读，未发送任何消息）：
+`Listener(watermark={self: 1794562383000}).add_listener(self, cb)` 启动 2 秒内
+回收到 `local_id=4`（文本）与 `local_id=5`（语音）两条。
+
 ## 二、改动文件
 
 | 层 | 文件 | 要点 |
@@ -262,16 +290,18 @@ True**，`current_chat='安佳胤'`、`openim_label='@我的车车'`。
 | 后端 | `app/db.py` | `analysis_logs.image_local_id`（DDL + 迁移 + 查询）、`delete_image_analysis` |
 | 后端 | `app/api/router_opportunities.py` | 列表/详情补 `session_display`/`sender_display`、`manual_confirm` 默认 True |
 | 后端 | `app/api/router_settings.py` | `GET/PUT /api/settings/server` |
+| 后端 | `app/api/router_targets.py` | 「给自己发消息」显示名补「（我自己）」（getattr 探测，兼容服务替身） |
 | 后端 | `app/api/router_system.py` | `POST /api/images/retry`（异常绝不 500） |
 | 后端 | `app/api/deps.py` | `get_wechat_service_optional()`（未注入返回 None） |
 | 前端 | `pages/OpportunityList.tsx` | `SourceCell` 合并列 + tooltip + 复制 |
 | 前端 | `pages/OpportunityDetail.tsx` | 手动确认开关、双按钮文案、跳转会话 |
 | 前端 | `pages/AnalysisLogs.tsx` | 图片行「重新识别」 |
-| 前端 | `pages/SettingsPage.tsx` | 启动端口区块 |
+| 前端 | `pages/SettingsPage.tsx` | 启动端口区块；候选列表「我自己」Chip 与说明 |
 | 测试 | `tests/test_batch13.py` | 32 例（新增） |
 | 测试 | `tests/test_batch13_media_key.py` | 14 例（新增）：账号密钥投票/实测/缓存/兜底 |
 | 测试 | `tests/test_batch13_openim_aid.py` | 17 例（新增）：新旧 AID、子树兜底、三态、就绪门禁、预热不抢焦点、消歧与企业名比对 |
 | 测试 | `tests/test_batch13b_openim_search.py` | 14 例（新增）：候选不被去重删掉、逐个点开验标签、别的企业拒收、失败原因码 |
+| 测试 | `tests/test_batch13c_self_chat.py` | 10 例（新增）：`is_self` 标记、自我会话豁免过滤、加入监控标注 |
 | 测试 | `tests/test_api.py` 等 | 契约字段更新；图片打桩改到 `get_image_bytes_with_reason` |
 
 ## 三、测试

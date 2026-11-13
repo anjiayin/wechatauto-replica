@@ -285,10 +285,11 @@ class TestSystemContract:
         items = resp.json()
         assert len(items) == 1
         assert set(items[0]) == {"username", "display_name", "kind",
-                                 "openim", "corp"}
+                                 "openim", "corp", "is_self"}
         assert items[0]["kind"] == "group"
         assert items[0]["openim"] is False   # 群聊不标记企业微信
         assert items[0]["corp"] == ""        # 群聊无企业简称
+        assert items[0]["is_self"] is False  # 群聊不可能是「我自己」
 
     def test_sessions_search_kind_filter(self, env):
         """优化 2：kind 查询参数按类型过滤（all/group/friend）。"""
