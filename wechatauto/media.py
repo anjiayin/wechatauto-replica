@@ -19,10 +19,16 @@ server_id、packed_info），本模块负责把媒体内容从本地取回/解�
 
     - AES 密钥: 16 字节 ASCII（字母/数字），仅在 Weixin.exe 进程内存中。
       通过 AES-ECB 解首块密文、校验 JPEG/PNG 魔数反推出（内存正则扫描）。
-    - XOR 密钥: 单字节，从同图兄弟文件尾部反推：JPEG（缩略图 ``<md5>_t.dat``）
-      看 ``FF D9``（``key = tail[-2] ^ 0xFF``），PNG 原图（复制粘贴的图片存在
-      ``<md5>_h.dat``）看 IEND 块 CRC 末字节 ``0x82``。多个候选逐个试，
-      解出可用图就停（见 :meth:`MediaDownloader._xor_key_candidates`）。
+    - XOR 密钥: 单字节，**按账号固定**（本机实测 0xF9）。优先从同图兄弟文件
+      尾部反推：JPEG（缩略图 ``<md5>_t.dat``）看 ``FF D9``
+      （``key = tail[-2] ^ 0xFF``），PNG 原图（复制粘贴的图片存在
+      ``<md5>_h.dat``）看 IEND 块 CRC 末字节 ``0x82``。
+
+      注意：逐文件反推依赖「明文正好以结束标记收尾」，尾部带填充/噪声的文件
+      会推出**假密钥**（实测 40 张缩略图里 5 张如此），表现为「JPEG 头正常、
+      之后全乱码 → 被判半截/花屏」。因此全部候选都失败时还有第二轮：从账号
+      内一批缩略图**投票 + 实测**学出账号密钥再解一遍，见
+      :meth:`MediaDownloader._learn_account_xor_key`。
 
 用法::
 
@@ -46,6 +52,7 @@ import struct
 import tempfile
 import threading
 import time
+from collections import Counter
 from typing import Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
@@ -263,6 +270,10 @@ class MediaDownloader:
         self._xor_key: Optional[int] = None
         self._img_key: Optional[Tuple[str, int]] = None
         self._key_probe: Optional[bytes] = None
+        # 账号级 XOR 密钥缓存：account_dir → (过期时刻, 密钥)。见
+        # :meth:`_learn_account_xor_key`（尾字节反推失手时的兜底）。
+        self._acct_key_cache: Dict[str, Tuple[float, Optional[int]]] = {}
+        self._acct_key_lock = threading.Lock()
 
     @staticmethod
     def derive_image_keys(cfg_dword: int, wxid: str) -> Tuple[str, int]:
@@ -946,6 +957,56 @@ class MediaDownloader:
                     user, local_id, len(current), len(data))
         return data, path or cached
 
+    # 账号级 XOR 密钥学习参数（见 :meth:`_learn_account_xor_key`）
+    _ACCT_KEY_TTL = 600.0        # 学到后的缓存时长
+    _ACCT_KEY_NEG_TTL = 60.0     # 学不出来时的短缓存（别每张图都扫盘）
+    _ACCT_KEY_VOTE_FILES = 16    # 参与投票的缩略图数量
+    _ACCT_KEY_VERIFY_FILES = 3   # 胜出者实测几张
+
+    def _decode_file(self, path: str, keys: List[int],
+                     aes_key: Optional[str]) -> Optional[bytes]:
+        """按候选密钥逐个解一个 .dat，返回第一个**可用**的图片字节。
+
+        Args:
+            path: .dat 文件路径。
+            keys: 待尝试的单字节 XOR 密钥（按可信度排序）。
+            aes_key: 图片 AES 密钥（None = 自动解析）。
+
+        Returns:
+            可用的图片字节；全部密钥都解不出可用图返回 None。
+        """
+        last_size = 0
+        decrypted = False
+        for index, key in enumerate(keys):
+            try:
+                data = self.decrypt_image(path, aes_key, xor_key=key)
+            except Exception as exc:
+                logger.warning("图片解密失败（%s）：%s",
+                               os.path.basename(path), exc)
+                break
+            decrypted = True
+            last_size = len(data)
+            if data[:4] == b"wxgf":
+                # HEVC 容器转码后同样要过校验（这条路径最容易出半截绿块）
+                jpg = self._wxgf_to_jpg(data)
+                if jpg is None:
+                    logger.info("wxgf 转码失败（%s key=0x%02x），换密钥重试",
+                                os.path.basename(path), key)
+                    continue
+                data = jpg
+            if not is_usable_image(data):
+                continue
+            if index:
+                logger.info(
+                    "图片 XOR 密钥回退命中：%s 用 key=0x%02x"
+                    "（首选 0x%02x 解不出可用图）",
+                    os.path.basename(path), key, keys[0])
+            return data
+        if decrypted:
+            logger.info("图片不完整或疑似花屏，跳过：%s（%d 字节）",
+                        os.path.basename(path), last_size)
+        return None
+
     def _decode_usable_image(self, user: str, md5: str, create_time: int,
                              aes_key: Optional[str],
                              xor_key: Optional[int]
@@ -953,8 +1014,16 @@ class MediaDownloader:
         """逐候选解密并校验，返回 (图片字节, 是否来自缩略图)；全不合格返回 None。
 
         候选顺序：原图 ``.dat`` → 原图高清 ``_h.dat`` → 缩略图 ``_t.dat``。
-        原图常因微信只下载了一部分而不完整（实测尾部缺 FF D9），此时回落
-        到缩略图——缩略图在群聊里总是完整的，尺寸小但至少是真图。
+        原图常因微信只下载了一部分而不完整，此时回落到缩略图——缩略图在
+        群聊里通常完整，尺寸小但至少是真图。
+
+        密钥策略（两轮，批次 13 需求 7 补第二轮）：
+
+        1. 逐文件反推（``原图 → _h → _t`` 兄弟尾部）——绝大多数情况够用；
+        2. **账号级密钥兜底**：实测同账号 40 张缩略图里 35 张能反推出真密钥，
+           另外 5 张因明文尾部带填充/噪声反推出假密钥（``0x11/0x2A/...``），
+           结果是 AES 首块（JPEG 头）正常、之后全乱码 → 被误判成「半截/花屏」，
+           误报「微信还没下载完」。这类图等多久都不会好，只能靠账号级密钥救。
         """
         candidates: List[Tuple[str, bool]] = []
         seen: Set[str] = set()
@@ -972,40 +1041,107 @@ class MediaDownloader:
             # 数据、推出来的密钥是错的，多候选 + 可用性校验才能自愈。
             keys = [xor_key] if xor_key is not None \
                 else self._xor_key_candidates(path)
-            last_size = 0
-            decrypted = False
-            for index, key in enumerate(keys):
-                try:
-                    data = self.decrypt_image(path, aes_key, xor_key=key)
-                except Exception as exc:
-                    logger.warning("图片解密失败（%s）：%s",
-                                   os.path.basename(path), exc)
-                    break
-                decrypted = True
-                last_size = len(data)
-                if data[:4] == b"wxgf":
-                    # HEVC 容器转码后同样要过校验（这条路径最容易出半截绿块）
-                    jpg = self._wxgf_to_jpg(data)
-                    if jpg is None:
-                        logger.info("wxgf 转码失败（%s key=0x%02x），换密钥重试",
-                                    os.path.basename(path), key)
-                        continue
-                    data = jpg
-                if not is_usable_image(data):
+            data = self._decode_file(path, keys, aes_key)
+            if data is None:
+                continue
+            if thumbnail:
+                logger.info("原图不可用，已回退缩略图：%s %s",
+                            user, os.path.basename(path))
+            return data, thumbnail
+        # 第二轮：账号级密钥兜底（尾字节反推在「尾部带填充」的文件上会失手）
+        learned = self._learn_account_xor_key() if xor_key is None else None
+        if learned is not None:
+            for path, thumbnail in candidates:
+                if learned in self._xor_key_candidates(path):
+                    continue            # 已试过这个密钥，别再解一遍
+                data = self._decode_file(path, [learned], aes_key)
+                if data is None:
                     continue
-                if index:
-                    logger.info(
-                        "图片 XOR 密钥回退命中：%s 用 key=0x%02x"
-                        "（首选 0x%02x 解不出可用图）",
-                        os.path.basename(path), key, keys[0])
+                logger.info("账号级 XOR 密钥兜底命中：%s key=0x%02x"
+                            "（逐文件反推失手，文件本身是完整的）",
+                            os.path.basename(path), learned)
                 if thumbnail:
                     logger.info("原图不可用，已回退缩略图：%s %s",
                                 user, os.path.basename(path))
                 return data, thumbnail
-            if decrypted:
-                logger.info("图片不完整或疑似花屏，跳过：%s（%d 字节）",
-                            os.path.basename(path), last_size)
         return None
+
+    def _learn_account_xor_key(self) -> Optional[int]:
+        """学出**账号级**单字节 XOR 密钥（尾字节投票 + 实测校验）。
+
+        单字节 XOR 密钥按账号固定，但逐文件反推依赖「明文恰好以 ``FF D9``
+        结尾」；微信写 .dat 时可能带尾部填充，于是反推出的是假密钥。这里取
+        账号内最新一批缩略图各自反推并投票，得票最高者再用真实文件实测，
+        实测通过才采信。
+
+        Returns:
+            密钥（0-255）或 None（拿不到账号目录 / 样本不足 / 学不出来）。
+        """
+        account_dir = str(getattr(self.db, "account_dir", "") or "")
+        if not account_dir:
+            return None
+        now = time.monotonic()
+        with self._acct_key_lock:
+            hit = self._acct_key_cache.get(account_dir)
+            if hit is not None and now < hit[0]:
+                return hit[1]
+        key = self._detect_account_xor_key()
+        ttl = self._ACCT_KEY_TTL if key is not None else self._ACCT_KEY_NEG_TTL
+        with self._acct_key_lock:
+            self._acct_key_cache[account_dir] = (time.monotonic() + ttl, key)
+        return key
+
+    def _detect_account_xor_key(self) -> Optional[int]:
+        """:meth:`_learn_account_xor_key` 的实际探测（不含缓存）。"""
+        try:
+            files = self._collect_templates(
+                limit=self._ACCT_KEY_VOTE_FILES * 4,
+                keep=self._ACCT_KEY_VOTE_FILES)
+        except Exception:
+            logger.exception("收集缩略图样本失败（学不出账号密钥，已忽略）")
+            return None
+        votes: Counter = Counter()
+        samples: Dict[int, List[str]] = {}
+        for path in files:
+            try:
+                key = self._key_from_tail(self._read_tail(path))
+            except OSError:
+                continue
+            if key is None:
+                continue            # 尾部带填充的文件反推不出来，跳过
+            votes[key] += 1
+            samples.setdefault(key, []).append(path)
+        if not votes:
+            logger.warning("学不出账号级图片 XOR 密钥（%d 个样本都反推不出）",
+                           len(files))
+            return None
+        for key, count in votes.most_common(3):
+            paths = samples.get(key, [])[:self._ACCT_KEY_VERIFY_FILES]
+            if not self._verify_account_key(key, paths):
+                logger.info("账号密钥候选 0x%02x（%d 票）实测不可用，换下一个",
+                            key, count)
+                continue
+            logger.info("已学出账号级图片 XOR 密钥 0x%02x（%d/%d 票，实测通过）",
+                        key, count, len(files))
+            return key
+        logger.warning("学不出账号级图片 XOR 密钥（%d 个样本，候选均未通过实测）",
+                       len(files))
+        return None
+
+    def _verify_account_key(self, key: int, paths: List[str]) -> bool:
+        """用真实文件实测某候选密钥是不是账号密钥（最多 3 张，够判）。"""
+        ok = tried = 0
+        for path in paths:
+            tried += 1
+            try:
+                data = self.decrypt_image(path, None, xor_key=key)
+            except Exception:
+                continue
+            if is_usable_image(data):
+                ok += 1
+        if tried >= 2:
+            return ok >= 2
+        return tried == 1 and ok == 1
 
     def load_image(self, user: str, local_id: int,
                    save_dir: Optional[str] = None,
