@@ -42,13 +42,14 @@
           <option value="all">全部</option>
           <option value="unused">未使用</option>
           <option value="used">已使用</option>
+          <option value="voided">已作废</option>
         </select></div>
       <div class="field"><label for="f-phone">手机号</label>
         <input id="f-phone" maxlength="32"></div>
       <div class="field"><label for="f-batch">批次</label>
         <input id="f-batch" maxlength="32" placeholder="B20261114-ABCD"></div>
       <button class="btn" id="search">查询</button>
-      <button class="btn ghost" id="export">导出 txt</button>
+      <button class="btn ghost" id="export">导出 CSV</button>
     </div>
   </div>
 
@@ -74,23 +75,46 @@
     return params;
   }
 
+  function statusBadge(item) {
+    if (item.voided_at) { return LS.badge('已作废', 'danger'); }
+    return item.used_machine ? LS.badge('已使用', 'warn')
+                             : LS.badge('未使用', 'ok');
+  }
+
   function renderItems(items) {
     var box = document.getElementById('list');
     box.replaceChildren(LS.table(
-      ['激活码', '天数', '客户', '手机号', '批次', '状态', '绑定机器码', '使用时间', '生成时间'],
+      ['激活码', '天数', '客户', '手机号', '批次', '状态', '绑定机器码', '使用时间', '生成时间', '操作'],
       items.map(function (item) {
+        var td = h('td');
+        if (!item.used_machine && !item.voided_at) {
+          td.append(h('button', {
+            class: 'btn small danger', text: '作废',
+            onclick: function () { voidCode(item); }
+          }));
+        }
         return [
           h('td', null, h('code', { text: item.code })),
           String(item.days),
           item.customer_name || '-',
           item.customer_phone || '-',
           item.batch || '-',
-          item.used_machine ? LS.badge('已使用', 'warn') : LS.badge('未使用', 'ok'),
+          statusBadge(item),
           h('td', { class: 'mono', text: item.used_machine || '-' }),
           LS.fmtTime(item.used_at),
-          LS.fmtTime(item.created_at)
+          LS.fmtTime(item.created_at),
+          td
         ];
       })));
+  }
+
+  async function voidCode(item) {
+    if (!window.confirm('确认作废激活码 ' + item.code + ' ？\n作废后该码永久不可使用，且不可恢复。')) { return; }
+    try {
+      await LS.apiPost('/admin/api/codes/' + encodeURIComponent(item.code) + '/void', {});
+      LS.toast('激活码已作废');
+      load();
+    } catch (e) { LS.showError(e); }
   }
 
   async function load() {
@@ -163,8 +187,8 @@
       load();
     });
     document.getElementById('export').addEventListener('click', function () {
+      // 与列表共用筛选（含状态），导出的就是当前筛选结果
       var params = query();
-      params.delete('status');
       window.open('/admin/api/codes/export?' + params.toString(), '_blank');
     });
     load();

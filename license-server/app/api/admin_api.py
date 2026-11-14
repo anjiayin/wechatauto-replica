@@ -18,8 +18,8 @@ from app import db, signing
 from app.api.deps import (get_client_ip, require_admin, require_csrf,
                           require_password_changed)
 from app.errors import ApiError
-from app.models import (CreateCodesIn, CreateCustomerIn, ExtendIn, RenewIn,
-                        RevokeIn, SetExpiryIn)
+from app.models import (BindCustomerIn, CreateCodesIn, CreateCustomerIn,
+                        ExtendIn, RenewIn, RevokeIn, SetExpiryIn)
 from app.repo import audit as audit_repo
 from app.repo import codes as codes_repo
 from app.repo import customers as customers_repo
@@ -157,18 +157,59 @@ def list_codes(q: str = Query("", max_length=64),
             "page": page_no, "size": page_size}
 
 
-@router.get("/codes/export", summary="B4 导出激活码",
+@router.get("/codes/export", summary="B4 导出激活码（CSV，含筛选与完整字段）",
             response_class=PlainTextResponse)
-def export_codes(batch: str = Query("", max_length=32),
-                 q: str = Query("", max_length=64)) -> PlainTextResponse:
-    """导出激活码（一行一个，浏览器直接下载/复制）。"""
+def export_codes(q: str = Query("", max_length=64),
+                 status: str = Query("all", max_length=16),
+                 phone: str = Query("", max_length=32),
+                 batch: str = Query("", max_length=32)) -> PlainTextResponse:
+    """导出激活码（CSV，Excel 可直接打开）。
+
+    **与列表共用同一套筛选参数**（关键字/状态/手机号/批次），导出的就是当前
+    筛选结果。列：激活码、天数、版本、批次、客户、手机号、状态、绑定机器码、
+    使用时间、生成时间、生成人、备注；带 BOM 便于 Excel 识别 UTF-8。
+    """
     with db.transaction() as cur:
-        items = codes_repo.export_codes(cur, keyword=q, batch=batch)
-    body = "\n".join(items) + ("\n" if items else "")
+        rows = codes_repo.export_rows(cur, keyword=q, status=status,
+                                      phone=phone, batch=batch)
+
+    def cell(value: Any) -> str:
+        text = "" if value is None else str(value)
+        if any(ch in text for ch in (",", '"', "\n", "\r")):
+            return '"' + text.replace('"', '""') + '"'
+        return text
+
+    def status_text(row: Dict[str, Any]) -> str:
+        if row.get("voided_at") is not None:
+            return "已作废"
+        return "已使用" if str(row.get("used_machine") or "") else "未使用"
+
+    header = ["激活码", "天数", "版本", "批次", "客户", "手机号", "状态",
+              "绑定机器码", "使用时间", "生成时间", "生成人", "备注"]
+    lines = [",".join(header)]
+    for row in rows:
+        lines.append(",".join(cell(x) for x in (
+            row.get("code"), row.get("days"), row.get("edition"),
+            row.get("batch"), row.get("customer_name"),
+            row.get("customer_phone"), status_text(row),
+            row.get("used_machine") or "",
+            signing.to_iso(row["used_at"]) if row.get("used_at") else "",
+            signing.to_iso(row["created_at"]) if row.get("created_at") else "",
+            row.get("created_by"), row.get("note"))))
+    body = "\ufeff" + "\r\n".join(lines) + ("\r\n" if rows else "")
+    logger.info("导出激活码 %d 条（筛选 q=%r status=%r phone=%r batch=%r）",
+                len(rows), q, status, phone, batch)
     return PlainTextResponse(
-        content=body, media_type="text/plain; charset=utf-8",
+        content=body, media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition":
-                 'attachment; filename="activation-codes.txt"'})
+                 'attachment; filename="activation-codes.csv"'})
+
+
+@router.post("/codes/{code}/void", summary="B19 作废未使用的激活码")
+def void_code(code: str, request: Request) -> Dict[str, Any]:
+    """销毁一个未使用的激活码（已使用的码不能作废，只能吊销许可证）。"""
+    return admin_service.void_code(code=code, actor=_actor(request),
+                                   ip=get_client_ip(request))
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +303,17 @@ def restore(license_id: str, request: Request) -> Dict[str, Any]:
     """撤销吊销（客户下次心跳即恢复）。"""
     return admin_service.restore(license_id=license_id, actor=_actor(request),
                                  ip=get_client_ip(request))
+
+
+@router.post("/licenses/{license_id}/customer", summary="B18 补录/修改客户绑定")
+def bind_customer(license_id: str, body: BindCustomerIn,
+                  request: Request) -> Dict[str, Any]:
+    """给已有许可证补录客户名称与手机号（名称/手机号至少填一个）。"""
+    return admin_service.bind_customer(license_id=license_id,
+                                       customer=body.customer,
+                                       phone=body.phone,
+                                       actor=_actor(request),
+                                       ip=get_client_ip(request))
 
 
 # ---------------------------------------------------------------------------

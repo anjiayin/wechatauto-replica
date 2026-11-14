@@ -248,8 +248,101 @@ def restore(*, license_id: str, actor: Dict[str, Any], ip: str) -> Dict[str, Any
 
 
 # ---------------------------------------------------------------------------
+# 客户绑定
+# ---------------------------------------------------------------------------
+def bind_customer(*, license_id: str, customer: str, phone: str,
+                  actor: Dict[str, Any], ip: str) -> Dict[str, Any]:
+    """给已有许可证补录/修改客户名称与手机号（无客户信息激活后的补录入口）。
+
+    规则：
+    - 名称与手机号**至少填一个**；传空串 = 清空对应字段；
+    - 手机号非空 → 按手机号 upsert 客户档案，并把 ``customer_id`` 回写
+      许可证行（B15「按手机号定位机器码」即刻可用）；
+    - 只填手机号、名称留空时，沿用档案里已有的客户名；
+    - 不触碰授权状态（到期/吊销/current_key 都不动），变更写审计。
+
+    Raises:
+        ApiError: not_found(404) / invalid_param(400)。
+    """
+    name_text = str(customer or "").strip()[:64]
+    phone_text = customers.normalize_phone(phone)
+    if not name_text and not phone_text:
+        raise ApiError("invalid_param", "客户名称与手机号不能同时为空", 400)
+    moment = signing.now()
+
+    with db.transaction() as cur:
+        record = licenses.find_for_update(cur, license_id)
+        if record is None:
+            raise ApiError("not_found", f"许可证不存在：{license_id}", 404)
+        profile = customers.upsert_by_phone(cur, phone_text, name_text, moment)
+        final_name = name_text or profile["name"]
+        licenses.set_customer(cur, record["id"], customer_id=profile["id"],
+                              name=final_name, phone=phone_text, now=moment)
+        audit.write(cur, **_actor_fields(actor), now=moment,
+                    action="bind_customer", target_type="license",
+                    target_id=str(record["license_id"]),
+                    machine_code=str(record["machine_code"]),
+                    before={"customer": str(record.get("customer_name") or ""),
+                            "phone": str(record.get("customer_phone") or "")},
+                    after={"customer": final_name, "phone": phone_text},
+                    ip=ip, note="补录客户绑定")
+        logger.info("客户绑定：%s → %s / %s（操作人 %s）",
+                    record["license_id"], final_name or "-",
+                    phone_text or "-", actor.get("username"))
+
+    return {
+        "ok": True,
+        "item": {
+            "license_id": str(license_id),
+            "customer": final_name,
+            "phone": phone_text,
+            "customer_id": int(profile["id"]),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # 激活码 / 客户
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 激活码作废
+# ---------------------------------------------------------------------------
+def void_code(*, code: str, actor: Dict[str, Any], ip: str) -> Dict[str, Any]:
+    """作废（销毁）一个**未使用**的激活码。
+
+    已使用的码不能作废（授权已兑现，只能走许可证吊销）；已作废的码不能重复
+    作废。作废后该码永久不可激活（激活接口返回 ``code_voided``）。
+
+    Raises:
+        ApiError: not_found(404) / code_used(409) / already_voided(409)。
+    """
+    moment = signing.now()
+    with db.transaction() as cur:
+        item = codes.find_by_code_for_update(cur, code)
+        if item is None:
+            raise ApiError("not_found", f"激活码不存在：{code}", 404)
+        if str(item.get("used_machine") or ""):
+            raise ApiError(
+                "code_used",
+                f"该激活码已被机器 {item['used_machine']} 使用，不能作废；"
+                f"如需收回授权请吊销对应许可证", 409)
+        if item.get("voided_at") is not None:
+            raise ApiError("already_voided", "该激活码已被作废，无需重复操作",
+                           409)
+        codes.void(cur, str(item["code"]), moment)
+        audit.write(cur, **_actor_fields(actor), now=moment,
+                    action="void_code", target_type="code",
+                    target_id=str(item["code"]),
+                    machine_code="", days_delta=0,
+                    before={"voided_at": None},
+                    after={"voided_at": signing.to_iso(moment)},
+                    ip=ip, note="作废未使用激活码")
+        logger.info("作废激活码：%s（操作人 %s）", item["code"],
+                    actor.get("username"))
+    return {"ok": True, "item": {"code": str(item["code"]),
+                                 "voided_at": signing.to_iso(moment)}}
+
+
 def create_codes(*, count: int, days: int, customer: str, customer_phone: str,
                  edition: str, note: str, batch: str,
                  actor: Dict[str, Any], ip: str) -> Dict[str, Any]:

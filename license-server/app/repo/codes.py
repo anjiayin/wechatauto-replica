@@ -19,6 +19,7 @@ _MAX_CODE_RETRY = 5
 
 _STATUS_UNUSED = "unused"
 _STATUS_USED = "used"
+_STATUS_VOIDED = "voided"
 
 
 def _code_exists(cur: Any, code: str) -> bool:
@@ -101,12 +102,26 @@ def find_by_code_for_update(cur: Any, code: str) -> Optional[Dict[str, Any]]:
 
 def mark_used(cur: Any, code: str, machine_code: str,
               now: datetime) -> None:
-    """标记激活码已被某台机器使用（已用则不改回空）。"""
+    """标记激活码已被某台机器使用（已用则不改回空；已作废的码不可用）。"""
     cur.execute(
         "UPDATE license_code SET used_machine = %s, used_at = %s "
-        "WHERE code = %s AND used_machine = ''",
+        "WHERE code = %s AND used_machine = '' AND voided_at IS NULL",
         (str(machine_code)[:40], now, signing.normalize_code(code)),
     )
+
+
+def void(cur: Any, code: str, now: datetime) -> int:
+    """作废未使用的激活码。
+
+    Returns:
+        受影响行数（0 = 码不存在 / 已使用 / 已作废，语义由服务层区分）。
+    """
+    cur.execute(
+        "UPDATE license_code SET voided_at = %s "
+        "WHERE code = %s AND used_machine = '' AND voided_at IS NULL",
+        (now, signing.normalize_code(code)),
+    )
+    return int(getattr(cur, "rowcount", 0) or 0)
 
 
 def _where(keyword: str, status: str, phone: str,
@@ -118,9 +133,11 @@ def _where(keyword: str, status: str, phone: str,
              " OR customer_phone LIKE %s OR batch LIKE %s)"]
     params: List[Any] = [text, like, like, like, like]
     if status == _STATUS_UNUSED:
-        conds.append("used_machine = ''")
+        conds.append("used_machine = '' AND voided_at IS NULL")
     elif status == _STATUS_USED:
         conds.append("used_machine <> ''")
+    elif status == _STATUS_VOIDED:
+        conds.append("voided_at IS NOT NULL")
     phone_text = customers.normalize_phone(phone)
     if phone_text:
         conds.append("customer_phone LIKE %s")
@@ -144,7 +161,7 @@ def list_page(cur: Any, *, keyword: str, status: str, phone: str,
     sql = (
         "SELECT id, code, days, edition, customer_id, customer_name, "
         "       customer_phone, batch, note, used_machine, used_at, "
-        "       created_by, created_at "
+        "       voided_at, created_by, created_at "
         f"FROM license_code WHERE {where} "
         "ORDER BY id DESC LIMIT %s OFFSET %s"
     )
@@ -153,23 +170,29 @@ def list_page(cur: Any, *, keyword: str, status: str, phone: str,
     return [_row_out(row) for row in rows], total
 
 
-def export_codes(cur: Any, *, keyword: str, batch: str, limit: int = 5000
-                 ) -> List[str]:
-    """导出激活码（一行一个，供 txt 下载）。"""
-    where, params = _where(keyword, "all", "", batch)
-    cur.execute(f"SELECT code FROM license_code WHERE {where} "
+def export_rows(cur: Any, *, keyword: str, status: str, phone: str,
+                batch: str, limit: int = 20000) -> List[Dict[str, Any]]:
+    """导出激活码完整行（与列表同一套筛选条件，供 CSV 下载）。"""
+    where, params = _where(keyword, status, phone, batch)
+    cur.execute(f"SELECT id, code, days, edition, customer_name, "
+                "       customer_phone, batch, note, used_machine, used_at, "
+                "       voided_at, created_by, created_at "
+                f"FROM license_code WHERE {where} "
                 "ORDER BY id DESC LIMIT %s",
                 tuple(params + [int(limit)]))
-    return [str(row.get("code") or "") for row in (cur.fetchall() or [])]
+    return list(cur.fetchall() or [])
 
 
 def count_stats(cur: Any, now: datetime, days: int = 30) -> Dict[str, int]:
-    """激活码统计（总/已用/未用/近 N 天新增）。"""
+    """激活码统计（总/已用/未用/已作废/近 N 天新增）。"""
     since = now - timedelta(days=int(days))
     cur.execute(
         "SELECT COUNT(*) AS total, "
         "       SUM(CASE WHEN used_machine <> '' THEN 1 ELSE 0 END) AS used, "
-        "       SUM(CASE WHEN used_machine = '' THEN 1 ELSE 0 END) AS unused, "
+        "       SUM(CASE WHEN used_machine = '' AND voided_at IS NULL "
+        "                THEN 1 ELSE 0 END) AS unused, "
+        "       SUM(CASE WHEN voided_at IS NOT NULL THEN 1 ELSE 0 END) "
+        "            AS voided, "
         "       SUM(CASE WHEN created_at >= %s THEN 1 ELSE 0 END) AS recent "
         "FROM license_code",
         (since,),
@@ -179,6 +202,7 @@ def count_stats(cur: Any, now: datetime, days: int = 30) -> Dict[str, int]:
         "total": to_int(row.get("total")),
         "used": to_int(row.get("used")),
         "unused": to_int(row.get("unused")),
+        "voided": to_int(row.get("voided")),
         "new_30d": to_int(row.get("recent")),
     }
 
@@ -197,6 +221,7 @@ def _row_out(row: Dict[str, Any]) -> Dict[str, Any]:
         "note": str(row.get("note") or ""),
         "used_machine": str(row.get("used_machine") or ""),
         "used_at": row.get("used_at"),
+        "voided_at": row.get("voided_at"),
         "created_by": str(row.get("created_by") or ""),
         "created_at": row.get("created_at"),
     }

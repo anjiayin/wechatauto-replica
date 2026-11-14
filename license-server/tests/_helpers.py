@@ -5,7 +5,8 @@
 1. ``Client``：绕过本机 ``HTTP_PROXY`` 的 HTTP 客户端（否则打不到 127.0.0.1），
    每次请求自带独立 ``X-Forwarded-For``，避免进程内滑动窗口限流把测试用例互相打死；
 2. 数据库直查（``q`` / ``q1`` / ``x``）：断言"库里到底发生了什么"，而不是只看接口回包；
-3. ``reset_all``：把库恢复成交付态（业务表清空 + admin / must_change=1）；
+3. ``reset_all``：清空**测试库**（``*_test``，默认 wechat_kefu_test）业务表并
+   重建 admin —— 真实库 wechat_kefu 只读不写，里面的数据不受测试影响；
 4. ``client_side``：**在 kefu-system 目录下用子进程**调用真正的客户端
    ``app.license.payload_bytes / verify_license / extract_error``，
    避免与服务端 ``app`` 包同名冲突，也避免"用服务端自己的函数验自己"的假阳性。
@@ -35,9 +36,69 @@ if str(ROOT) not in sys.path:
 from app import security, signing                      # noqa: E402
 from app.config import get_config                      # noqa: E402
 
-BASE_URL = os.environ.get("LS_TEST_BASE", "http://127.0.0.1:8800").rstrip("/")
+# ---------------------------------------------------------------------------
+# 测试库隔离（铁律：测试绝不触碰真实库 wechat_kefu）
+# ---------------------------------------------------------------------------
+def _env_file_value(key: str) -> str:
+    """从 ``license-server/.env`` 读一个值（真实库名以它为准）。"""
+    path = ROOT / ".env"
+    if not path.exists():
+        return ""
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if line.startswith(key + "="):
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
 
-#: 交付态管理员（.env / README 约定）
+
+#: 测试库名（LS_TEST_DB 可覆盖；默认 = .env 里的真实库名 + "_test" 后缀）。
+TEST_DB_NAME = (os.environ.get("LS_TEST_DB")
+                or (_env_file_value("LS_DB_NAME") or "wechat_kefu") + "_test")
+#: 从本进程起，所有 get_config() / 子进程服务都指向测试库（env 优先级高于 .env）。
+os.environ["LS_DB_NAME"] = TEST_DB_NAME
+
+#: 测试专用端口默认 8801（避免与用户在 8800 跑的真实服务撞车）。
+TEST_PORT = int(os.environ.get("LS_TEST_PORT", "8801") or "8801")
+#: 测试请求地址：未显式给 LS_TEST_BASE 时从 TEST_PORT 推导（修掉"只设 PORT
+#: 请求却打到 BASE"的历史陷阱，两者永远一致）。
+BASE_URL = (os.environ.get("LS_TEST_BASE")
+            or "http://127.0.0.1:%d" % TEST_PORT).rstrip("/")
+
+
+def _guard_test_db(cfg: Any) -> None:
+    """兜底守卫：目标库必须以 ``_test`` 结尾，否则抛错（防误清真实库）。"""
+    if not str(cfg.db_name).endswith("_test"):
+        raise RuntimeError(
+            "拒绝操作：目标库 %r 不是测试库（必须以 _test 结尾）。"
+            "真实库绝不允许被测试代码清空或写入。" % cfg.db_name)
+
+
+def ensure_test_db() -> None:
+    """确保测试库存在且 schema 为最新（幂等，可重复调用）。
+
+    测试库独立于真实库：真实库里的激活码 / 许可证 / 客户数据不受测试影响。
+    """
+    cfg = get_config()
+    _guard_test_db(cfg)
+    conn = pymysql.connect(
+        host=cfg.db_host, port=cfg.db_port, user=cfg.db_user,
+        password=cfg.db_password, charset=cfg.db_charset,
+        autocommit=True, cursorclass=DictCursor,
+        connect_timeout=cfg.db_connect_timeout)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "CREATE DATABASE IF NOT EXISTS `%s` "
+                "DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                % cfg.db_name)
+    finally:
+        conn.close()
+    from app import boot                       # 局部导入：避免加载顺序问题
+    boot.init_db()                             # 建表 + voided_at 幂等迁移
+
+
+#: 交付态管理员（.env / README 约定）。注意：reset_all() 用它重建 admin，
+#: 必须与 README/交付文档中的口令一致，否则每次跑完测试都会"改掉"管理员密码。
 ADMIN_USER = "admin"
 ADMIN_PASSWORD = "Admin98765!"
 #: 复验过程中改成的密码（改完 must_change 归 0，业务接口才可用）
@@ -111,7 +172,12 @@ def unlock_admin() -> None:
 
 
 def reset_all() -> None:
-    """恢复交付态：业务表清空，管理员只留 admin/Admin98765!/强制改密=1。"""
+    """清空**测试库**业务表并重建 admin（每个测试前的隔离态）。
+
+    只作用于 ``*_test`` 测试库；真实库（wechat_kefu）绝不会被触碰——
+    真实库里的激活码 / 许可证 / 客户数据在测试前后保持原样。
+    """
+    _guard_test_db(get_config())
     with db() as conn:
         with conn.cursor() as cur:
             for table in ("license", "license_code", "customer", "audit_log",

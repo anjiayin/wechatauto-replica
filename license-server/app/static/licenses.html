@@ -186,6 +186,25 @@
     }
   }
 
+  async function bindCustomer(item) {
+    var phone = window.prompt('客户手机号（留空则只设置名称）',
+                              item.customer_phone || '');
+    if (phone === null) { return; }
+    var name = window.prompt('客户名称', item.customer_name || '');
+    if (name === null) { return; }
+    if (!phone.trim() && !name.trim()) {
+      LS.showError('客户名称与手机号不能同时为空');
+      return;
+    }
+    try {
+      await LS.apiPost('/admin/api/licenses/' +
+        encodeURIComponent(item.license_id) + '/customer',
+        { customer: name.trim(), phone: phone.trim() });
+      LS.toast('客户绑定已保存');
+      load();
+    } catch (e) { LS.showError(e); }
+  }
+
   function actionCell(item) {
     var td = h('td');
     var add = function (text, fn, cls, disabled) {
@@ -212,6 +231,7 @@
       }
     });
     add('设到期日', function () { setExpiryDate(item); });
+    add('客户', function () { bindCustomer(item); });
     if (item.role === 'revoked') {
       if (item.can_restore) { add('恢复', function () { restoreItem(item); }); }
     } else {

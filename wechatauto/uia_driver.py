@@ -219,6 +219,12 @@ class WeChatUIA:
             auto.SetGlobalSearchTimeout(search_timeout)
         except Exception:
             pass
+        # 服务一启动就把用户级环境变量落盘（幂等）：客户机用户随时可能
+        # 手动重启微信，晚了就来不及继承（进程环境只在启动时读取）。
+        try:
+            self._ensure_user_env()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ 基础
     @staticmethod
@@ -233,7 +239,20 @@ class WeChatUIA:
             return False
 
     def wake(self) -> None:
-        """weixin:// 协议唤起/显示窗口（托盘态也能拉起）；失败则拉起 exe。"""
+        """weixin:// 协议唤起/显示窗口（托盘态也能拉起）；失败则拉起 exe。
+
+        拉起前先确保 ``QT_ACCESSIBILITY=1``：微信 4.1.15 起只改内存里的
+        accessibility 开关字节已经无法让 UIA 树物化（字节写入成功但 Qt 不再
+        重建 Provider），必须**在 Qt 初始化之前**就带上这个环境变量——由
+        我们拉起的微信进程会继承它，树从启动起就是完整的，不再依赖版本
+        特征扫描（微信每次更新都不用重新适配）。用户自己双击启动的微信
+        不继承进程环境变量，靠用户级环境变量（见 :meth:`_ensure_user_env`）
+        或内存补丁兜底。
+        """
+        self._ensure_qt_accessibility()
+        # 用户级环境变量（注册表）：客户机上用户手动双击启动的微信继承的是
+        # Explorer 的环境块，只写进程环境覆盖不到——必须在注册表里落一份。
+        self._ensure_user_env()
         try:
             os.startfile("weixin://")
             return
@@ -244,6 +263,65 @@ class WeChatUIA:
             subprocess.Popen([DEFAULT_EXE])
         except Exception:
             wxlog.warning("拉起微信失败")
+
+    @staticmethod
+    def _ensure_qt_accessibility() -> None:
+        """确保本进程环境里 ``QT_ACCESSIBILITY=1``（子进程会继承）。"""
+        if os.environ.get("QT_ACCESSIBILITY", "").strip() == "1":
+            return
+        os.environ["QT_ACCESSIBILITY"] = "1"
+        wxlog.info("已设置 QT_ACCESSIBILITY=1（微信 UIA 树随启动完整暴露，"
+                   "不再依赖内存补丁）")
+
+    @staticmethod
+    def _ensure_user_env() -> bool:
+        """把 ``QT_ACCESSIBILITY=1`` 写入当前用户环境（HKCU\\Environment）。
+
+        仅写进程环境（:meth:`_ensure_qt_accessibility`）只能覆盖由我们拉起
+        的微信；部署到客户机后，用户自己双击启动的微信继承的是 Explorer 的
+        环境块——必须把变量落到注册表并广播 ``WM_SETTINGCHANGE``，Explorer
+        立即刷新后，此后手动启动的微信也带上该变量。**客户机无需任何手工
+        配置**。幂等：已为 1 时不重写、不广播。
+
+        Returns:
+            True = 变量已就绪（本次写入或本就存在）；False = 写注册表失败。
+        """
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                                winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
+                try:
+                    cur, _ = winreg.QueryValueEx(key, "QT_ACCESSIBILITY")
+                except OSError:
+                    cur = None
+                if cur is not None and str(cur).strip() == "1":
+                    return True
+                winreg.SetValueEx(key, "QT_ACCESSIBILITY", 0,
+                                  winreg.REG_SZ, "1")
+        except Exception as e:
+            wxlog.warning("写入用户级环境变量 QT_ACCESSIBILITY 失败：%s", e)
+            return False
+        WeChatUIA._broadcast_env_change()
+        wxlog.info("已写入用户级环境变量 QT_ACCESSIBILITY=1"
+                   "（用户手动启动微信也生效）")
+        return True
+
+    @staticmethod
+    def _broadcast_env_change() -> None:
+        """广播 ``WM_SETTINGCHANGE``，让 Explorer 立即刷新环境块。
+
+        只写注册表的话，Explorer 要等重新登录才感知——期间用户手动启动的
+        微信仍拿不到变量。广播后新启动的进程立即继承。
+        """
+        try:
+            HWND_BROADCAST, WM_SETTINGCHANGE = 0xFFFF, 0x001A
+            SMTO_ABORTIFHUNG = 0x0002
+            res = wintypes.DWORD()
+            ctypes.windll.user32.SendMessageTimeoutW(
+                HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment",
+                SMTO_ABORTIFHUNG, 2000, ctypes.byref(res))
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ 热激活
     @staticmethod
@@ -1233,8 +1311,11 @@ class WeChatUIA:
                                time.time() - t0)
                     return True
             time.sleep(0.4)
-        wxlog.warning("微信控件树唤醒超时（已等 %.0fs），本次跳过",
-                      time.time() - t0)
+        wxlog.warning(
+            "微信控件树唤醒超时（已等 %.0fs）。4.1.15+ 的微信需要"
+            "「QT_ACCESSIBILITY=1 环境 + 热激活补丁」两者齐备（程序会自动"
+            "写用户级环境变量并打补丁）。若手动打开的微信先于本服务启动，"
+            "请重启一次微信让它继承环境变量。", time.time() - t0)
         return False
 
     def send_text(self, text: str) -> bool:

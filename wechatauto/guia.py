@@ -789,6 +789,36 @@ class WeChatGUI:
     def is_alive(self) -> bool:
         return bool(self._input._user32.IsWindow(self.main_hwnd))
 
+    def rebind(self) -> bool:
+        """微信重启/重登后重新定位主窗口并刷新内部状态。
+
+        背景：本类在初始化时缓存 ``main_hwnd``，而微信重启后旧句柄死亡，
+        ``is_alive()`` 恒为 False——调用方若只判 ``is_alive`` 就直接报
+        「微信未登录或窗口不存在」，用户看到的是微信明明开着却发不出消息
+        （实测 0 秒失败）。本方法重新按多特征评分定位主窗口，成功则刷新
+        main_hwnd / render_hwnd / render_rect / pid，并清空会话与 UIA
+        缓存（旧 UIA 引擎的 ``_win`` 也指向已失效窗口）。
+
+        Returns:
+            True = 重绑成功（含句柄其实未变的情况）；False = 当前找不到
+            可见的微信主窗口（微信确实没开），调用方应走既有失败提示。
+        """
+        hwnd = self._find_main_window(WX_MAIN_WIN_TITLE)
+        if not hwnd:
+            return False
+        if hwnd != self.main_hwnd:
+            self.main_hwnd = hwnd
+            self.render_hwnd = self._find_render_window(hwnd) or hwnd
+            self._update_render_rect()
+            self.pid = self._get_pid(hwnd)
+            self._current_chat = None
+            self._last_input_box = None
+            self._uia = None
+            self._uia_tried = False
+            self._last_open_error = ''
+            wxlog.info('微信窗口已重绑：句柄失效后重新定位 hwnd=%s', hwnd)
+        return True
+
     # ------------------------------------------------------------------
     # 前台与可用性
     # ------------------------------------------------------------------

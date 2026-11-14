@@ -310,3 +310,207 @@ def test_b01_new_code_base_is_today_when_expired(admin):
     assert abs((new_expires - expect).total_seconds()) < 300, (
         "过期后续期基准不是今天：期望 %s 附近，实际 %s" % (expect, new_expires))
     assert payload["license_id"] == lic_id, "续期不应新建许可证"
+
+
+# ---------------------------------------------------------------------------
+# B18 无客户信息的激活码激活后补录客户绑定
+# ---------------------------------------------------------------------------
+def test_b18_bind_customer_after_activation(admin):
+    """无手机号的码激活后补录：许可证快照 + 客户档案 + 审计三处齐全。"""
+    code = H.create_codes(admin, count=1, days=100, customer="", phone="")[0]
+    lic_id = H.activate_ok(H.M1, code)["payload"]["license_id"]
+    # 该码没带客户信息：许可证行客户字段为空、客户档案 0 条
+    row = H.q1("SELECT customer_id, customer_name, customer_phone FROM license "
+               "WHERE license_id = %s", (lic_id,))
+    assert row["customer_name"] == "" and row["customer_phone"] == ""
+    assert H.q1("SELECT COUNT(*) c FROM customer")["c"] == 0
+
+    resp = admin.post("/admin/api/licenses/%s/customer" % lic_id,
+                      {"customer": "某某汽配", "phone": "13900007777"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["item"]["customer"] == "某某汽配"
+    assert body["item"]["phone"] == "13900007777"
+    assert body["item"]["customer_id"] > 0
+
+    row = H.q1("SELECT customer_id, customer_name, customer_phone FROM license "
+               "WHERE license_id = %s", (lic_id,))
+    assert row["customer_name"] == "某某汽配"
+    assert row["customer_phone"] == "13900007777"
+    assert row["customer_id"] == body["item"]["customer_id"]
+    # 客户档案按手机号建档一次
+    assert H.q1("SELECT COUNT(*) c FROM customer WHERE phone = %s",
+                ("13900007777",))["c"] == 1
+    # 审计含 before/after
+    audits = H.q("SELECT before_json, after_json FROM audit_log "
+                 "WHERE action = 'bind_customer'")
+    assert len(audits) == 1
+    assert '"customer": ""' in audits[0]["before_json"]
+    assert '"phone": "13900007777"' in audits[0]["after_json"]
+
+
+def test_b18_bind_customer_validations(admin):
+    """校验与多机多档案：全空 400；同手机号不重复建档；换手机号建新档案。"""
+    code = H.create_codes(admin, count=1, days=100)[0]
+    lic_id = H.activate_ok(H.M2, code)["payload"]["license_id"]
+
+    # 两个都为空 → 400 invalid_param
+    resp = admin.post("/admin/api/licenses/%s/customer" % lic_id,
+                      {"customer": "", "phone": ""})
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_param"
+
+    # 不存在的许可证 → 404
+    resp = admin.post("/admin/api/licenses/LIC-NOT-EXIST/customer",
+                      {"customer": "甲", "phone": "13900008888"})
+    assert resp.status_code == 404, resp.text
+
+    # 第一次绑定
+    resp = admin.post("/admin/api/licenses/%s/customer" % lic_id,
+                      {"customer": "甲客户", "phone": "139 0000-8888"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["item"]["phone"] == "13900008888", "手机号应归一化"
+
+    # 同手机号再绑定（名称留空）：不重复建档，名称沿用档案
+    resp = admin.post("/admin/api/licenses/%s/customer" % lic_id,
+                      {"customer": "", "phone": "13900008888"})
+    assert resp.status_code == 200, resp.text
+    row = H.q1("SELECT customer_id, customer_name FROM license "
+               "WHERE license_id = %s", (lic_id,))
+    assert row["customer_name"] == "甲客户"
+    assert H.q1("SELECT COUNT(*) c FROM customer")["c"] == 1
+
+    # 换手机号 → 新档案，customer_id 回写
+    resp = admin.post("/admin/api/licenses/%s/customer" % lic_id,
+                      {"customer": "乙客户", "phone": "13900009999"})
+    assert resp.status_code == 200, resp.text
+    row = H.q1("SELECT customer_id, customer_name, customer_phone FROM license "
+               "WHERE license_id = %s", (lic_id,))
+    assert row["customer_name"] == "乙客户"
+    assert row["customer_phone"] == "13900009999"
+    assert row["customer_id"] != 0
+    assert H.q1("SELECT COUNT(*) c FROM customer")["c"] == 2
+
+
+# ---------------------------------------------------------------------------
+# B19 激活码作废 / 导出筛选 / 客户编辑
+# ---------------------------------------------------------------------------
+def test_b19_void_unused_code(admin):
+    """作废未使用的码：不能再激活、重复作废 409、已使用的码不能作废。"""
+    code = H.create_codes(admin, count=1, days=100)[0]
+
+    resp = admin.post("/admin/api/codes/%s/void" % code, {})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["item"]["voided_at"]
+
+    row = H.q1("SELECT voided_at FROM license_code WHERE code = %s", (code,))
+    assert row["voided_at"] is not None, "作废未写库"
+
+    # 已作废的码激活 → 400 code_voided（客户端能看到明确的中文原因）
+    resp = H.activate(H.M1, code)
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "code_voided"
+
+    # 重复作废 → 409 already_voided
+    resp = admin.post("/admin/api/codes/%s/void" % code, {})
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "already_voided"
+
+    # 已使用的码 → 409 code_used
+    code2 = H.create_codes(admin, count=1, days=100)[0]
+    H.activate_ok(H.M1, code2)
+    resp = admin.post("/admin/api/codes/%s/void" % code2, {})
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "code_used"
+
+    # 不存在的码 → 404
+    resp = admin.post("/admin/api/codes/KF-XXXX-YYYY-ZZZZ-1111/void", {})
+    assert resp.status_code == 404, resp.text
+
+    # 审计
+    assert H.q1("SELECT COUNT(*) c FROM audit_log "
+                "WHERE action = 'void_code'")["c"] == 1
+
+
+def test_b19_voided_codes_hidden_from_unused_filter_and_stats(admin):
+    """作废后：未使用筛选不含它；stats.voided 计数正确。"""
+    c_void = H.create_codes(admin, count=1, days=100)[0]
+    c_used = H.create_codes(admin, count=1, days=100)[0]
+    admin.post("/admin/api/codes/%s/void" % c_void, {})
+    H.activate_ok(H.M1, c_used)
+
+    resp = admin.get("/admin/api/codes", params={"status": "unused"})
+    codes = [r["code"] for r in resp.json()["items"]]
+    assert c_void not in codes and c_used not in codes
+
+    resp = admin.get("/admin/api/codes", params={"status": "voided"})
+    codes = [r["code"] for r in resp.json()["items"]]
+    assert codes == [c_void]
+
+    stats = admin.get("/admin/api/dashboard").json()["codes"]
+    assert stats.get("voided") == 1, stats
+    assert stats["unused"] == 0, "作废的码不应计入未使用"
+
+
+def test_b19_export_csv_follows_filters(admin):
+    """导出跟随筛选条件，且包含天数/客户/手机号/状态/机器码/使用时间/生成时间。"""
+    c_hit = H.create_codes(admin, count=1, days=100, customer="甲客户",
+                           phone="13900001111")[0]
+    c_other = H.create_codes(admin, count=1, days=30, customer="乙客户",
+                             phone="13900002222")[0]
+    lic = H.activate_ok(H.M1, c_hit)["payload"]["license_id"]
+    H.activate_ok(H.M2, c_other)
+    admin.post("/admin/api/codes/%s/void" % (
+        H.create_codes(admin, count=1, days=10, customer="甲客户",
+                       phone="13900001111")[0]), {})
+
+    # 只导出手机号 13900001111 的（含已使用 + 已作废，不含乙客户）
+    resp = admin.get("/admin/api/codes/export",
+                     params={"q": "", "status": "all", "phone": "13900001111",
+                             "batch": ""})
+    assert resp.status_code == 200, resp.text
+    text = resp.text.lstrip("\ufeff")
+    lines = [l for l in text.strip().split("\r\n") if l]
+    assert len(lines) == 3, "应含表头 + 2 行：%r" % lines
+    header = lines[0]
+    for col in ("激活码", "天数", "客户", "手机号", "状态", "绑定机器码",
+                "使用时间", "生成时间"):
+        assert col in header, "缺列：%s" % col
+    assert c_hit in text and c_other not in text
+    hit_line = [l for l in lines if c_hit in l][0]
+    assert "已使用" in hit_line and H.M1 in hit_line and "100" in hit_line
+    assert "甲客户" in hit_line and "13900001111" in hit_line
+
+    # 状态筛选也生效：只导已使用
+    resp = admin.get("/admin/api/codes/export",
+                     params={"q": "", "status": "used",
+                             "phone": "13900001111", "batch": ""})
+    text = resp.text.lstrip("\ufeff")
+    lines = [l for l in text.strip().split("\r\n") if l]
+    assert len(lines) == 2 and c_hit in text, lines
+
+    # 空筛选导出全部（3 行数据）
+    resp = admin.get("/admin/api/codes/export",
+                     params={"q": "", "status": "all", "phone": "",
+                             "batch": ""})
+    lines = [l for l in resp.text.strip().split("\r\n") if l]
+    assert len(lines) == 4, "空筛选应导出全部 3 条 + 表头"
+
+
+def test_b19_customer_edit(admin):
+    """客户编辑：同名手机号 upsert 更新名称与备注，审计记 update_customer。"""
+    body = {"name": "甲客户", "phone": "13900001111", "note": ""}
+    resp = admin.post("/admin/api/customers", body)
+    assert resp.status_code == 200, resp.text
+
+    resp = admin.post("/admin/api/customers",
+                      {"name": "甲客户改", "phone": "13900001111",
+                       "note": "新备注"})
+    assert resp.status_code == 200, resp.text
+    row = H.q1("SELECT name, note FROM customer WHERE phone = %s",
+               ("13900001111",))
+    assert row["name"] == "甲客户改" and row["note"] == "新备注"
+    assert H.q1("SELECT COUNT(*) c FROM customer")["c"] == 1, "不应重复建档"
+    assert H.q1("SELECT COUNT(*) c FROM audit_log "
+                "WHERE action = 'update_customer'")["c"] == 1

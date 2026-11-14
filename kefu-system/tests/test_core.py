@@ -922,6 +922,136 @@ class TestSender:
         assert db.get_opportunity(opp["id"])["status"] == "pending"
 
 
+class TestEnsureGuiRebind:
+    """微信重启后缓存句柄失效：_ensure_gui 必须先重绑而不是 0 秒失败。
+
+    实测事故：后端持有旧 WeChatGUI，微信重启后 is_alive()（只查缓存句柄
+    IsWindow）恒 False，发送/跳转全部秒报「微信未登录或窗口不存在」。
+    """
+
+    def _sender(self):
+        db = Database(":memory:")
+        sender = Sender(db, Notifier())
+        return sender
+
+    def test_alive_cached_gui_reused(self):
+        sender = self._sender()
+        gui = FakeGUI()
+        sender._gui = gui
+        assert sender._ensure_gui() is gui
+
+    def test_dead_handle_rebind_success_reuses_instance(self):
+        sender = self._sender()
+        gui = FakeGUI()
+        gui.alive = False
+        gui.main_hwnd = 999999  # rebind 成功后的新句柄（成功日志要打）
+        gui.rebind_called = 0
+
+        def rebind():
+            gui.rebind_called += 1
+            gui.alive = True
+            return True
+
+        gui.rebind = rebind
+        sender._gui = gui
+        assert sender._ensure_gui() is gui
+        assert gui.rebind_called == 1
+
+    def test_dead_handle_rebind_fail_recreates(self, monkeypatch):
+        import wechatauto.guia as guia_mod
+
+        class FakeNewGUI:
+            def is_alive(self):
+                return True
+
+        created = []
+
+        def fake_ctor():
+            g = FakeNewGUI()
+            created.append(g)
+            return g
+
+        monkeypatch.setattr(guia_mod, "WeChatGUI", fake_ctor)
+        sender = self._sender()
+        gui = FakeGUI()
+        gui.alive = False
+        gui.rebind = lambda: False  # 重绑失败（微信窗口找不到）
+        sender._gui = gui
+        got = sender._ensure_gui()
+        assert got is created[0] and sender._gui is got
+
+    def test_dead_handle_rebind_raise_recreates(self, monkeypatch):
+        import wechatauto.guia as guia_mod
+
+        class FakeNewGUI:
+            def is_alive(self):
+                return True
+
+        created = []
+        monkeypatch.setattr(guia_mod, "WeChatGUI",
+                            lambda: created.append(FakeNewGUI()) or
+                            created[0])
+        sender = self._sender()
+        gui = FakeGUI()
+        gui.alive = False
+
+        def boom():
+            raise RuntimeError("EnumWindows 失败")
+
+        gui.rebind = boom
+        sender._gui = gui
+        got = sender._ensure_gui()
+        assert got is created[0]
+
+
+class TestWeChatGUIRebind:
+    """WeChatGUI.rebind：重定位主窗口并刷新句柄/缓存（不碰真实微信）。"""
+
+    def _mk(self, monkeypatch, found_hwnd):
+        from wechatauto.guia import WeChatGUI
+        g = object.__new__(WeChatGUI)
+        g._input = None
+        g.main_hwnd = 111111
+        g.render_hwnd = 222222
+        g.render_rect = (0, 0, 0, 0)
+        g.pid = 1
+        g._current_chat = "旧会话"
+        g._last_input_box = (1, 2, 3, 4)
+        g._uia = object()
+        g._uia_tried = True
+        g._last_open_error = "tree_not_ready"
+
+        monkeypatch.setattr(g, "_find_main_window", lambda title: found_hwnd)
+        monkeypatch.setattr(g, "_find_render_window", lambda h: 333333)
+        monkeypatch.setattr(g, "_update_render_rect", lambda: None)
+        monkeypatch.setattr(g, "_get_pid", lambda h: 4242)
+        return g
+
+    def test_rebind_updates_all_state(self, monkeypatch):
+        g = self._mk(monkeypatch, 999999)
+        assert g.rebind() is True
+        assert g.main_hwnd == 999999
+        assert g.render_hwnd == 333333
+        assert g.pid == 4242
+        assert g._current_chat is None
+        assert g._last_input_box is None
+        assert g._uia is None
+        assert g._uia_tried is False
+        assert g._last_open_error == ""
+
+    def test_rebind_no_window_returns_false_keeps_state(self, monkeypatch):
+        g = self._mk(monkeypatch, 0)
+        assert g.rebind() is False
+        assert g.main_hwnd == 111111  # 状态不被破坏
+        assert g._uia_tried is True
+
+    def test_rebind_same_hwnd_returns_true_noop(self, monkeypatch):
+        g = self._mk(monkeypatch, 111111)
+        assert g.rebind() is True
+        assert g.render_hwnd == 222222  # 未变句柄不重刷
+        assert g._uia_tried is True
+
+
 # ---------------------------------------------------------------------------
 # wechat_service（不触碰真实微信的路径）
 # ---------------------------------------------------------------------------

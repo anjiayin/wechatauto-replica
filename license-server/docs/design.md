@@ -588,6 +588,13 @@ TRUST_PROXY=0 时：只用 socket 对端（防伪造头）
 | B14 | GET | `/admin/api/customers/{id}` | — | 客户详情 + 该客户所有机器与激活码 |
 | B15 | GET | `/admin/api/machines` | `q`(手机号/客户名/机器码) | **按手机号或客户名定位机器码**（轻量：id/machine/name/phone/expires/status） |
 | B16 | GET | `/admin/api/audit` | `action`, `machine_code`, `q`, `page`, `size` | 审计日志（倒序） |
+| B18 | POST | `/admin/api/licenses/{license_id}/customer` | `customer`, `phone`（至少一个） | 补录/修改许可证客户绑定（无客户信息的码激活后补录）；手机号非空则 upsert 客户档案并回写 `customer_id`；审计 `bind_customer` |
+| B19 | POST | `/admin/api/codes/{code}/void` | — | 作废**未使用**的激活码（销毁）；已使用的码 → 409 `code_used`（只能吊销许可证）；重复作废 → 409 `already_voided`；作废后激活返回 400 `code_voided`；审计 `void_code` |
+
+> **B4 导出（CSV）**：`GET /admin/api/codes/export` 与列表共用筛选参数
+> （`q`/`status`(all/unused/used/voided)/`phone`/`batch`），导出的即当前筛选结果；
+> 列：激活码、天数、版本、批次、客户、手机号、状态、绑定机器码、使用时间、
+> 生成时间、生成人、备注（UTF-8 带 BOM，Excel 可直接打开）。
 | B17 | GET | `/admin/api/meta` | — | 字典：edition 选项、默认天数、默认宽限、限流参数（前端渲染用） |
 
 **B7/B8 错误码**

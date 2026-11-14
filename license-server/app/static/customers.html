@@ -83,6 +83,20 @@
     }
   }
 
+  function actionCell(row) {
+    var td = h('td');
+    td.append(h('button', {
+      class: 'btn small ghost', text: '详情',
+      onclick: function () { showDetail(row); }
+    }));
+    td.append(document.createTextNode(' '));
+    td.append(h('button', {
+      class: 'btn small ghost', text: '编辑',
+      onclick: function () { editCustomer(row); }
+    }));
+    return td;
+  }
+
   function renderItems(items) {
     var box = document.getElementById('list');
     box.replaceChildren(LS.table(
@@ -97,12 +111,23 @@
           LS.fmtDay(row.max_expires_at),
           LS.fmtTime(row.last_seen_at),
           row.note || '-',
-          h('td', null, h('button', {
-            class: 'btn small ghost', text: '详情',
-            onclick: function () { showDetail(row); }
-          }))
+          actionCell(row)
         ];
       })));
+  }
+
+  async function editCustomer(row) {
+    var name = window.prompt('客户名称（手机号是唯一键，不可修改）',
+                             row.name || '');
+    if (name === null) { return; }
+    var note = window.prompt('备注', row.note || '');
+    if (note === null) { return; }
+    try {
+      await LS.apiPost('/admin/api/customers',
+        { name: name.trim(), phone: row.phone || '', note: note.trim() });
+      LS.toast('客户档案已更新');
+      load();
+    } catch (e) { LS.showError(e); }
   }
 
   async function load() {

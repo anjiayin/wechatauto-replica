@@ -592,9 +592,25 @@ class Sender:
     # GUI 实例
     # ------------------------------------------------------------------
     def _ensure_gui(self):
-        """线程内懒创建 WeChatGUI 单例；失败广播中文错误并返回 None。"""
+        """线程内懒创建 WeChatGUI 单例；失败广播中文错误并返回 None。
+
+        缓存实例的窗口句柄失效（微信重启/重登）时先调 ``rebind()`` 重新
+        定位：重绑成功直接复用，失败才丢弃重建。没有这一步，微信重启一次
+        之后所有发送/跳转都会 0 秒报「微信未登录或窗口不存在」（实测：
+        is_alive 只查缓存句柄 IsWindow，旧句柄已死恒 False）。
+        """
         if self._gui is not None:
-            return self._gui
+            if self._gui.is_alive():
+                return self._gui
+            try:
+                if self._gui.rebind():
+                    logger.info("微信窗口句柄已失效，重绑成功：hwnd=%s",
+                                self._gui.main_hwnd)
+                    return self._gui
+            except Exception as exc:
+                logger.warning("微信窗口重绑异常：%s", exc)
+            logger.info("微信窗口重绑失败，重建 GUI 组件")
+            self._gui = None
         try:
             from wechatauto.guia import WeChatGUI
         except Exception as exc:

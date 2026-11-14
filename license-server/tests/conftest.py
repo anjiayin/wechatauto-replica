@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""pytest 夹具：服务可用性守卫、交付态重置、登录态客户端。
+"""pytest 夹具：测试库准备、专用服务自起、登录态客户端。
 
-服务地址取环境变量 ``LS_TEST_BASE``，默认 ``http://127.0.0.1:8800``。
-若目标地址不可达，夹具会自动用 ``python run.py serve --port 8800`` 拉起一个
-临时进程（会话结束时关掉），这样 ``pytest tests`` 一条命令即可复验。
+铁律：测试一律连**测试库**（``wechat_kefu_test``，见 ``_helpers.TEST_DB_NAME``），
+并**总是自起**一个专用服务进程（默认 127.0.0.1:8801，``LS_TEST_PORT`` 可改），
+绝不复用已运行的真实服务（8800）——否则测试请求会打到真实库上，污染真实数据。
+会话结束时自动收掉临时服务。
 """
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _helpers as H  # noqa: E402
 
 ROOT = H.ROOT
-_PORT = int(os.environ.get("LS_TEST_PORT", "8800") or "8800")
+_PORT = H.TEST_PORT
 
 
 def _healthy() -> bool:
@@ -42,23 +43,24 @@ def _port_open() -> bool:
 
 @pytest.fixture(scope="session", autouse=True)
 def server():
-    """确保被测服务在跑（没跑就自己拉起来，结束时收掉）。"""
-    proc = None
-    if not _healthy():
-        assert not _port_open(), (
-            "端口 %d 已被其它进程占用但 /api/health 不可用，请先清理" % _PORT)
-        proc = subprocess.Popen(
-            [sys.executable, "run.py", "serve", "--port", str(_PORT)],
-            cwd=str(ROOT), stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT)
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            if _healthy():
-                break
-            if proc.poll() is not None:
-                raise RuntimeError("服务进程启动即退出，退出码 %s" % proc.returncode)
-            time.sleep(0.5)
-        assert _healthy(), "服务 60 秒内没有起来（%s）" % H.BASE_URL
+    """准备测试库并自起专用服务（结束时收掉）。"""
+    H.ensure_test_db()          # 建库 + 建表 + 幂等迁移（测试库，不影响真实库）
+    assert not _port_open(), (
+        "端口 %d 已被其它进程占用（可能是真实服务或残留进程）。"
+        "为避免测试请求打到真实库，请先清理该端口再跑测试。" % _PORT)
+    proc = subprocess.Popen(
+        [sys.executable, "run.py", "serve", "--port", str(_PORT)],
+        cwd=str(ROOT), stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+        env=dict(os.environ))   # LS_DB_NAME 已由 _helpers 指向测试库，子进程继承
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if _healthy():
+            break
+        if proc.poll() is not None:
+            raise RuntimeError("服务进程启动即退出，退出码 %s" % proc.returncode)
+        time.sleep(0.5)
+    assert _healthy(), "服务 60 秒内没有起来（%s）" % H.BASE_URL
     yield H.BASE_URL
     if proc is not None and proc.poll() is None:
         proc.terminate()

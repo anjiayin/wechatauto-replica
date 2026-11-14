@@ -7,7 +7,7 @@
 
 ## 当前交接入口
 - **2026-11-13 第 13 批：`D:/Git/wechatauto-replica/HANDOVER-2026-11-13-batch13.md`**（7 项全完成，未提交）；前序 `HANDOVER-2026-11-13.md`（第 8~12 批，已提交）。
-- 基线 `HEAD=89fd98a`；测试基线 **983 passed**（全量约 6.5 分钟）。
+- 基线 `HEAD=89fd98a`；测试基线 **1086 passed**（2026-11-14 第 20 批后，全量约 8 分钟）。
 
 ## 铁律 / 常踩的坑
 - pytest 必须 `--basetemp=D:/tmp/...`（本机 safe-delete 守卫会拦临时目录清理）；全量约 4~5 分钟。
@@ -33,6 +33,8 @@
   写死旧路径的后果不是「报错」，而是 `is_openim_chat()` 恒 False → **所有企业微信联系人被当同名好友拒发**。
   现用 `OPENIM_NAME_AIDS` 新旧两套 + `openim_label()` 三态（@企业名/''/None）+ `title_h_view` 子树扫「@ 开头文本」兜底。改微信版本后先跑一次 `openim_label()` 自检。
 - **微信 UIA 树会被回收，`_find_main()` 仍能拿到只剩 Qt 外壳的窗口**（`MMUIRenderSubWindowHW`+`QWidget` 两子控件）；此时任何 Edit/Text 查找都超时，表现成「无法定位会话」。判定锚点用 `MainView`（`is_ready()`），首次物化实测 15~30 秒。
+- **4.1.15.56 UIA 树物化 = 环境变量 + 补丁缺一不可**（2026-11-14 实测修正）：进程带 `QT_ACCESSIBILITY=1` 启动后树**仍不随启动物化**，必须再打 `_wake_accessibility()` 热激活补丁（gate byte 0→1）才在约 1s 内物化；不带环境变量时补丁无效（昨天误判「补丁路线失效」就是这种组合）。两者都已在代码链路里（wake() 写进程 env + ensure_window 自动补丁），无需人工介入。
+- **微信重启后 sender 会 0 秒报「微信未登录」**：`WeChatGUI` 缓存 `main_hwnd`，重启后 `is_alive()`（只查 IsWindow）恒 False，原代码 `_ensure_gui` 直接判死。已加 `rebind()`（重新评分定位主窗口+刷新 render/pid+清空会话与 UIA 缓存），`sender._ensure_gui` 死句柄先 rebind 再失败。别再往 `_ensure_gui` 加「is_alive False 就报错」的短路。
 - **商机类型能否命中，八成取决于该类型的 `description`，不是 Prompt 模板**（2026-11-13 实测）：`build_system_prompt` 的总纲是「是否表达明确的业务合作意向（采购/委托/询价/求供）」+ balanced「有标的物+意向动作」+ 原则「闲聊一律 hit=false」+ points 只收标的/数量/价格 + direction 只有 buy/sell——非交易型类型（投诉/售后/求助）在这套范式里**天然落空**。只把旧类型描述扩成「命中特征词清单 + 豁免句（如『没有报价/数量/标的物不影响命中』）+ 字段约定（type/points/direction 怎么填）」，实测 7 条投诉全命中、6 条闲聊全不命中、配件交易仍归「汽车配件」，无需改代码。新加类型别再只写「判断是否有 X」。
 
 - **群商机回复分「群内 / 私信」**（第 15 批）：`ReplyRequest.target`（session|sender）；私信只能发给发送人本人，且必须 `is_friend`（`wechatauto/db.py`：local_type 3=好友、1 非群/公众号/小程序/系统号=仅聊天好友、5-7=企业微信，0=非好友交互者→False，delete_flag=1→False）。前端私信按钮非好友置灰。**手动确认模式下 @ 不生效**（微信 @ 要输入时从弹层选人，`input_only` 只粘贴文字），UI 用提示条+「改为自动发送」兜住；私信回复不许带 at/quote（引用的消息在群会话里）。@ 必须用`list_group_members` 的当前群昵称，商机里存的旧名改名后 @ 不到。

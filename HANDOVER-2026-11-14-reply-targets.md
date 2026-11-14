@@ -190,3 +190,94 @@
 **验证**：tsc 0 错误、build 成功、产物含「联网确认中」。链路各环节
 （服务端 404/revoked 响应、客户端 refresh→revoked 落盘、/api/license/refresh
 端到端返回 revoked）均实测通过。
+
+---
+
+## 十八、回复/跳转再次失效：微信 4.1.15.56 根因与永久方案（2026-11-14 15:15）
+
+**现场**：用户报「回复消息和跳转又不能找到会话了，微信到前台后没有后续动作」。
+当天微信自动更新到 **4.1.15.56**。
+
+### 实测定位（全部只读/或与 wake 同机制的写内存）
+
+1. 主窗口在（`mmui::MainWindow` / hwnd 131806），`is_ready()=False`：
+   UIA 树整棵缺失，主窗口下只剩 1 个 `MMUIRenderSubWindowHW` 渲染子 HWND。
+2. 特征扫描在 4.1.15.56 上**仍能命中**：`qt.accessibility.core` 字符串在
+   RVA 0x9042b28，2 个 gate 候选（target 0xb39c9d8 / 0xbbd3b78）。
+3. **把两个候选字节都写入 1 后等 40s，树仍然不物化** → 内存补丁路线在
+   4.1.15 上失效（字节写成功但 Qt 不再重建 Provider）。这不是签名失效，
+   是微信改了 accessibility 的初始化时机。
+4. 期间微信进程被强制重启过 → 停在登录界面，需要用户手机确认后才能继续
+   验证 QT_ACCESSIBILITY=1 的效果。
+
+### 永久方案（已落地一半）
+
+- **`QT_ACCESSIBILITY=1`**：Qt 框架在**进程启动时**读这个环境变量，
+  无障碍树从启动起就完整暴露，不需要内存补丁、不需要版本特征扫描，
+  微信后续更新天然免疫（只要还是 Qt）。社区已验证 4.1.x 有效
+  （CSDN 159012810、send-wechat-message skill 等）。
+- 已设置**用户级环境变量** `QT_ACCESSIBILITY=1`（用户手动双击启动的微信也生效）。
+- `uia_driver.py`：`wake()` 拉起微信前 `_ensure_qt_accessibility()` 写入进程
+  环境（子进程继承）；唤醒超时的警告文案改为说明新机制。
+- 内存补丁保留为兜底（对老版本仍有效，对 4.1.15 无效但无害）。
+
+### 待办
+
+- 用户在手机上确认登录后，验证 `QT_ACCESSIBILITY=1` 下 4.1.15.56 的树是否
+  从启动起就完整（is_ready / search box / current_chat）。
+- 若验证通过：考虑在唤醒超时提示里引导用户「设置用户级环境变量后重启微信」
+  （已写进警告文案）；服务端（kefu-system）无需改动。
+
+## 20. 微信重启后发送/跳转 0 秒失败：句柄缓存不重绑（2026-11-14 第 20 批）
+
+**症状**：微信重新登录后，回复/跳转连「调微信到前台」都没有，0.0 秒报
+「微信未登录或窗口不存在」。
+
+**根因**（实测，非 UIA 树问题）：`sender._ensure_gui` 缓存 WeChatGUI 单例
+永不重建；微信重启后缓存 `main_hwnd` 已死，`is_alive()` 只查
+`IsWindow(缓存句柄)` 恒 False，在进入 ensure_window 之前就判死。
+
+**修复**：
+- `wechatauto/guia.py` 新增 `WeChatGUI.rebind()`：重新按多特征评分定位主
+  窗口，刷新 main_hwnd/render_hwnd/render_rect/pid，清空 `_current_chat`/
+  `_last_input_box`/`_uia`/`_uia_tried`/`_last_open_error`（旧 UIA 引擎的
+  `_win` 同样失效）。找不到可见主窗口返回 False。
+- `kefu-system/app/sender.py _ensure_gui`：缓存实例 is_alive() 为 False 时
+  先 rebind()，成功复用；失败/异常丢弃重建（保留原有中文广播）。
+
+**顺带修正昨日结论（4.1.15.56 UIA 树物化）**：实机验证微信进程已带
+`QT_ACCESSIBILITY=1` 时树**仍不随启动物化**，必须再打 `_wake_accessibility()`
+热激活补丁（gate byte 0→1）约 1s 内物化；**环境变量 + 补丁缺一不可**。
+昨日「补丁无效」是因为当时微信没带环境变量。代码链路已自动完成两者，无需人工。
+
+**实机验证**：死句柄 rebind=True → open_chat('文件传输助手')=True（5.3s，
+UIA 混合路径，未发消息）。
+
+**测试**：test_core.py 新增 TestEnsureGuiRebind(4)+TestWeChatGUIRebind(3)；
+全量 **1086 passed**（--basetemp=D:/tmp/pt-full18，7m50s）。
+
+**注意**：8766 后端（13:11 启动）是旧代码——需重启才能拿到本修复与第
+14~19 批全部改动（群回复 targets、真刷新按钮、看门狗、license v2 等）。
+
+## 21. 部署可迁移性补强：环境变量自动落盘 _ensure_user_env（同日追加）
+
+第 20 节验收时发现：用户级环境变量 QT_ACCESSIBILITY=1 在本机是**手工**写入
+的，wake() docstring 引用的 `_ensure_user_env` 并不存在——客户机上用户
+手动启动的微信拿不到该变量，树物化条件缺一半。
+
+**修复**（wechatauto/uia_driver.py）：
+- 新增 `_ensure_user_env()`：写 HKCU\Environment 的 QT_ACCESSIBILITY=1
+  （REG_SZ）+ 广播 WM_SETTINGCHANGE("Environment") 让 Explorer 立即刷新，
+  此后用户手动启动的微信也继承。幂等（已是 1 则不写不广播）。
+- 新增 `_broadcast_env_change()`：SendMessageTimeoutW 广播（2s 超时防挂）。
+- 调用点：`WeChatUIA.__init__`（服务一启动就落盘）+ `wake()`（拉起微信前）。
+- `_wake_and_wait_ready` 超时文案改为「重启一次微信让其继承」。
+
+**测试**：新增 tests/test_uia_env.py（5 例，全部打桩不碰真实注册表）；
+本机实测幂等 no-op=True；后端 py3.12 py_compile 通过。
+
+**客户机部署口径**：
+- 服务启动即自动配置环境变量，零手工步骤；唯一一次性条件：微信在变量
+  写入之后启动过一次（客户手动重启微信即可）。
+- 无法对「微信未来更新」提供 100% 保证（UIA/内存补丁天然依赖版本），
+  防线 = 特征扫描（非写死 RVA）+ UIA 失败自动降级 OCR + 告警日志。

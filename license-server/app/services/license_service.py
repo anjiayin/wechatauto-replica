@@ -102,6 +102,12 @@ def activate(*, machine_code: str, activation_code: str, app_version: str,
                 item = codes.find_by_code_for_update(cur, code)
                 if item is None:
                     raise ApiError("invalid_code", "激活码不存在，请核对后重试", 400)
+                if (item.get("voided_at") is not None
+                        and str(item.get("used_machine") or "") != machine):
+                    # 作废码不可续期（防御：作废只允许发生在未使用的码上，
+                    # 这里理论上不会命中，双保险）
+                    raise ApiError("code_voided",
+                                   "该激活码已作废，请联系供应商重新发码", 400)
                 used_machine = str(item.get("used_machine") or "")
                 if used_machine and used_machine != machine:
                     raise ApiError("code_used", "该激活码已被其它电脑使用", 409)
@@ -150,6 +156,10 @@ def activate(*, machine_code: str, activation_code: str, app_version: str,
         item = codes.find_by_code_for_update(cur, code)
         if item is None:
             raise ApiError("invalid_code", "激活码不存在，请核对后重试", 400)
+        if item.get("voided_at") is not None:
+            # 已作废的码（未使用即被销毁）：不能再激活，也拿不回天数
+            raise ApiError("code_voided",
+                           "该激活码已作废，请联系供应商重新发码", 400)
         used_machine = str(item.get("used_machine") or "")
         if used_machine and used_machine != machine:
             raise ApiError("code_used", "该激活码已被其它电脑使用", 409)

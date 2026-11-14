@@ -170,7 +170,16 @@ server {
 | GET | `/api/health` | DB 探活，不通返回 503 |
 
 管理端（`/admin/api/*`，除 `login` 外全部要会话；写操作要 `X-CSRF-Token`）：
-`login/logout/me/password`、`dashboard/codes(+/export)/licenses(+/renew/extend/expiry/revoke/restore)/customers/machines/audit/meta`。
+`login/logout/me/password`、`dashboard/codes(+/export/void)/licenses(+/renew/extend/expiry/revoke/restore/customer)/customers/machines/audit/meta`。
+
+> `POST /licenses/{license_id}/customer`（body：`customer`/`phone` 至少一个）用于给
+> 没带客户信息的激活码补录绑定：手机号非空会自动建档并回写 `customer_id`，之后
+> 即可用「客户/手机号」搜索定位该机器。
+>
+> `POST /codes/{code}/void` 作废**未使用**的激活码（销毁，不可恢复）：作废后该码
+> 永久不可激活（客户端返回 `code_voided`）；已使用的码不能作废，只能吊销许可证。
+> `GET /codes/export` 导出 CSV（带 BOM），与列表共用筛选条件，包含天数/客户/
+> 手机号/状态/绑定机器码/使用时间/生成时间等完整字段。
 
 错误体统一：`{"error": {"code": "...", "message": "中文可操作提示"}}`。
 

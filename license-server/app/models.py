@@ -101,6 +101,13 @@ class RevokeIn(_Base):
     force: bool = Field(False, description="该机器已有更新证时需 true")
 
 
+class BindCustomerIn(_Base):
+    """B18 给许可证补录/修改客户绑定（名称与手机号至少填一个）。"""
+
+    customer: str = Field("", max_length=64, description="客户名称")
+    phone: str = Field("", max_length=32, description="客户手机号")
+
+
 class CreateCustomerIn(_Base):
     """B13 新增/更新客户档案。"""
 

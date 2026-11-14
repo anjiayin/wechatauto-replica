@@ -21,7 +21,29 @@ def init_db() -> int:
     cfg = get_config()
     count = db.execute_script(cfg.schema_path)
     logger.info("建表脚本执行完成：%d 条语句（%s）", count, cfg.dsn)
+    _migrate_code_voided()
     return count
+
+
+def _migrate_code_voided() -> None:
+    """给已存在的库补 ``license_code.voided_at`` 列（幂等迁移）。
+
+    ``CREATE TABLE IF NOT EXISTS`` 不会给**已存在**的表加新列，所以老库升级
+    依赖这里：查 ``information_schema``，缺列才 ``ALTER TABLE``。
+    """
+    with db.transaction() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'license_code' "
+            "AND COLUMN_NAME = 'voided_at'")
+        row = cur.fetchone() or {}
+        if int(row.get("n") or 0) > 0:
+            return
+        cur.execute(
+            "ALTER TABLE license_code ADD COLUMN voided_at DATETIME NULL "
+            "DEFAULT NULL COMMENT '非 NULL=已作废（仅未使用的码可作废）' "
+            "AFTER used_at, ADD KEY idx_voided (voided_at)")
+        logger.info("已迁移：license_code 新增 voided_at 列（激活码作废功能）")
 
 
 def bootstrap_admin(verbose: bool = True) -> Dict[str, Any]:

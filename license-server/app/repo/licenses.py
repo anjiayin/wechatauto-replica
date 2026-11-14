@@ -149,6 +149,17 @@ def set_expiry(cur: Any, rec_id: int, expires_at: datetime,
                 "WHERE id = %s", (expires_at, now, int(rec_id)))
 
 
+def set_customer(cur: Any, rec_id: int, *, customer_id: int, name: str,
+                 phone: str, now: datetime) -> None:
+    """补录/修改许可证的客户绑定快照（不触碰授权状态与 current_key）。"""
+    cur.execute(
+        "UPDATE license SET customer_id = %s, customer_name = %s, "
+        "customer_phone = %s, updated_at = %s WHERE id = %s",
+        (int(customer_id), str(name or "")[:64], str(phone or "")[:32],
+         now, int(rec_id)),
+    )
+
+
 def touch_seen(cur: Any, rec_id: int, now: datetime,
                app_version: str = "") -> None:
     """刷新最近心跳时间与客户端版本（成功心跳才调用）。"""
