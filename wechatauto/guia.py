@@ -459,15 +459,41 @@ class WeChatGUI:
             ctypes.windll.kernel32.CloseHandle(h)
         return ''
 
+    def _is_wechat_process(self, hwnd: int) -> Optional[bool]:
+        """窗口归属进程是否为微信（硬门槛）。
+
+        评分制曾经只把「进程名」当加分项：桌面窗口标题恰好带「微信」的
+        第三方程序（实测 EditPlus 打开 ``微信客服开发-记事本.txt``，标题
+        加分 5 + 尺寸加分 2 = 7 过线）会在微信退出后被绑成主窗口，自动化
+        的点击/键盘全部落到那个程序上——用户看得一清二楚。现在进程身份是
+        一票否决项。
+
+        Returns:
+            True  = 进程名以 weixin 开头（weixin.exe 及后续变体）；
+            False = 已确认是其它进程，必须淘汰；
+            None  = 进程查询失败（权限等），不做硬判（交给其余特征评分，
+                    避免权限问题误杀真微信）。
+        """
+        name = self._process_name(self._get_pid(hwnd))
+        if not name:
+            return None
+        return name.startswith('weixin')
+
     def _looks_like_main_window(self, hwnd: int) -> bool:
         """多特征联合判断是否为微信主窗口（类名只是软条件之一）。
 
         特征：标题含微信关键字 / 类名前缀 Qt51514QWindowIcon* /
-        进程名为 weixin.exe / 可见 / 尺寸 >= MIN_WINDOW_SIZE。任一项都不
-        单独成立，评分（权重和）>=5 才认可，防止 Qt 升级改名后失效。
+        进程名为 weixin.exe / 可见 / 尺寸 >= MIN_WINDOW_SIZE。
+
+        **进程身份是一票否决项**：确认窗口不属于微信进程时直接淘汰，
+        不看评分（2026-11-14 实测 EditPlus 标题带「微信」被误绑事故）。
+        进程查询失败（None）时不否决，其余特征照常评分。
         """
         u = self._input._user32
         if not u.IsWindow(hwnd) or not u.IsWindowVisible(hwnd):
+            return False
+        we = self._is_wechat_process(hwnd)
+        if we is False:
             return False
         buf = ctypes.create_unicode_buffer(256)
         cls = ctypes.create_unicode_buffer(256)
@@ -479,7 +505,7 @@ class WeChatGUI:
             score += 5
         if cls_name.startswith(WX_MAIN_WIN_CLASS_PREFIX):
             score += 4
-        if self._process_name(self._get_pid(hwnd)) == PROCESS_NAME:
+        if we:
             score += 3
         rr = wintypes.RECT()
         u.GetWindowRect(hwnd, ctypes.byref(rr))
@@ -493,7 +519,10 @@ class WeChatGUI:
 
         类名前缀不再是硬条件（Qt 升级 Qt51514→Qt6xxx 后会改名），改为在
         所有可见顶层窗口中按「标题/类名/进程名/可见/尺寸」评分，取最高分。
-        找不到时退回按标题精确查找。
+        **进程身份是一票否决项**：确认不属于微信进程的窗口（标题恰好带
+        「微信」的第三方程序，如 EditPlus 打开「微信客服开发-记事本.txt」）
+        直接淘汰——微信退出后绝不允许绑到别的程序上（2026-11-14 实测事故）。
+        找不到时退回按标题精确查找（同样过 _looks_like_main_window 硬门槛）。
         """
         u = self._input._user32
         scored = []
@@ -502,6 +531,9 @@ class WeChatGUI:
         def _cb(h, lp):
             if not u.IsWindowVisible(h):
                 return True
+            we = self._is_wechat_process(h)
+            if we is False:
+                return True          # 非微信进程：一票否决，不参与评分
             buf = ctypes.create_unicode_buffer(256)
             cls = ctypes.create_unicode_buffer(256)
             u.GetWindowTextW(h, buf, 256)
@@ -514,7 +546,7 @@ class WeChatGUI:
                 score += 5
             if cls_name.startswith(WX_MAIN_WIN_CLASS_PREFIX):
                 score += 4
-            if self._process_name(self._get_pid(h)) == PROCESS_NAME:
+            if we:
                 score += 3
             rr = wintypes.RECT()
             u.GetWindowRect(h, ctypes.byref(rr))
@@ -1225,6 +1257,37 @@ class WeChatGUI:
                 self._uia = None
                 wxlog.debug('初始化 UIA 引擎失败：%s', e)
         return self._uia
+
+    def warm_up(self, timeout: float = 30.0) -> bool:
+        """启动预热：把 UIA 引擎建好、控件树物化，**不激活窗口、不动前后台**。
+
+        微信 4.x 的 UIA 树首次物化实测 15~30 秒（4.1.15 还要先热激活补丁），
+        这段耗时压在用户点「发送」上就是「微信到前台后半天没动静」——第一次
+        发送的「打开会话 25s+」主要就是它。服务启动时调用本方法，把物化过程
+        提前做掉；调用方必须持发送互斥锁（UIA provider 单线程）。
+
+        与 ``_get_uia`` 的区别：这里走 :meth:`WeChatUIA.warm_tree`——只做
+        ControlFromHandle/Exists 级查询，不点搜索框、不置前，用户正在用微信
+        也不受打扰。失败时 ``_uia_tried`` 保持 False，第一次发送会再走完整
+        的 ``ensure_window`` 流程（含 OCR 兜底）。
+
+        Returns:
+            True = 引擎就绪（发送可立即开始）；False = 微信未启动或树未
+            物化（预热失败不影响正常发送）。
+        """
+        if self._uia is not None:
+            return True
+        try:
+            from wechatauto.uia_driver import WeChatUIA
+        except Exception as e:                  # 依赖未装（如 linux CI）
+            wxlog.debug('预热跳过（UIA 依赖不可用）：%s', e)
+            return False
+        eng = WeChatUIA()
+        if not eng.warm_tree(timeout=timeout):
+            return False                        # _uia_tried 保持 False
+        self._uia = eng
+        self._uia_tried = True
+        return True
 
     @staticmethod
     def _same_chat(a: Optional[str], b: Optional[str]) -> bool:

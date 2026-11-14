@@ -136,30 +136,38 @@ class Sender:
         self._prewarm_thread.start()
 
     def _prewarm(self) -> None:
-        """预热 UIA 控件树。失败无所谓，真正发送时会再试一次。
+        """启动预热：建 GUI 组件 + 物化 UIA 控件树。失败无所谓，发送时会再试。
 
-        **必须与发送线程互斥**：微信的 UIA provider 是单线程的，两个线程同时
-        做 ``ControlFromHandle``/``Exists`` 会互相排队，实测能把一次发送拖到
-        60 秒以上且期间一条日志都没有（看起来像「微信到前台后就不动了」）。
-        拿不到锁就直接放弃——预热只是优化，永远不该影响正常发送。
+        为什么必须在启动时做：微信 4.x 的 UIA 树首次物化实测 15~30 秒，压在
+        用户点「发送」上就是「微信到前台后半天没动静」（实测一次首次发送
+        「打开会话 25.4s」，第二次只要 5.1s）。预热全程持 ``_gui_lock``——
+        微信的 UIA provider 是单线程的，两个线程同时 ``ControlFromHandle``/
+        ``Exists`` 会互相排队，曾把一次发送拖到 60 秒以上且全程无日志。
+        拿不到锁直接放弃——预热只是优化，永远不该影响正常发送。
         """
         try:
-            from wechatauto.uia_driver import WeChatUIA
+            from wechatauto.guia import WeChatGUI  # noqa: F401  探测依赖
         except Exception as exc:      # 依赖未装（如 linux CI）
-            logger.debug("跳过微信控件树预热：%s", exc)
+            logger.debug("跳过微信预热：%s", exc)
             return
         if not self._gui_lock.acquire(timeout=0.2):
-            logger.debug("发送正在占用微信窗口，跳过控件树预热")
+            logger.debug("发送正在占用微信窗口，跳过预热")
             return
         try:
-            ok = WeChatUIA().warm_tree(timeout=20.0)
+            gui = self._ensure_gui()
+            if gui is None:
+                return
+            t0 = time.monotonic()
+            ok = gui.warm_up(timeout=30.0)
+            logger.info("微信预热%s（耗时 %.1fs）",
+                        "完成（首次发送可立即开始）" if ok
+                        else "未完成（微信可能未启动，发送时会再试）",
+                        time.monotonic() - t0)
         except Exception:
-            logger.debug("微信控件树预热异常（忽略）", exc_info=True)
+            logger.debug("微信预热异常（忽略）", exc_info=True)
             return
         finally:
             self._gui_lock.release()
-        logger.info("微信控件树预热%s", "完成（发送可立即开始）"
-                    if ok else "未完成（微信可能未启动，发送时会再试）")
 
     def stop(self) -> None:
         """停止发送线程。"""

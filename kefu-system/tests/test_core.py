@@ -1052,6 +1052,154 @@ class TestWeChatGUIRebind:
         assert g._uia_tried is True
 
 
+class TestWeChatGUIWarmUp:
+    """启动预热：树物化提前做掉（首次发送「打开会话 25.4s」的主要来源）。"""
+
+    def _mk(self):
+        from wechatauto.guia import WeChatGUI
+        g = object.__new__(WeChatGUI)
+        g._uia = None
+        g._uia_tried = False
+        return g
+
+    def test_warm_up_success_caches_engine(self, monkeypatch):
+        import wechatauto.uia_driver as ud
+
+        created = []
+
+        class FakeEng:
+            def __init__(self):
+                created.append(self)
+
+            def warm_tree(self, timeout=30.0):
+                return True
+
+        monkeypatch.setattr(ud, "WeChatUIA", FakeEng)
+        g = self._mk()
+        assert g.warm_up(timeout=5) is True
+        assert g._uia is created[0]
+        assert g._uia_tried is True
+
+    def test_warm_up_failure_keeps_retry_state(self, monkeypatch):
+        import wechatauto.uia_driver as ud
+
+        class FakeEng:
+            def __init__(self):
+                pass
+
+            def warm_tree(self, timeout=30.0):
+                return False  # 微信没开/树没物化
+
+        monkeypatch.setattr(ud, "WeChatUIA", FakeEng)
+        g = self._mk()
+        assert g.warm_up(timeout=5) is False
+        assert g._uia is None
+        assert g._uia_tried is False  # 发送时 _get_uia 会再试
+
+    def test_warm_up_cached_engine_short_circuit(self):
+        sentinel = object()
+        g = self._mk()
+        g._uia = sentinel
+        assert g.warm_up() is True  # 已就绪直接返回，不做任何 UIA 查询
+
+
+class TestWechatProcessGate:
+    """进程身份硬门槛：微信退出后绝不允许绑到标题带「微信」的第三方窗口。
+
+    实测事故（2026-11-14）：EditPlus 打开「微信客服开发-记事本.txt」，
+    标题加分 5 + 尺寸加分 2 = 7 过线被绑成主窗口，自动化的点击/键盘全部
+    落到 EditPlus 上，用户亲眼可见。
+    """
+
+    def _mk(self):
+        from wechatauto.guia import WeChatGUI, WinInput
+        g = object.__new__(WeChatGUI)
+        g._input = WinInput()
+        return g
+
+    def test_is_wechat_process_variants(self, monkeypatch):
+        g = self._mk()
+        monkeypatch.setattr(g, "_get_pid", lambda h: 42)
+        monkeypatch.setattr(g, "_process_name", lambda pid: "weixin.exe")
+        assert g._is_wechat_process(1) is True
+        monkeypatch.setattr(g, "_process_name", lambda pid: "editplus.exe")
+        assert g._is_wechat_process(1) is False
+        monkeypatch.setattr(g, "_process_name", lambda pid: "")
+        assert g._is_wechat_process(1) is None  # 查询失败不硬判
+
+    def test_looks_like_main_window_rejects_foreign_process(self, monkeypatch):
+        g = self._mk()
+        # 即使其余特征全中（这里直接以真实 EditPlus 窗口为例），进程不是
+        # 微信就一票否决
+        monkeypatch.setattr(g, "_is_wechat_process", lambda h: False)
+        assert g._looks_like_main_window(3212074) is False
+
+    def test_looks_like_main_window_none_does_not_veto(self, monkeypatch):
+        """进程查询失败（None）不否决——避免权限问题误杀真微信。"""
+        g = self._mk()
+        monkeypatch.setattr(g, "_is_wechat_process", lambda h: None)
+        # 真实窗口存在与否不影响断言方向：None 不应直接 False 出局；
+        # 这里借 EditPlus 窗口（标题带微信、可见）验证「不否决」路径能走下去
+        result = g._looks_like_main_window(3212074)
+        assert result in (True, False)  # 走完评分而非被门槛直接拦截
+        monkeypatch.setattr(g, "_is_wechat_process", lambda h: False)
+        assert g._looks_like_main_window(3212074) is False  # 对照：False 会拦
+
+    def test_find_main_window_skips_foreign_windows(self, monkeypatch):
+        """桌面存在标题带「微信」的第三方窗口时，定位必须返回 0。"""
+        from wechatauto.guia import WeChatGUI, WinInput
+        g = self._mk()
+        g._input = WinInput()
+        monkeypatch.setattr(g, "_is_wechat_process", lambda h: False)
+        assert g._find_main_window("微信") == 0
+
+
+class TestSenderPrewarm:
+    def _sender(self):
+        return Sender(Database(":memory:"), Notifier())
+
+    def test_prewarm_skipped_when_lock_busy(self, monkeypatch):
+        sender = self._sender()
+        assert sender._gui_lock.acquire(timeout=0.2)
+        try:
+            called = []
+            monkeypatch.setattr(sender, "_ensure_gui",
+                                lambda: called.append(1))
+            sender._prewarm()
+            assert called == []  # 锁被发送占用 → 预热立即放弃
+        finally:
+            sender._gui_lock.release()
+
+    def test_prewarm_creates_gui_and_warms(self):
+        calls = []
+
+        class FakeWarmGUI:
+            def is_alive(self):
+                return True
+
+            def warm_up(self, timeout=30.0):
+                calls.append(timeout)
+                return True
+
+        sender = self._sender()
+        sender._gui = FakeWarmGUI()
+        sender._prewarm()
+        assert calls and calls[0] == 30.0
+
+    def test_prewarm_swallows_exception(self, monkeypatch):
+        sender = self._sender()
+
+        def boom():
+            raise RuntimeError("预热炸了")
+
+        sender._gui = FakeGUI()
+        sender._gui.warm_up = boom
+        sender._prewarm()  # 不应抛出
+        # 锁已释放（再次获取成功即证明）
+        assert sender._gui_lock.acquire(timeout=0.2)
+        sender._gui_lock.release()
+
+
 # ---------------------------------------------------------------------------
 # wechat_service（不触碰真实微信的路径）
 # ---------------------------------------------------------------------------

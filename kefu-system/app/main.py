@@ -221,11 +221,12 @@ def create_app() -> FastAPI:
         def _start_runtime() -> None:
             """启动抓取 / 分析 / 发送（授权通过后才会被调用）。"""
             pipeline.start()
-            # 不预热：UIA 控件树探查（ControlFromHandle + Exists）每 0.4s 一轮，
-            # 与发送线程的搜索/点击抢微信 UI 线程，实测会把首次发送拖到 60s+
-            # 且全程无日志（预热线程自己也会卡在 _find_main 里）。第一次发送时
-            # ensure_window(require_ready=True) 会显式等待并打日志，更可诊断。
-            sender.start()
+            # 启动预热（后台线程、持 _gui_lock、不激活微信窗口）：把 UIA 控件树
+            # 首次物化的 15~30 秒从「用户点发送的那一刻」挪到服务启动时。
+            # 实测首次发送「打开会话 25.4s」，预热后这部分归零。当年「预热把
+            # 发送拖到 60s+」的事故根因是预热线程没持 _gui_lock，与发送线程
+            # 抢微信单线程 UIA provider；现在 _prewarm 全程持锁，抢不到就放弃。
+            sender.start(prewarm=True)
             aggregator.start()
             # 微信初始化（密钥提取）可能耗时十几秒：放后台线程，避免阻塞事件循环
             wx_start = threading.Thread(target=wechat.start,
