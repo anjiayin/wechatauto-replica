@@ -1,0 +1,108 @@
+%% 授权服务后台（license-server）关键流程时序图
+%% 与 docs/design.md §7 对应；可直接粘贴到支持 Mermaid 的编辑器查看
+
+sequenceDiagram
+    autonumber
+    participant C as 客户端 app/license.py
+    participant A as client_api
+    participant S as license_service
+    participant DB as MySQL
+
+    Note over C,DB: ① 激活：首次 / 幂等续期 / 吊销后重发
+    C->>A: POST /api/v1/license/activate
+    A->>A: 限流(IP + 机器码) 超限则 429 rate_limited
+    A->>S: activate(body, ip)
+    S->>S: 校验机器码格式 非法则 400 invalid_machine_code
+    S->>DB: BEGIN
+    S->>DB: SELECT 当前生效证 WHERE current_key = 机器码
+    alt 已有生效证
+        alt 未带激活码
+            S->>S: 幂等：直接复用原证
+        else 带激活码
+            S->>DB: SELECT 激活码 FOR UPDATE
+            alt 码不存在
+                S-->>C: 400 invalid_code
+            else 码已被其它机器使用
+                S-->>C: 409 code_used
+            else 同一个码重复提交
+                S->>S: 不再叠加天数（幂等修正）
+            else 全新码
+                S->>DB: UPDATE license SET expires_at = max(旧到期,今天) + days
+                S->>DB: UPDATE license_code SET used_machine, used_at
+                S->>DB: INSERT audit_log
+            end
+        end
+        S->>DB: COMMIT
+        S-->>C: 200 ok=true + license(每次重签)
+    else 无生效证
+        alt 未带激活码
+            S-->>C: 400 activation_required
+        else 带激活码
+            S->>DB: SELECT 激活码 FOR UPDATE
+            S->>DB: SELECT 该机器最新一条证 ORDER BY id DESC LIMIT 1
+            alt 最新一条已吊销 且 提交的是该机用过的旧码
+                S-->>C: 400 revoked（堵死自助解封）
+            else 全新码（供应商重新授权）
+                S->>DB: INSERT license 新 license_id, current_key=机器码, reissued_from=旧证号
+                S->>DB: UPDATE license_code SET used_machine, used_at
+                S->>DB: INSERT audit_log
+                S->>DB: COMMIT
+                S-->>C: 200 ok=true + license
+            end
+        end
+    end
+
+    Note over C,DB: ② 心跳：正常 / 延期生效 / 吊销 / 到期
+    C->>A: POST /api/v1/license/heartbeat
+    A->>S: heartbeat(body)
+    S->>DB: 按 license_id 查（若带）
+    alt license_id 属于另一台机器
+        S-->>C: 409 machine_mismatch
+    end
+    S->>DB: SELECT 当前生效证 WHERE current_key = 机器码
+    alt 无生效证
+        S->>DB: SELECT 最新一条 ORDER BY id DESC LIMIT 1
+        alt 完全没有记录
+            S-->>C: 404 not_found
+        else 最新一条已吊销
+            S-->>C: 200 ok=false revoked（不更新 last_seen_at）
+        end
+    end
+    S->>DB: UPDATE license SET last_seen_at, app_version
+    alt expires_at <= now
+        S-->>C: 200 ok=false expired
+    else 正常
+        S-->>C: 200 ok=true status=active + license（issued_at 不变，expires_at 最新）
+        Note over C: 客户端验签通过后覆盖本地 license.json，<br/>管理端延期在下次心跳自动生效
+    end
+    Note over A,C: 授权失效一律 200 + ok=false；4xx 只用于真正的请求错误
+
+    Note over C,DB: ③ 管理端延期 / 缩期 / 直接设到期日
+    participant U as 管理员浏览器
+    participant D as require_admin + require_csrf
+    U->>D: POST /admin/api/licenses/{id}/extend days=-30
+    D->>DB: 校验会话 token_hash 未过期未吊销
+    alt 会话无效
+        D-->>U: 401 unauthorized
+    end
+    D->>D: 校验 X-CSRF-Token 与 session.csrf_token 一致
+    D->>A: 透传 current_user
+    A->>S: admin_service.extend(license_id, days, force, actor, ip)
+    S->>DB: SELECT license FOR UPDATE
+    alt 不存在
+        S-->>U: 404 not_found
+    end
+    alt days > 0
+        S->>S: base = max(expires_at, now)；new = base + days
+    else days < 0
+        S->>S: new = expires_at + days
+        alt new < issued_at
+            S-->>U: 409 expiry_too_early（force 也不能越过）
+        else new < now 且 force=false
+            S-->>U: 409 expiry_in_past（需二次确认）
+        end
+    end
+    S->>DB: UPDATE license SET expires_at, updated_at
+    S->>DB: INSERT audit_log days_delta=days, before/after
+    S->>DB: COMMIT
+    S-->>U: 200 ok=true item

@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>许可证 · 授权服务后台</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="nav"></div>
+<main class="wrap">
+  <h1>许可证管理</h1>
+
+  <div class="card">
+    <div class="row">
+      <div class="field"><label for="f-q">搜索</label>
+        <input id="f-q" maxlength="64" placeholder="机器码 / 客户名 / 手机号 / 许可证号" style="min-width:280px"></div>
+      <div class="field"><label for="f-status">状态</label>
+        <select id="f-status">
+          <option value="all">全部</option>
+          <option value="current">有生效记录（含已过期）</option>
+          <option value="active">当前生效</option>
+          <option value="expired">已过期</option>
+          <option value="revoked">已吊销</option>
+          <option value="superseded">已被取代</option>
+        </select></div>
+      <button class="btn" id="search">查询</button>
+    </div>
+    <p class="hint">
+      延期从「当前到期日」与「今天」中较晚者起算；缩期硬边界是不早于签发日（force 也不能越过），
+      缩到过去需确认强制。所有调整在客户端下次心跳（≤6 小时）自动生效，客户无需操作。
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>许可证列表</h2>
+    <div id="list"></div>
+    <div class="pager" id="pager"></div>
+  </div>
+
+  <div class="card" id="detail-card" style="display:none">
+    <h2>许可证详情</h2>
+    <div id="detail"></div>
+  </div>
+</main>
+<script src="app.js"></script>
+<script>
+(function () {
+  'use strict';
+  var h = LS.h;
+  var state = { page: 1, size: 20, total: 0 };
+
+  // ---------------------------------------------------------------- 操作
+  async function extendDays(item, days) {
+    try {
+      await LS.apiPost('/admin/api/licenses/' + encodeURIComponent(item.license_id) + '/extend',
+        { days: days, force: false });
+      LS.toast(item.license_id + ' 已调整 ' + (days > 0 ? '+' : '') + days + ' 天');
+      load();
+    } catch (e) {
+      if (e.code === 'expiry_in_past') {
+        if (window.confirm(e.message + '\n\n确认强制设为该到期日？')) {
+          try {
+            await LS.apiPost('/admin/api/licenses/' + encodeURIComponent(item.license_id) + '/extend',
+              { days: days, force: true });
+            LS.toast('已强制调整 ' + days + ' 天');
+            load();
+          } catch (e2) { LS.showError(e2); }
+        }
+        return;
+      }
+      LS.showError(e);
+    }
+  }
+
+  async function setExpiryDate(item) {
+    var text = window.prompt('请输入新的到期日（YYYY-MM-DD）', LS.fmtDay(item.expires_at));
+    if (!text) { return; }
+    var body = { expires_at: text, force: false };
+    try {
+      await LS.apiPost('/admin/api/licenses/' + encodeURIComponent(item.license_id) + '/expiry', body);
+      LS.toast('到期日已更新');
+      load();
+    } catch (e) {
+      if (e.code === 'expiry_in_past') {
+        if (window.confirm(e.message + '\n\n确认强制改为已过去的日期？')) {
+          body.force = true;
+          try {
+            await LS.apiPost('/admin/api/licenses/' + encodeURIComponent(item.license_id) + '/expiry', body);
+            LS.toast('到期日已强制更新');
+            load();
+          } catch (e2) { LS.showError(e2); }
+        }
+        return;
+      }
+      LS.showError(e);
+    }
+  }
+
+  async function revokeItem(item) {
+    var reason = window.prompt('吊销原因（可空）', '');
+    if (reason === null) { return; }
+    if (!window.confirm('确认吊销 ' + item.license_id + '？客户下次心跳会立即锁死。')) { return; }
+    try {
+      await LS.apiPost('/admin/api/licenses/' + encodeURIComponent(item.license_id) + '/revoke',
+        { reason: reason, force: false });
+      LS.toast('已吊销');
+      load();
+    } catch (e) {
+      if (e.code === 'superseded_require_force') {
+        if (window.confirm(e.message + '\n\n确认强制吊销？')) {
+          try {
+            await LS.apiPost('/admin/api/licenses/' + encodeURIComponent(item.license_id) + '/revoke',
+              { reason: reason, force: true });
+            LS.toast('已强制吊销');
+            load();
+          } catch (e2) { LS.showError(e2); }
+        }
+        return;
+      }
+      LS.showError(e);
+    }
+  }
+
+  async function restoreItem(item) {
+    if (!window.confirm('确认恢复 ' + item.license_id + '？客户下次心跳即可继续使用。')) { return; }
+    try {
+      await LS.apiPost('/admin/api/licenses/' + encodeURIComponent(item.license_id) + '/restore');
+      LS.toast('已恢复');
+      load();
+    } catch (e) {
+      LS.showError(e);
+    }
+  }
+
+  async function showDetail(item) {
+    try {
+      var data = await LS.apiGet('/admin/api/licenses/' + encodeURIComponent(item.license_id));
+      var card = document.getElementById('detail-card');
+      var box = document.getElementById('detail');
+      card.style.display = '';
+      box.replaceChildren();
+      box.append(LS.table(
+        ['字段', '值'],
+        [
+          ['许可证号', data.item.license_id],
+          ['机器码', h('td', { class: 'mono', text: data.item.machine_code })],
+          ['客户', (data.item.customer_name || '-') + ' / ' + (data.item.customer_phone || '-')],
+          ['版本 / 宽限', (data.item.edition || '-') + ' / ' + data.item.grace_days + ' 天'],
+          ['签发时间', LS.fmtTime(data.item.issued_at)],
+          ['到期时间', LS.fmtTime(data.item.expires_at)],
+          ['最近心跳', LS.fmtTime(data.item.last_seen_at)],
+          ['激活码', data.item.activation_code || '-'],
+          ['重发来源', data.item.reissued_from || '-'],
+          ['状态', LS.roleBadge(data.item.role)]
+        ].map(function (pair) {
+          return [h('td', { class: 'hint', text: pair[0] }),
+            (pair[1] instanceof Node) ? pair[1] : h('td', { text: String(pair[1]) })];
+        })));
+
+      box.append(h('h2', { text: '该机器历史（' + (data.history || []).length + ' 条）' }));
+      box.append(LS.table(['许可证号', '状态', '到期', '吊销时间', '重发来源', '签发时间'],
+        (data.history || []).map(function (row) {
+          return [h('td', null, h('code', { text: row.license_id })),
+            LS.roleBadge(row.role), LS.fmtTime(row.expires_at),
+            LS.fmtTime(row.revoked_at), row.reissued_from || '-',
+            LS.fmtTime(row.created_at)];
+        })));
+
+      box.append(h('h2', { text: '该机器用过的激活码' }));
+      box.append(LS.table(['激活码', '天数', '批次', '使用时间'],
+        (data.codes || []).map(function (row) {
+          return [h('td', null, h('code', { text: row.code })),
+            String(row.days), row.batch || '-', LS.fmtTime(row.used_at)];
+        })));
+
+      box.append(h('h2', { text: '该机器审计记录' }));
+      box.append(LS.table(['时间', '操作人', '动作', '天数', '备注'],
+        ((data.audit && data.audit.items) || []).map(function (row) {
+          return [LS.fmtTime(row.created_at), row.actor || '-', row.action,
+            row.days_delta ? String(row.days_delta) : '-', row.note || '-'];
+        })));
+      card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (e) {
+      LS.showError(e);
+    }
+  }
+
+  function actionCell(item) {
+    var td = h('td');
+    var add = function (text, fn, cls, disabled) {
+      var btn = h('button', {
+        class: 'btn small ' + (cls || 'ghost'), text: text,
+        onclick: fn, disabled: disabled || false
+      });
+      td.append(btn);
+      td.append(document.createTextNode(' '));
+    };
+    add('详情', function () { showDetail(item); });
+    add('+365', function () { extendDays(item, 365); });
+    add('+30', function () { extendDays(item, 30); });
+    add('自定义增加', function () {
+      var n = window.prompt('增加多少天？', '180');
+      var days = parseInt(n, 10);
+      if (days > 0) { extendDays(item, days); }
+    });
+    add('减少天数', function () {
+      var n = window.prompt('减少多少天？（请输入正数）', '30');
+      var days = parseInt(n, 10);
+      if (days > 0) {
+        if (window.confirm('确认减少 ' + days + ' 天？')) { extendDays(item, -days); }
+      }
+    });
+    add('设到期日', function () { setExpiryDate(item); });
+    if (item.role === 'revoked') {
+      if (item.can_restore) { add('恢复', function () { restoreItem(item); }); }
+    } else {
+      add('吊销', function () { revokeItem(item); }, 'danger');
+    }
+    return td;
+  }
+
+  function renderItems(items) {
+    var box = document.getElementById('list');
+    box.replaceChildren(LS.table(
+      ['许可证号', '状态', '机器码', '客户', '手机号', '到期日', '剩余', '最近心跳', '操作'],
+      items.map(function (item) {
+        var left = LS.daysLeft(item.expires_at);
+        return [
+          h('td', null, h('code', { text: item.license_id })),
+          LS.roleBadge(item.role),
+          h('td', { class: 'mono', text: item.machine_code }),
+          item.customer_name || '-',
+          item.customer_phone || '-',
+          LS.fmtTime(item.expires_at),
+          left === null ? '-' : (left >= 0 ? left + ' 天' : '已过期 ' + (-left) + ' 天'),
+          LS.fmtTime(item.last_seen_at),
+          actionCell(item)
+        ];
+      })));
+  }
+
+  async function load() {
+    var params = new URLSearchParams();
+    params.set('q', LS.val('f-q'));
+    params.set('status', LS.val('f-status') || 'all');
+    params.set('page', String(state.page));
+    params.set('size', String(state.size));
+    try {
+      var data = await LS.apiGet('/admin/api/licenses?' + params.toString());
+      state.total = data.total;
+      state.size = data.size;
+      renderItems(data.items || []);
+      LS.pager(document.getElementById('pager'), state, function (page) {
+        state.page = page;
+        load();
+      });
+    } catch (e) {
+      if (e.code !== 'unauthorized') { LS.showError(e); }
+    }
+  }
+
+  LS.bootPage('licenses').then(function (user) {
+    if (!user) { return; }
+    document.getElementById('search').addEventListener('click', function () {
+      state.page = 1;
+      load();
+    });
+    document.getElementById('f-q').addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') { state.page = 1; load(); }
+    });
+    load();
+  });
+}());
+</script>
+</body>
+</html>

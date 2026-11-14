@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>激活码 · 授权服务后台</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="nav"></div>
+<main class="wrap">
+  <h1>激活码管理</h1>
+
+  <div class="card">
+    <h2>批量生成</h2>
+    <div class="row">
+      <div class="field"><label for="g-days">有效天数</label>
+        <input id="g-days" type="number" value="365" min="1" max="3650" style="width:110px"></div>
+      <div class="field"><label for="g-count">数量</label>
+        <input id="g-count" type="number" value="1" min="1" max="500" style="width:90px"></div>
+      <div class="field"><label for="g-customer">客户名称</label>
+        <input id="g-customer" maxlength="64" placeholder="可空"></div>
+      <div class="field"><label for="g-phone">客户手机号</label>
+        <input id="g-phone" maxlength="32" placeholder="填了会建客户档案"></div>
+      <div class="field"><label for="g-edition">版本</label>
+        <input id="g-edition" value="standard" maxlength="32" style="width:100px"></div>
+      <div class="field"><label for="g-note">备注</label>
+        <input id="g-note" maxlength="255" placeholder="可空"></div>
+      <button class="btn" id="gen">生成</button>
+    </div>
+    <p class="hint">生成后把激活码发给客户，客户在软件里粘贴激活。有手机号的会自动建立客户档案。</p>
+    <div id="gen-result"></div>
+  </div>
+
+  <div class="card">
+    <h2>筛选</h2>
+    <div class="row">
+      <div class="field"><label for="f-q">关键字</label>
+        <input id="f-q" maxlength="64" placeholder="激活码/客户/批次"></div>
+      <div class="field"><label for="f-status">状态</label>
+        <select id="f-status">
+          <option value="all">全部</option>
+          <option value="unused">未使用</option>
+          <option value="used">已使用</option>
+        </select></div>
+      <div class="field"><label for="f-phone">手机号</label>
+        <input id="f-phone" maxlength="32"></div>
+      <div class="field"><label for="f-batch">批次</label>
+        <input id="f-batch" maxlength="32" placeholder="B20261114-ABCD"></div>
+      <button class="btn" id="search">查询</button>
+      <button class="btn ghost" id="export">导出 txt</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>激活码列表</h2>
+    <div id="list"></div>
+    <div class="pager" id="pager"></div>
+  </div>
+</main>
+<script src="app.js"></script>
+<script>
+(function () {
+  'use strict';
+  var h = LS.h;
+  var state = { page: 1, size: 20, total: 0 };
+
+  function query() {
+    var params = new URLSearchParams();
+    params.set('q', LS.val('f-q'));
+    params.set('status', LS.val('f-status') || 'all');
+    params.set('phone', LS.val('f-phone'));
+    params.set('batch', LS.val('f-batch'));
+    return params;
+  }
+
+  function renderItems(items) {
+    var box = document.getElementById('list');
+    box.replaceChildren(LS.table(
+      ['激活码', '天数', '客户', '手机号', '批次', '状态', '绑定机器码', '使用时间', '生成时间'],
+      items.map(function (item) {
+        return [
+          h('td', null, h('code', { text: item.code })),
+          String(item.days),
+          item.customer_name || '-',
+          item.customer_phone || '-',
+          item.batch || '-',
+          item.used_machine ? LS.badge('已使用', 'warn') : LS.badge('未使用', 'ok'),
+          h('td', { class: 'mono', text: item.used_machine || '-' }),
+          LS.fmtTime(item.used_at),
+          LS.fmtTime(item.created_at)
+        ];
+      })));
+  }
+
+  async function load() {
+    var params = query();
+    params.set('page', state.page);
+    params.set('size', state.size);
+    try {
+      var data = await LS.apiGet('/admin/api/codes?' + params.toString());
+      state.total = data.total;
+      state.size = data.size;
+      renderItems(data.items || []);
+      LS.pager(document.getElementById('pager'), state, function (page) {
+        state.page = page;
+        load();
+      });
+    } catch (e) {
+      if (e.code !== 'unauthorized') { LS.showError(e); }
+    }
+  }
+
+  async function generate() {
+    var body = {
+      days: parseInt(LS.val('g-days'), 10) || 365,
+      count: parseInt(LS.val('g-count'), 10) || 1,
+      customer: LS.val('g-customer'),
+      customer_phone: LS.val('g-phone'),
+      edition: LS.val('g-edition') || 'standard',
+      note: LS.val('g-note')
+    };
+    var button = document.getElementById('gen');
+    button.disabled = true;
+    try {
+      var data = await LS.apiPost('/admin/api/codes', body);
+      var codes = (data.items || []).map(function (item) { return item.code; });
+      var box = document.getElementById('gen-result');
+      box.replaceChildren();
+      box.append(h('p', { class: 'hint', text: '已生成 ' + codes.length +
+        ' 个（批次 ' + data.batch + '），点击下面按钮可复制全部：' }));
+      box.append(h('pre', { class: 'text-out', text: codes.join('\n') }));
+      box.append(h('button', {
+        class: 'btn ghost', text: '复制全部',
+        onclick: function () { copyText(codes.join('\n')); }
+      }));
+      state.page = 1;
+      load();
+    } catch (e) {
+      LS.showError(e);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () {
+        LS.toast('已复制到剪贴板');
+      }, function () {
+        LS.toast('复制失败，请手动选择文本', true);
+      });
+    } else {
+      LS.toast('当前浏览器不支持自动复制，请手动选择文本', true);
+    }
+  }
+
+  LS.bootPage('codes').then(function (user) {
+    if (!user) { return; }
+    document.getElementById('gen').addEventListener('click', generate);
+    document.getElementById('search').addEventListener('click', function () {
+      state.page = 1;
+      load();
+    });
+    document.getElementById('export').addEventListener('click', function () {
+      var params = query();
+      params.delete('status');
+      window.open('/admin/api/codes/export?' + params.toString(), '_blank');
+    });
+    load();
+  });
+}());
+</script>
+</body>
+</html>

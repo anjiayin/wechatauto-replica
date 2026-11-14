@@ -1,0 +1,230 @@
+%% 授权服务后台（license-server）类图（模块职责与依赖）
+%% 与 docs/design.md §2 / §3 / §4 对应
+
+classDiagram
+    class Config {
+        +str db_host
+        +int db_port
+        +str db_user
+        +str db_password
+        +str db_name
+        +str license_key_id
+        +str license_private_key_path
+        +int session_ttl_hours
+        +bool cookie_secure
+        +int pbkdf2_iterations
+        +load() Config
+        +load_private_key() Ed25519PrivateKey
+    }
+
+    class Signing {
+        +TZ
+        +payload_bytes(payload) bytes
+        +now() datetime
+        +to_iso(dt) str
+        +from_iso(text) datetime
+        +build_payload(rec) dict
+        +sign_doc(payload, key, key_id) dict
+        +new_license_id() str
+        +valid_machine_code(code) bool
+        +normalize_machine(code) str
+        +normalize_code(code) str
+    }
+
+    class Security {
+        +hash_password(pwd) str
+        +verify_password(pwd, stored) bool
+        +new_session_token() str
+        +new_csrf_token() str
+        +hash_token(token) str
+        +set_session_cookie(resp, token)
+        +clear_session_cookie(resp)
+        +get_client_ip(request) str
+    }
+
+    class RateLimiter {
+        -dict buckets
+        -Lock lock
+        +allow(key) bool
+    }
+
+    class Database {
+        +get_conn() Connection
+        +transaction() Cursor
+        +query_one(sql, args) dict
+        +query_all(sql, args) list
+        +execute(sql, args) int
+        +execute_many(sql, args)
+        +init_schema()
+    }
+
+    class LicenseRepo {
+        +find_current(cur, machine) dict
+        +find_latest(cur, machine) dict
+        +find_by_license_id(cur, lid) dict
+        +find_for_update(cur, lid) dict
+        +insert(cur, **kw) dict
+        +update_for_renew(cur, id, expires, code, cust)
+        +set_expiry(cur, id, expires, now)
+        +revoke(cur, id, now)
+        +restore(cur, id, machine, now)
+        +touch_seen(cur, id, now, ver)
+        +list_page(cur, q, status, page, size)
+        +history_by_machine(cur, machine) list
+    }
+
+    class CodeRepo {
+        +batch_create(cur, count, days, cust, edition, note, actor) list
+        +find_by_code_for_update(cur, code) dict
+        +mark_used(cur, code, machine, now)
+        +list_page(cur, q, status, batch, page, size) list
+        +count_stats(cur) dict
+    }
+
+    class CustomerRepo {
+        +upsert_by_phone(cur, phone, name) dict
+        +search(cur, q, page, size) list
+        +get(cur, id) dict
+        +list_with_stats(cur) list
+    }
+
+    class AdminRepo {
+        +get_by_username(cur, username) dict
+        +record_login_success(cur, uid, ip, now)
+        +record_login_failed(cur, uid, max_failed, lock_min)
+        +create(cur, username, pwd_hash, display, must_change)
+        +change_password(cur, uid, pwd_hash, now)
+        +create_session(cur, uid, token_hash, csrf, ip, ua, exp)
+        +get_session_by_token(cur, token_hash, now) dict
+        +revoke_session(cur, token_hash, now)
+        +revoke_all_sessions(cur, uid, except_hash, now)
+        +cleanup_expired(cur, now) int
+    }
+
+    class AuditRepo {
+        +write(cur, actor, actor_id, action, target_type, target_id, machine_code, days_delta, before, after, ip, note)
+        +list_page(cur, action, machine, q, page, size) list
+    }
+
+    class StatsRepo {
+        +license_counts(cur, now) dict
+        +code_counts(cur, now) dict
+        +by_phone(cur, now, limit) list
+        +by_customer(cur, now, limit) list
+        +trend(cur, days) list
+        +recent_activations(cur, limit) list
+    }
+
+    class LicenseService {
+        -Ed25519PrivateKey key
+        -str key_id
+        +activate(machine, code, app_version, os_name, ip) dict
+        +heartbeat(machine, license_id, app_version) dict
+        +query(machine) dict
+    }
+
+    class AdminService {
+        +login(username, password, ip) dict
+        +logout(token_hash)
+        +change_password(uid, old, new, ip)
+        +create_codes(payload, actor, ip) list
+        +extend(license_id, days, force, actor, ip) dict
+        +set_expiry(license_id, expires_at, force, actor, ip) dict
+        +revoke(license_id, reason, force, actor, ip) dict
+        +restore(license_id, actor, ip) dict
+        +dashboard(days) dict
+    }
+
+    class AdminUser {
+        +int id
+        +str username
+        +str password_hash
+        +int status
+        +int must_change_password
+        +int failed_count
+        +datetime locked_until
+        +datetime last_login_at
+    }
+
+    class AdminSession {
+        +int id
+        +str token_hash
+        +str csrf_token
+        +int user_id
+        +datetime expires_at
+        +datetime revoked_at
+    }
+
+    class Customer {
+        +int id
+        +str name
+        +str phone
+        +str note
+    }
+
+    class LicenseCode {
+        +int id
+        +str code
+        +int days
+        +int customer_id
+        +str customer_name
+        +str customer_phone
+        +str batch
+        +str used_machine
+        +datetime used_at
+    }
+
+    class License {
+        +int id
+        +str license_id
+        +str machine_code
+        +str current_key
+        +int customer_id
+        +str customer_phone
+        +datetime issued_at
+        +datetime expires_at
+        +int grace_days
+        +datetime revoked_at
+        +datetime superseded_at
+        +str reissued_from
+        +datetime last_seen_at
+    }
+
+    class AuditLog {
+        +int id
+        +str actor
+        +str action
+        +str target_type
+        +str target_id
+        +str machine_code
+        +int days_delta
+        +str before_json
+        +str after_json
+        +datetime created_at
+    }
+
+    Config --> Signing : 提供 key_id / 私钥
+    Signing --> LicenseService : payload / 签名
+    Security --> AdminService : 密码与会话
+    RateLimiter --> LicenseService : activate 限流
+    Database --> LicenseRepo
+    Database --> CodeRepo
+    Database --> CustomerRepo
+    Database --> AdminRepo
+    Database --> AuditRepo
+    Database --> StatsRepo
+    LicenseRepo --> LicenseService
+    CodeRepo --> LicenseService
+    CustomerRepo --> LicenseService
+    AuditRepo --> LicenseService : 激活/续期审计
+    LicenseRepo --> AdminService
+    CodeRepo --> AdminService
+    CustomerRepo --> AdminService
+    AdminRepo --> AdminService
+    AuditRepo --> AdminService
+    StatsRepo --> AdminService
+    AdminUser "1" --> "0..*" AdminSession
+    Customer "1" --> "0..*" License
+    Customer "1" --> "0..*" LicenseCode
+    LicenseCode "1" --> "0..*" License
+    AdminUser "1" --> "0..*" AuditLog

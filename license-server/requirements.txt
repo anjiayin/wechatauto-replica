@@ -1,0 +1,5 @@
+fastapi>=0.110,<1.0        # Web 框架
+uvicorn>=0.27              # ASGI 服务器
+pydantic>=2.5,<3.0         # 请求体校验（v2）
+cryptography>=41.0         # Ed25519 签名
+PyMySQL>=1.1.0             # MySQL 驱动

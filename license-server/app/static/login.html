@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 · 授权服务后台</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="login-wrap">
+  <div class="login-box">
+    <h1>授权服务后台</h1>
+    <p class="sub">电脑授权：激活码 / 许可证 / 审计</p>
+    <form id="login-form" autocomplete="off">
+      <div class="field">
+        <label for="username">用户名</label>
+        <input id="username" name="username" type="text" maxlength="32" required autofocus>
+      </div>
+      <div class="field">
+        <label for="password">密码</label>
+        <input id="password" name="password" type="password" maxlength="128" required>
+      </div>
+      <button class="btn" id="submit" type="submit">登录</button>
+      <div class="login-err" id="msg"></div>
+    </form>
+  </div>
+</div>
+<script src="app.js"></script>
+<script>
+(function () {
+  'use strict';
+  var msg = document.getElementById('msg');
+  var params = new URLSearchParams(location.search);
+  if (params.get('changed') === '1') {
+    msg.style.color = '#17764a';
+    msg.textContent = '密码已修改，请用新密码重新登录。';
+  }
+
+  function target() {
+    var next = params.get('next') || 'index.html';
+    // 只允许同目录下的相对页面，避免被构造成外链跳转
+    if (!/^[a-z0-9_-]+\.html(\?.*)?$/i.test(next)) { return 'index.html'; }
+    return next;
+  }
+
+  async function login(event) {
+    event.preventDefault();
+    var button = document.getElementById('submit');
+    msg.style.color = '#b3261e';
+    msg.textContent = '';
+    button.disabled = true;
+    var body = {
+      username: document.getElementById('username').value,
+      password: document.getElementById('password').value
+    };
+    try {
+      var resp = await fetch('/admin/api/login', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        body: JSON.stringify(body)
+      });
+      var text = await resp.text();
+      var data = null;
+      try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
+      if (!resp.ok || (data && data.ok === false)) {
+        var reason = (data && data.error && data.error.message)
+          ? data.error.message
+          : ('登录失败（HTTP ' + resp.status + '）');
+        msg.textContent = reason;
+        return;
+      }
+      LS.setCsrf(data.csrf_token);
+      sessionStorage.setItem('ls_user', JSON.stringify(data.user));
+      if (data.user.must_change_password) {
+        location.href = 'account.html?first=1';
+        return;
+      }
+      location.href = target();
+    } catch (e) {
+      msg.textContent = '网络异常，请确认授权服务是否正常运行';
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  document.getElementById('login-form').addEventListener('submit', login);
+}());
+</script>
+</body>
+</html>

@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>客户档案 · 授权服务后台</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="nav"></div>
+<main class="wrap">
+  <h1>客户档案</h1>
+
+  <div class="card">
+    <h2>新增 / 更新客户（按手机号去重）</h2>
+    <div class="row">
+      <div class="field"><label for="c-name">客户名称</label>
+        <input id="c-name" maxlength="64" placeholder="某某汽配"></div>
+      <div class="field"><label for="c-phone">手机号（必填）</label>
+        <input id="c-phone" maxlength="32" placeholder="13800000000"></div>
+      <div class="field"><label for="c-note">备注</label>
+        <input id="c-note" maxlength="255"></div>
+      <button class="btn" id="save">保存</button>
+    </div>
+    <p class="hint">手机号是客户档案的业务主键：同号保存即更新名称/备注，不会产生重复客户。</p>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div class="field"><label for="f-q">搜索</label>
+        <input id="f-q" maxlength="64" placeholder="客户名称 / 手机号"></div>
+      <button class="btn" id="search">查询</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>客户列表</h2>
+    <div id="list"></div>
+    <div class="pager" id="pager"></div>
+  </div>
+
+  <div class="card" id="detail-card" style="display:none">
+    <h2>客户详情</h2>
+    <div id="detail"></div>
+  </div>
+</main>
+<script src="app.js"></script>
+<script>
+(function () {
+  'use strict';
+  var h = LS.h;
+  var state = { page: 1, size: 20, total: 0 };
+
+  async function showDetail(row) {
+    try {
+      var data = await LS.apiGet('/admin/api/customers/' + row.id);
+      var card = document.getElementById('detail-card');
+      var box = document.getElementById('detail');
+      card.style.display = '';
+      box.replaceChildren();
+      box.append(LS.table(['客户名称', '手机号', '备注', '建档时间'], [[
+        data.item.name || '-', data.item.phone || '-', data.item.note || '-',
+        LS.fmtTime(data.item.created_at)
+      ]]));
+      box.append(h('h2', { text: '该客户机器（' + (data.machines || []).length + ' 台/条）' }));
+      box.append(LS.table(['许可证号', '状态', '机器码', '到期日', '最近心跳'],
+        (data.machines || []).map(function (item) {
+          return [h('td', null, h('code', { text: item.license_id })),
+            LS.roleBadge(item.role), h('td', { class: 'mono', text: item.machine_code }),
+            LS.fmtTime(item.expires_at), LS.fmtTime(item.last_seen_at)];
+        })));
+      box.append(h('h2', { text: '该客户激活码（' + (data.codes || []).length + ' 个）' }));
+      box.append(LS.table(['激活码', '天数', '批次', '状态', '使用时间'],
+        (data.codes || []).map(function (item) {
+          return [h('td', null, h('code', { text: item.code })),
+            String(item.days), item.batch || '-',
+            item.used_machine ? LS.badge('已使用', 'warn') : LS.badge('未使用', 'ok'),
+            LS.fmtTime(item.used_at)];
+        })));
+      card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (e) {
+      LS.showError(e);
+    }
+  }
+
+  function renderItems(items) {
+    var box = document.getElementById('list');
+    box.replaceChildren(LS.table(
+      ['ID', '客户名称', '手机号', '机器数', '生效数', '最近到期', '最近心跳', '备注', '操作'],
+      items.map(function (row) {
+        return [
+          String(row.id),
+          row.name || '-',
+          row.phone || '-',
+          String(row.machine_total),
+          String(row.active_count),
+          LS.fmtDay(row.max_expires_at),
+          LS.fmtTime(row.last_seen_at),
+          row.note || '-',
+          h('td', null, h('button', {
+            class: 'btn small ghost', text: '详情',
+            onclick: function () { showDetail(row); }
+          }))
+        ];
+      })));
+  }
+
+  async function load() {
+    var params = new URLSearchParams();
+    params.set('q', LS.val('f-q'));
+    params.set('page', String(state.page));
+    params.set('size', String(state.size));
+    try {
+      var data = await LS.apiGet('/admin/api/customers?' + params.toString());
+      state.total = data.total;
+      state.size = data.size;
+      renderItems(data.items || []);
+      LS.pager(document.getElementById('pager'), state, function (page) {
+        state.page = page;
+        load();
+      });
+    } catch (e) {
+      if (e.code !== 'unauthorized') { LS.showError(e); }
+    }
+  }
+
+  async function save() {
+    var body = {
+      name: LS.val('c-name'), phone: LS.val('c-phone'), note: LS.val('c-note')
+    };
+    if (!body.phone) { LS.toast('手机号必填', true); return; }
+    var button = document.getElementById('save');
+    button.disabled = true;
+    try {
+      await LS.apiPost('/admin/api/customers', body);
+      LS.toast('已保存客户档案');
+      document.getElementById('c-note').value = '';
+      state.page = 1;
+      load();
+    } catch (e) {
+      LS.showError(e);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  LS.bootPage('customers').then(function (user) {
+    if (!user) { return; }
+    document.getElementById('save').addEventListener('click', save);
+    document.getElementById('search').addEventListener('click', function () {
+      state.page = 1;
+      load();
+    });
+    load();
+  });
+}());
+</script>
+</body>
+</html>

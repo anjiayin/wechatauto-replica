@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>审计日志 · 授权服务后台</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="nav"></div>
+<main class="wrap">
+  <h1>审计日志</h1>
+
+  <div class="card">
+    <div class="row">
+      <div class="field"><label for="f-action">动作</label>
+        <select id="f-action"><option value="">全部</option></select></div>
+      <div class="field"><label for="f-machine">机器码</label>
+        <input id="f-machine" maxlength="40" placeholder="可选"></div>
+      <div class="field"><label for="f-q">关键字</label>
+        <input id="f-q" maxlength="64" placeholder="操作人 / 目标 / 备注"></div>
+      <button class="btn" id="search">查询</button>
+    </div>
+    <p class="hint">审计日志只增不删：谁在什么时候把哪张证改成了什么，都能回溯（含变更前后 JSON）。</p>
+  </div>
+
+  <div class="card">
+    <div id="list"></div>
+    <div class="pager" id="pager"></div>
+  </div>
+</main>
+<script src="app.js"></script>
+<script>
+(function () {
+  'use strict';
+  var h = LS.h;
+  var state = { page: 1, size: 20, total: 0 };
+
+  function cell(dict) {
+    if (!dict) { return h('td', { class: 'hint', text: '-' }); }
+    var text = JSON.stringify(dict, null, 2);
+    var pre = h('pre', { class: 'text-out', text: text });
+    return h('td', null, h('details', null,
+      h('summary', { text: '展开' }), pre));
+  }
+
+  function renderItems(items) {
+    var box = document.getElementById('list');
+    box.replaceChildren(LS.table(
+      ['时间', '操作人', '动作', '目标', '机器码', '天数', 'IP', '备注', '变更前', '变更后'],
+      items.map(function (row) {
+        return [
+          LS.fmtTime(row.created_at),
+          row.actor || '-',
+          row.action,
+          (row.target_type ? row.target_type + ':' : '') + (row.target_id || '-'),
+          h('td', { class: 'mono', text: row.machine_code || '-' }),
+          row.days_delta ? String(row.days_delta) : '-',
+          row.ip || '-',
+          row.note || '-',
+          cell(row.before),
+          cell(row.after)
+        ];
+      })));
+  }
+
+  function fillActions(actions) {
+    var select = document.getElementById('f-action');
+    var current = select.value;
+    (actions || []).forEach(function (action) {
+      if (!action) { return; }
+      select.append(h('option', { value: action, text: action }));
+    });
+    select.value = current || '';
+  }
+
+  async function load() {
+    var params = new URLSearchParams();
+    params.set('action', LS.val('f-action'));
+    params.set('machine_code', LS.val('f-machine'));
+    params.set('q', LS.val('f-q'));
+    params.set('page', String(state.page));
+    params.set('size', String(state.size));
+    try {
+      var data = await LS.apiGet('/admin/api/audit?' + params.toString());
+      state.total = data.total;
+      state.size = data.size;
+      renderItems(data.items || []);
+      fillActions(data.actions);
+      LS.pager(document.getElementById('pager'), state, function (page) {
+        state.page = page;
+        load();
+      });
+    } catch (e) {
+      if (e.code !== 'unauthorized') { LS.showError(e); }
+    }
+  }
+
+  LS.bootPage('audit').then(function (user) {
+    if (!user) { return; }
+    document.getElementById('search').addEventListener('click', function () {
+      state.page = 1;
+      load();
+    });
+    load();
+  });
+}());
+</script>
+</body>
+</html>

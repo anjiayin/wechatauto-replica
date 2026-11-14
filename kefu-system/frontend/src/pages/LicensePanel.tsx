@@ -20,6 +20,7 @@ import {
   Typography,
 } from '@mui/material'
 import ContentCopyIcon from '@mui/icons-material/ContentCopy'
+import CloseIcon from '@mui/icons-material/Close'
 import KeyIcon from '@mui/icons-material/VpnKey'
 import { ApiError, apiGet, apiPost } from '../api/client'
 import type { LicenseStatusOut } from '../api/types'
@@ -306,14 +307,6 @@ export function LicenseDialog(props: {
   )
 }
 
-/** 授权开关来源的中文说明（后端 enabled_source 字段） */
-const SOURCE_LABELS: Record<string, string> = {
-  'env-force': '环境变量 KEFU_LICENSE_MODE（强制授权，无视测试口令）',
-  env: '环境变量 KEFU_LICENSE_ENABLED',
-  db: '数据库设置 license.enabled',
-  default: 'app/config.py 默认值',
-}
-
 /**
  * 设置页「授权」标签页：随时查看机器码与授权状态。
  *
@@ -328,6 +321,21 @@ export function LicenseSettingsTab() {
   const ok = Boolean(status?.ok)
   const devMode = Boolean(status?.dev_mode)
   const nearExpiry = (status?.days_left ?? 999) <= 7
+
+  // 「刷新状态」必须真的连一次服务器（心搏），而不是只重读本地缓存——
+  // 吊销/续期/改期限都发生在服务器上，本地文件感知不到（现场踩过：
+  // 后台吊销后客户端一直显示正常，因为按钮只刷了本地）。
+  // 后台周期心搏默认 6 小时一次，手动点按钮就是为了让用户立刻看到结果。
+  const serverRefresh = useMutation({
+    mutationFn: () => apiPost<LicenseStatusOut>('/api/license/refresh'),
+    onSuccess: (next) => {
+      void refetch()
+      setToast(next.ok
+        ? `已联网确认：${next.state === 'offline_grace' ? '离线宽限中' : '授权正常'}`
+        : `服务器返回：${STATE_TITLES[next.state] ?? next.state}`)
+    },
+    onError: (e) => setToast(`联网确认失败：${(e as Error).message}`),
+  })
 
   const severity = devMode ? 'error'
     : ok ? (nearExpiry ? 'warning' : 'success') : 'error'
@@ -348,12 +356,6 @@ export function LicenseSettingsTab() {
   return (
     <Stack spacing={2} sx={{ maxWidth: 760 }}>
       <Alert severity={severity}>{headline}</Alert>
-      {status?.enabled_source && (
-        <Typography variant="caption" color="text.secondary">
-          授权开关来源：{SOURCE_LABELS[status.enabled_source] ??
-            status.enabled_source}
-        </Typography>
-      )}
       {status?.message && (enabled || devMode) && (
         <Typography variant="body2" color="text.secondary">
           {status.message}
@@ -443,10 +445,10 @@ export function LicenseSettingsTab() {
         </Button>
         <Button
           variant="outlined"
-          disabled={!enabled || isFetching}
-          onClick={() => void refetch()}
+          disabled={!enabled || serverRefresh.isPending}
+          onClick={() => serverRefresh.mutate()}
         >
-          {isFetching ? '查询中…' : '刷新状态'}
+          {serverRefresh.isPending ? '联网确认中…' : '刷新状态'}
         </Button>
       </Stack>
 
@@ -486,34 +488,78 @@ export function LicenseSettingsTab() {
   )
 }
 
+/** 当日不再提示的 localStorage 键（值为 `${日期}|${提示身份}`） */
+const NOTICE_DISMISS_KEY = 'license.notice.dismissed'
+
+/** 本地日期 YYYY-MM-DD（不用 toISOString——那是 UTC，会提前一天翻日）。 */
+function localToday(): string {
+  const d = new Date()
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+function readNoticeDismissed(): string {
+  try {
+    return localStorage.getItem(NOTICE_DISMISS_KEY) ?? ''
+  } catch {
+    return ''           // 隐私模式等存不进去：退化为「每次都提示」
+  }
+}
+
+function writeNoticeDismissed(value: string): void {
+  try {
+    localStorage.setItem(NOTICE_DISMISS_KEY, value)
+  } catch {
+    /* 存不进去就算了，下次还会提示，无伤大雅 */
+  }
+}
+
 /**
  * 全局授权门：横幅提示 + 不可关闭的激活遮罩。
  *
+ * 到期前 7 天起每天提示剩余天数；用户点 × 关闭后**当日**不再提示，
+ * 次日（或剩余天数变化，比如续费后又到期）自动恢复提示。
+ *
  * Args:
- *     onRequestOpen: 顶部 Chip 被点击时通知外层打开对话框。
- *     registerChip: 把 Chip 元素注册给顶栏渲染（避免顶栏重复请求）。
+ *     onOpen: 「查看」按钮/顶部 Chip 被点击时通知外层打开对话框。
  */
 export function LicenseNotice(props: {
   status?: LicenseStatusOut
   onOpen: () => void
 }) {
   const { status } = props
+  const [dismissedMark, setDismissedMark] = useState(readNoticeDismissed)
   if (!status || !status.enabled || !status.ok) return null
   // 只提示「离线」与「7 天内到期」两种，正常状态不打扰
   const nearExpiry = (status.days_left ?? 999) <= 7
   if (status.state !== 'offline_grace' && !nearExpiry) return null
+  // 提示身份 = 状态 + 剩余天数：跨天必换日期、续费/到期必变剩余天数，
+  // 两者任一变化都会让关闭记录失效、横幅重新出现
+  const noticeKey = `${status.state}:${status.days_left}`
+  if (dismissedMark === `${localToday()}|${noticeKey}`) return null
   const text =
     status.state === 'offline_grace'
       ? `离线运行中：暂时连不上授权服务器（宽限 ${status.grace_days} 天内可继续使用）`
       : `授权将在 ${formatDate(status.expires_at)} 到期（剩余 ${status.days_left} 天），请及时续费`
+  const dismiss = () => {
+    const mark = `${localToday()}|${noticeKey}`
+    writeNoticeDismissed(mark)
+    setDismissedMark(mark)
+  }
   return (
     <Alert
       severity="warning"
       sx={{ mb: 2 }}
       action={
-        <Button color="inherit" size="small" onClick={props.onOpen}>
-          查看
-        </Button>
+        <Stack direction="row" spacing={0.5} alignItems="center">
+          <Button color="inherit" size="small" onClick={props.onOpen}>
+            查看
+          </Button>
+          <IconButton color="inherit" size="small" onClick={dismiss}
+                      aria-label="今日不再提示">
+            <CloseIcon fontSize="small" />
+          </IconButton>
+        </Stack>
       }
     >
       {text}

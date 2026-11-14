@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>仪表盘 · 授权服务后台</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="nav"></div>
+<main class="wrap">
+  <h1>仪表盘</h1>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <div class="row">
+        <div class="field">
+          <label for="days">趋势区间</label>
+          <select id="days">
+            <option value="7">近 7 天</option>
+            <option value="30" selected>近 30 天</option>
+            <option value="90">近 90 天</option>
+          </select>
+        </div>
+        <button class="btn" id="refresh">刷新</button>
+      </div>
+      <span class="hint" id="stamp"></span>
+    </div>
+  </div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="card">
+    <h2>新增趋势（激活码 / 许可证）</h2>
+    <div class="legend">
+      <span><i style="background:#4c9aff"></i>激活码新增</span>
+      <span><i style="background:#2fbf85"></i>许可证新增</span>
+    </div>
+    <div id="trend"></div>
+  </div>
+
+  <div class="split">
+    <div class="card">
+      <h2>按手机号聚合（Top 20）</h2>
+      <div id="by-phone"></div>
+    </div>
+    <div class="card">
+      <h2>按客户名聚合（Top 20）</h2>
+      <div id="by-customer"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>最近激活（10 条）</h2>
+    <div id="recent"></div>
+  </div>
+</main>
+<script src="app.js"></script>
+<script>
+(function () {
+  'use strict';
+  var h = LS.h;
+
+  function renderCards(data) {
+    var items = [
+      ['激活码总数', data.codes.total],
+      ['激活码已用', data.codes.used],
+      ['激活码未用', data.codes.unused],
+      ['许可证总数', data.licenses.total],
+      ['当前生效', data.licenses.active],
+      ['已过期（占位中）', data.licenses.expired],
+      ['已吊销', data.licenses.revoked],
+      ['近 7 天活跃机器', data.machines.active_7d],
+      ['30 天内到期', data.expiring_30d],
+      ['去重机器数', data.machines.total]
+    ];
+    var box = document.getElementById('cards');
+    box.replaceChildren();
+    items.forEach(function (pair) {
+      box.append(h('div', { class: 'stat' },
+        h('div', { class: 'k', text: pair[0] }),
+        h('div', { class: 'v', text: String(pair[1] === undefined ? 0 : pair[1]) })));
+    });
+  }
+
+  function renderTrend(trend) {
+    var box = document.getElementById('trend');
+    box.replaceChildren();
+    if (!trend || !trend.length) {
+      box.append(h('div', { class: 'hint', text: '暂无数据' }));
+      return;
+    }
+    var max = 1;
+    trend.forEach(function (row) {
+      max = Math.max(max, row.codes || 0, row.licenses || 0);
+    });
+    var chart = h('div', { class: 'chart' });
+    trend.forEach(function (row) {
+      var bars = h('div', { class: 'bars' },
+        h('div', {
+          class: 'bar bar-code',
+          style: 'height:' + Math.max(1, Math.round((row.codes || 0) / max * 100)) + '%'
+        }),
+        h('div', {
+          class: 'bar bar-lic',
+          style: 'height:' + Math.max(1, Math.round((row.licenses || 0) / max * 100)) + '%'
+        }));
+      var col = h('div', {
+        class: 'chart-col',
+        title: row.date + '：激活码 ' + (row.codes || 0) + ' / 许可证 ' + (row.licenses || 0)
+      }, bars, h('div', { class: 'chart-label', text: String(row.date || '').slice(5) }));
+      chart.append(col);
+    });
+    box.append(chart);
+  }
+
+  function renderGroups(el, rows) {
+    el.replaceChildren(LS.table(
+      ['手机号/客户名', '最近客户名', '机器数', '生效数', '最近到期', '最近心跳'],
+      (rows || []).map(function (row) {
+        return [
+          h('td', { class: 'mono', text: row.key || '-' }),
+          row.customer_name || '-',
+          row.machine_total,
+          row.active_count,
+          LS.fmtDay(row.max_expires_at),
+          LS.fmtTime(row.last_seen_at)
+        ];
+      })));
+  }
+
+  function renderRecent(rows) {
+    var box = document.getElementById('recent');
+    box.replaceChildren(LS.table(
+      ['许可证号', '机器码', '客户', '到期日', '签发时间', '状态'],
+      (rows || []).map(function (row) {
+        return [
+          h('td', null, h('code', { text: row.license_id || '-' })),
+          h('td', { class: 'mono', text: row.machine_code || '-' }),
+          row.customer_name || '-',
+          LS.fmtDay(row.expires_at),
+          LS.fmtTime(row.created_at),
+          row.current ? LS.badge('生效中', 'ok') : LS.badge('历史', 'muted')
+        ];
+      })));
+  }
+
+  async function load() {
+    var days = LS.val('days') || '30';
+    try {
+      var data = await LS.apiGet('/admin/api/dashboard?days=' + encodeURIComponent(days));
+      renderCards(data);
+      renderTrend(data.trend);
+      renderGroups(document.getElementById('by-phone'), data.by_phone);
+      renderGroups(document.getElementById('by-customer'), data.by_customer);
+      renderRecent(data.recent_activations);
+      LS.setText('stamp', '统计时间：' + LS.fmtTime(data.generated_at));
+    } catch (e) {
+      if (e.code !== 'unauthorized') { LS.showError(e); }
+    }
+  }
+
+  LS.bootPage('index').then(function (user) {
+    if (!user) { return; }
+    document.getElementById('refresh').addEventListener('click', load);
+    document.getElementById('days').addEventListener('change', load);
+    load();
+  });
+}());
+</script>
+</body>
+</html>
