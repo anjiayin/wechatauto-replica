@@ -6,7 +6,8 @@
 - GET   /api/opportunities/{id}                详情（并清除该条未读；不查微信库，秒开）
 - GET   /api/opportunities/{id}/context        上下文消息（独立异步，失败可重试）
 - PATCH /api/opportunities/{id}                {status}
-- POST  /api/opportunities/{id}/reply          {text, at?, quote?} → 202 受理
+- GET   /api/opportunities/{id}/reply-targets  回复去向（群聊?/发送人能否私信）
+- POST  /api/opportunities/{id}/reply          {text, at?, quote?, target?} → 202 受理
 """
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ from app.schemas import (
     OpportunityStatusUpdate,
     ReplyAccepted,
     ReplyRequest,
+    ReplyTargetOut,
 )
 from app.sender import SendTask
 from app.wechat_service import WeChatService
@@ -295,12 +297,118 @@ def update_opportunity_status(opp_id: int, body: OpportunityStatusUpdate,
 # ---------------------------------------------------------------------------
 # 回复
 # ---------------------------------------------------------------------------
+def _group_sender_name(svc: Any, chatroom: str, sender_username: str,
+                       stored: str) -> str:
+    """群发送人的当前群内显示名（@ 用），失败回退库里的发送人名。
+
+    群里改名很常见（`opp.sender_name` 是产生商机时的群昵称），而微信 @ 弹层
+    匹配的是**当前**群昵称，所以优先取群成员表里的实时名字；读不到就用已存值
+    ——名字对不上顶多 @ 不到人，不能让详情页报错。
+    """
+    if not sender_username:
+        return stored
+    lister = getattr(svc, "list_group_members", None)
+    if not callable(lister):
+        return stored
+    try:
+        for member in lister(chatroom):
+            if str(member.get("wxid") or "") == sender_username:
+                return str(member.get("name") or "") or stored
+    except Exception as exc:
+        logger.debug("读取群成员实时昵称失败（%s）：%s", chatroom, exc)
+    return stored
+
+
+def _dm_target(opp: dict, svc: Any) -> tuple[str, str]:
+    """私信回复的目标（发送人 wxid + 私信会话显示名）。
+
+    群商机默认回复到群里；客户想单独说的事（报价、联系方式）必须走私信，
+    但**只有好友才能私信**——群里的陌生人（local_type=0）根本开不出会话。
+
+    Raises:
+        HTTPException: 400，带用户可读原因（非群聊 / 识别不到发送人 /
+            对方不是好友）。
+    """
+    chatroom = str(opp.get("session_username") or "")
+    if not chatroom.endswith("@chatroom"):
+        raise HTTPException(status_code=400,
+                            detail="当前商机不是群聊，直接回复会话即可")
+    sender = str(opp.get("sender_wxid") or "").strip()
+    if not sender:
+        raise HTTPException(
+            status_code=400,
+            detail="无法识别该条消息的发送人，不能私信回复；"
+                   "请改用群内回复")
+    checker = getattr(svc, "is_friend", None)
+    if not callable(checker) or not checker(sender):
+        raise HTTPException(
+            status_code=400,
+            detail=f"「{opp.get('sender_name') or sender}」不是你的微信好友，"
+                   "不能私信回复；请改用群内回复")
+    name = ""
+    try:
+        resolver = getattr(svc, "display_name_with_corp", None)
+        if callable(resolver):
+            name = str(resolver(sender) or "").strip()
+    except Exception:      # 显示名只是搜索用的关键词，失败就退回已存名称
+        logger.debug("取私信目标显示名失败（%s）", sender)
+    return sender, name or str(opp.get("sender_name") or "") or sender
+
+
+@router.get("/{opp_id}/reply-targets", response_model=ReplyTargetOut)
+def get_reply_targets(opp_id: int,
+                      db: Database = Depends(get_db),
+                      ) -> ReplyTargetOut:
+    """回复去向信息：是否群聊 / 发送人是谁 / 能不能私信。
+
+    前端据此决定「私信回复」按钮是否可点、@ 默认勾选谁。微信库读不到时
+    退化为「群内回复可用、私信不可用」，不影响详情页打开（详情本身只读
+    业务库）。
+    """
+    opp = db.get_opportunity(opp_id)
+    if not opp:
+        raise HTTPException(status_code=404, detail="商机不存在")
+    # 这里用「可选」服务：微信库没就绪时也要能返回 is_group，前端据此
+    # 只禁用私信按钮，详情页不能被微信库拖下水
+    svc = get_wechat_service_optional()
+    chatroom = str(opp.get("session_username") or "")
+    is_group = chatroom.endswith("@chatroom")
+    sender_username = str(opp.get("sender_wxid") or "").strip()
+    stored_sender = str(opp.get("sender_name") or "").strip()
+    out = ReplyTargetOut(
+        is_group=is_group,
+        session_username=chatroom,
+        session_name=str(opp.get("session_name") or ""),
+        sender_username=sender_username,
+        sender_name=stored_sender,
+    )
+    if not is_group:
+        return out
+    out.sender_name = _group_sender_name(svc, chatroom, sender_username,
+                                         stored_sender) or sender_username
+    if not sender_username:
+        out.reason = "无法识别该条消息的发送人，只能群内回复"
+        return out
+    checker = getattr(svc, "is_friend", None)
+    out.sender_is_friend = bool(callable(checker) and checker(sender_username))
+    if not out.sender_is_friend:
+        out.reason = "对方不是你的微信好友，只能群内回复"
+    return out
+
+
 @router.post("/{opp_id}/reply", response_model=ReplyAccepted, status_code=202)
 def reply_opportunity(opp_id: int, body: ReplyRequest,
                       db: Database = Depends(get_db),
                       svc: WeChatService = Depends(get_wechat_service),
                       ) -> ReplyAccepted:
     """人工回复：入队 GUI 串行发送，结果经 WS ``send_result`` 事件送达。
+
+    ``target``（第 15 批）区分两种去向：
+
+    - ``session``（默认）：发到商机所在会话。群商机即「群内回复」，
+      可 @ 发送人/群成员、可引用某条消息；
+    - ``sender``：**私信**发给该条消息的发送人。仅群商机且对方是好友时
+      可用（群里 @ 与引用对私信没有意义，一律丢弃）。
 
     目标校验①：会话须存在于监控对象或微信联系人库。
 
@@ -311,21 +419,34 @@ def reply_opportunity(opp_id: int, body: ReplyRequest,
     opp = db.get_opportunity(opp_id)
     if not opp:
         raise HTTPException(status_code=404, detail="商机不存在")
-    session_username = opp["session_username"]
+    target = "sender" if body.target == "sender" else "session"
+    extra_note = ""
+    if target == "sender":
+        # 私信：目标换成发送人本人；@ 与引用在私信会话里无从谈起，丢弃
+        session_username, session_name = _dm_target(opp, svc)
+        if body.at or body.quote is not None:
+            logger.info("私信回复丢弃 @/引用（商机 #%d）", opp_id)
+        at_names: List[str] = []
+        quote_local_id: Optional[int] = None
+    else:
+        session_username = opp["session_username"]
+        # 会话显示名：企业微信联系人为「昵称@企业简称」
+        # （展开发送时会剥离后缀再搜索）
+        session_name = opp["session_name"] or opp["session_username"]
+        if _is_openim(session_username) and "@" not in session_name:
+            session_name = _display_with_corp(svc, session_username,
+                                              session_name)
+        at_names = [a.strip() for a in body.at if a.strip()]
+        quote_local_id = body.quote.local_id if body.quote else None
     # 目标校验①：监控对象或联系人存在性
     if not db.get_target_by_username(session_username) \
             and not svc.session_exists(session_username):
         raise HTTPException(
             status_code=400,
-            detail=f"目标会话不存在或已失效：{opp['session_name']}，"
+            detail=f"目标会话不存在或已失效：{session_name}，"
                    "请确认微信仍在使用该会话")
-    # 会话显示名：企业微信联系人为「昵称@企业简称」（展开发送时会剥离后缀再搜索）
-    session_name = opp["session_name"] or opp["session_username"]
-    if _is_openim(session_username) and "@" not in session_name:
-        session_name = _display_with_corp(svc, session_username, session_name)
-    extra_note = ""
     manual = bool(body.manual_confirm)
-    if manual and (body.at or body.quote is not None):
+    if manual and (at_names or quote_local_id is not None):
         # 人工确认模式下只做「清空输入框 + 填入正文」，@ 弹层与引用卡片都
         # 需要发送动作配合才能成型。丢弃它们比强行自动发送安全：这一步本来
         # 就是让用户在微信里自己收尾，@ 与引用在微信里点一下即可。
@@ -336,20 +457,25 @@ def reply_opportunity(opp_id: int, body: ReplyRequest,
         session_username=session_username,
         session_name=session_name,
         text=body.text.strip(),
-        at=[] if manual else [a.strip() for a in body.at if a.strip()],
-        quote_local_id=None if manual else (
-            body.quote.local_id if body.quote else None),
+        at=[] if manual else at_names,
+        quote_local_id=None if manual else quote_local_id,
         manual_confirm=manual,
+        target=target,
     )
     if not task.text:
         raise HTTPException(status_code=422, detail="回复内容不能为空")
     if not get_sender().submit(task):
         raise HTTPException(status_code=500, detail="发送队列不可用，请稍后重试")
     action = "填入输入框" if task.manual_confirm else "自动发送"
-    logger.info("回复任务已受理（商机 #%d → %s，%s）", opp_id, task.session_name,
+    logger.info("回复任务已受理（商机 #%d → %s%s，%s）", opp_id,
+                task.session_name, "（私信）" if target == "sender" else "",
                 action)
-    return ReplyAccepted(
-        ok=True,
-        message=(f"已加入队列：将把内容填入「{session_name}」的微信输入框，"
-                 f"请在微信里核对后点发送{extra_note}" if task.manual_confirm
-                 else "已加入发送队列，发送结果将在页面提示"))
+    if task.manual_confirm:
+        box = "私信输入框" if target == "sender" else "微信输入框"
+        message = (f"已加入队列：将把内容填入「{session_name}」的{box}，"
+                   f"请在微信里核对后点发送{extra_note}")
+    elif target == "sender":
+        message = f"已加入私信发送队列（发给{session_name}），发送结果将在页面提示"
+    else:
+        message = "已加入发送队列，发送结果将在页面提示"
+    return ReplyAccepted(ok=True, message=message)

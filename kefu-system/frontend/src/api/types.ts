@@ -240,6 +240,8 @@ export interface OpportunityDetail extends OpportunityListItem {
   key_quote: string
   reply_content: string | null
   replied_at: string | null
+  /** 上次回复去向：session=会话内（群商机=群内）/ sender=私信；存量为空串 */
+  reply_target?: string
   // 上下文已拆分为独立接口 GET /api/opportunities/{id}/context
 }
 
@@ -312,10 +314,29 @@ export interface ReplyPayload {
   at: string[]
   quote?: { local_id: number }
   /**
+   * 回复去向：session=商机会话（群商机即群内回复）；
+   * sender=私信发给该条消息的发送人（仅群商机、对方是好友时可用）
+   */
+  target?: 'session' | 'sender'
+  /**
    * 人工确认（默认 true）：只把内容填进微信输入框，由用户在微信里核对
    * 收件人后自己点发送。false = 自动发送并按数据库确认。
    */
   manual_confirm?: boolean
+}
+
+/** /api/opportunities/{id}/reply-targets：回复去向（群内 / 私信） */
+export interface ReplyTarget {
+  is_group: boolean
+  session_username: string
+  session_name: string
+  /** 该商机消息的发送人（群内默认 @ 他，私信回复发给他） */
+  sender_username: string
+  sender_name: string
+  /** 发送人是否能私信：false 时「私信回复」按钮置灰 */
+  sender_is_friend: boolean
+  /** 不能私信的用户可读原因（空串 = 可以私信） */
+  reason: string
 }
 
 /** /api/opportunities/{id}/members：@ 群成员候选（name 为群内显示名） */

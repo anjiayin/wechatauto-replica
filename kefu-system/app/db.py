@@ -91,6 +91,9 @@ _OPPORTUNITIES_COLUMNS = """
                        CHECK (status IN ('pending','replied','ignored','handled')),
       reply_content    TEXT,
       replied_at       TEXT,
+      -- 回复去向（第 15 批）：'session'=会话内回复（群商机=群内），
+      -- 'sender'=私信发给该条消息的发送人；存量记录为空串
+      reply_target     TEXT NOT NULL DEFAULT '',
       created_at       TEXT NOT NULL DEFAULT (datetime('now','localtime'))
     """
 
@@ -320,6 +323,8 @@ class Database:
             ("opportunities", "direction", "TEXT NOT NULL DEFAULT ''"),
             # 原文图片引用（批次 11 需求 1）：JSON 数组字符串，默认 '[]'
             ("opportunities", "raw_refs", "TEXT NOT NULL DEFAULT '[]'"),
+            # 回复去向（第 15 批）：群商机的「群内回复 / 私信回复」区分
+            ("opportunities", "reply_target", "TEXT NOT NULL DEFAULT ''"),
             ("analysis_logs", "prompt_tokens", "INTEGER"),
             ("analysis_logs", "completion_tokens", "INTEGER"),
             # 时序诊断（收消息→合并→排队→AI）：定位「延迟到底花在哪一段」
@@ -861,13 +866,22 @@ class Database:
             self._conn.commit()
             return cur.rowcount
 
-    def set_opportunity_replied(self, opp_id: int, reply_content: str) -> int:
-        """标记商机已回复（回复成功后由 Sender 调用）。"""
+    def set_opportunity_replied(self, opp_id: int, reply_content: str,
+                                target: str = "session") -> int:
+        """标记商机已回复（回复成功后由 Sender 调用）。
+
+        Args:
+            target: ``session``=会话内回复（群商机=群内）/ ``sender``=私信回复。
+                详情页据此提示「这是私信回的还是群里回的」，避免用户以为
+                群里的人都看到了。
+        """
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE opportunities SET status='replied', reply_content=?, "
-                "replied_at=? WHERE id=?",
-                (reply_content, now_iso(), opp_id),
+                "replied_at=?, reply_target=? WHERE id=?",
+                (reply_content, now_iso(),
+                 target if target in ("session", "sender") else "session",
+                 opp_id),
             )
             self._conn.commit()
             return cur.rowcount

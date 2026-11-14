@@ -447,6 +447,8 @@ class OpportunityDetailOut(OpportunityListItem):
     key_quote: str = ""
     reply_content: Optional[str] = None
     replied_at: Optional[str] = None
+    # 上次回复去向：session=群内回复（或私聊会话直接回复）/ sender=私信回复
+    reply_target: str = ""
     # 上下文已拆分为独立接口 GET /api/opportunities/{id}/context
     # （详情接口不查微信库，秒开；上下文区域独立加载态）
 
@@ -469,6 +471,9 @@ class ReplyRequest(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
     at: List[str] = Field(default_factory=list)
     quote: Optional[QuoteRef] = None
+    # 回复去向（第 15 批）：session=发到商机所在会话（群商机=群内回复）；
+    # sender=私信发给该条消息的发送人（仅群商机、且对方是好友时可用）。
+    target: str = Field(default="session", pattern="^(session|sender)$")
     # 人工确认（用户反馈：怕发错人）：True = 只把内容填进微信输入框，由用户
     # 自己核对后点发送；False = 自动发送并按数据库确认。默认 True —— 误发到
     # 同名联系人的代价远大于多一次人工点击。
@@ -478,6 +483,23 @@ class ReplyRequest(BaseModel):
 class ReplyAccepted(BaseModel):
     ok: bool
     message: str
+
+
+class ReplyTargetOut(BaseModel):
+    """回复去向信息（前端据此决定「私信回复」按钮是否可点、@ 默认谁）。"""
+
+    # 是否群商机（群商机才有「群内 / 私信」两种去向）
+    is_group: bool = False
+    # 商机会话
+    session_username: str = ""
+    session_name: str = ""
+    # 该商机消息的发送人（群内回复默认 @ 他，私信回复发给他）
+    sender_username: str = ""
+    sender_name: str = ""
+    # 发送人是否可私信（好友/可聊联系人）；False 时前端把私信按钮置灰
+    sender_is_friend: bool = False
+    # 不可私信的用户可读原因（空串 = 可以私信）
+    reason: str = ""
 
 
 class GroupMemberOut(BaseModel):

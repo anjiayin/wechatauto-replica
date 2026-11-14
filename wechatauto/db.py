@@ -2588,6 +2588,60 @@ class WeChatDB:
             out = out[:limit]
         return out
 
+    def get_contact(self, username: str) -> Optional[dict]:
+        """按 username 取单个联系人（contact.db），找不到返回 None。
+
+        只用于「这个人能不能私信」这类单点判断，不遍历整表（contact.db
+        在客户机器上可能上万条，逐行 Python 过滤没必要）。
+
+        Returns:
+            dict：username / nick_name / remark / local_type / delete_flag。
+        """
+        username = (username or "").strip()
+        if not username:
+            return None
+        conn = self._contact_conn()
+        if not conn:
+            return None
+        try:
+            row = conn.execute(
+                "SELECT username, nick_name, remark, local_type, delete_flag "
+                "FROM contact WHERE username=? LIMIT 1", (username,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return dict(row) if row else None
+
+    def is_friend(self, username: str) -> bool:
+        """该账号是否「可以私信」的联系人（口径对齐 get_contacts("friend")）。
+
+        群商机要区分「群内回复」与「私信回复」：群成员未必是好友
+        （local_type=0 是「非好友交互者」，微信里点他头像也发不了私信），
+        这种情况前端把私信按钮置灰。
+
+        实测 local_type 分布（微信 4.x）：3=通讯录好友，2=群，1=混合桶
+        （公众号/仅聊天好友/系统号/自己），0=非好友交互者，5-7=企业微信
+        联系人。企业微信联系人同样可以私信，按可私信处理。
+        """
+        row = self.get_contact(username)
+        if not row or row.get("delete_flag"):
+            return False
+        uid = str(row.get("username") or "")
+        if not uid:
+            return False
+        try:
+            local_type = int(row.get("local_type") or 0)
+        except (TypeError, ValueError):
+            local_type = 0
+        if local_type in (5, 6, 7):        # 企业微信联系人（@openim/@kefu）
+            return True
+        if (uid.endswith("@chatroom") or uid.startswith("gh_")
+                or uid.endswith("@app") or uid in _SYSTEM_USERNAMES):
+            return False
+        if uid == str(self.wxid or ""):
+            return False                    # 自己
+        return local_type in (1, 3)
+
     def get_openim_corp_names(self) -> Dict[str, str]:
         """企业微信/客服联系人 → 所属企业名称（还原微信端「昵称@企业名」）。
 

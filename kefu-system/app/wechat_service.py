@@ -2232,6 +2232,22 @@ class WeChatService:
             pass
         return False
 
+    def is_friend(self, username: str) -> bool:
+        """该账号是否可私信的好友（群商机「私信回复」按钮是否可用）。
+
+        微信库未就绪（降级）或读失败时一律返回 False：宁可把私信按钮置灰
+        让人走群内回复，也不要在界面上承诺一个点了会失败的按钮。
+        """
+        if self._wxdb is None:
+            return False
+        try:
+            if self.is_self_username(username):
+                return False
+            return bool(self._wxdb.is_friend(username))
+        except Exception as exc:
+            logger.debug("判断好友关系失败（%s）：%s", username, exc)
+            return False
+
     def get_latest_local_id(self, username: str) -> int:
         """会话最新一条消息的 local_id（0 = 读不到）。
 

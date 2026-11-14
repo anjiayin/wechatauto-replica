@@ -56,6 +56,13 @@ class FakeWechatService:
         ]
         # 上下文接口故障注入（体验优化 4/5：拆分接口 + 失败重试）
         self.context_fail = False
+        # 好友集合（第 15 批：群商机「私信回复」按钮是否可用）
+        self.friends: set = {"wxid_a", "wxid_b"}
+        # 群成员（群昵称实时名；默认与商机发送人同名）
+        self.group_members: List[dict] = [
+            {"name": "张三", "wxid": "wxid_a", "is_owner": False},
+            {"name": "李四", "wxid": "wxid_b", "is_owner": False},
+        ]
 
     # --- 状态（/api/status） ---
     @property
@@ -116,6 +123,12 @@ class FakeWechatService:
 
     def session_exists(self, username: str) -> bool:
         return self.exists_map.get(username, True)
+
+    def is_friend(self, username: str) -> bool:
+        return (username or "") in self.friends
+
+    def list_group_members(self, chatroom: str) -> List[dict]:
+        return list(self.group_members)
 
     # --- 监控联动 ---
     def register_target(self, username: str) -> None:
@@ -232,7 +245,9 @@ DETAIL_EXTRA_KEYS = {"window_start", "merged_count", "raw_text", "key_quote",
                      "raw_text_display",
                      # 批次 11 需求 1：原文行里的图片引用（line/local_id/kind）
                      # 详情页据此把图片行渲染成真图；列表页不含该字段
-                     "raw_refs"}
+                     "raw_refs",
+                     # 第 15 批：上次回复去向（session=群内 / sender=私信）
+                     "reply_target"}
 
 
 # ---------------------------------------------------------------------------
@@ -974,6 +989,119 @@ class TestReplyEndpoint:
         resp = env.client.post(f"/api/opportunities/{opp['id']}/reply",
                                json={"text": "您好"})
         assert resp.status_code == 202
+
+
+# ---------------------------------------------------------------------------
+# 回复去向（第 15 批）：群内回复 / 私信回复
+# ---------------------------------------------------------------------------
+class TestReplyTargets:
+    """群商机要区分「群内回复」与「私信回复」。
+
+    规则：只有好友能私信（群里陌生人微信里开不出会话），前端把按钮置灰；
+    私信时 @/引用 一律丢弃（私信窗口里没有那条群消息）。
+    """
+
+    def _prepare(self, env, **kw) -> dict:
+        env.db.insert_target("111@chatroom", "加工群", "group")
+        return insert_opp(env.db, **kw)
+
+    def test_group_friend_can_dm(self, env):
+        opp = self._prepare(env)
+        data = env.client.get(
+            f"/api/opportunities/{opp['id']}/reply-targets").json()
+        assert data["is_group"] is True
+        assert data["sender_username"] == "wxid_a"
+        assert data["sender_name"] == "张三"
+        assert data["sender_is_friend"] is True
+        assert data["reason"] == ""
+
+    def test_group_stranger_dm_disabled_with_reason(self, env):
+        env.svc.friends.clear()
+        opp = self._prepare(env)
+        data = env.client.get(
+            f"/api/opportunities/{opp['id']}/reply-targets").json()
+        assert data["sender_is_friend"] is False
+        assert "不是你的微信好友" in data["reason"]
+
+    def test_group_uses_live_group_card_name(self, env):
+        """群昵称改了：@ 要用当前名字（用商机里存的旧名会 @ 不到人）。"""
+        env.svc.group_members = [
+            {"name": "张三（车间）", "wxid": "wxid_a", "is_owner": False}]
+        opp = self._prepare(env)
+        data = env.client.get(
+            f"/api/opportunities/{opp['id']}/reply-targets").json()
+        assert data["sender_name"] == "张三（车间）"
+
+    def test_direct_chat_has_no_dm_option(self, env):
+        """私聊商机没有「群内/私信」之分：发送人就是会话对端。"""
+        opp = insert_opp(env.db, session="wxid_b", session_name="李四",
+                         sender_wxid="wxid_b", sender_name="李四")
+        data = env.client.get(
+            f"/api/opportunities/{opp['id']}/reply-targets").json()
+        assert data["is_group"] is False
+        assert data["sender_is_friend"] is False
+
+    def test_reply_targets_404(self, env):
+        resp = env.client.get("/api/opportunities/9999/reply-targets")
+        assert resp.status_code == 404
+
+    def test_private_reply_goes_to_sender(self, env):
+        opp = self._prepare(env)
+        resp = env.client.post(f"/api/opportunities/{opp['id']}/reply", json={
+            "text": "  加个微信聊  ", "target": "sender", "manual_confirm": False,
+            "at": ["张三"], "quote": {"local_id": 12}})
+        assert resp.status_code == 202
+        assert "私信" in resp.json()["message"]
+        task = env.sender.tasks[0]
+        assert task.target == "sender"
+        assert task.session_username == "wxid_a"      # 换成发送人本人
+        assert task.session_name == "张三"
+        assert task.text == "加个微信聊"
+        assert task.at == [] and task.quote_local_id is None
+
+    def test_private_reply_manual_confirm_message(self, env):
+        opp = self._prepare(env)
+        resp = env.client.post(f"/api/opportunities/{opp['id']}/reply",
+                               json={"text": "私下聊", "target": "sender"})
+        assert resp.status_code == 202
+        assert "私信输入框" in resp.json()["message"]
+        assert env.sender.tasks[0].manual_confirm is True
+
+    def test_private_reply_blocked_for_stranger(self, env):
+        env.svc.friends.clear()
+        opp = self._prepare(env)
+        resp = env.client.post(f"/api/opportunities/{opp['id']}/reply",
+                               json={"text": "私下聊", "target": "sender"})
+        assert resp.status_code == 400
+        assert "不是你的微信好友" in resp.json()["detail"]
+        assert env.sender.tasks == []
+
+    def test_private_reply_rejects_direct_chat(self, env):
+        opp = insert_opp(env.db, session="wxid_b", session_name="李四",
+                         sender_wxid="wxid_b", sender_name="李四")
+        resp = env.client.post(f"/api/opportunities/{opp['id']}/reply",
+                               json={"text": "您好", "target": "sender"})
+        assert resp.status_code == 400
+        assert "不是群聊" in resp.json()["detail"]
+
+    def test_group_reply_defaults_to_session(self, env):
+        opp = self._prepare(env)
+        resp = env.client.post(f"/api/opportunities/{opp['id']}/reply", json={
+            "text": "在群里回", "at": ["张三"], "manual_confirm": False})
+        assert resp.status_code == 202
+        task = env.sender.tasks[0]
+        assert task.target == "session"
+        assert task.session_username == "111@chatroom"
+        assert task.at == ["张三"]
+
+    def test_reply_target_recorded_in_detail(self, env):
+        """落库标记：详情页据此标「私信回复 / 群内回复」。"""
+        opp = self._prepare(env)
+        env.db.set_opportunity_replied(opp["id"], "私信内容", target="sender")
+        data = env.client.get(f"/api/opportunities/{opp['id']}").json()
+        assert data["reply_target"] == "sender"
+        assert data["reply_content"] == "私信内容"
+        assert data["status"] == "replied"
 
 
 # ---------------------------------------------------------------------------

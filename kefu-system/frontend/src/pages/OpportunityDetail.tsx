@@ -5,6 +5,7 @@ import {
   Autocomplete,
   Box,
   Button,
+  Checkbox,
   Chip,
   Divider,
   Drawer,
@@ -29,6 +30,7 @@ import FormatQuoteIcon from '@mui/icons-material/FormatQuote'
 import OpenInNewIcon from '@mui/icons-material/OpenInNew'
 import PlayArrowIcon from '@mui/icons-material/PlayArrow'
 import PauseIcon from '@mui/icons-material/Pause'
+import ForwardToInboxIcon from '@mui/icons-material/ForwardToInbox'
 import { apiGet, apiPatch, apiPost } from '../api/client'
 import type {
   GroupMembers,
@@ -36,6 +38,7 @@ import type {
   OpportunityContextOut,
   OpportunityDetail,
   ReplyPayload,
+  ReplyTarget,
   WechatJumpResult,
 } from '../api/types'
 
@@ -49,6 +52,9 @@ interface SendResultData {
   stages?: Record<string, number>
   total_ms?: number
 }
+
+/** 回复去向：session=商机会话（群商机即群内回复）/ sender=私信发送人 */
+type ReplyTargetKind = 'session' | 'sender'
 
 const STAGE_LABELS: Record<string, string> = {
   init: '组件初始化',
@@ -68,8 +74,32 @@ function stageText(data: SendResultData): string {
   return `${parts.join(' · ')} · 合计 ${(((data.total_ms ?? 0) / 1000)).toFixed(1)}s`
 }
 
-/** 上下文中的图片消息：尝试展示解密真图，加载失败回退占位文本（反馈 2）。 */
-function ContextImage(props: { username: string; localId: number; fallback: string }) {
+/**
+ * 「群内回复默认 @ 发送人」的用户偏好（记住上次选择）。
+ *
+ * 存在 localStorage 而不是后端：这是每台电脑的操作习惯，换人用同一套系统
+ * 时不该互相影响，也没必要为它加一列数据库字段。
+ */
+const AT_SENDER_KEY = 'kefu.reply.atSender'
+
+function readAtSenderPref(): boolean {
+  try {
+    // 没有记录时默认勾选（群里回复先说「@张三」是常态）
+    return window.localStorage.getItem(AT_SENDER_KEY) !== '0'
+  } catch {
+    return true // 隐私模式/存储被禁：用默认值，不影响回复
+  }
+}
+
+function saveAtSenderPref(value: boolean): void {
+  try {
+    window.localStorage.setItem(AT_SENDER_KEY, value ? '1' : '0')
+  } catch {
+    /* 存不下就只是下次不记得，不该阻断回复 */
+  }
+}
+
+/** 上下文中的图片消息：尝试展示解密真图，加载失败回退占位文本（反馈 2）。 */function ContextImage(props: { username: string; localId: number; fallback: string }) {
   const [failed, setFailed] = useState(false)
   // 图片识别结果（批次 6 需求 5）：是车辆/汽车配件就在图下方标出来。
   // 未识别过（404）或接口失败一律静默——图片很多，不能弹错误。
@@ -235,6 +265,8 @@ export default function OpportunityDetail(props: {
   const queryClient = useQueryClient()
   const [replyText, setReplyText] = useState('')
   const [atMembers, setAtMembers] = useState<string[]>([])
+  // 群内回复默认 @ 发送人（可取消，记住上次选择）
+  const [atSender, setAtSender] = useState(readAtSenderPref)
   const [quoteLocalId, setQuoteLocalId] = useState<number | null>(null)
   // 人工确认（用户反馈：存在发错人的情况——同名联系人/企业微信身份/操作失败）。
   // 默认开启：只把回复内容填进微信输入框，由用户在微信里核对收件人后
@@ -243,6 +275,8 @@ export default function OpportunityDetail(props: {
   const [snack, setSnack] = useState<{ ok: boolean; message: string } | null>(null)
   // 发送中耗时（202 受理后要等微信 GUI 操作，必须让用户看到进度）
   const [sendingSince, setSendingSince] = useState<number | null>(null)
+  // 这次发往哪里：群内（session）/ 私信（sender），只影响按钮文案
+  const [sendingTarget, setSendingTarget] = useState<ReplyTargetKind>('session')
   const [sendingMs, setSendingMs] = useState(0)
   const timerRef = useRef<number | null>(null)
 
@@ -339,6 +373,41 @@ export default function OpportunityDetail(props: {
     [membersQuery.data],
   )
 
+  // 回复去向（第 15 批）：群商机才有「群内 / 私信」两种，能否私信由后端
+  // 判「发送人是不是好友」——群里陌生人（非好友）私信按钮必须置灰，
+  // 否则点下去只会在微信里搜不到人。
+  const replyTargetQuery = useQuery({
+    queryKey: ['opportunity-reply-target', id],
+    queryFn: () => apiGet<ReplyTarget>(`/api/opportunities/${id}/reply-targets`),
+    enabled: id !== null && isGroup,
+    staleTime: 60 * 1000,
+  })
+  const replyTarget = replyTargetQuery.data
+  const canDm = Boolean(isGroup && replyTarget?.sender_is_friend)
+  const dmDisabledReason = replyTarget?.reason
+    || (replyTargetQuery.isLoading ? '正在确认对方是否为好友…' : '')
+  // @ 用的发送人名：优先后端实时群昵称（改名后仍能 @ 到），
+  // 其次详情里已解析的显示名
+  const senderName = replyTarget?.sender_name
+    || opp?.sender_display || opp?.sender_name || ''
+  // 实际 @ 名单：勾选时把发送人放最前，再拼用户手选的成员（去重）
+  const effectiveAt = useMemo(() => {
+    const names: string[] = []
+    if (isGroup && atSender && senderName) names.push(senderName)
+    for (const raw of atMembers) {
+      const name = raw.trim()
+      if (name && !names.includes(name)) names.push(name)
+    }
+    return names
+  }, [isGroup, atSender, senderName, atMembers])
+
+  // 切换商机时清空草稿（@ 名单/引用是上一条商机的，带过去会发错人）
+  useEffect(() => {
+    setReplyText('')
+    setAtMembers([])
+    setQuoteLocalId(null)
+  }, [id])
+
   // 发送结果经 WS → CustomEvent 送达（202 受理后异步反馈）
   useEffect(() => {
     const handler = (ev: Event) => {
@@ -410,16 +479,21 @@ export default function OpportunityDetail(props: {
     },
   })
 
-  const handleSend = () => {
+  const handleSend = (target: ReplyTargetKind = 'session') => {
     if (!replyText.trim()) return
+    if (target === 'sender' && !canDm) return
     const payload: ReplyPayload = {
       text: replyText.trim(),
-      at: atMembers,
+      // 群内回复带 @（默认含发送人）；私信回复不带 @，也不带引用
+      // ——引用的那条消息在群会话里，私信窗口里根本不存在
+      at: target === 'sender' ? [] : effectiveAt,
+      target,
       manual_confirm: manualConfirm,
     }
-    if (quoteLocalId !== null) {
+    if (target === 'session' && quoteLocalId !== null) {
       payload.quote = { local_id: quoteLocalId }
     }
+    setSendingTarget(target)
     setSendingSince(Date.now())
     replyMutation.mutate(payload)
   }
@@ -638,7 +712,21 @@ export default function OpportunityDetail(props: {
 
             {opp.reply_content && (
               <>
-                <Typography variant="subtitle2">已回复内容（{opp.replied_at?.replace('T', ' ')}）</Typography>
+                <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 0.5 }}>
+                  <Typography variant="subtitle2">
+                    已回复内容（{opp.replied_at?.replace('T', ' ')}）
+                  </Typography>
+                  {/* 私信回的和群里回的不一样：私信只有发送人看到，
+                      群里其他成员看不到，必须标出来 */}
+                  {isGroup && (
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      color={opp.reply_target === 'sender' ? 'secondary' : 'default'}
+                      label={opp.reply_target === 'sender' ? '私信回复' : '群内回复'}
+                    />
+                  )}
+                </Stack>
                 <Typography variant="body2" sx={{ mb: 1 }}>{opp.reply_content}</Typography>
               </>
             )}
@@ -647,6 +735,7 @@ export default function OpportunityDetail(props: {
 
             <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
               回复目标：{opp.session_display || opp.session_name}
+              {isGroup && senderName && `（发送人：${senderName}）`}
               {opp.status === 'replied' && '（已回复过，可继续发送）'}
             </Typography>
             <TextField
@@ -682,6 +771,29 @@ export default function OpportunityDetail(props: {
             />
             <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1, flexWrap: 'wrap' }} useFlexGap>
               {isGroup && (
+                // 群内回复默认 @ 发送人：取消勾选后不再 @，选择记在本地
+                // （下次打开还是上次的选择）
+                <FormControlLabel
+                  sx={{ m: 0 }}
+                  control={
+                    <Checkbox
+                      size="small"
+                      checked={atSender}
+                      disabled={!senderName}
+                      onChange={(e) => {
+                        setAtSender(e.target.checked)
+                        saveAtSenderPref(e.target.checked)
+                      }}
+                    />
+                  }
+                  label={
+                    <Typography variant="body2">
+                      @发送人{senderName ? `（${senderName}）` : ''}
+                    </Typography>
+                  }
+                />
+              )}
+              {isGroup && (
                 <Autocomplete
                   multiple
                   freeSolo
@@ -698,8 +810,8 @@ export default function OpportunityDetail(props: {
                   renderInput={(params) => (
                     <TextField
                       {...params}
-                      label="@群成员（从列表选择）"
-                      placeholder={atMembers.length ? '' : '选择要 @ 的人'}
+                      label="@其他群成员（可选）"
+                      placeholder={atMembers.length ? '' : '选择还要 @ 的人'}
                       helperText={membersQuery.data?.error
                         ? membersQuery.data.error
                         : undefined}
@@ -729,6 +841,25 @@ export default function OpportunityDetail(props: {
                 )
               )}
             </Stack>
+            {/* 手动确认只「填文字」：微信的 @ 必须在输入时从弹层里选人，
+                纯粘贴实现不了真 @。提前说清楚，并给一键改成自动发送。 */}
+            {manualConfirm && isGroup && (effectiveAt.length > 0 || quoteLocalId !== null) && (
+              <Alert
+                severity="info"
+                sx={{ mb: 1, py: 0 }}
+                action={
+                  <Button color="inherit" size="small" onClick={() => setManualConfirm(false)}>
+                    改为自动发送
+                  </Button>
+                }
+              >
+                手动确认模式只把文字填进输入框，
+                {effectiveAt.length > 0 ? '@' : ''}
+                {effectiveAt.length > 0 && quoteLocalId !== null ? '和' : ''}
+                {quoteLocalId !== null ? '引用' : ''}
+                不会生效（可在微信里自己补）。要真正 @ 到人，请点「改为自动发送」。
+              </Alert>
+            )}
             {sendingSince !== null && (
               <Alert
                 severity="info"
@@ -745,22 +876,58 @@ export default function OpportunityDetail(props: {
               >
                 已受理，正在操作微信窗口（{(sendingMs / 1000).toFixed(1)}s）…
                 {manualConfirm
-                  ? '会把内容填进微信输入框，填完请在微信里核对后点发送；'
+                  ? (sendingTarget === 'sender'
+                    ? '会把内容填进与发送人的私信输入框，填完请在微信里核对后点发送；'
+                    : '会把内容填进微信输入框，填完请在微信里核对后点发送；')
                   : ''}
                 首次发送需初始化自动化组件，通常 3~8 秒；若超过 30 秒请检查微信窗口是否被遮挡。
               </Alert>
             )}
             <Stack direction="row" spacing={1} sx={{ flexWrap: 'wrap' }} useFlexGap>
-              <Button
-                variant="contained"
-                startIcon={<SendIcon />}
-                disabled={replyMutation.isPending || sendingSince !== null || !replyText.trim()}
-                onClick={handleSend}
+              <Tooltip
+                title={isGroup
+                  ? `发到群里（${opp.session_display || opp.session_name}）${manualConfirm ? '，只填进输入框' : ''}`
+                  : ''}
               >
-                {sendingSince !== null
-                  ? (manualConfirm ? '填入中…' : '发送中…')
-                  : (manualConfirm ? '填入微信输入框' : '发送回复')}
-              </Button>
+                <span>
+                  <Button
+                    variant="contained"
+                    startIcon={<SendIcon />}
+                    disabled={replyMutation.isPending || sendingSince !== null || !replyText.trim()}
+                    onClick={() => handleSend('session')}
+                  >
+                    {sendingSince !== null && sendingTarget === 'session'
+                      ? (manualConfirm ? '填入中…' : '发送中…')
+                      : isGroup
+                        ? (manualConfirm ? '群内回复（填入输入框）' : '群内回复')
+                        : (manualConfirm ? '填入微信输入框' : '发送回复')}
+                  </Button>
+                </span>
+              </Tooltip>
+              {/* 私信回复（第 15 批）：群商机专用，发给该条消息的发送人。
+                  对方不是好友时微信里根本开不出会话，按钮置灰并说明原因。 */}
+              {isGroup && (
+                <Tooltip
+                  title={canDm
+                    ? `私信发给 ${senderName || '发送人'}（群里其他人看不到）`
+                    : (dmDisabledReason || '对方不可私信')}
+                >
+                  <span>
+                    <Button
+                      startIcon={<ForwardToInboxIcon />}
+                      disabled={
+                        !canDm || replyMutation.isPending
+                        || sendingSince !== null || !replyText.trim()
+                      }
+                      onClick={() => handleSend('sender')}
+                    >
+                      {sendingSince !== null && sendingTarget === 'sender'
+                        ? (manualConfirm ? '填入中…' : '发送中…')
+                        : '私信回复'}
+                    </Button>
+                  </span>
+                </Tooltip>
+              )}
               {/* 只跳转、不发消息：用户想直接在微信里自己处理（弹窗点进来时最常用）。
                   与右上角的跳转图标功能相同，这里放在操作行更好找（原图标保留）。 */}
               <Tooltip title="只跳转到消息来源会话（不发送任何消息），在微信里自己处理">

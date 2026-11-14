@@ -82,6 +82,10 @@ class SendTask:
     # 人工确认模式（用户反馈：怕发错人）：True = 只把内容填进微信输入框，
     # 由用户自己在微信里核对收件人后点发送；False = 自动发送并按数据库确认。
     manual_confirm: bool = False
+    # 回复去向：session=发到商机所在会话（群商机=群内回复）；
+    # sender=私信发给该条消息的发送人（此时 session_username/session_name
+    # 已被调用方换成发送人，本字段只用于文案与落库）。
+    target: str = "session"
 
 
 class Sender:
@@ -313,10 +317,12 @@ class Sender:
             message = str(resp.get("message") or "") if isinstance(resp, dict) else ""
             ok = bool(getattr(resp, "is_success", False))
             if ok:
-                self._db.set_opportunity_replied(task.opportunity_id, task.text)
+                self._db.set_opportunity_replied(
+                    task.opportunity_id, task.text, target=task.target)
                 self._notifier.broadcast("send_result", {
                     "opportunity_id": task.opportunity_id,
                     "ok": True,
+                    "target": task.target,
                     "message": message or "已发送并经数据库确认",
                     "stages": stage.ms,
                     "total_ms": stage.total_ms(),
@@ -325,8 +331,9 @@ class Sender:
                     "opportunity_id": task.opportunity_id,
                     "status": "replied",
                 })
-                logger.info("[发送完成] 商机 #%d → %s | %s | 合计 %.1fs",
+                logger.info("[发送完成] 商机 #%d → %s%s | %s | 合计 %.1fs",
                             task.opportunity_id, task.session_name,
+                            "（私信）" if task.target == "sender" else "",
                             stage.summary(), stage.total_ms() / 1000.0)
             else:
                 self._fail(task, f"发送失败：{message or '未知原因，请重试'}", stage)
@@ -393,13 +400,17 @@ class Sender:
             "opportunity_id": task.opportunity_id,
             "ok": True,
             "manual": True,
-            "message": message or f"已填入微信输入框（{task.session_name}），"
-                                  "请在微信里核对后点发送",
+            "target": task.target,
+            "message": message or (
+                f"已填入{'私信' if task.target == 'sender' else '微信'}"
+                f"输入框（{task.session_name}），请在微信里核对后点发送"),
             "stages": stage.ms,
             "total_ms": stage.total_ms(),
         })
-        logger.info("[已填入输入框] 商机 #%d → %s（人工确认模式）| %s",
-                    task.opportunity_id, task.session_name, stage.summary())
+        logger.info("[已填入输入框] 商机 #%d → %s%s（人工确认模式）| %s",
+                    task.opportunity_id, task.session_name,
+                    "（私信）" if task.target == "sender" else "",
+                    stage.summary())
 
     def _do_send(self, gui, task: SendTask, who: Optional[str] = None):
         """按 @成员 / 引用 / 普通文本选择发送接口（全部 verify=True 回读确认）。
