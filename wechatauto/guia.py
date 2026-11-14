@@ -156,6 +156,12 @@ SEND_BUTTON_RATIO = (0.78, 0.92, 0.995, 0.99)  # 「发送」按钮检索区（�
 # 联合判断，避免 Qt 升级改名（Qt51514 → Qt6xxx）后主窗口定位失效。
 PROCESS_NAME = 'weixin.exe'              # 微信进程名（小写）
 MIN_WINDOW_SIZE = 800                    # 主窗口最小边长（像素），小于此视为非主窗
+# 窗口矩形硬下限：最小化的窗口 GetWindowRect 返回 (-32000,-32000,-31840,-31972)
+# 之类的伪矩形（160x28），IsWindowVisible 仍为 True。旧评分只看「宽或高 >=800」
+# 且没查 IsIconic，会把最小化主窗当成可用窗口，随后 _update_render_rect 用
+# 160x28 算布局 → 输入框/侧栏全部找不到 → 60~80s 重试后报「无法定位会话」。
+MIN_WINDOW_W = 400
+MIN_WINDOW_H = 300
 MAIN_TITLE_KEYWORDS = ('微信', 'Weixin', 'WeChat')
 
 # 布局校准配置目录：~/.wechatauto/layout-<机器标识>.json
@@ -407,9 +413,12 @@ class WeChatGUI:
         self._input = WinInput()
         self._sidebar_ratio = SIDEBAR_RATIO
         self._send_button_ratio = SEND_BUTTON_RATIO
-        self.main_hwnd = hwnd or self._find_main_window(title)
+        self.main_hwnd = hwnd or self._locate_main_window(title)
         if not self.main_hwnd:
             raise RuntimeError('未找到微信主窗口，请确认微信已登录并运行')
+        # 真主窗口锚点：use_window() 会把 main_hwnd 临时切到搜索打开的独立
+        # 聊天窗；重绑时优先回到这个锚点，别把独立窗或同名候选当主窗口。
+        self._primary_hwnd = self.main_hwnd
         self.render_hwnd = self._find_render_window(self.main_hwnd)
         if not self.render_hwnd:
             # 找不到渲染子窗口（Qt 改版等）→ 直接用主窗口矩形计算坐标
@@ -492,6 +501,13 @@ class WeChatGUI:
         u = self._input._user32
         if not u.IsWindow(hwnd) or not u.IsWindowVisible(hwnd):
             return False
+        # 最小化窗口 IsWindowVisible 仍为 True，但它不可操作；其矩形是
+        # (-32000,-32000,...) 伪值，拿它算布局会让后续所有定位全错。
+        try:
+            if u.IsIconic(hwnd):
+                return False
+        except Exception:
+            pass
         we = self._is_wechat_process(hwnd)
         if we is False:
             return False
@@ -509,8 +525,10 @@ class WeChatGUI:
             score += 3
         rr = wintypes.RECT()
         u.GetWindowRect(hwnd, ctypes.byref(rr))
-        if (rr.right - rr.left) >= MIN_WINDOW_SIZE \
-                or (rr.bottom - rr.top) >= MIN_WINDOW_SIZE:
+        w, ht = rr.right - rr.left, rr.bottom - rr.top
+        if w < MIN_WINDOW_W or ht < MIN_WINDOW_H:
+            return False       # 伪矩形/托盘/浮窗一律不算主窗口
+        if w >= MIN_WINDOW_SIZE or ht >= MIN_WINDOW_SIZE:
             score += 2
         return score >= 5
 
@@ -531,6 +549,11 @@ class WeChatGUI:
         def _cb(h, lp):
             if not u.IsWindowVisible(h):
                 return True
+            try:
+                if u.IsIconic(h):
+                    return True      # 最小化窗口不参与主窗口评分
+            except Exception:
+                pass
             we = self._is_wechat_process(h)
             if we is False:
                 return True          # 非微信进程：一票否决，不参与评分
@@ -552,7 +575,7 @@ class WeChatGUI:
             u.GetWindowRect(h, ctypes.byref(rr))
             w = rr.right - rr.left
             ht = rr.bottom - rr.top
-            if w > 0 and ht > 0:
+            if w >= MIN_WINDOW_W and ht >= MIN_WINDOW_H:
                 if w >= MIN_WINDOW_SIZE or ht >= MIN_WINDOW_SIZE:
                     score += 2
                 if score >= 5:
@@ -570,6 +593,71 @@ class WeChatGUI:
         if hwnd and self._looks_like_main_window(hwnd):
             return hwnd
         return 0
+
+    def _find_minimized_main_window(self) -> int:
+        """找出被最小化的微信主窗口（只用于自动恢复，绝不绑成可用窗口）。
+
+        最小化窗口 ``IsWindowVisible`` 仍为 True，且 ``GetWindowRect`` 返回
+        (-32000,-32000,-31840,-31972) 之类的 160x28 伪矩形。旧实现把它当
+        主窗口使用后，布局校准、输入框探测、侧栏点击全部基于错误坐标，
+        表现为「无法定位会话 / 多次重试未完成」并耗时 60~80 秒。
+        """
+        try:
+            u = self._input._user32
+        except Exception:
+            return 0
+        found = []
+        cb_ref = []
+
+        def _cb(h, lp):
+            if not u.IsWindowVisible(h):
+                return True
+            try:
+                if not u.IsIconic(h):
+                    return True
+            except Exception:
+                return True
+            if self._is_wechat_process(h) is False:
+                return True
+            buf = ctypes.create_unicode_buffer(256)
+            cls = ctypes.create_unicode_buffer(256)
+            u.GetWindowTextW(h, buf, 256)
+            u.GetClassNameW(h, cls, 256)
+            title, cls_name = buf.value.strip(), cls.value
+            if not any(k in title for k in MAIN_TITLE_KEYWORDS):
+                return True
+            if not cls_name.startswith(WX_MAIN_WIN_CLASS_PREFIX):
+                return True
+            found.append(h)
+            return True
+
+        CB = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        cb_ref.append(CB(_cb))
+        try:
+            u.EnumWindows(cb_ref[0], 0)
+        except Exception:
+            return 0
+        return found[0] if found else 0
+
+    def _locate_main_window(self, title: str) -> int:
+        """定位可操作的主窗口；微信只被最小化时先恢复它，而不是误判为不可用。
+
+        2026-11-14 实测：连续回复时微信窗口会被最小化（自动最小化遮挡窗口 /
+        用户切换），此时若直接报「未找到微信主窗口」，用户看到的就是
+        「刚才还好好的，突然发不出去」。恢复后重新走一遍正常识别，确保拿到
+        的是恢复后的真实尺寸而不是伪矩形。
+        """
+        hwnd = self._find_main_window(title)
+        if hwnd:
+            return hwnd
+        mini = self._find_minimized_main_window()
+        if not mini:
+            return 0
+        u = self._input._user32
+        _restore_keep_maximize(u, mini)
+        time.sleep(0.5)
+        wxlog.info('微信主窗口处于最小化状态，已自动恢复 hwnd=%s', mini)
+        return self._find_main_window(title) or mini
 
     def _find_render_window(self, main_hwnd: int) -> int:
         u = self._input._user32
@@ -835,10 +923,16 @@ class WeChatGUI:
             True = 重绑成功（含句柄其实未变的情况）；False = 当前找不到
             可见的微信主窗口（微信确实没开），调用方应走既有失败提示。
         """
-        hwnd = self._find_main_window(WX_MAIN_WIN_TITLE)
+        hwnd = self._locate_main_window(WX_MAIN_WIN_TITLE)
         if not hwnd:
             return False
+        primary = getattr(self, '_primary_hwnd', 0)
+        if (primary and primary != hwnd
+                and self._input._user32.IsWindow(primary)
+                and self._looks_like_main_window(primary)):
+            hwnd = primary
         if hwnd != self.main_hwnd:
+            self._primary_hwnd = hwnd
             self.main_hwnd = hwnd
             self.render_hwnd = self._find_render_window(hwnd) or hwnd
             self._update_render_rect()
@@ -946,7 +1040,10 @@ class WeChatGUI:
         for h in targets:
             u.ShowWindow(h, 6)  # SW_MINIMIZE
         if targets:
-            wxlog.info(f'自动最小化遮挡窗口 {len(targets)} 个')
+            # 带上 pid 便于排障：若这里出现微信自己的 PID，说明 wx_pid
+            # 判定失效，微信被自己最小化后控件树会被 Qt 回收。
+            wxlog.info('自动最小化遮挡窗口 %d 个：%s', len(targets),
+                       [(h, self._get_pid(h)) for h in targets[:5]])
         return len(targets)
 
     def ensure_visible(self) -> bool:
@@ -962,16 +1059,38 @@ class WeChatGUI:
         可见性仅以主窗口句柄存活判定（不依赖截图白屏采样），
         控件定位走 UIA，不依赖桌面截图。
         """
+        u = self._input._user32
+        try:
+            iconic = bool(u.IsIconic(self.main_hwnd))
+        except Exception:
+            iconic = False
+        # 缓存命中还要求微信仍是前台：用户在浏览器点「回复」后浏览器会
+        # 抢回焦点，此时必须重新置前，否则后续点击会落到浏览器上。
+        try:
+            fg = u.GetForegroundWindow()
+            still_front = (not fg or fg == self.main_hwnd
+                           or fg == self.render_hwnd)
+        except Exception:
+            still_front = False
         if (getattr(self, '_last_visible_ok', False)
                 and getattr(self, '_last_visible_ts', 0) > time.time() - 15
-                and self.is_alive()):
+                and self.is_alive() and not iconic and still_front):
             return True
+        if iconic:
+            # 直接恢复：最小化窗口的 GetWindowRect 是 160x28 伪矩形，
+            # 拿它做遮挡判定和布局换算会让输入框/侧栏定位全错。
+            _restore_keep_maximize(u, self.main_hwnd)
+            time.sleep(0.5)
         self._minimize_blockers()
         time.sleep(0.8)
         self.bring_to_front(keep_topmost=True)
         time.sleep(0.5)
         self._update_render_rect()
-        ok = self.is_alive()
+        try:
+            iconic = bool(u.IsIconic(self.main_hwnd))
+        except Exception:
+            iconic = False
+        ok = self.is_alive() and not iconic
         self._last_visible_ok = ok
         self._last_visible_ts = time.time()
         return ok
@@ -1389,11 +1508,23 @@ class WeChatGUI:
 
         Returns:
             ``"tree_not_ready"`` 控件树还没物化（微信刚被唤醒，需等）；
+            ``"tree_throttled"`` 控件树反复回收、自动修复已达上限（需重启微信）；
             ``"identity_mismatch"`` 打开的是同名普通好友/群（无企业名标签）；
             ``"corp_mismatch"`` 打开的是另一家企业的同名联系人；
             ``""`` 其它（没搜到等）。
         """
-        return self._last_open_error
+        if self._last_open_error:
+            return self._last_open_error
+        try:
+            from wechatauto.uia_driver import WeChatUIA
+            import time
+            if (getattr(WeChatUIA, '_throttled_pid', 0)
+                    and time.monotonic()
+                    - getattr(WeChatUIA, '_throttled_at', 0.0) < 300):
+                return 'tree_throttled'
+        except Exception:
+            pass
+        return ''
 
     @staticmethod
     def _corp_matches(label: str, corp: str) -> bool:

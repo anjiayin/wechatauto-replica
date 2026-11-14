@@ -530,8 +530,19 @@ class WeChatUIA:
             handle, ctypes.c_void_p(address), buf, 1, ctypes.byref(written))
         return bool(ok and written.value == 1)
 
-    def _hot_activate_accessibility(self, hwnd: int) -> bool:
-        """运行中热激活 Qt accessibility gate，不重启微信进程。"""
+    def _hot_activate_accessibility(self, hwnd: int):
+        """运行中热激活 Qt accessibility gate，不重启微信进程。
+
+        Returns:
+            ``'patched'`` 真实写了 0→1（只有这种情况才算一次补丁）；
+            ``'already'`` gate 本来就是 1，什么都没写；
+            ``False``    读写失败 / 版本不支持。
+
+        旧实现把 ``'already'`` 也返回 True，调用方照单计数、清 UIA 缓存，
+        于是「什么都没做」也吃掉限流配额：实测日志只出现 3 次 0→1，
+        限流却已报「已热激活 5 次」，随后 300 秒内全部强制降级 OCR，
+        用户输入框定位失败、白等 60~80 秒（时好时坏的直接来源）。
+        """
         pid = self._pid_from_hwnd(hwnd)
         if not pid:
             return False
@@ -560,7 +571,7 @@ class WeChatUIA:
             address = int(base) + int(rva)
             current = self._read_process_byte(handle, address)
             if current == 1:
-                return True
+                return 'already'
             if current is None:
                 wxlog.warning("热激活 UIA 失败：无法读取 active byte。")
                 return False
@@ -569,7 +580,7 @@ class WeChatUIA:
                 return False
             wxlog.info("已热激活微信 UIA 树：PID=%s Weixin.dll+0x%x: %s -> 1",
                        pid, rva, current)
-            return True
+            return 'patched'
         finally:
             kernel32.CloseHandle(handle)
 
@@ -581,12 +592,27 @@ class WeChatUIA:
     PATCH_COOLDOWN = 20.0        # 距上次热激活的最小间隔（秒）
     PATCH_MAX_PER_PID = 5        # 同一微信进程代内最多热激活次数
     _patch_log: dict = {}        # pid -> [count, last_monotonic]
+    _throttled_pid: int = 0      # 最近被限流拒绝的 PID（供上层给可操作提示）
+    _throttled_at: float = 0.0   # 该次拒绝的 monotonic 时刻（5 分钟内有效）
 
     def _wake_accessibility(self) -> bool:
+        """按 PID 去重地热激活；**只有真实写内存**才消耗限流配额。
+
+        两个实测坑：
+        1) 同一微信进程可能有多个标题为「微信」的顶层窗口，旧实现逐个
+           打补丁、逐个计数，一次调用就能吃掉好几份配额；
+        2) gate byte 本来就是 1 时「什么都没写」也算一次成功热激活，
+           还顺手清掉 ``_win`` 缓存，让 UIA 树锚点反复重建。
+        """
         ok = False
-        now = time.monotonic()
+        patched_any = False
+        seen_pids = set()
         for hwnd in self._wechat_hwnds():
             pid = self._pid_from_hwnd(hwnd)
+            if pid in seen_pids:
+                continue          # 同进程只处理一次，避免一次调用连写多遍
+            seen_pids.add(pid)
+            now = time.monotonic()
             rec = WeChatUIA._patch_log.setdefault(pid or 0, [0, 0.0])
             if now - rec[1] < WeChatUIA.PATCH_COOLDOWN:
                 wxlog.debug("距上次热激活不足 %.0fs，跳过（PID=%s）",
@@ -598,16 +624,25 @@ class WeChatUIA:
                     WeChatUIA._patch_log[pid or 0] = [0, 0.0]
                     rec = WeChatUIA._patch_log[pid or 0]
                 else:
+                    WeChatUIA._throttled_pid = pid or 0
+                    WeChatUIA._throttled_at = time.monotonic()
                     wxlog.warning(
                         "微信 UIA 已热激活 %d 次仍反复回收（PID=%s），"
                         "疑似微信异常，本次跳过、走 OCR 兜底。建议重启微信。",
                         rec[0], pid)
                     continue
-            if self._hot_activate_accessibility(hwnd):
-                ok = True
-                rec[0] += 1
-                rec[1] = time.monotonic()
-        if ok:
+            state = self._hot_activate_accessibility(hwnd)
+            if state == 'already':
+                ok = True        # gate 已开：不写内存、不占配额、不清缓存
+                continue
+            if not state:
+                continue
+            ok = True
+            patched_any = True
+            WeChatUIA._throttled_pid = 0
+            rec[0] += 1
+            rec[1] = time.monotonic()
+        if patched_any:
             self._win = None
             time.sleep(0.2)
         return ok
@@ -1331,20 +1366,33 @@ class WeChatUIA:
         t0 = time.time()
         wxlog.info("微信控件树尚未就绪，正在热激活（首次约 15~30 秒，请稍等）")
         self._wake_accessibility()
-        deadline = time.time() + max(timeout, 15.0)
+        deadline = t0 + max(timeout, 15.0)
+        next_wake = t0 + 6.0
+        missing = 0
         while time.time() < deadline:
             w = self._find_main()
             if w is None:
-                # 微信被关掉/退回登录态：没必要干等满 30 秒
+                # 微信被关掉/退回登录态：连续几次确认后再放弃，避免窗口
+                # 标题瞬时变化被误判成「微信消失」。
                 if not self._wechat_hwnds():
-                    wxlog.warning("等待控件树期间微信窗口消失，放弃本次预热")
-                    return False
+                    missing += 1
+                    if missing >= 3:
+                        wxlog.warning("等待控件树期间微信窗口消失，放弃本次预热")
+                        return False
+                else:
+                    missing = 0
             else:
+                missing = 0
                 self._win = w
                 if self.is_ready():
                     wxlog.info("微信控件树已就绪（耗时 %.1fs）",
                                time.time() - t0)
                     return True
+            if time.time() >= next_wake:
+                # 20s 冷却期内补丁会被限流跳过；等待期间必须再试几次，
+                # 否则「刚打完补丁 2s 又来一次」只会干等满 30s 才超时。
+                self._wake_accessibility()
+                next_wake = time.time() + 6.0
             time.sleep(0.4)
         wxlog.warning(
             "微信控件树唤醒超时（已等 %.0fs）。4.1.15+ 的微信需要"

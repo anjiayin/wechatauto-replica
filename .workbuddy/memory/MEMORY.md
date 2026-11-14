@@ -18,6 +18,7 @@
 - `kefu-system/data/` 已 gitignore（ASR 模型 229MB、语音/图片缓存）；`tools/silk_v3_decoder.exe` 已被 git 跟踪。
 
 ## 领域结论（已实测，别再推翻）
+- **「回复时好时坏 / 界面卡死」先查窗口状态与热激活配额，别查会话名、网络、AI**（2026-11-14 23:39~23:51 实测）：①最小化窗口 `IsWindowVisible` 仍 True，但 `GetWindowRect` 是 `(-32000,-32000,-31840,-31972)` 即 160×28 伪矩形；被绑成 `main_hwnd` 后布局/输入框/侧栏全错（日志「校准=1108 vs 当前=280」），3 轮重试耗 60~80s。②`_hot_activate_accessibility` 曾把 gate 已为 1（什么都没写）也返回 True 并计入限流，日志只见 3 次真实 0→1 却报「已热激活 5 次」→ 300s 内强制 OCR 兜底；配额重置后立刻流畅，这就是「时好时坏」的时钟。③sender 每次发送两次 `bring_to_front` 翻转 Z 序 + rebind 清 `_uia` 触发预热巡检再打补丁，形成自激循环；补丁写太频会把 Qt 输入系统写挂（界面卡死）。现已修：guia 淘汰 IsIconic/伪矩形 + `_locate_main_window` 自动恢复最小化窗、ensure_visible 缓存校验「微信仍在前台」；uia_driver 三态只计真实写入 + 按 PID 去重 + 等待期间每 6s 重试；sender 置前统一交给 ensure_visible。排查入口 `kefu-system/wechatauto_logs/app_YYYYMMDD.log` 的「热激活」「重绑 hwnd=」「自动最小化遮挡窗口」。
 - 微信语音**异步落库**：消息行先到、`media_*.db VoiceInfo.voice_data` 后到；转写失败须进 `voice_retry.py` 退避队列（5/15/45/120/300s），失败直接丢弃会漏商机。
 - 微信 4.x 本地库**不存群名片**；`contact.nick_name` 是全局昵称。群昵称只能从 session.db `last_sender_display_name` 增量学习（`group_cards` 表 + 最后发送者守卫）。
 - 微信 4.x 输入框 Accessibility Name 可能拼上 UI 提示语（如「文件传输助手长按鼠标 语音输入」）；会话校验必须用 `same_chat` 宽松匹配，严格相等会误判失败并落入 OCR 兜底（曾导致发送全链路 56.6s）。

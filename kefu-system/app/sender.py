@@ -3,7 +3,7 @@
 
 流程（技术方案 4.2）：
     submit(SendTask) → SenderThread 取任务（同一时刻仅一个 GUI 操作）
-    → WeChatGUI 单例（线程内创建）→ is_alive / bring_to_front / ensure_visible
+    → WeChatGUI 单例（线程内创建）→ is_alive / ensure_visible（置前统一在此）
     → open_chat（_chat_open_confirmed 校验）
     → at_member / quote_msg / send_msg(verify=True 数据库确认)
     → 更新商机为已回复 → WS 广播 send_result
@@ -275,10 +275,10 @@ class Sender:
             if not gui.is_alive():
                 self._fail(task, "微信未登录或窗口不存在，请检查后重试", stage)
                 return
-            try:
-                gui.bring_to_front()
-            except Exception:
-                logger.debug("bring_to_front 异常（继续尝试 ensure_visible）")
+            # 前置只交给 ensure_visible()：它会置前并保持置顶，且已加
+            # 「微信仍是前台」的缓存判定。旧代码这里先调一次
+            # bring_to_front()（NOTOPMOST），ensure_visible() 又置顶一次，
+            # 每次发送把窗口 Z 序翻两遍，是 Qt 控件树反复回收的诱因之一。
             if not gui.ensure_visible():
                 self._fail(task, "微信窗口不可见（可能被遮挡或锁屏），请检查后重试",
                            stage)
@@ -316,6 +316,15 @@ class Sender:
                         task,
                         "微信控件树正在唤醒（首次约 15~30 秒），请稍后重试；"
                         "若反复出现请确认微信窗口未被最小化", stage)
+                    return
+                if reason == "tree_throttled":
+                    # 限流生效时旧提示只说「无法定位会话」，用户看不到
+                    # 「该重启微信了」，会一直重试并白等 60~80 秒。
+                    self._fail(
+                        task,
+                        "微信控件树反复回收，自动修复已达上限；请重启一次微信，"
+                        "并避免发送过程中最小化微信窗口或频繁切换会话，再重试",
+                        stage)
                     return
                 if openim and reason == "identity_mismatch":
                     self._fail(
@@ -606,10 +615,10 @@ class Sender:
             # 与 _process_locked 同款三步：存活 → 前置可见 → 打开会话
             if not gui.is_alive():
                 return False, "微信未登录或窗口不存在，请检查后重试"
-            try:
-                gui.bring_to_front()
-            except Exception:
-                logger.debug("bring_to_front 异常（继续尝试 ensure_visible）")
+            # 前置只交给 ensure_visible()：它会置前并保持置顶，且已加
+            # 「微信仍是前台」的缓存判定。旧代码这里先调一次
+            # bring_to_front()（NOTOPMOST），ensure_visible() 又置顶一次，
+            # 每次发送把窗口 Z 序翻两遍，是 Qt 控件树反复回收的诱因之一。
             if not gui.ensure_visible():
                 return False, "微信窗口不可见（可能被遮挡或锁屏），请检查后重试"
             if openim:
