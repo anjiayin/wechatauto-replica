@@ -7,7 +7,7 @@
 
 ## 当前交接入口
 - **2026-11-13 第 13 批：`D:/Git/wechatauto-replica/HANDOVER-2026-11-13-batch13.md`**（7 项全完成，未提交）；前序 `HANDOVER-2026-11-13.md`（第 8~12 批，已提交）。
-- 基线 `HEAD=89fd98a`；测试基线 **1086 passed**（2026-11-14 第 20 批后，全量约 8 分钟）。
+- 基线 `HEAD=89fd98a`；测试基线 **1115 passed**（2026-11-14 第 23 节后，全量约 10 分钟）。
 
 ## 铁律 / 常踩的坑
 - pytest 必须 `--basetemp=D:/tmp/...`（本机 safe-delete 守卫会拦临时目录清理）；全量约 4~5 分钟。
@@ -33,7 +33,7 @@
   写死旧路径的后果不是「报错」，而是 `is_openim_chat()` 恒 False → **所有企业微信联系人被当同名好友拒发**。
   现用 `OPENIM_NAME_AIDS` 新旧两套 + `openim_label()` 三态（@企业名/''/None）+ `title_h_view` 子树扫「@ 开头文本」兜底。改微信版本后先跑一次 `openim_label()` 自检。
 - **微信 UIA 树会被回收，`_find_main()` 仍能拿到只剩 Qt 外壳的窗口**（`MMUIRenderSubWindowHW`+`QWidget` 两子控件）；此时任何 Edit/Text 查找都超时，表现成「无法定位会话」。判定锚点用 `MainView`（`is_ready()`），首次物化实测 15~30 秒。
-- **4.1.15.56 UIA 树物化 = 环境变量 + 补丁缺一不可**（2026-11-14 实测修正）：进程带 `QT_ACCESSIBILITY=1` 启动后树**仍不随启动物化**，必须再打 `_wake_accessibility()` 热激活补丁（gate byte 0→1）才在约 1s 内物化；不带环境变量时补丁无效（昨天误判「补丁路线失效」就是这种组合）。两者都已在代码链路里（wake() 写进程 env + ensure_window 自动补丁），无需人工介入。
+- **4.1.15.56 UIA 树物化 = 环境变量 + 补丁缺一不可，但补丁必须限流**（2026-11-14 两次实测修正）：进程带 `QT_ACCESSIBILITY=1` 启动后树**仍不随启动物化**，必须再打 `_wake_accessibility()` 热激活补丁（gate byte 0→1）才在约 1s 内物化；不带环境变量时补丁无效。**90 秒内对同一进程补丁 4+ 次会把 Qt 输入系统写挂**——症状：渲染正常、WM_NULL 正常、CPU 0%，但 SendInput/PostMessage 鼠标全被吞、SetWindowPos 被拒，只能重启微信。已加类级限流（同 PID 冷却 20s、上限 5 次、300s 重置、失败不计数），超限走 OCR 兜底。改这块前先看 TestWakeAccessibilityThrottle。
 - **微信重启后 sender 会 0 秒报「微信未登录」**：`WeChatGUI` 缓存 `main_hwnd`，重启后 `is_alive()`（只查 IsWindow）恒 False，原代码 `_ensure_gui` 直接判死。已加 `rebind()`（重新评分定位主窗口+刷新 render/pid+清空会话与 UIA 缓存），`sender._ensure_gui` 死句柄先 rebind 再失败。别再往 `_ensure_gui` 加「is_alive False 就报错」的短路。
 - **窗口识别必须有进程硬门槛，评分不能替代身份**（2026-11-14 实测事故）：微信退出后，EditPlus 打开的「微信客服开发-记事本.txt」窗口（标题含「微信」+5、尺寸+2=7 分过线）被绑成微信主窗口，自动化点击/键盘全落到 EditPlus 上，用户肉眼可见。修复：guia `_is_wechat_process`（进程名 startswith('weixin')，查询失败返回 None 不否决防误杀）在 `_looks_like_main_window` 与 `_find_main_window` 一票否决。改窗口识别逻辑时，标题/类名只能用于同进程内区分，进程身份必须先行。
 - **商机类型能否命中，八成取决于该类型的 `description`，不是 Prompt 模板**（2026-11-13 实测）：`build_system_prompt` 的总纲是「是否表达明确的业务合作意向（采购/委托/询价/求供）」+ balanced「有标的物+意向动作」+ 原则「闲聊一律 hit=false」+ points 只收标的/数量/价格 + direction 只有 buy/sell——非交易型类型（投诉/售后/求助）在这套范式里**天然落空**。只把旧类型描述扩成「命中特征词清单 + 豁免句（如『没有报价/数量/标的物不影响命中』）+ 字段约定（type/points/direction 怎么填）」，实测 7 条投诉全命中、6 条闲聊全不命中、配件交易仍归「汽车配件」，无需改代码。新加类型别再只写「判断是否有 X」。

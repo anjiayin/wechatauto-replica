@@ -573,10 +573,40 @@ class WeChatUIA:
         finally:
             kernel32.CloseHandle(handle)
 
+    # 热激活限流（类级，跨实例共享）：微信 4.1.15 实测在短时间内对同一
+    # 进程反复写 accessibility gate byte（0->1->0->1 循环）会把 Qt 输入
+    # 系统弄挂——窗口渲染正常、WM_NULL 响应、CPU 空闲，但所有鼠标点击
+    # （包括 PostMessage 直投）都被吞掉，只能重启微信恢复（2026-11-14
+    # 实测：90 秒内补丁 4+ 次 → 假死）。限流后最坏情况退化为 OCR 兜底。
+    PATCH_COOLDOWN = 20.0        # 距上次热激活的最小间隔（秒）
+    PATCH_MAX_PER_PID = 5        # 同一微信进程代内最多热激活次数
+    _patch_log: dict = {}        # pid -> [count, last_monotonic]
+
     def _wake_accessibility(self) -> bool:
         ok = False
+        now = time.monotonic()
         for hwnd in self._wechat_hwnds():
-            ok = self._hot_activate_accessibility(hwnd) or ok
+            pid = self._pid_from_hwnd(hwnd)
+            rec = WeChatUIA._patch_log.setdefault(pid or 0, [0, 0.0])
+            if now - rec[1] < WeChatUIA.PATCH_COOLDOWN:
+                wxlog.debug("距上次热激活不足 %.0fs，跳过（PID=%s）",
+                            WeChatUIA.PATCH_COOLDOWN, pid)
+                continue
+            if rec[0] >= WeChatUIA.PATCH_MAX_PER_PID:
+                if now - rec[1] > 300:
+                    # 长时间无补丁后再现 → 可能已换代，重置计数
+                    WeChatUIA._patch_log[pid or 0] = [0, 0.0]
+                    rec = WeChatUIA._patch_log[pid or 0]
+                else:
+                    wxlog.warning(
+                        "微信 UIA 已热激活 %d 次仍反复回收（PID=%s），"
+                        "疑似微信异常，本次跳过、走 OCR 兜底。建议重启微信。",
+                        rec[0], pid)
+                    continue
+            if self._hot_activate_accessibility(hwnd):
+                ok = True
+                rec[0] += 1
+                rec[1] = time.monotonic()
         if ok:
             self._win = None
             time.sleep(0.2)
@@ -1282,13 +1312,18 @@ class WeChatUIA:
         需要 15~30 秒。这段时间如果压在用户点「发送」上，用户只会看到
         「微信到前台后半天没动静」。放到服务启动的后台线程里做掉，用户
         第一次发送就只剩搜索+点击的几秒。
+
+        注意：树未物化时窗口类名是 Qt 外壳类而非 ``mmui::MainWindow``，
+        ``_find_main()`` 必然返回 None——**不能**据此判定微信没开而直接
+        失败，必须走 ``_wake_and_wait_ready``（热激活补丁 + 等待物化）。
+        否则预热在冷树场景下永远空转（2026-11-14 实测踩坑：预热日志一直
+        「未完成」，首次发送仍然要付出完整物化耗时）。
         """
         w = self._find_main()
-        if w is None:
-            return False
-        self._win = w
-        if self.is_ready():
-            return True
+        if w is not None:
+            self._win = w
+            if self.is_ready():
+                return True
         return self._wake_and_wait_ready(timeout)
 
     def _wake_and_wait_ready(self, timeout: float = 30.0) -> bool:

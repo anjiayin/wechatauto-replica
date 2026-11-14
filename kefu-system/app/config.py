@@ -125,9 +125,43 @@ MONITOR_MAX_TARGETS_MAX = 2000     # monitor.max_targets 允许上限
 AI_DISABLE_THINKING_DEFAULT = True
 
 # ---------------------------------------------------------------------------
-# 版本号（授权接口会带上，便于服务端按客户端版本下发策略）
+# 版本号（唯一真源：仓库根 version.txt）
 # ---------------------------------------------------------------------------
-APP_VERSION = "1.0.0"
+# 发版只改 version.txt，并用 `python kefu-system/tools/version_sync.py --bump X.Y.Z`
+# 同步其余位置。这里运行时直接读文件，避免 APP_VERSION 变成第二份真源。
+# 打包后 version.txt 随包落在安装根 / app\<版本>\，也可用 KEFU_VERSION_FILE 指定。
+# 只有「version.txt 完全找不到」时才用兜底值；兜底值同样被 version_sync.py 校验。
+_FALLBACK_VERSION = "1.2.1"
+
+
+def _read_app_version() -> str:
+    """按「显式指定 → KEFU_APP_ROOT → 打包布局 → 开发态仓库根」顺序读版本号。"""
+    import re
+    version_re = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.\-]+)?$")
+    candidates: list[Path] = []
+    override = os.environ.get("KEFU_VERSION_FILE", "").strip()
+    if override:
+        candidates.append(Path(override))
+    app_root = os.environ.get("KEFU_APP_ROOT", "").strip()
+    if app_root:
+        candidates.append(Path(app_root) / "version.txt")
+    here = Path(__file__).resolve()
+    candidates.extend([
+        here.parent / "version.txt",           # 打包：app/version.txt
+        here.parent.parent / "version.txt",    # 打包：kefu-system/version.txt
+        here.parents[2] / "version.txt",       # 开发态：仓库根/version.txt
+    ])
+    for path in candidates:
+        try:
+            lines = path.read_bytes().decode("utf-8").splitlines()
+        except OSError:
+            continue
+        if lines and version_re.match(lines[0].strip()):
+            return lines[0].strip()
+    return _FALLBACK_VERSION
+
+
+APP_VERSION = _read_app_version()
 
 # ---------------------------------------------------------------------------
 # 授权（license）相关常量

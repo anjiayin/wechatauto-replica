@@ -136,36 +136,69 @@ class Sender:
         self._prewarm_thread.start()
 
     def _prewarm(self) -> None:
-        """启动预热：建 GUI 组件 + 物化 UIA 控件树。失败无所谓，发送时会再试。
+        """常驻预热巡检线程：微信就绪后自动物化 UIA 控件树。
 
-        为什么必须在启动时做：微信 4.x 的 UIA 树首次物化实测 15~30 秒，压在
-        用户点「发送」上就是「微信到前台后半天没动静」（实测一次首次发送
-        「打开会话 25.4s」，第二次只要 5.1s）。预热全程持 ``_gui_lock``——
-        微信的 UIA provider 是单线程的，两个线程同时 ``ControlFromHandle``/
-        ``Exists`` 会互相排队，曾把一次发送拖到 60 秒以上且全程无日志。
-        拿不到锁直接放弃——预热只是优化，永远不该影响正常发送。
+        服务启动时微信往往还没登录（甚至没启动），一次性预热只会失败一次
+        就结束，用户登录后的首次发送仍要付出 15~30 秒的树物化耗时（实测
+        「打开会话 25.4s」的主体就是它）。因此改为常驻巡检：每轮检查
+        「微信活着且引擎未就绪」才做一次 warm_up；warm 失败（微信活着但
+        树迟迟物化不了）按 15→30→60→120 秒退避，其余情况保持 15 秒轮询——
+        微信重启（rebind 清空引擎缓存）后也会再次自动预热。
+
+        预热全程持 ``_gui_lock``——微信的 UIA provider 是单线程的，两个
+        线程同时 ``ControlFromHandle``/``Exists`` 会互相排队，曾把一次发送
+        拖到 60 秒以上且全程无日志。巡检路径绝不广播状态事件（``quiet``），
+        否则微信没启动时每 15 秒就会往前端刷一次「微信未启动」。
+        """
+        interval = 15.0
+        while not self._stop.is_set():
+            state = "failed"
+            try:
+                state = self._prewarm_once()
+            except Exception:
+                logger.debug("微信预热巡检异常（忽略）", exc_info=True)
+            if state == "failed":
+                interval = min(interval * 2, 120.0)
+            else:
+                interval = 15.0
+            self._stop.wait(interval)
+
+    def _prewarm_once(self) -> str:
+        """单轮预热尝试（轻量、无广播）。
+
+        Returns:
+            ``"warmed"``  本次完成了预热（引擎就绪，首次发送可立即开始）；
+            ``"ready"``   引擎本就就绪，无需预热；
+            ``"no_wechat"`` 微信未启动/窗口未就绪，稍后重试；
+            ``"failed"``  微信活着但预热失败（如树物化超时），调用方应退避。
         """
         try:
             from wechatauto.guia import WeChatGUI  # noqa: F401  探测依赖
-        except Exception as exc:      # 依赖未装（如 linux CI）
-            logger.debug("跳过微信预热：%s", exc)
-            return
-        if not self._gui_lock.acquire(timeout=0.2):
-            logger.debug("发送正在占用微信窗口，跳过预热")
-            return
+        except Exception:                 # 依赖未装（如 linux CI）
+            return "no_wechat"
+        gui = self._ensure_gui(quiet=True)
+        if gui is None:
+            return "no_wechat"
         try:
-            gui = self._ensure_gui()
-            if gui is None:
-                return
+            if not gui.is_alive():
+                return "no_wechat"
+            if getattr(gui, "_uia", None) is not None:
+                return "ready"            # 引擎已就绪：零成本巡检
+        except Exception:
+            return "failed"
+        if not self._gui_lock.acquire(timeout=0.5):
+            return "failed"               # 发送正在占用窗口，稍后再试
+        try:
             t0 = time.monotonic()
             ok = gui.warm_up(timeout=30.0)
             logger.info("微信预热%s（耗时 %.1fs）",
                         "完成（首次发送可立即开始）" if ok
-                        else "未完成（微信可能未启动，发送时会再试）",
+                        else "未完成（微信就绪后会自动重试）",
                         time.monotonic() - t0)
+            return "warmed" if ok else "failed"
         except Exception:
             logger.debug("微信预热异常（忽略）", exc_info=True)
-            return
+            return "failed"
         finally:
             self._gui_lock.release()
 
@@ -324,14 +357,20 @@ class Sender:
             stage.mark("send")
             message = str(resp.get("message") or "") if isinstance(resp, dict) else ""
             ok = bool(getattr(resp, "is_success", False))
-            if ok:
+            # 「已操作发送但数据库未确认」：UI 层发送已完成（输入框回车成功），
+            # 只是数据库回读超时——微信重启后消息分片重建首分钟很慢，8s 轮询
+            # 不够。按已回复处理：用户看到失败去重发就是重复消息（实测隐患）。
+            unconfirmed = (not ok) and ("消息已操作发送" in message)
+            if ok or unconfirmed:
                 self._db.set_opportunity_replied(
                     task.opportunity_id, task.text, target=task.target)
                 self._notifier.broadcast("send_result", {
                     "opportunity_id": task.opportunity_id,
                     "ok": True,
                     "target": task.target,
-                    "message": message or "已发送并经数据库确认",
+                    "message": message if unconfirmed
+                    else (message or "已发送并经数据库确认"),
+                    "unconfirmed": unconfirmed,
                     "stages": stage.ms,
                     "total_ms": stage.total_ms(),
                 })
@@ -339,7 +378,8 @@ class Sender:
                     "opportunity_id": task.opportunity_id,
                     "status": "replied",
                 })
-                logger.info("[发送完成] 商机 #%d → %s%s | %s | 合计 %.1fs",
+                logger.info("[发送完成%s] 商机 #%d → %s%s | %s | 合计 %.1fs",
+                            "·DB未确认" if unconfirmed else "",
                             task.opportunity_id, task.session_name,
                             "（私信）" if task.target == "sender" else "",
                             stage.summary(), stage.total_ms() / 1000.0)
@@ -599,8 +639,13 @@ class Sender:
     # ------------------------------------------------------------------
     # GUI 实例
     # ------------------------------------------------------------------
-    def _ensure_gui(self):
+    def _ensure_gui(self, quiet: bool = False):
         """线程内懒创建 WeChatGUI 单例；失败广播中文错误并返回 None。
+
+        Args:
+            quiet: True 时不广播状态事件、只记日志。预热巡检线程用它——
+                巡检每 15 秒跑一次，微信没启动时若每次都广播，前端会被
+                「微信未启动」提示刷屏；广播只留给真正的发送/跳转路径。
 
         缓存实例的窗口句柄失效（微信重启/重登）时先调 ``rebind()`` 重新
         定位：重绑成功直接复用，失败才丢弃重建。没有这一步，微信重启一次
@@ -624,21 +669,25 @@ class Sender:
         except Exception as exc:
             logger.error("微信自动化组件加载失败：%s", exc)
             self._gui = None
-            # 无具体任务上下文，广播全局状态事件
-            self._notifier.broadcast("status_change", {
-                "send_available": False,
-                "message": f"微信自动化组件不可用（{exc}），无法发送消息",
-            })
+            if not quiet:
+                # 无具体任务上下文，广播全局状态事件
+                self._notifier.broadcast("status_change", {
+                    "send_available": False,
+                    "message": f"微信自动化组件不可用（{exc}），无法发送消息",
+                })
             return None
         try:
             self._gui = WeChatGUI()
         except Exception as exc:
-            logger.error("微信窗口定位失败：%s", exc)
+            if quiet:
+                logger.debug("微信窗口定位失败（巡检静默）：%s", exc)
+            else:
+                logger.error("微信窗口定位失败：%s", exc)
+                self._notifier.broadcast("status_change", {
+                    "send_available": False,
+                    "message": f"未找到微信主窗口（微信可能未启动），无法发送消息",
+                })
             self._gui = None
-            self._notifier.broadcast("status_change", {
-                "send_available": False,
-                "message": f"未找到微信主窗口（微信可能未启动），无法发送消息",
-            })
             return None
         return self._gui
 

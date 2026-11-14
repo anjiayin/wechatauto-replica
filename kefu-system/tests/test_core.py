@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import builtins
 import json
 import sqlite3
 import time
@@ -921,6 +922,46 @@ class TestSender:
                                  session_name="加工群", text="hi"))
         assert db.get_opportunity(opp["id"])["status"] == "pending"
 
+    def test_sent_but_unconfirmed_marks_replied(self):
+        """「已操作发送但 DB 未确认」按已回复处理，防止重试造成重复发送。"""
+        db, opp, sender = self._prepare()
+
+        class UnconfirmedGUI(FakeGUI):
+            def send_msg(self, text, who=None, verify=False,
+                         assume_open=False, who_username=None):
+                self.sent.append(text)
+                return FakeWxResponse(False, "消息已操作发送，但数据库未确认")
+
+        gui = UnconfirmedGUI()
+        events = []
+        sender._ensure_gui = lambda: gui
+        sender._notifier.broadcast = lambda t, p: events.append((t, p))
+        sender._process(SendTask(opportunity_id=opp["id"],
+                                 session_username="12345@chatroom",
+                                 session_name="加工群", text="hi"))
+        assert db.get_opportunity(opp["id"])["status"] == "replied"
+        send_results = [p for t, p in events if t == "send_result"]
+        assert send_results and send_results[0]["ok"] is True
+        assert send_results[0]["unconfirmed"] is True
+
+    def test_real_failure_still_pending(self):
+        """真正的发送失败（UI 层没发出去）仍保持 pending。"""
+        db, opp, sender = self._prepare()
+
+        class RealFailGUI(FakeGUI):
+            def send_msg(self, text, who=None, verify=False,
+                         assume_open=False, who_username=None):
+                self.sent.append(text)
+                return FakeWxResponse(False, "发送失败：模拟")
+
+        gui = RealFailGUI()
+        sender._ensure_gui = lambda: gui
+        sender._process(SendTask(opportunity_id=opp["id"],
+                                 session_username="12345@chatroom",
+                                 session_name="加工群", text="hi"))
+        assert db.get_opportunity(opp["id"])["status"] == "pending"
+        assert gui.sent == ["hi"]  # 确实尝试过发送
+
 
 class TestEnsureGuiRebind:
     """微信重启后缓存句柄失效：_ensure_gui 必须先重绑而不是 0 秒失败。
@@ -1158,19 +1199,16 @@ class TestSenderPrewarm:
     def _sender(self):
         return Sender(Database(":memory:"), Notifier())
 
-    def test_prewarm_skipped_when_lock_busy(self, monkeypatch):
+    def test_prewarm_once_lock_busy_backs_off(self):
         sender = self._sender()
+        sender._gui = FakeGUI()          # 微信活着，才会走到锁检查
         assert sender._gui_lock.acquire(timeout=0.2)
         try:
-            called = []
-            monkeypatch.setattr(sender, "_ensure_gui",
-                                lambda: called.append(1))
-            sender._prewarm()
-            assert called == []  # 锁被发送占用 → 预热立即放弃
+            assert sender._prewarm_once() == "failed"  # 锁被发送占用 → 退避
         finally:
             sender._gui_lock.release()
 
-    def test_prewarm_creates_gui_and_warms(self):
+    def test_prewarm_once_creates_gui_and_warms(self):
         calls = []
 
         class FakeWarmGUI:
@@ -1183,21 +1221,111 @@ class TestSenderPrewarm:
 
         sender = self._sender()
         sender._gui = FakeWarmGUI()
-        sender._prewarm()
+        assert sender._prewarm_once() == "warmed"
         assert calls and calls[0] == 30.0
 
-    def test_prewarm_swallows_exception(self, monkeypatch):
-        sender = self._sender()
+    def test_prewarm_once_engine_ready_zero_cost(self):
+        class FakeReadyGUI:
+            def __init__(self):
+                self._uia = object()   # 引擎已缓存
 
+            def is_alive(self):
+                return True
+
+            def warm_up(self, timeout=30.0):  # 不应被调用
+                raise AssertionError("引擎就绪不应再 warm")
+
+        sender = self._sender()
+        sender._gui = FakeReadyGUI()
+        assert sender._prewarm_once() == "ready"
+
+    def test_prewarm_once_swallows_exception_and_releases_lock(self):
         def boom():
             raise RuntimeError("预热炸了")
 
+        sender = self._sender()
         sender._gui = FakeGUI()
         sender._gui.warm_up = boom
-        sender._prewarm()  # 不应抛出
+        assert sender._prewarm_once() == "failed"  # 不应抛出
         # 锁已释放（再次获取成功即证明）
         assert sender._gui_lock.acquire(timeout=0.2)
         sender._gui_lock.release()
+
+    def test_prewarm_once_quiet_no_broadcast_on_no_wechat(self, monkeypatch):
+        """微信未启动时巡检绝不能广播（否则前端每 15 秒刷一次提示）。"""
+        sender = self._sender()
+        broadcast = []
+        monkeypatch.setattr(sender._notifier, "broadcast",
+                            lambda *a, **k: broadcast.append(a))
+        monkeypatch.setattr(sender, "_ensure_gui", lambda quiet=True: None)
+        assert sender._prewarm_once() == "no_wechat"
+        assert broadcast == []
+
+    def test_ensure_gui_quiet_broadcasts_nothing(self, monkeypatch):
+        """quiet=True：组件加载失败/定位失败都不广播。"""
+        sender = self._sender()
+        broadcast = []
+        monkeypatch.setattr(sender._notifier, "broadcast",
+                            lambda *a, **k: broadcast.append(a))
+        import importlib
+        real_import = builtins.__import__
+
+        def fake_import(name, *a, **k):
+            if name == "wechatauto.guia":
+                raise ImportError("no guia")
+            return real_import(name, *a, **k)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        sender._gui = None
+        assert sender._ensure_gui(quiet=True) is None
+        assert broadcast == []
+        # 非 quiet 仍广播（发送路径的用户提示不能丢）
+        assert sender._ensure_gui() is None
+        assert len(broadcast) == 1
+
+    def test_prewarm_loop_retries_after_warm_failure(self, monkeypatch):
+        """warm 失败后循环按退避间隔重试，成功后恢复。"""
+        sender = self._sender()
+        states = iter(["failed", "failed", "warmed"])
+        waits = []
+
+        class FakeStop:
+            def wait(self, s):
+                waits.append(s)
+
+            def is_set(self):
+                return len(waits) >= 3
+
+        monkeypatch.setattr(sender, "_prewarm_once", lambda: next(states))
+        monkeypatch.setattr(sender, "_stop", FakeStop())
+        sender._prewarm()
+        # 失败退避：15→30→60，成功后回到 15
+        assert waits == [30.0, 60.0, 15.0]
+
+    def test_prewarm_loop_warms_after_wechat_restart(self):
+        """微信重启（rebind 清空引擎）后巡检会再次预热。"""
+        sender = self._sender()
+        warm_calls = []
+
+        class FakeReliveGUI:
+            def __init__(self):
+                self._uia = None        # rebind 后引擎被清空
+
+            def is_alive(self):
+                return True
+
+            def warm_up(self, timeout=30.0):
+                warm_calls.append(1)
+                self._uia = object()    # 预热成功引擎就位
+                return True
+
+        gui = FakeReliveGUI()
+        sender._gui = gui
+        assert sender._prewarm_once() == "warmed"
+        assert len(warm_calls) == 1
+        # 引擎就绪后巡检零成本
+        assert sender._prewarm_once() == "ready"
+        assert len(warm_calls) == 1
 
 
 # ---------------------------------------------------------------------------
