@@ -84,9 +84,11 @@ class FakeGui:
         return Resp(True, "引用已发送并确认")
 
     def at_members(self, members, text: str, who: str | None = None,
-                   verify: bool = False, who_username: str | None = None):
+                   verify: bool = False, who_username: str | None = None,
+                   quote: bool = False,
+                   quote_target_text: str | None = None):
         self.calls.append(("at_members", list(members), text, who, verify,
-                           who_username))
+                           who_username, quote, quote_target_text))
         return Resp(True, "@成员消息已发送并确认")
 
 
@@ -265,6 +267,56 @@ class TestAtMembers:
         assert len(quotes) == 1
         assert quotes[0][2] == "上周的报价单"      # target_text
         assert quotes[0][5] == "21264829018@chatroom"
+
+
+# ---------------------------------------------------------------------------
+# 3b. 引用 + @ 组合回复
+#     2026-11-15 实测：同时选「@发送人 + 引用最新一条」，旧代码 if/return
+#     互斥只走了 @ 分支，引用被静默丢弃，界面却提示发送成功。
+# ---------------------------------------------------------------------------
+class TestQuoteAtCombo:
+    def test_combo_routes_to_at_members_with_quote_latest(self, sender):
+        gui = FakeGui()
+        sender.sender._gui = gui
+        sender.sender._process(make_task(at=["张三"], text="收到",
+                                         quote_latest=True))
+
+        calls = [c for c in gui.calls if c[0] == "at_members"]
+        assert len(calls) == 1
+        assert calls[0][6] is True             # quote=True
+        assert calls[0][7] is None            # latest 意图 → 引用最新一条
+        assert not [c for c in gui.calls if c[0] == "quote_msg"]
+        assert sender.notifier.of("send_result")[-1]["ok"] is True
+
+    def test_combo_with_local_id_passes_snippet(self, sender):
+        gui = FakeGui()
+        sender.sender._gui = gui
+        sender.sender._message_lookup = lambda u, i: {
+            "content": "张三:\n上周的报价单"}
+        sender.sender._latest_lookup = lambda u: 99
+        sender.sender._process(make_task(at=["张三"], text="收到",
+                                         quote_local_id=5))
+
+        calls = [c for c in gui.calls if c[0] == "at_members"]
+        assert len(calls) == 1 and calls[0][6] is True
+        assert calls[0][7] == "上周的报价单"
+
+    def test_legacy_gui_refuses_combo_instead_of_silent_at(self, sender):
+        gui = LegacyGui()
+        sender.sender._gui = gui
+        sender.sender._process(make_task(at=["张三"], quote_latest=True))
+
+        res = sender.notifier.of("send_result")[-1]
+        assert res["ok"] is False
+        assert "组合" in res.get("message", "")
+
+    def test_plain_at_does_not_set_quote(self, sender):
+        gui = FakeGui()
+        sender.sender._gui = gui
+        sender.sender._process(make_task(at=["张三"]))
+
+        calls = [c for c in gui.calls if c[0] == "at_members"]
+        assert len(calls) == 1 and calls[0][6] is False
 
 
 # ---------------------------------------------------------------------------

@@ -164,6 +164,21 @@ MIN_WINDOW_W = 400
 MIN_WINDOW_H = 300
 MAIN_TITLE_KEYWORDS = ('微信', 'Weixin', 'WeChat')
 
+# 发送链路是否允许降级到「截图 + OCR」。默认**彻底关闭**（2026-11-15 用户
+# 要求）：实测托盘/最小化恢复后，render_rect 变成 160x28 伪矩形，OCR 兜底
+# 会连刷「未检测到输入框」+ 自动重校准 + 截图坐标非法，白耗 20~30 秒后
+# 抛 ``Coordinate 'right' is less than 'left'``，还可能把消息打进别的会话。
+# 前面的 UIA 方法失败就直接判失败，不再做无意义的截图识别。
+# 仅命令行 demo（demo_send.py / demo_quote.py）可用环境变量显式打开。
+OCR_FALLBACK_ENABLED = os.environ.get(
+    'WECHATAUTO_OCR_FALLBACK', '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+# UIA 不可用时的统一提示（组件层与 sender 层共用，避免各写一版）
+UIA_UNAVAILABLE_MSG = (
+    '微信控件树不可用（窗口可能被关闭到托盘或最小化），已取消发送；'
+    '请点开微信窗口、等 1~2 秒后重试')
+
+
 # 布局校准配置目录：~/.wechatauto/layout-<机器标识>.json
 LAYOUT_CONFIG_DIR = os.path.join(os.path.expanduser('~'), '.wechatauto')
 
@@ -595,12 +610,17 @@ class WeChatGUI:
         return 0
 
     def _find_minimized_main_window(self) -> int:
-        """找出被最小化的微信主窗口（只用于自动恢复，绝不绑成可用窗口）。
+        """找出被最小化 / 关闭到托盘（SW_HIDE）的微信主窗口。
 
-        最小化窗口 ``IsWindowVisible`` 仍为 True，且 ``GetWindowRect`` 返回
-        (-32000,-32000,-31840,-31972) 之类的 160x28 伪矩形。旧实现把它当
-        主窗口使用后，布局校准、输入框探测、侧栏点击全部基于错误坐标，
-        表现为「无法定位会话 / 多次重试未完成」并耗时 60~80 秒。
+        只用于自动恢复，绝不绑成可用窗口。最小化窗口 ``IsWindowVisible``
+        仍为 True，且 ``GetWindowRect`` 返回 (-32000,-32000,...) 之类的
+        160x28 伪矩形；拿它算布局会让输入框/侧栏定位全错，表现为「无法
+        定位会话 / 多次重试未完成」并耗时 60~80 秒。
+
+        2026-11-15 实测补充：用户点 X「关闭到托盘」时窗口是 **SW_HIDE**
+        （visible=False），旧实现第一句 ``if not IsWindowVisible: return``
+        直接跳过，永远恢复不了，随后 UIA 树在不可见窗口上不物化 → 唤醒
+        超时 31s → OCR 连刷 → 界面假死。这里不再要求 visible。
         """
         try:
             u = self._input._user32
@@ -610,13 +630,13 @@ class WeChatGUI:
         cb_ref = []
 
         def _cb(h, lp):
-            if not u.IsWindowVisible(h):
-                return True
             try:
-                if not u.IsIconic(h):
-                    return True
+                iconic = bool(u.IsIconic(h))
+                visible = bool(u.IsWindowVisible(h))
             except Exception:
                 return True
+            if visible and not iconic:
+                return True          # 正常可见窗口不归这里管
             if self._is_wechat_process(h) is False:
                 return True
             buf = ctypes.create_unicode_buffer(256)
@@ -861,6 +881,45 @@ class WeChatGUI:
         wxlog.info(f'已加载布局校准：sidebar_ratio={self._sidebar_ratio:.3f}')
         return True
 
+    def _rebind_if_window_changed(self) -> bool:
+        """窗口从托盘/最小化恢复后，若真实主窗口句柄已变则重新绑定。
+
+        只认「进程身份 + 标题/类名 + 合格尺寸」的真主窗口，绝不把独立聊天
+        窗当主窗口。重新绑定后 render_hwnd / render_rect / pid 全部刷新，
+        避免后续所有坐标换算基于旧的 160x28 伪矩形。
+
+        Returns: True = 句柄发生变化并已重绑。
+        """
+        try:
+            new_hwnd = self._find_main_window(WX_MAIN_WIN_TITLE)
+        except Exception:
+            return False
+        if not new_hwnd or new_hwnd == self.main_hwnd:
+            return False
+        old = self.main_hwnd
+        try:
+            # 先算出全部新值再一次性赋值：任何一步失败都不留下「句柄换了
+            # 但 render_rect 还是旧的」这种半更新状态。
+            render = self._find_render_window(new_hwnd) or new_hwnd
+            pid = self._get_pid(new_hwnd)
+            self.main_hwnd = new_hwnd
+            self._primary_hwnd = new_hwnd
+            self.render_hwnd = render
+            self._update_render_rect()
+            self.pid = pid
+            self._current_chat = None
+            self._last_input_box = None
+            self._uia = None
+            self._uia_tried = False
+            self._uia_retry_after = 0
+            wxlog.info('微信主窗口句柄已变化，重新绑定 %s → %s（rect=%s）',
+                       old, new_hwnd, getattr(self, 'render_rect', None))
+            return True
+        except Exception as exc:
+            self.main_hwnd = old
+            wxlog.warning('微信主窗口重绑失败（沿用原句柄）：%s', exc)
+            return False
+
     def use_window(self, top_hwnd: int) -> bool:
         """把 GUI 操作目标切换到指定顶层微信窗口（主窗或独立聊天窗）。
 
@@ -942,6 +1001,7 @@ class WeChatGUI:
             self._uia = None
             self._uia_tried = False
             self._last_open_error = ''
+            self._uia_retry_after = 0
             wxlog.info('微信窗口已重绑：句柄失效后重新定位 hwnd=%s', hwnd)
         return True
 
@@ -1060,10 +1120,15 @@ class WeChatGUI:
         控件定位走 UIA，不依赖桌面截图。
         """
         u = self._input._user32
-        try:
-            iconic = bool(u.IsIconic(self.main_hwnd))
-        except Exception:
-            iconic = False
+
+        def _window_state():
+            try:
+                return (bool(u.IsWindowVisible(self.main_hwnd)),
+                        bool(u.IsIconic(self.main_hwnd)))
+            except Exception:
+                return True, False
+
+        visible, iconic = _window_state()
         # 缓存命中还要求微信仍是前台：用户在浏览器点「回复」后浏览器会
         # 抢回焦点，此时必须重新置前，否则后续点击会落到浏览器上。
         try:
@@ -1074,23 +1139,41 @@ class WeChatGUI:
             still_front = False
         if (getattr(self, '_last_visible_ok', False)
                 and getattr(self, '_last_visible_ts', 0) > time.time() - 15
-                and self.is_alive() and not iconic and still_front):
+                and self.is_alive() and visible and not iconic and still_front):
             return True
-        if iconic:
-            # 直接恢复：最小化窗口的 GetWindowRect 是 160x28 伪矩形，
-            # 拿它做遮挡判定和布局换算会让输入框/侧栏定位全错。
+        if not visible or iconic:
+            # 「关闭到托盘」是 SW_HIDE（visible=False），「最小化」是
+            # iconic=True。两者都必须先恢复可见：Qt 控件树只在可见窗口上
+            # 物化，不恢复的话 UIA 唤醒会白等 30s 并反复写补丁把输入挂掉。
+            if not visible:
+                u.ShowWindow(self.main_hwnd, 5)      # SW_SHOW
             _restore_keep_maximize(u, self.main_hwnd)
             time.sleep(0.5)
+            wxlog.info('微信主窗口%s，已自动恢复可见 hwnd=%s',
+                       '关闭到托盘（隐藏）' if not visible else '处于最小化状态',
+                       self.main_hwnd)
+            # 微信从托盘恢复 / 主窗口重建时**句柄会变**（实测日志
+            # 4000292 → 1378074）。旧代码继续拿旧 main_hwnd 去算
+            # render_rect，得到 160x28 伪矩形 → 截图 bbox right<left 崩溃、
+            # 会话名缓存也指向恢复前那个会话 → 消息发到别的会话。
+            self._rebind_if_window_changed()
+            # 窗口刚恢复可见，界面可能停在另一个会话：缓存必须作废，
+            # 后续一律用 UIA current_chat() 实时校验（_confirm_target_chat）。
+            self._current_chat = None
+            self._last_input_box = None
+            self._last_open_error = ''
+            # 允许下一次 _get_uia() 立刻重建 UIA 引擎，别让上一次「树未
+            # 物化」的 30 秒冷却继续把流程压在旧锚点上。
+            self._uia_retry_after = 0
+            self._uia = None
+            self._uia_tried = False
         self._minimize_blockers()
         time.sleep(0.8)
         self.bring_to_front(keep_topmost=True)
         time.sleep(0.5)
         self._update_render_rect()
-        try:
-            iconic = bool(u.IsIconic(self.main_hwnd))
-        except Exception:
-            iconic = False
-        ok = self.is_alive() and not iconic
+        visible, iconic = _window_state()
+        ok = self.is_alive() and visible and not iconic
         self._last_visible_ok = ok
         self._last_visible_ts = time.time()
         return ok
@@ -1144,15 +1227,26 @@ class WeChatGUI:
     # 截图与 OCR
     # ------------------------------------------------------------------
     def _grab_screen(self, box: Optional[Tuple[int, int, int, int]] = None) -> Image.Image:
-        """截取屏幕区域（带重试）。box 为屏幕绝对坐标。"""
+        """截取屏幕区域（带重试）。box 为屏幕绝对坐标。
+
+        窗口最小化/托盘恢复时 render_rect 是 160x28 伪矩形，换算出的 bbox
+        会出现 ``right < left``，PIL 抛 ``Coordinate 'right' is less than
+        'left'``；旧实现还重试 6 次（白等 3 秒）才把异常抛给发送线程。
+        这里提前校验坐标，非法立即失败并说明原因。
+        """
+        if box is not None:
+            x0, y0, x1, y1 = box
+            if x1 <= x0 or y1 <= y0:
+                raise RuntimeError(
+                    f'截图区域无效（窗口可能最小化/关闭到托盘）：{box}')
         from PIL import ImageGrab
         last = None
-        for _ in range(6):
+        for _ in range(3):
             try:
                 return ImageGrab.grab(bbox=box) if box else ImageGrab.grab()
             except Exception as e:
                 last = e
-                time.sleep(0.5)
+                time.sleep(0.3)
         raise RuntimeError(f'屏幕截图失败：{last}')
 
     def _rel_to_screen(self, rel: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
@@ -1351,31 +1445,119 @@ class WeChatGUI:
             return False
 
     def _get_uia(self, refresh: bool = False):
-        """惰性创建并复用 UIA 引擎；不可用时返回 None（由调用方降级 OCR）。
+        """惰性创建并复用 UIA 引擎；不可用时返回 None（调用方 fail-closed）。
 
-        混合驱动：UIA 树需热激活（写 Weixin.dll 的 Qt accessibility byte）。
-        首次尝试失败则本次会话内不再重试（避免每条消息都等超时）。
+        UIA 树需热激活（写 Weixin.dll 的 Qt accessibility byte）。发送链路
+        已按 2026-11-15 用户要求禁用截图/OCR 兜底，返回 None 即代表本次
+        发送必须直接判失败；冷却 30 秒只是避免每条消息都重复等唤醒超时。
 
         Args:
             refresh: True 时跳过缓存**强制重新热激活**（写 accessibility gate
                 byte）并重建引擎。微信重启/重登后 gate byte 会失效、导致
                 “昨天能用今天不能”，此时传 True 可恢复 UIA 树。
         """
-        if refresh or not self._uia_tried:
-            self._uia_tried = True
-            try:
-                from wechatauto.uia_driver import WeChatUIA
-                eng = WeChatUIA()
-                if eng.ensure_window():
-                    self._uia = eng
-                    wxlog.info('已启用 UIA 驱动（混合路径：UIA 优先，OCR 兜底）')
-                else:
-                    self._uia = None
-                    wxlog.info('UIA 树不可用，本次会话使用 OCR 驱动')
-            except Exception as e:
+        if self._uia is not None:
+            return self._uia
+        # 控件树会被微信临时回收（切换会话、窗口关到托盘）。旧实现一次
+        # ensure_window() 失败就把 _uia_tried 永久置 True，之后整场会话都
+        # 走 OCR 慢路径，哪怕窗口早就恢复可见——2026-11-15 私信失败后
+        # 「侧栏未确认打开 ×3」就是这么来的。改成失败后冷却 30 秒可重试，
+        # 且 ensure_visible() 恢复窗口时会立即清零冷却。
+        retry_after = getattr(self, '_uia_retry_after', 0)
+        if self._uia_tried and not refresh and time.time() < retry_after:
+            return None
+        self._uia_tried = True
+        try:
+            from wechatauto.uia_driver import WeChatUIA
+            eng = WeChatUIA()
+            if eng.ensure_window():
+                self._uia = eng
+                self._uia_retry_after = 0
+                wxlog.info('已启用 UIA 驱动（发送链路唯一入口）')
+            else:
                 self._uia = None
-                wxlog.debug('初始化 UIA 引擎失败：%s', e)
+                self._uia_retry_after = time.time() + 30
+                wxlog.info('UIA 树暂不可用，30 秒后可重试（本次发送直接判失败）')
+        except Exception as e:
+            self._uia = None
+            self._uia_retry_after = time.time() + 30
+            wxlog.debug('初始化 UIA 引擎失败：%s', e)
         return self._uia
+
+    def _require_uia(self, operation: str):
+        """发送类操作的 UIA 总闸：控件树不可用就直接失败，绝不降级截图。
+
+        返回 ``(uia, None)`` 或 ``(None, WxResponse.failure)``。
+
+        2026-11-15 用户要求：截图/OCR 兜底又慢又不可靠（托盘/最小化恢复后
+        render_rect 是伪矩形，截图坐标非法、白等 20~30 秒还可能把消息打进
+        别的会话），前面的方法失败就**直接判失败**。这里统一收口，避免每个
+        发送接口各写一版「降级」逻辑、漏掉一处就又走回 OCR。
+        """
+        uia = self._get_uia()
+        if uia is not None:
+            return uia, None
+        self._last_open_error = 'uia_unavailable'
+        wxlog.warning('%s：UIA 控件树不可用，按 fail-closed 直接判失败'
+                      '（未启用截图/OCR 兜底）', operation)
+        return None, WxResponse.failure(
+            f'{operation}失败：{UIA_UNAVAILABLE_MSG}；已阻止发送',
+            data={'chat_verified': False})
+
+    def _confirm_target_chat(self, uia, who: Optional[str],
+                             openim: bool = False) -> bool:
+        """发送前**实时**确认当前会话就是目标，绝不相信 ``_current_chat`` 缓存。
+
+        事故（2026-11-15 09:57）：窗口关闭到托盘/最小化再恢复后，微信界面
+        可能停在上次打开的另一个会话，而 ``_current_chat`` 仍是「家人群」。
+        ``send_msg`` 旧逻辑先拿缓存判 ``already_open``，命中就跳过 UIA 的
+        ``current_chat()`` 校验，直接把文字打进当前输入框 → 消息发到别的
+        会话；DB 回读查不到 → 报「已操作发送，但数据库未确认」，还被上层
+        当成成功标记已回复。
+
+        这里每次发送都读 UIA 实时会话名；不匹配就重新打开并**二次校验**，
+        仍不匹配（或企业微信身份无法二次确认）直接拒绝发送。
+        """
+        if not who:
+            return True
+        try:
+            cur = uia.current_chat()
+        except Exception as exc:
+            wxlog.warning('发送前读取当前会话失败，拒绝发送：%s', exc)
+            return False
+        if uia.same_chat(cur, who):
+            self._current_chat = who
+            return True
+        wxlog.warning('发送前会话不匹配：当前=%s 目标=%s，尝试重新打开',
+                      cur, who)
+        if openim:
+            # 企业微信同名联系人靠「逐个点开验企业名标签」消歧，本层拿不到
+            # corp 信息，不做二次 open_chat，免得开成同名普通好友。
+            wxlog.warning('企业微信会话身份无法二次确认，拒绝发送以免发错人')
+            return False
+        if not uia.open_chat(who):
+            return False
+        # 窗口刚从托盘恢复时输入框 Name 可能要几百毫秒才渲染出来，给一个
+        # 短轮询（最多 ~1.2s）；仍读不到就拒绝，绝不「猜」它是目标会话。
+        cur = None
+        for _ in range(4):
+            time.sleep(0.3)
+            try:
+                cur = uia.current_chat()
+            except Exception:
+                return False
+            if uia.same_chat(cur, who):
+                self._current_chat = who
+                return True
+        wxlog.warning('重新打开后会话仍不匹配（当前=%s 目标=%s），'
+                      '拒绝发送以免发错人', cur, who)
+        return False
+
+    def _send_unverified_failure(self, text: str, what: str) -> WxResponse:
+        """UIA 输入/打开失败：直接判失败，带 chat_verified=False。"""
+        return WxResponse.failure(
+            f'{what}，已取消发送；请点开微信窗口、确认会话后重试',
+            data={'content': text, 'chat_verified': False})
 
     def warm_up(self, timeout: float = 30.0) -> bool:
         """启动预热：把 UIA 引擎建好、控件树物化，**不激活窗口、不动前后台**。
@@ -1388,7 +1570,8 @@ class WeChatGUI:
         与 ``_get_uia`` 的区别：这里走 :meth:`WeChatUIA.warm_tree`——只做
         ControlFromHandle/Exists 级查询，不点搜索框、不置前，用户正在用微信
         也不受打扰。失败时 ``_uia_tried`` 保持 False，第一次发送会再走完整
-        的 ``ensure_window`` 流程（含 OCR 兜底）。
+        的 ``ensure_window`` 流程；控件树仍不可用则按 fail-closed 直接判
+        失败（不做截图/OCR 兜底）。
 
         Returns:
             True = 引擎就绪（发送可立即开始）；False = 微信未启动或树未
@@ -1424,42 +1607,61 @@ class WeChatGUI:
         return ca == cb or ca.startswith(cb) or cb.startswith(ca)
 
     def open_chat(self, name: str, exact: bool = False) -> bool:
-        """打开指定会话的聊天窗口（优先 UIA，其次 OCR 侧栏/搜索）。
+        """打开指定会话的聊天窗口（**只走 UIA**，打开后实时校验）。
 
-        微信 4.x 行为：点侧栏会话在主窗右侧面板打开；搜索下拉点联系人则
-        打开独立聊天窗口（标题“昵称与X的聊天记录”）。本方法两条路都处理，
-        打开后把 GUI 操作目标切到对应窗口，并验证会话真正打开。
+        2026-11-15：删除默认 OCR 侧栏/搜索兜底。窗口刚从托盘/最小化恢复时
+        render_rect 是 160x28 伪矩形，OCR 路径坐标全错，会「确认」一个其实
+        没打开的会话，随后把消息发到别的会话（用户实测）。UIA 不可用或
+        找不到就直接失败，由上层给出可操作提示。
+
+        命令行 demo 需要纯坐标模式时，可显式设环境变量
+        ``WECHATAUTO_OCR_FALLBACK=1`` 走 :meth:`_open_chat_ocr`；客服系统
+        默认绝不走这条路。
         """
+        self._last_open_error = ''
         uia = self._get_uia()
-        if uia is not None:
-            # 会话已在当前面板打开 → 直接复用，不做搜索（连续回复同一会话时
-            # 省掉整段「点搜索框 + 粘关键词 + 等下拉 + 点结果」的等待）
-            if uia.same_chat(uia.current_chat(), name):
-                self._current_chat = name
-                return True
-            if uia.open_chat(name):
-                self._current_chat = name
-                return True
+        if uia is None:
+            self._last_open_error = 'uia_unavailable'
+            wxlog.warning('打开会话 %s：UIA 不可用，fail-closed 直接返回失败', name)
+            if OCR_FALLBACK_ENABLED:
+                return self._open_chat_ocr(name)
+            return False
+        # 会话已在当前面板打开 → 直接复用（实时读 UIA，不信缓存）
+        if uia.same_chat(uia.current_chat(), name):
+            self._current_chat = name
+            return True
+        if uia.open_chat(name):
+            self._current_chat = name
+            return True
+        ready = True
+        try:
+            ready = bool(uia.is_ready())
+        except Exception:
+            pass
+        self._last_open_error = '' if ready else 'tree_not_ready'
+        wxlog.warning('打开会话 %s 失败（UIA 路径，原因=%s）',
+                      name, self._last_open_error or '未搜到目标')
+        if OCR_FALLBACK_ENABLED:
+            return self._open_chat_ocr(name)
+        return False
+
+    def _open_chat_ocr(self, name: str) -> bool:
+        """纯坐标/OCR 打开会话，**仅命令行 demo 显式开启时使用**。"""
         if not self.ensure_visible():
             wxlog.warning('无法将微信窗口置于前台，尝试继续操作')
-        # 优先：右侧面板当前已打开目标会话 → 直接成功
-        # （微信 4.x 已打开的会话才渲染右侧，侧栏查找反而慢且易误配）
         self._update_render_rect()
         if self._chat_is_open(name) and self._pane_has_content():
             self._current_chat = name
             return True
-        # 优先侧栏：多轮「查找 + 点击 + 确认」（侧栏点击最可靠）
         for _ in range(3):
             pos = self.find_session(name)
             if pos:
                 self.use_window(self.main_hwnd)
                 rx, ry = pos
-                # 行已是当前高亮（会话已打开）：再点一次会关闭它，直接确认
                 if self._row_is_active(ry):
                     if self._pane_has_content():
                         self._current_chat = name
                         return True
-                    # 高亮但面板空白：不点击（点击会关闭会话），交给搜索兜底
                     wxlog.debug(f'会话 {name} 行已高亮但面板空白，跳过点击')
                 else:
                     self.wx_click(self.origin_x + rx, self.origin_y + ry)
@@ -1468,7 +1670,6 @@ class WeChatGUI:
                         return True
             wxlog.debug(f'侧栏未确认打开 {name}，重试')
             time.sleep(0.5)
-        # 侧栏找不到 → 搜索框回退（搜索下拉易误开独立历史窗，仅作最后手段）
         if self._search_chat(name):
             sub = self._find_chat_window(name)
             if sub:
@@ -1614,8 +1815,11 @@ class WeChatGUI:
                 # 同名普通好友（或别家企业的同名），已逐个点开核对过标签。
                 self._last_open_error = 'identity_mismatch'
             return False
-        # 无 UIA（OCR 兜底）时无法识别企业名标签，退回普通打开逻辑
-        return self.open_chat(name)
+        # 无 UIA 时无法识别企业名标签；旧代码退回 OCR 打开逻辑，会在同名
+        # 好友/企业微信之间误开，直接失败更安全（2026-11-15 fail-closed）。
+        self._last_open_error = 'uia_unavailable'
+        wxlog.warning('打开企业微信会话 %s：UIA 不可用，拒绝降级 OCR', name)
+        return False
 
     def input_only(self, text: str, who: Optional[str] = None,
                    who_username: Optional[str] = None) -> WxResponse:
@@ -1635,29 +1839,29 @@ class WeChatGUI:
         """
         if not text.strip():
             return WxResponse.failure('填入内容为空')
-        uia = self._get_uia()
-        if uia is None:
-            # OCR 兜底路径的输入法组合会在无候选窗时按 Enter 直接发出，
-            # 人工确认模式绝不能冒这个险
-            return WxResponse.failure(
-                '当前微信版本不支持「只填入不发送」，请改用自动发送或手动跳转')
+        uia, err = self._require_uia('填入输入框（人工确认模式）')
+        if err is not None:
+            return err
         if not self.ensure_visible():
             return WxResponse.failure('微信窗口不可见（可能锁屏或会话断开）')
         if who:
             openim = self._is_openim_id(who_username)
-            corp = who.split("@", 1)[1].strip() if "@" in (who or "") else ""
-            opened = (self.open_chat_prefer_openim(who, corp) if openim
-                      else (uia.same_chat(uia.current_chat(), who)
-                            or uia.open_chat(who)))
+            if openim:
+                corp = who.split("@", 1)[1].strip() if "@" in (who or "") else ""
+                opened = self.open_chat_prefer_openim(who, corp)
+            else:
+                # 实时校验会话，避免窗口从托盘恢复后填进别的会话
+                opened = self._confirm_target_chat(uia, who)
             if not opened:
-                return WxResponse.failure(f'无法打开会话：{who}')
+                return WxResponse.failure(
+                    f'未能确认微信当前打开的是会话「{who}」，已取消填入')
             self._current_chat = who
             time.sleep(0.3)
         if not uia.fill_text(text):
             return WxResponse.failure('填入输入框失败，请在微信里手动粘贴')
         return WxResponse.success(
             f'已填入微信输入框（{who or "当前会话"}），请在微信里核对后点发送',
-            data={'content': text, 'manual': True})
+            data={'content': text, 'manual': True, 'chat_verified': True})
 
     def _chat_open_confirmed(self, name: str) -> bool:
         """点击会话后轮询确认已打开。
@@ -1985,7 +2189,16 @@ class WeChatGUI:
             return False
         x0, y0, x1, y1 = box
         rel = (x0 + 20, y0 + 10, x1 - 20, y0 + 200)
-        img = self._grab_screen(self._rel_to_screen(rel))
+        # 托盘/最小化恢复后 render_w 可能是 160 甚至 28：x1-20 < x0+20，
+        # 截图 bbox 非法。直接判定「无文字」，不让异常冒泡到发送线程。
+        if rel[2] <= rel[0] or rel[3] <= rel[1]:
+            wxlog.debug('输入框矩形无效，跳过截图检测：%s', box)
+            return False
+        try:
+            img = self._grab_screen(self._rel_to_screen(rel))
+        except RuntimeError as exc:
+            wxlog.debug('输入框截图失败，按未输入处理：%s', exc)
+            return False
         px = img.load()
         dark = sum(1 for y in range(0, img.size[1], 2) for x in range(0, img.size[0], 2)
                    if sum(px[x, y]) < 450)
@@ -2058,87 +2271,41 @@ class WeChatGUI:
         Returns:
             WxResponse
 
-        整条流程带总时限（默认 75s）：打开会话 / 输入 / 发送任一步偶发
-        失败时重试；已发送但 DB 未落库时轮询等待确认，不重复发送。
+        整条流程**只走 UIA，失败即返回**，不再重试、不再截图/OCR 兜底；
+        已发送但 DB 未落库时最多轮询 8 秒再判「数据库未确认」，绝不重复
+        发送。返回 ``data.chat_verified=True`` 表示发送前已用 UIA 实时校验
+        过目标会话，上层据此才敢把「DB 未确认」按已回复处理。
         """
-        # 快速路径：连续发送同一会话（如分段回复）时，复用已探测的输入框，
-        # 跳过 ensure_visible / 会话重检 / 重复探测与截图确认，失败自动回退完整流程。
-        if (not verify and who
-                and self._same_chat(who, getattr(self, '_current_chat', None))
-                and getattr(self, '_last_input_box', None) is not None
-                and self.input_text(text, box=self._last_input_box, fast=True)
-                and self.click_send(fast=True)):
-            return WxResponse.success(f'消息已发送：{text}', data={'content': text})
-        # UIA 路径：热激活后可直接输入+回车发送，无 OCR 抖动，最快。
-        uia = self._get_uia()
+        # 2026-11-15：发送链路**只走 UIA**。旧的「截图探测输入框 + OCR
+        # 发送按钮」快速路径和三轮兜底循环已被删除：托盘/最小化恢复后
+        # render_rect 是 160x28 伪矩形，截图会抛
+        # ``Coordinate 'right' is less than 'left'``，还要白等 20~30 秒
+        # 做输入框探测 + 自动重校准；更糟的是它会在会话没校验通过时把
+        # 文字打进当前输入框 → 发到别的会话。前面的方法失败就直接判失败。
+        uia, err = self._require_uia('发送文本消息')
+        if err is not None:
+            return err
         openim = self._is_openim_id(who_username)
-        if uia is not None:
-            if who:
-                # open_chat 刚成功时 _current_chat 已是目标会话：直接复用，
-                # 不再全树扫一次输入框（current_chat）重复判定同一件事
-                already_open = self._same_chat(
-                    who, getattr(self, '_current_chat', None))
-                if not already_open:
-                    already_open = uia.same_chat(uia.current_chat(), who)
-            else:
-                already_open = True
-            if already_open or uia.open_chat(who, prefer_openim=openim):
-                if already_open:
-                    time.sleep(0.2)   # 已在前台：无需等面板切换
-                if who:
-                    self._current_chat = who
-                if uia.send_text(text):
-                    if not verify:
-                        return WxResponse.success(f'消息已发送：{text}', data={'content': text})
-                    if self._verify_sent(text, who, who_username):
-                        return WxResponse.success(f'消息已发送并确认：{text}', data={'content': text})
-                    wait_until = time.time() + 8
-                    while time.time() < wait_until:
-                        time.sleep(1.0)
-                        if self._verify_sent(text, who, who_username):
-                            return WxResponse.success(f'消息已发送并确认：{text}', data={'content': text})
-                    return WxResponse.failure('消息已操作发送，但数据库未确认', data={'content': text})
-        # assume_open 只在会话确实是刚打开的那个时才跳过前置检查
-        skip_open = bool(assume_open and who
-                         and self._same_chat(who, getattr(self, '_current_chat', None)))
-        if not skip_open and not self.ensure_visible():
-            return WxResponse.failure('微信窗口不可见（可能锁屏/会话断开）')
-        self._last_input_box = None
-        deadline = time.time() + 75
-        for attempt in range(3):
-            if who and not skip_open:
-                if time.time() > deadline:
-                    break
-                # 会话复用：目标仍是当前已打开会话时跳过 open_chat（每次
-                # open_chat 都重扫侧栏/点击，是逐条发送的主要耗时点）
-                if not (self._same_chat(who, getattr(self, '_current_chat', None))
-                        and self._chat_is_open(who)):
-                    if not self.open_chat(who):
-                        wxlog.debug(f'open_chat 未确认（attempt={attempt}），重试')
-                        continue
-                    self._current_chat = who
-                    time.sleep(0.8)   # 等右侧面板/输入框渲染稳定，避免探测误判
-            skip_open = True          # 仅首次跳过；后续重试走正常打开
-            if time.time() > deadline:
-                break
-            if not self.input_text(text):
-                wxlog.debug(f'输入文字失败（attempt={attempt}），重试')
-                continue
-            if not self.click_send():
-                wxlog.debug(f'点击发送未确认清空输入框（attempt={attempt}），重试')
-                continue
-            if not verify:
-                return WxResponse.success(f'消息已发送：{text}', data={'content': text})
+        if not self._confirm_target_chat(uia, who, openim=openim):
+            self._last_open_error = 'chat_mismatch'
+            return self._send_unverified_failure(
+                text, f'未能确认微信当前打开的是会话「{who}」')
+        if not uia.send_text(text):
+            return self._send_unverified_failure(text, '微信输入框不可用')
+        data = {'content': text, 'chat_verified': True}
+        if not verify:
+            return WxResponse.success(f'消息已发送：{text}', data=data)
+        if self._verify_sent(text, who, who_username):
+            return WxResponse.success(f'消息已发送并确认：{text}', data=data)
+        # 可能已发送但 DB 异步落库，轮询确认，不重发避免重复
+        wait_until = time.time() + 8
+        while time.time() < wait_until:
+            time.sleep(1.0)
             if self._verify_sent(text, who, who_username):
-                return WxResponse.success(f'消息已发送并确认：{text}', data={'content': text})
-            # 可能已发送但 DB 异步落库，轮询确认，不重发避免重复
-            wait_until = time.time() + 8
-            while time.time() < wait_until:
-                time.sleep(1.0)
-                if self._verify_sent(text, who, who_username):
-                    return WxResponse.success(f'消息已发送并确认：{text}', data={'content': text})
-            return WxResponse.failure('消息已操作发送，但数据库未确认', data={'content': text})
-        return WxResponse.failure('发送失败：多次重试未完成')
+                return WxResponse.success(f'消息已发送并确认：{text}', data=data)
+        # 注意：这里带 chat_verified=True —— 发送前已用 UIA 实时校验过会话，
+        # 只是 DB 回读没赶上；上层才可以按「已回复」处理，避免重复发送。
+        return WxResponse.failure('消息已操作发送，但数据库未确认', data=data)
 
     def _get_db(self):
         """惰性创建并复用 WeChatDB（密钥提取/解密较慢，避免每次校验都重建）。"""
@@ -2494,130 +2661,108 @@ class WeChatGUI:
                 best = (x + w // 2, cy)
         return best
 
+    def _find_quote_menu_point(self, band: Tuple[int, int, int, int]):
+        """OCR 右键菜单里找「引用」项中心点（相对渲染窗口坐标）。"""
+        for t, x, yy, w, h in self.ocr(band):
+            if '引用' in (t or ''):
+                return (x + w // 2, yy + h // 2)
+        return None
+
     def quote_msg(self, text: str, who: Optional[str] = None,
                   target_text: Optional[str] = None, verify: bool = False,
                   assume_open: bool = False,
                   who_username: Optional[str] = None) -> WxResponse:
         """引用指定/最近一条消息（右键 → 菜单「引用」→ 输入 → 发送）。
 
-        UIA 优先：菜单项是真实控件，图片/小程序/长文本消息也能引用；OCR
-        仅作兜底。target_text 用于定位要引用的消息（可选，省略=最新一条）。
+        **只走 UIA**：菜单项是真实控件，图片/小程序/长文本消息也能引用。
+        旧的 OCR 兜底（截图找消息 → 右键 → OCR 找「引用」菜单）已删除：
+        窗口从托盘恢复时坐标全错，实测白等 28.6s 后报「未找到「引用」菜单项」，
+        还可能在会话未校验时把消息发到别处（2026-11-15 用户要求 fail-closed）。
+        target_text 用于定位要引用的消息（可选，省略=最新一条）。
         who_username：目标会话 wxid，verify=True 时数据库回读直查用。
         """
-        uia = self._get_uia()
-        if uia is not None:
-            if uia.quote_message(text, who=who, target_text=target_text):
-                self._current_chat = who or getattr(self, '_current_chat', None)
-                if not verify:
-                    return WxResponse.success(f'引用已发送：{text}',
-                                              data={'content': text})
-                if self._verify_sent(text, who, who_username):
-                    return WxResponse.success(f'引用已发送并确认：{text}',
-                                              data={'content': text})
-                wait_until = time.time() + 8
-                while time.time() < wait_until:
-                    time.sleep(1.0)
-                    if self._verify_sent(text, who, who_username):
-                        return WxResponse.success(f'引用已发送并确认：{text}',
-                                                  data={'content': text})
-                return WxResponse.failure('引用已操作发送，但数据库未确认',
-                                          data={'content': text})
-            wxlog.debug('UIA 引用失败，降级 OCR 路径')
-        skip_front = bool(assume_open and who
-                          and self._same_chat(who, getattr(self, '_current_chat', None)))
-        if not skip_front and not self.ensure_visible():
-            return WxResponse.failure('微信窗口不可见（可能锁屏/会话断开）')
-        if who and not self._same_chat(who, getattr(self, '_current_chat', None)):
-            self.open_chat(who)
-            time.sleep(0.8)
-        box = self.get_input_box()
-        msg_bottom = box[1] if box else int(self.render_h * 0.8)
-        if target_text:
-            items = self.ocr((self.right_pane_left, 100, self.render_w, msg_bottom))
-            pt = None
-            for t, x, yy, w, h in items:
-                if target_text in t:
-                    pt = (x + w // 2, yy + h // 2)
-                    break
-            if not pt:
-                return WxResponse.failure(f'未找到要引用的消息：{target_text}')
-        else:
-            y = self._last_message_y()
-            if y is None:
-                return WxResponse.failure('未检测到消息区域')
-            hit = self._locate_last_message_pt(y)
-            if hit is None:
-                return WxResponse.failure('未定位到最近一条消息')
-            pt = hit
-        # 右键点击目标消息，弹出操作菜单
-        # 用 SendInput（而非 mouse_event）：微信渲染窗口对 mouse_event 的
-        # 右键不响应，SendInput 可直接命中弹出菜单（原图那次的同类修复）。
-        self._input.send_input_click(self.origin_x + pt[0], self.origin_y + pt[1], right=True)
-        time.sleep(0.7)
-        menu = self.ocr((self.right_pane_left, max(80, pt[1] - 200), self.render_w, self.render_h))
-        click_pt = None
-        for t, x, yy, w, h in menu:
-            if '引用' in t:
-                click_pt = (x + w // 2, yy + h // 2)
-                break
-        if not click_pt:
-            return WxResponse.failure('未找到「引用」菜单项')
-        self.wx_click(self.origin_x + click_pt[0], self.origin_y + click_pt[1])
-        time.sleep(0.8)
-        if not self._append_text_ocr(text, box):
-            return WxResponse.failure('输入引用内容失败')
-        self.click_send()
-        if verify:
-            ok = self._verify_sent(text, who, who_username)
-            return (WxResponse.success(f'引用已发送并确认：{text}', data={'content': text})
-                    if ok else WxResponse.failure('引用已操作发送，但数据库未确认', data={'content': text}))
-        return WxResponse.success(f'引用已发送：{text}', data={'content': text})
+        uia, err = self._require_uia('引用回复')
+        if err is not None:
+            return err
+        openim = self._is_openim_id(who_username)
+        if not self._confirm_target_chat(uia, who, openim=openim):
+            return self._send_unverified_failure(
+                text, f'未能确认微信当前打开的是会话「{who}」')
+        if not uia.quote_message(text, who=who, target_text=target_text):
+            # 失败可能留下开着的右键菜单 / 滚到历史位置的消息列表：清场，
+            # 避免污染下一次操作。但**不再降级 OCR**，直接判失败。
+            try:
+                uia.dismiss_quote_menu()
+            except Exception as exc:
+                wxlog.debug('引用失败后清理异常（忽略）：%s', exc)
+            return self._send_unverified_failure(text, '引用操作未完成')
+        self._current_chat = who or getattr(self, '_current_chat', None)
+        data = {'content': text, 'chat_verified': True}
+        if not verify:
+            return WxResponse.success(f'引用已发送：{text}', data=data)
+        if self._verify_sent(text, who, who_username):
+            return WxResponse.success(f'引用已发送并确认：{text}', data=data)
+        wait_until = time.time() + 8
+        while time.time() < wait_until:
+            time.sleep(1.0)
+            if self._verify_sent(text, who, who_username):
+                return WxResponse.success(f'引用已发送并确认：{text}', data=data)
+        return WxResponse.failure('引用已操作发送，但数据库未确认', data=data)
 
     # ------------------------------------------------------------------
     # 艾特成员（群聊）
     # ------------------------------------------------------------------
     def at_members(self, members: List[str], text: str,
                    who: Optional[str] = None, verify: bool = False,
-                   who_username: Optional[str] = None) -> WxResponse:
+                   who_username: Optional[str] = None,
+                   quote: bool = False,
+                   quote_target_text: Optional[str] = None) -> WxResponse:
         """群聊 @ 多个成员并发送正文（同一条消息）。
 
-        UIA 优先：@ 弹层是 ``mmui::XPopover/MentionPopover`` 真实控件，按
+        只走 UIA：@ 弹层是 ``mmui::XPopover/MentionPopover`` 真实控件，按
         名称精确选中，不再依赖 OCR 识别弹层文字（旧实现 OCR 读不到就报
-        「未在成员列表中找到」）。OCR 仅作兜底。
+        「未在成员列表中找到」）。UIA 不可用/失败一律直接判失败，不做截图
+        兜底。
         who_username：目标会话 wxid，verify=True 时数据库回读直查用。
+
+        ``quote=True`` 时先建立引用卡片再 @（组合回复）。OCR 兜底无法可靠
+        地同时完成引用 + @ 弹层，因此 UIA 不可用时**明确失败**而不是静默
+        退化成「只发 @」——用户会以为引用也发出去了（2026-11-15 实测）。
         """
         names = [m.strip() for m in (members or []) if m and m.strip()]
         if not names:
+            if quote:
+                return self.quote_msg(text, who=who,
+                                      target_text=quote_target_text,
+                                      verify=verify,
+                                      who_username=who_username)
             return self.send_msg(text, who=who, verify=verify,
                                  who_username=who_username)
-        uia = self._get_uia()
-        if uia is not None:
-            if uia.at_members(names, text, who=who):
-                self._current_chat = who or getattr(self, '_current_chat', None)
-                data = {'members': names, 'content': text}
-                if not verify:
-                    return WxResponse.success('@成员消息已发送', data=data)
-                if self._verify_sent(text, who, who_username):
-                    return WxResponse.success('@成员消息已发送并确认', data=data)
-                wait_until = time.time() + 8
-                while time.time() < wait_until:
-                    time.sleep(1.0)
-                    if self._verify_sent(text, who, who_username):
-                        return WxResponse.success('@成员消息已发送并确认', data=data)
-                return WxResponse.failure('@消息已操作发送，但数据库未确认', data=data)
-            wxlog.debug('UIA @ 成员失败，降级 OCR 路径')
-        if len(names) > 1:
-            # OCR 兜底无法一次插入多个提及，明确报错好过发出多条残缺消息
-            return WxResponse.failure(
-                f'UIA 不可用，无法一次 @ 多个成员：{", ".join(names)}；'
-                '请只 @ 一个成员后重试')
-        if not self.ensure_visible():
-            return WxResponse.failure('微信窗口不可见（可能锁屏/会话断开）')
-        if who and not self._same_chat(who, getattr(self, '_current_chat', None)):
-            self.open_chat(who)
-            time.sleep(0.8)
-        return self._at_member_ocr(names[0], text, who, verify,
-                                   who_username)
+        # 只走 UIA：旧代码的 OCR @ 弹层兜底既慢又会在窗口从托盘恢复后
+        # 点错位置；2026-11-15 起前面的方法失败就直接判失败。
+        uia, err = self._require_uia('@ 成员发送')
+        if err is not None:
+            return err
+        openim = self._is_openim_id(who_username)
+        if not self._confirm_target_chat(uia, who, openim=openim):
+            return self._send_unverified_failure(
+                text, f'未能确认微信当前打开的是会话「{who}」')
+        if not uia.at_members(names, text, who=who, quote=quote,
+                              quote_target_text=quote_target_text):
+            return self._send_unverified_failure(
+                text, '@ 成员/引用操作未完成' if quote else '@ 成员操作未完成')
+        self._current_chat = who or getattr(self, '_current_chat', None)
+        data = {'members': names, 'content': text, 'chat_verified': True}
+        if not verify:
+            return WxResponse.success('@成员消息已发送', data=data)
+        if self._verify_sent(text, who, who_username):
+            return WxResponse.success('@成员消息已发送并确认', data=data)
+        wait_until = time.time() + 8
+        while time.time() < wait_until:
+            time.sleep(1.0)
+            if self._verify_sent(text, who, who_username):
+                return WxResponse.success('@成员消息已发送并确认', data=data)
+        return WxResponse.failure('@消息已操作发送，但数据库未确认', data=data)
 
     def at_member(self, member: str, text: str, who: Optional[str] = None,
                   verify: bool = False,

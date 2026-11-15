@@ -826,8 +826,9 @@ class TestOpportunityMerge:
 class FakeWxResponse(dict):
     """WxResponse 替身（dict 子类 + is_success 属性，同 wechatauto.param）。"""
 
-    def __init__(self, ok: bool, message: str):
-        super().__init__(status="成功" if ok else "失败", message=message)
+    def __init__(self, ok: bool, message: str, data=None):
+        super().__init__(status="成功" if ok else "失败", message=message,
+                         data=data)
         self.is_success = ok
 
 
@@ -923,14 +924,80 @@ class TestSender:
         assert db.get_opportunity(opp["id"])["status"] == "pending"
 
     def test_sent_but_unconfirmed_marks_replied(self):
-        """「已操作发送但 DB 未确认」按已回复处理，防止重试造成重复发送。"""
+        """「已操作发送但 DB 未确认」+ 会话已实时校验 → 按已回复处理。
+
+        只有组件层明确给出 ``chat_verified=True``（发送前用 UIA 实时确认过
+        会话）才允许按已回复处理，防止重试造成重复发送。
+        """
         db, opp, sender = self._prepare()
 
         class UnconfirmedGUI(FakeGUI):
             def send_msg(self, text, who=None, verify=False,
                          assume_open=False, who_username=None):
                 self.sent.append(text)
-                return FakeWxResponse(False, "消息已操作发送，但数据库未确认")
+                return FakeWxResponse(
+                    False, "消息已操作发送，但数据库未确认",
+                    data={"chat_verified": True})
+
+        gui = UnconfirmedGUI()
+        events = []
+        sender._ensure_gui = lambda: gui
+        sender._notifier.broadcast = lambda t, p: events.append((t, p))
+        sender._process(SendTask(opportunity_id=opp["id"],
+                                 session_username="12345@chatroom",
+                                 session_name="加工群", text="hi"))
+        assert db.get_opportunity(opp["id"])["status"] == "replied"
+        send_results = [p for t, p in events if t == "send_result"]
+        assert send_results and send_results[0]["ok"] is True
+        assert send_results[0]["unconfirmed"] is True
+
+    def test_unconfirmed_without_chat_verification_stays_pending(self):
+        """会话没实时校验过的「DB 未确认」绝不能标已回复。
+
+        2026-11-15 事故：窗口从托盘恢复后消息发到了别的会话，DB 回读
+        查不到，旧逻辑仍按成功标记 replied。
+        """
+        db, opp, sender = self._prepare()
+
+        class UnverifiedGUI(FakeGUI):
+            def send_msg(self, text, who=None, verify=False,
+                         assume_open=False, who_username=None):
+                self.sent.append(text)
+                return FakeWxResponse(False, "消息已操作发送，但数据库未确认",
+                                      data={"chat_verified": False})
+
+        gui = UnverifiedGUI()
+        events = []
+        sender._ensure_gui = lambda: gui
+        sender._notifier.broadcast = lambda t, p: events.append((t, p))
+        sender._process(SendTask(opportunity_id=opp["id"],
+                                 session_username="12345@chatroom",
+                                 session_name="加工群", text="hi"))
+        assert db.get_opportunity(opp["id"])["status"] == "pending"
+        send_results = [p for t, p in events if t == "send_result"]
+        assert send_results and send_results[0]["ok"] is False
+
+    @pytest.mark.parametrize("message", [
+        "消息已操作发送，但数据库未确认",
+        "引用已操作发送，但数据库未确认",
+        "@消息已操作发送，但数据库未确认",
+    ])
+    def test_all_unconfirmed_variants_mark_replied_when_verified(
+            self, message):
+        """各发送接口的「已操作发送 + DB 未确认」都要按已回复处理。
+
+        ``quote_msg`` 用的是「引用已操作发送」而不是「消息已操作发送」，
+        旧 sender 只匹配后者 → 引用回复明明发出去了却被判失败，用户重发
+        就会得到两条消息。只要组件层给了 chat_verified=True 就统一放行。
+        """
+        db, opp, sender = self._prepare()
+
+        class UnconfirmedGUI(FakeGUI):
+            def send_msg(self, text, who=None, verify=False,
+                         assume_open=False, who_username=None):
+                self.sent.append(text)
+                return FakeWxResponse(False, message,
+                                      data={"chat_verified": True})
 
         gui = UnconfirmedGUI()
         events = []

@@ -255,9 +255,15 @@ class TestWaitReadyRetries:
         monkeypatch.setattr(drv, "time", clk)   # 只替换模块级引用，不动全局 time
         uia = object.__new__(WeChatUIA)
         wakes = []
+        # 新签名支持 rearm=True（gate=1 但树被回收时的受控重触发）
         monkeypatch.setattr(uia, "_wake_accessibility",
-                            lambda: wakes.append(clk.t) or False)
+                            lambda rearm=False: wakes.append(
+                                (clk.t, rearm)) or False)
         monkeypatch.setattr(uia, "_wechat_hwnds", lambda: [111])
+        # 窗口可见性恢复有真实系统副作用，单测必须隔离；默认窗口可见。
+        monkeypatch.setattr(uia, "_restore_window_visible", lambda: True)
+        # 重触发限流涉及真实 PID 查询，单测里禁用，另设专项测试覆盖
+        monkeypatch.setattr(uia, "_rearm_allowed", lambda: False)
         return uia, wakes, clk
 
     def test_retries_wake_during_wait(self, monkeypatch):
@@ -322,13 +328,23 @@ class TestWindowVisibilityGuards:
         states = iter([True, False])   # 第一次探测最小化，恢复后不再最小化
 
         class _U:
+            def __init__(self):
+                self.shown = []
+
+            def IsWindowVisible(self, h):
+                return True          # 最小化窗口 Win32 仍报 visible
+
             def IsIconic(self, h):
                 return next(states, False)
+
+            def ShowWindow(self, h, cmd):
+                self.shown.append((h, cmd))
 
             def GetForegroundWindow(self):
                 return 0
 
-        g._input._user32 = _U()
+        win_u = _U()
+        g._input._user32 = win_u
         restored = []
         monkeypatch.setattr(guia, "_restore_keep_maximize",
                             lambda u, h: restored.append(h))
@@ -340,3 +356,166 @@ class TestWindowVisibilityGuards:
         monkeypatch.setattr(g, "is_alive", lambda: True)
         assert g.ensure_visible() is True
         assert restored == [330176]
+        assert win_u.shown == []       # 最小化不需要先 SW_SHOW
+
+    def test_ensure_visible_restores_hidden_tray_window(self, monkeypatch):
+        """「关闭到托盘」= SW_HIDE，必须先 SW_SHOW 再恢复，否则树不物化。"""
+        from wechatauto import guia
+        g = self._gui()
+        g.main_hwnd = 330176
+        g.render_hwnd = 330176
+        vis = iter([False, True, True])   # 隐藏 → SW_SHOW 后可见
+
+        class _U:
+            def __init__(self):
+                self.shown = []
+
+            def IsWindowVisible(self, h):
+                return next(vis, True)
+
+            def IsIconic(self, h):
+                return False
+
+            def ShowWindow(self, h, cmd):
+                self.shown.append((h, cmd))
+
+            def GetForegroundWindow(self):
+                return 0
+
+        win_u = _U()
+        g._input._user32 = win_u
+        restored = []
+        monkeypatch.setattr(guia, "_restore_keep_maximize",
+                            lambda u, h: restored.append(h))
+        monkeypatch.setattr("wechatauto.guia.time.sleep", lambda s: None)
+        monkeypatch.setattr(g, "_minimize_blockers", lambda: 0)
+        monkeypatch.setattr(g, "bring_to_front",
+                            lambda keep_topmost=False: True)
+        monkeypatch.setattr(g, "_update_render_rect", lambda: None)
+        monkeypatch.setattr(g, "is_alive", lambda: True)
+        assert g.ensure_visible() is True
+        assert win_u.shown == [(330176, 5)]    # SW_SHOW
+        assert restored == [330176]
+        # 恢复窗口后必须清掉 UIA 冷却，否则继续走 OCR 慢路径
+        assert getattr(g, '_uia_retry_after', 0) == 0
+        assert g._uia_tried is False
+
+
+class TestTrayVisibilityPatchGuard:
+    """关闭到托盘/最小化：控件树不物化，补丁必须跳过且不能反复写内存。
+
+    2026-11-15 01:05 实测：私信回复时微信被关到托盘 → 唤醒超时 31s →
+    OCR「侧栏未确认打开」连刷 3 次 → 93s 失败 → 界面假死。
+    """
+
+    @staticmethod
+    def _clock(monkeypatch):
+        import wechatauto.uia_driver as drv
+
+        class _Clock:
+            def __init__(self):
+                self.t = 1000.0
+
+            def time(self):
+                return self.t
+
+            def monotonic(self):
+                return self.t
+
+            def sleep(self, s):
+                self.t += s
+
+        clk = _Clock()
+        monkeypatch.setattr(drv, "time", clk)   # 只替换模块级引用
+        return clk
+
+    def test_invisible_window_skips_all_patches(self, monkeypatch):
+        uia = object.__new__(WeChatUIA)
+        self._clock(monkeypatch)
+        monkeypatch.setattr(uia, "_restore_window_visible", lambda: False)
+        monkeypatch.setattr(uia, "_wechat_hwnds", lambda: [111])
+        monkeypatch.setattr(uia, "_find_main", lambda: None)
+        monkeypatch.setattr(uia, "is_ready", lambda: False)
+        wakes = []
+        monkeypatch.setattr(uia, "_wake_accessibility",
+                            lambda: wakes.append(1) or False)
+
+        assert uia._wake_and_wait_ready(timeout=15.0) is False
+        assert wakes == []                 # 一次内存都不写
+
+    def test_patch_writes_capped_during_wait(self, monkeypatch):
+        uia = object.__new__(WeChatUIA)
+        self._clock(monkeypatch)
+        monkeypatch.setattr(uia, "_restore_window_visible", lambda: True)
+        monkeypatch.setattr(uia, "_wechat_hwnds", lambda: [111])
+        monkeypatch.setattr(uia, "_find_main", lambda: None)
+        monkeypatch.setattr(uia, "is_ready", lambda: False)
+        wakes = []
+
+        def _wake():
+            wakes.append(1)
+            uia._last_patch_written = True
+            return True
+
+        monkeypatch.setattr(uia, "_wake_accessibility", _wake)
+        assert uia._wake_and_wait_ready(timeout=30.0) is False
+        assert len(wakes) == WeChatUIA.MAX_WRITES_IN_WAIT
+
+    def test_restore_shows_minimized_and_hidden_only(self, monkeypatch):
+        """最小化→SW_RESTORE；托盘隐藏→SW_SHOW；托盘辅助窗口不动。"""
+        from types import SimpleNamespace
+        import win32con
+        import wechatauto.uia_driver as drv
+
+        wins = {
+            111: ["微信", True, True],       # 最小化（visible 仍为 True）
+            222: ["微信", False, False],     # 关闭到托盘（SW_HIDE）
+            333: ["WxTrayIconMessageWindow", False, False],
+        }
+        shown = []
+
+        def _show(h, cmd):
+            shown.append((h, cmd))
+            if cmd == win32con.SW_RESTORE:
+                wins[h][2] = False
+                wins[h][1] = True
+            elif cmd == win32con.SW_SHOW:
+                wins[h][1] = True
+
+        fake = SimpleNamespace(
+            EnumWindows=lambda cb, lp: [cb(h, lp) for h in list(wins)],
+            GetWindowText=lambda h: wins[h][0],
+            IsIconic=lambda h: wins[h][2],
+            IsWindowVisible=lambda h: wins[h][1],
+            ShowWindow=_show,
+        )
+        monkeypatch.setattr(drv, "win32gui", fake)
+        uia = object.__new__(WeChatUIA)
+
+        assert uia._restore_window_visible() is True
+        assert shown == [(111, win32con.SW_RESTORE),
+                         (222, win32con.SW_SHOW)]
+
+    def test_uia_failure_retries_after_cooldown(self, monkeypatch):
+        """一次树回收不能让整场会话永久降级 OCR。"""
+        import time as _time
+        from wechatauto.guia import WeChatGUI
+
+        g = object.__new__(WeChatGUI)
+        g._uia = None
+        g._uia_tried = True
+        g._uia_retry_after = _time.time() + 30
+        monkeypatch.setattr(
+            "wechatauto.uia_driver.WeChatUIA",
+            lambda: (_ for _ in ()).throw(
+                AssertionError("冷却期内不应重建 UIA 引擎")))
+        assert g._get_uia() is None
+
+        class FakeEngine:
+            def ensure_window(self):
+                return True
+
+        g._uia_retry_after = 0
+        monkeypatch.setattr("wechatauto.uia_driver.WeChatUIA", FakeEngine)
+        assert isinstance(g._get_uia(), FakeEngine)
+        assert g._uia_retry_after == 0

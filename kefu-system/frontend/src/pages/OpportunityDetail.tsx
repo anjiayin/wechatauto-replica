@@ -268,6 +268,10 @@ export default function OpportunityDetail(props: {
   // 群内回复默认 @ 发送人（可取消，记住上次选择）
   const [atSender, setAtSender] = useState(readAtSenderPref)
   const [quoteLocalId, setQuoteLocalId] = useState<number | null>(null)
+  // 「引用最新一条消息」是**意图**而不是某个固定 local_id：页面加载后
+  // 群里随时会进来新消息（尤其是自己刚发的回复），若钉死 local_id，
+  // 后端会把它当成「引用更早的一条」去文本定位，既慢又易失败。
+  const [quoteLatest, setQuoteLatest] = useState(false)
   // 人工确认（用户反馈：存在发错人的情况——同名联系人/企业微信身份/操作失败）。
   // 默认开启：只把回复内容填进微信输入框，由用户在微信里核对收件人后
   // 自己点发送；关掉才是「自动发送 + 数据库确认」。
@@ -406,6 +410,7 @@ export default function OpportunityDetail(props: {
     setReplyText('')
     setAtMembers([])
     setQuoteLocalId(null)
+    setQuoteLatest(false)
   }, [id])
 
   // 发送结果经 WS → CustomEvent 送达（202 受理后异步反馈）
@@ -491,7 +496,9 @@ export default function OpportunityDetail(props: {
       manual_confirm: manualConfirm,
     }
     if (target === 'session' && quoteLocalId !== null) {
-      payload.quote = { local_id: quoteLocalId }
+      // latest=true：后端在真正执行发送时右键当时最新的一条，不受页面
+      // 加载后新消息（含自己上一条回复）影响
+      payload.quote = { local_id: quoteLocalId, latest: quoteLatest }
     }
     setSendingTarget(target)
     setSendingSince(Date.now())
@@ -509,9 +516,20 @@ export default function OpportunityDetail(props: {
     onError: (err: Error) => setSnack({ ok: false, message: err.message }),
   })
 
-  /** 引用某条上下文消息（再点一次取消）。 */
-  const toggleQuote = (localId: number) => {
-    setQuoteLocalId((cur) => (cur === localId ? null : localId))
+  /** 引用某条上下文消息（再点一次取消）；latest=引用执行时的最新一条。 */
+  const toggleQuote = (localId: number, latest = false) => {
+    if (quoteLocalId === localId && quoteLatest === latest) {
+      setQuoteLocalId(null)
+      setQuoteLatest(false)
+      return
+    }
+    setQuoteLocalId(localId)
+    setQuoteLatest(latest)
+  }
+
+  const clearQuote = () => {
+    setQuoteLocalId(null)
+    setQuoteLatest(false)
   }
 
   const quotedItem = quoteLocalId === null
@@ -820,21 +838,23 @@ export default function OpportunityDetail(props: {
                   )}
                 />
               )}
-              {quotedItem ? (
+              {quoteLocalId !== null ? (
                 <Chip
                   color="primary"
                   variant="outlined"
                   size="small"
                   icon={<FormatQuoteIcon />}
-                  label={`引用：${(quotedItem.content || quotedItem.type_name).slice(0, 16)}`}
-                  onDelete={() => setQuoteLocalId(null)}
+                  label={quoteLatest
+                    ? '引用最新一条消息'
+                    : `引用：${(quotedItem?.content || quotedItem?.type_name || '所选消息').slice(0, 16)}`}
+                  onDelete={clearQuote}
                 />
               ) : (
                 contextItems.length > 0 && (
                   <Button
                     size="small"
                     startIcon={<FormatQuoteIcon />}
-                    onClick={() => toggleQuote(contextItems[contextItems.length - 1].local_id)}
+                    onClick={() => toggleQuote(contextItems[contextItems.length - 1].local_id, true)}
                   >
                     引用最新一条消息
                   </Button>

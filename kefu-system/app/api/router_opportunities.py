@@ -428,6 +428,7 @@ def reply_opportunity(opp_id: int, body: ReplyRequest,
             logger.info("私信回复丢弃 @/引用（商机 #%d）", opp_id)
         at_names: List[str] = []
         quote_local_id: Optional[int] = None
+        quote_latest = False
     else:
         session_username = opp["session_username"]
         # 会话显示名：企业微信联系人为「昵称@企业简称」
@@ -438,6 +439,7 @@ def reply_opportunity(opp_id: int, body: ReplyRequest,
                                               session_name)
         at_names = [a.strip() for a in body.at if a.strip()]
         quote_local_id = body.quote.local_id if body.quote else None
+        quote_latest = bool(body.quote and body.quote.latest)
     # 目标校验①：监控对象或联系人存在性
     if not db.get_target_by_username(session_username) \
             and not svc.session_exists(session_username):
@@ -446,7 +448,7 @@ def reply_opportunity(opp_id: int, body: ReplyRequest,
             detail=f"目标会话不存在或已失效：{session_name}，"
                    "请确认微信仍在使用该会话")
     manual = bool(body.manual_confirm)
-    if manual and (at_names or quote_local_id is not None):
+    if manual and (at_names or quote_local_id is not None or quote_latest):
         # 人工确认模式下只做「清空输入框 + 填入正文」，@ 弹层与引用卡片都
         # 需要发送动作配合才能成型。丢弃它们比强行自动发送安全：这一步本来
         # 就是让用户在微信里自己收尾，@ 与引用在微信里点一下即可。
@@ -459,6 +461,7 @@ def reply_opportunity(opp_id: int, body: ReplyRequest,
         text=body.text.strip(),
         at=[] if manual else at_names,
         quote_local_id=None if manual else quote_local_id,
+        quote_latest=False if manual else quote_latest,
         manual_confirm=manual,
         target=target,
     )

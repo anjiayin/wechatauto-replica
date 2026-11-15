@@ -465,6 +465,9 @@ class OpportunityStatusUpdate(BaseModel):
 
 class QuoteRef(BaseModel):
     local_id: int
+    # 「引用最新一条消息」是意图而非固定消息：执行发送时才确定右键哪条。
+    # 旧客户端只传 local_id 时保持原语义（精确引用该条）。
+    latest: bool = False
 
 
 class ReplyRequest(BaseModel):

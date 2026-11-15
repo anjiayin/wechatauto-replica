@@ -49,6 +49,7 @@ except Exception:                                   # pragma: no cover
     _HAS_WIN32 = False
 
 from wechatauto.logger import wxlog
+from wechatauto.text_norm import normalize_match_text, contains_normalized
 
 # ---------------------------------------------------------------------------
 # 控件锚点
@@ -530,7 +531,7 @@ class WeChatUIA:
             handle, ctypes.c_void_p(address), buf, 1, ctypes.byref(written))
         return bool(ok and written.value == 1)
 
-    def _hot_activate_accessibility(self, hwnd: int):
+    def _hot_activate_accessibility(self, hwnd: int, rearm: bool = False):
         """运行中热激活 Qt accessibility gate，不重启微信进程。
 
         Returns:
@@ -542,6 +543,13 @@ class WeChatUIA:
         于是「什么都没做」也吃掉限流配额：实测日志只出现 3 次 0→1，
         限流却已报「已热激活 5 次」，随后 300 秒内全部强制降级 OCR，
         用户输入框定位失败、白等 60~80 秒（时好时坏的直接来源）。
+
+        ``rearm=True`` 处理「gate 已经是 1、但控件树被 Qt 回收」的死锁：
+        微信关闭到托盘/最小化再恢复时，Qt 会销毁 UIA 树却把 gate 留在 1，
+        此时普通热激活读到 1 直接返回 ``already``，什么都不做 → 干等 30 秒
+        超时（2026-11-15 09:54 日志「真实写入补丁 0 次」）。这里做一次
+        **0→1 脉冲**强制 Qt 重新物化树。脉冲写内存次数计入限流配额，调用方
+        必须严格限次（见 :meth:`_wake_and_wait_ready`）。
         """
         pid = self._pid_from_hwnd(hwnd)
         if not pid:
@@ -571,7 +579,19 @@ class WeChatUIA:
             address = int(base) + int(rva)
             current = self._read_process_byte(handle, address)
             if current == 1:
-                return 'already'
+                if not rearm:
+                    return 'already'
+                # 0→1 脉冲：让 Qt 认为 accessibility 被重新打开并重建树。
+                # 严格限次由调用方保证，避免「90 秒内 4+ 次补丁写挂 Qt 输入」。
+                if not self._write_process_byte(handle, address, 0):
+                    wxlog.warning("重触发 UIA 树失败：无法写入 gate=0。")
+                    return False
+                time.sleep(0.05)
+                if not self._write_process_byte(handle, address, 1):
+                    wxlog.warning("重触发 UIA 树失败：无法写回 gate=1。")
+                    return False
+                wxlog.info("已重触发微信 UIA 树（gate 1→0→1）：PID=%s", pid)
+                return 'patched'
             if current is None:
                 wxlog.warning("热激活 UIA 失败：无法读取 active byte。")
                 return False
@@ -588,14 +608,64 @@ class WeChatUIA:
     # 进程反复写 accessibility gate byte（0->1->0->1 循环）会把 Qt 输入
     # 系统弄挂——窗口渲染正常、WM_NULL 响应、CPU 空闲，但所有鼠标点击
     # （包括 PostMessage 直投）都被吞掉，只能重启微信恢复（2026-11-14
-    # 实测：90 秒内补丁 4+ 次 → 假死）。限流后最坏情况退化为 OCR 兜底。
+    # 实测：90 秒内补丁 4+ 次 → 假死）。限流后发送链路 fail-closed 直接
+    # 判失败（2026-11-15 起不再降级截图/OCR）。
     PATCH_COOLDOWN = 20.0        # 距上次热激活的最小间隔（秒）
     PATCH_MAX_PER_PID = 5        # 同一微信进程代内最多热激活次数
+    MAX_WRITES_IN_WAIT = 2       # 单次等待循环内最多真实写内存次数
+    REARM_COOLDOWN = 45.0        # 同一 PID 两次「gate 0→1 重触发」最小间隔
     _patch_log: dict = {}        # pid -> [count, last_monotonic]
+    _rearm_log: dict = {}        # pid -> last_monotonic（重触发单独限流）
     _throttled_pid: int = 0      # 最近被限流拒绝的 PID（供上层给可操作提示）
     _throttled_at: float = 0.0   # 该次拒绝的 monotonic 时刻（5 分钟内有效）
 
-    def _wake_accessibility(self) -> bool:
+    def _restore_window_visible(self) -> bool:
+        """把最小化 / 关闭到托盘（SW_HIDE）的微信主窗口恢复为可见。
+
+        微信 4.1 的 Qt accessibility 树**只在窗口可见时物化**。实测
+        （2026-11-15 01:05）：用户把微信关到托盘后主窗口变成 160x28
+        最小化伪矩形，此时热激活补丁写了 gate byte 树也不会重建 →
+        白等 31s → 降级 OCR 连刷 3 次 → 93s 失败；更糟的是在不可见状态
+        反复写内存会把 Qt 输入系统写挂，表现为「微信卡死、点击没反应」。
+
+        只恢复可见性、不改 Z 序不置前（尽量不打扰用户）；返回当前是否
+        至少存在一个「可见且非最小化」的主窗口。
+        """
+        if not _HAS_WIN32:
+            return True                 # 非 Windows（CI）不做窗口操作
+        restored = 0
+        visible_ok = False
+
+        def cb(h, _):
+            nonlocal restored, visible_ok
+            try:
+                if win32gui.GetWindowText(h) not in MAIN_NAMES:
+                    return True
+                iconic = bool(win32gui.IsIconic(h))
+                visible = bool(win32gui.IsWindowVisible(h))
+                if iconic:
+                    win32gui.ShowWindow(h, win32con.SW_RESTORE)
+                    restored += 1
+                elif not visible:
+                    win32gui.ShowWindow(h, win32con.SW_SHOW)
+                    restored += 1
+                visible_ok = visible_ok or (
+                    bool(win32gui.IsWindowVisible(h))
+                    and not bool(win32gui.IsIconic(h)))
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumWindows(cb, None)
+        except Exception:
+            return False
+        if restored:
+            wxlog.info('微信主窗口被最小化/关闭到托盘，已恢复可见（%d 个）',
+                       restored)
+        return visible_ok
+
+    def _wake_accessibility(self, rearm: bool = False) -> bool:
         """按 PID 去重地热激活；**只有真实写内存**才消耗限流配额。
 
         两个实测坑：
@@ -603,10 +673,16 @@ class WeChatUIA:
            打补丁、逐个计数，一次调用就能吃掉好几份配额；
         2) gate byte 本来就是 1 时「什么都没写」也算一次成功热激活，
            还顺手清掉 ``_win`` 缓存，让 UIA 树锚点反复重建。
+
+        本方法**只管补丁**，不改窗口状态：窗口可见性由
+        :meth:`_wake_and_wait_ready` / :meth:`ensure_window` 在调用前恢复，
+        不可见时它们会直接跳过补丁（不可见状态写 gate byte 既不会物化
+        控件树，反复写还会挂掉 Qt 输入系统）。
         """
         ok = False
         patched_any = False
         seen_pids = set()
+        self._last_patch_written = False
         for hwnd in self._wechat_hwnds():
             pid = self._pid_from_hwnd(hwnd)
             if pid in seen_pids:
@@ -628,10 +704,13 @@ class WeChatUIA:
                     WeChatUIA._throttled_at = time.monotonic()
                     wxlog.warning(
                         "微信 UIA 已热激活 %d 次仍反复回收（PID=%s），"
-                        "疑似微信异常，本次跳过、走 OCR 兜底。建议重启微信。",
+                        "疑似微信异常，本次跳过（发送将直接判失败）。建议重启微信。",
                         rec[0], pid)
                     continue
-            state = self._hot_activate_accessibility(hwnd)
+            # rearm=False 时走旧的单参数调用形式，保持与既有调用方/测试桩
+            # 兼容；只有真正需要 0→1 脉冲时才传新参数。
+            state = (self._hot_activate_accessibility(hwnd, rearm=True)
+                     if rearm else self._hot_activate_accessibility(hwnd))
             if state == 'already':
                 ok = True        # gate 已开：不写内存、不占配额、不清缓存
                 continue
@@ -645,6 +724,7 @@ class WeChatUIA:
         if patched_any:
             self._win = None
             time.sleep(0.2)
+        self._last_patch_written = patched_any
         return ok
 
     # ------------------------------------------------------------------ 窗口定位
@@ -791,8 +871,11 @@ class WeChatUIA:
             if not require_ready or self.is_ready():
                 self._activate(w)
                 return True
-            # 窗口在但控件树没物化：等它（不重启微信）
-            if wake and self._wake_and_wait_ready(max(timeout, 30.0)):
+            # 窗口在但控件树没物化：等它（不重启微信）。发送路径不再强制
+            # 等满 30s：那是冷启动首次物化的耗时，已由启动预热承担。
+            # 窗口从托盘恢复后 tree 重触发通常 1~3s 内就绪，等 30s 只会
+            # 让用户白等（2026-11-15 用户反馈「太慢」）。
+            if wake and self._wake_and_wait_ready(min(max(timeout, 12.0), 15.0)):
                 if self._win is not None:
                     self._activate(self._win)
                 return True
@@ -801,6 +884,9 @@ class WeChatUIA:
         if not wake:
             return False
         try:
+            # 托盘/最小化窗口在 _wechat_hwnds() 里根本枚举不到；先恢复可见
+            # 再判断，否则会误走「微信没开」的 screen reader / wake 分支。
+            self._restore_window_visible()
             if self._login_window() is not None:
                 self._auto_login()
             elif self._wechat_hwnds():
@@ -1362,12 +1448,32 @@ class WeChatUIA:
         return self._wake_and_wait_ready(timeout)
 
     def _wake_and_wait_ready(self, timeout: float = 30.0) -> bool:
-        """热激活并等待控件树就绪（不激活窗口）。"""
+        """热激活并等待控件树就绪（不主动置前，但必须保证窗口可见）。
+
+        树物化的前提是窗口**可见**：用户把微信关到托盘/最小化后，光打补丁
+        永远等不到树。这里在每次重试前恢复可见性，并限制单次等待内真实写
+        内存的次数（反复写会把 Qt 输入系统写挂，实测 90s 内 4+ 次即假死）。
+        """
         t0 = time.time()
         wxlog.info("微信控件树尚未就绪，正在热激活（首次约 15~30 秒，请稍等）")
+        visible = self._restore_window_visible()
+        if not visible:
+            # 窗口仍不可见（关闭到托盘且恢复失败）：控件树在不可见窗口上
+            # 不会物化，打补丁也无效。**立刻失败**，不要干等满 30 秒——
+            # 老版本在这里只是跳过补丁却继续等，用户白等 30s 才报错。
+            wxlog.warning("微信主窗口不可见（关闭到托盘/最小化且恢复失败），"
+                          "控件树不会物化，本次立即放弃")
+            return False
+        writes = 0
         self._wake_accessibility()
-        deadline = t0 + max(timeout, 15.0)
-        next_wake = t0 + 6.0
+        if getattr(self, '_last_patch_written', False):
+            writes += 1
+        # 关键：'already'（gate 本来就是 1）不算写入。窗口刚从托盘恢复时
+        # Qt 把树回收了却把 gate 留在 1，普通热激活什么都不做 → 干等超时
+        # （09:54 日志「真实写入补丁 0 次」）。此时做一次受控 0→1 重触发。
+        rearm_done = False
+        deadline = t0 + max(timeout, 12.0)
+        next_wake = t0 + 3.0
         missing = 0
         while time.time() < deadline:
             w = self._find_main()
@@ -1389,17 +1495,53 @@ class WeChatUIA:
                                time.time() - t0)
                     return True
             if time.time() >= next_wake:
-                # 20s 冷却期内补丁会被限流跳过；等待期间必须再试几次，
-                # 否则「刚打完补丁 2s 又来一次」只会干等满 30s 才超时。
-                self._wake_accessibility()
+                # 用户可能在这 6 秒里又把微信关回托盘：先恢复可见性。
+                still_visible = self._restore_window_visible()
+                if not still_visible:
+                    wxlog.warning("等待控件树期间微信窗口又变为不可见，立即放弃")
+                    return False
+                elapsed = time.time() - t0
+                if (not rearm_done and writes == 0 and elapsed >= 2.5
+                        and self._rearm_allowed()):
+                    # gate=1 但树没物化：做唯一一次 0→1 脉冲强制重建。
+                    self._wake_accessibility(rearm=True)
+                    rearm_done = True
+                    if getattr(self, '_last_patch_written', False):
+                        writes += 1
+                        wxlog.info("已对「gate=1 但树未物化」做一次受控重触发")
+                elif writes < WeChatUIA.MAX_WRITES_IN_WAIT:
+                    self._wake_accessibility()
+                    if getattr(self, '_last_patch_written', False):
+                        writes += 1
                 next_wake = time.time() + 6.0
             time.sleep(0.4)
         wxlog.warning(
-            "微信控件树唤醒超时（已等 %.0fs）。4.1.15+ 的微信需要"
-            "「QT_ACCESSIBILITY=1 环境 + 热激活补丁」两者齐备（程序会自动"
-            "写用户级环境变量并打补丁）。若手动打开的微信先于本服务启动，"
-            "请重启一次微信让它继承环境变量。", time.time() - t0)
+            "微信控件树唤醒超时（已等 %.0fs，本次真实写入补丁 %d 次，"
+            "重触发 %s）。常见原因：①微信被关闭到托盘/最小化（控件树不会"
+            "物化，请点开微信窗口）；②4.1.15+ 需要「QT_ACCESSIBILITY=1 "
+            "环境 + 热激活补丁」齐备，手动先于服务启动的微信需重启一次"
+            "继承环境变量。",
+            time.time() - t0, writes, "已尝试" if rearm_done else "未触发")
         return False
+
+    def _rearm_allowed(self) -> bool:
+        """同一 PID 的 0→1 重触发限流：45 秒内最多一次。
+
+        已知风险：短时间内反复写 accessibility gate 会把 Qt 输入系统写挂
+        （窗口渲染正常但鼠标点击全被吞）。重触发是额外的写内存动作，必须
+        比普通补丁更严格地限流。
+        """
+        pids = {self._pid_from_hwnd(h) for h in self._wechat_hwnds()}
+        now = time.monotonic()
+        for pid in pids:
+            if pid and now - WeChatUIA._rearm_log.get(pid, 0.0) < WeChatUIA.REARM_COOLDOWN:
+                wxlog.debug("距上次 UIA 重触发不足 %.0fs，跳过（PID=%s）",
+                            WeChatUIA.REARM_COOLDOWN, pid)
+                return False
+        for pid in pids:
+            if pid:
+                WeChatUIA._rearm_log[pid] = now
+        return True
 
     def send_text(self, text: str) -> bool:
         """在已打开会话的输入框发送文本。返回是否成功。"""
@@ -1441,12 +1583,19 @@ class WeChatUIA:
         return a == b or a.startswith(b) or b.startswith(a)
 
     # ------------------------------------------------------------------ 引用 / @
-    def _right_click_row(self, row) -> bool:
-        """在消息行内容重心处右键（self 靠右、好友靠左），弹操作菜单。"""
+    def _right_click_row(self, row) -> Optional[Tuple[int, int]]:
+        """在消息行内容重心处右键，返回右键坐标；失败返回 None。
+
+        ``row`` 既可以是 UIA 控件，也可以是 ``BoundingRectangle``/RECT
+        （``find_in_message_list`` 返回的第三项就是矩形）。旧实现只认控件，
+        滚动命中后传矩形进来会 AttributeError 被 except 吞掉 → 引用失败
+        降级 OCR；且旧实现返回 bool，菜单没弹出时 ``_set_cursor(*pos)``
+        又会因 bool 不可解包而抛异常。这里统一返回坐标供上层重试。
+        """
         try:
-            r = row.BoundingRectangle
+            r = getattr(row, "BoundingRectangle", row)
             if r.right - r.left < 10 or r.bottom - r.top < 10:
-                return False
+                return None
             from PIL import ImageGrab as IG
             import numpy as np
             img = IG.grab(bbox=(r.left, r.top, r.right, r.bottom))
@@ -1463,30 +1612,43 @@ class WeChatUIA:
             time.sleep(0.2)
             self._right_click()
             time.sleep(0.8)
-            return True
+            return (cx, cy)
         except Exception as exc:
             wxlog.debug(f"右键消息行失败：{exc}")
-            return False
+            return None
 
-    def _find_row_by_text(self, target_text: str):
-        """在消息列表中按文本查找消息行控件（先可视区，再滚向历史）。"""
-        text = (target_text or "").strip()
+    def _find_row_by_text(self, target_text: str) -> Optional[Tuple[int, int]]:
+        """按文本定位消息行并右键，返回右键坐标；失败返回 None。
+
+        两处关键修正（2026-11-15 实测）：
+        1. 比较前做 Unicode 空白归一化——微信 @ 消息里的 U+2005 被
+           ``_quote_snippet`` 折叠成普通空格，旧代码拿它直接 ``in`` UIA
+           Name，永远匹配不上；
+        2. 找不到时 ``find_in_message_list`` 会把列表滚回最新位置，避免
+           聊天面板停在历史消息处污染后续输入/右键（旧代码最多滚 12 次
+           且不复位，用户看到的就是「滑块一直在动却不输入」）。
+        找到时**不**复位：此刻右键菜单已弹出，滚轮会把菜单关掉；发送后
+        微信自身会跳回最新消息。
+        """
+        text = normalize_match_text(target_text)
         if not text:
             return None
         lst = self._message_list()
         if lst is None:
             return None
-        # 先只在可视区找：绝大多数引用目标就是最近几条
+        # 先只在可视区找：绝大多数引用目标就是最近几条。右键失败时不要
+        # 直接放弃，继续走滚动查找（截图/坐标抖动导致的单次失败可自愈）。
         for ch in list(lst.GetChildren()):
             try:
-                nm = (ch.Name or "")
-                if text in nm:
-                    return ch
+                if contains_normalized(text, ch.Name):
+                    pos = self._right_click_row(ch)
+                    if pos:
+                        return pos
             except Exception:
                 continue
         got = self.find_in_message_list(
-            lambda cn, nm: text in (nm or ""), max_scrolls=12)
-        return got[2] if got else None
+            lambda cn, nm: contains_normalized(text, nm), max_scrolls=12)
+        return self._right_click_row(got[2]) if got else None
 
     def _menu_click(self, keywords: Tuple[str, ...]) -> bool:
         """在当前弹出的右键菜单里点击名称含任一关键词的菜单项。"""
@@ -1495,6 +1657,40 @@ class WeChatUIA:
             if item is not None and self._uia_click_menu_item(item):
                 return True
         return False
+
+    @staticmethod
+    def _key_esc() -> None:
+        """按一次 Esc（关右键菜单）；单独抽出便于测试打桩，不发真实按键。"""
+        try:                                   # VK_ESCAPE / KEYEVENTF_KEYUP
+            ctypes.windll.user32.keybd_event(0x1B, 0, 0, 0)
+            ctypes.windll.user32.keybd_event(0x1B, 0, 2, 0)
+        except Exception:
+            pass
+
+    def dismiss_quote_menu(self) -> None:
+        """UIA 引用失败后的现场清理（**不再降级 OCR**）。
+
+        旧流程在「菜单没弹出 / 菜单项没识别到」时直接降级 OCR，此时右键
+        菜单可能仍开着、消息列表可能停在历史消息处，实测会连续「未检测到
+        输入框」、右键点到历史消息、找不到「引用」菜单项，白等 20~30 秒。
+        现在发送链路 fail-closed 直接判失败，这里按 Esc 关菜单并滚回最新，
+        只是给**下一次**操作留一个干净的起点。
+        """
+        self._key_esc()
+        time.sleep(0.2)
+        try:
+            lst = self._message_list()
+            if lst is None:
+                return
+            r = lst.BoundingRectangle
+            self._set_cursor((r.left + r.right) // 2,
+                             (r.top + r.bottom) // 2)
+            for _ in range(16):               # 兜底滚回最新（滚到底自然停）
+                self._mouse_wheel(-120)
+                time.sleep(0.02)
+            time.sleep(0.2)
+        except Exception as exc:
+            wxlog.debug(f"引用降级前清理失败（忽略）：{exc}")
 
     def _focus_input_end(self, ctrl) -> None:
         """把光标放到输入框底部（避开表情/文件工具栏，且不选中既有内容）。"""
@@ -1524,6 +1720,48 @@ class WeChatUIA:
         except Exception:
             pass
 
+    def _prepare_quote(self, target_text: Optional[str] = None):
+        """建立「引用卡片」并把光标放回输入框末尾，返回输入框控件。
+
+        顺序是硬约束：清草稿必须在右键引用**之前**（此时还没有引用卡片），
+        引用之后绝不能再 Ctrl+A/Delete，否则引用块会被一起删掉，发出去的
+        就变成普通消息。抽出这一步是为了让「引用 + @」组合复用同一条路径。
+        """
+        e0 = self._chat_input()
+        if e0 is not None:
+            self._clear_input(e0)
+        if target_text:
+            # _find_row_by_text 内部完成「归一化匹配 + 右键」，返回坐标
+            pos = self._find_row_by_text(target_text)
+            if pos is None:
+                wxlog.debug("引用目标未在消息列表中定位到：%s",
+                            (target_text or "")[:30])
+                return None
+        else:
+            pos = self._right_click_latest_row(None)
+        if not pos:
+            return None
+        if not self._menu_click(("引用", "Quote")):
+            # 菜单没弹出来时再右键一次，避免首击落在消息空白处
+            self._set_cursor(*pos)
+            time.sleep(0.2)
+            self._right_click()
+            time.sleep(0.8)
+            if not self._menu_click(("引用", "Quote")):
+                try:
+                    from wechatauto.ui.component import Menu
+                    Menu(self).close()
+                except Exception:
+                    pass
+                return None
+        time.sleep(0.5)
+        e = self._chat_input()
+        if e is None:
+            return None
+        # 点击菜单后焦点可能落在消息区：先把光标放回输入框末尾
+        self._focus_input_end(e)
+        return e
+
     def quote_message(self, text: str, who: Optional[str] = None,
                       target_text: Optional[str] = None) -> bool:
         """引用消息后发送正文（UIA 路线：右键消息行 → 菜单「引用」）。
@@ -1543,41 +1781,10 @@ class WeChatUIA:
             if not self.open_chat(who):
                 return False
             time.sleep(0.5)
-        # 先清掉旧草稿（此时还没有引用卡片，可以安全清空）
-        e0 = self._chat_input()
-        if e0 is not None:
-            self._clear_input(e0)
-        if target_text:
-            row = self._find_row_by_text(target_text)
-            if row is None:
-                wxlog.debug(f"引用目标未在消息列表中定位到：{target_text[:30]}")
-                return False
-            pos = self._right_click_row(row)
-        else:
-            pos = self._right_click_latest_row(None)
-        if not pos:
-            return False
-        if not self._menu_click(("引用", "Quote")):
-            # 菜单没弹出来时再右键一次，避免首击落在消息空白处
-            self._set_cursor(*pos)
-            time.sleep(0.2)
-            self._right_click()
-            time.sleep(0.8)
-            if not self._menu_click(("引用", "Quote")):
-                try:
-                    from wechatauto.ui.component import Menu
-                    Menu(self).close()
-                except Exception:
-                    pass
-                return False
-        time.sleep(0.5)
-        e = self._chat_input()
+        e = self._prepare_quote(target_text)
         if e is None:
             return False
-        # 点击菜单后焦点可能落在消息区：先把光标放回输入框末尾
-        self._focus_input_end(e)
-        # 注意：草稿里已经有「引用卡片」，这里绝不能再 Ctrl+A/Delete
-        # （那会把引用块一起清掉，变成普通消息）
+        # 草稿里已经有「引用卡片」，这里绝不能再 Ctrl+A/Delete
         if not self._paste_append(e, text):
             return False
         time.sleep(0.2)
@@ -1643,30 +1850,44 @@ class WeChatUIA:
         return True
 
     def at_members(self, members: List[str], text: str,
-                   who: Optional[str] = None) -> bool:
+                   who: Optional[str] = None,
+                   quote: bool = False,
+                   quote_target_text: Optional[str] = None) -> bool:
         """群聊 @ 多个成员后一次性发送正文（同一条消息）。
 
         旧实现是「每个成员各发一条消息」，@ 多个成员时会发出多条空正文
         消息；这里改成：逐个 @ 进同一个草稿 → 追加正文 → 只回车一次。
+
+        ``quote=True`` 时先建立引用卡片，再在同一个草稿里 @ ——微信允许
+        引用与 @ 共存。引用准备由 :meth:`_prepare_quote` 完成，它内部会
+        在**引用之前**清草稿；引用之后不能清空，否则引用卡片会被删掉。
+        ``quote_target_text=None`` 表示引用最新一条，字符串表示按文本定位。
         """
         names = [m.strip() for m in (members or []) if m and m.strip()]
         if not names:
-            return self.send_text(text)
+            return (self.quote_message(text, who=who,
+                                       target_text=quote_target_text)
+                    if quote else self.send_text(text))
         if not self.ensure_window():
             return False
         if who and not self.same_chat(self.current_chat(), who):
             if not self.open_chat(who):
                 return False
             time.sleep(0.5)
-        e = self._chat_input()
-        if e is None:
-            return False
-        # 清空草稿（可能有上次失败残留）
-        try:
-            e.Click()
-            e.SendKeys("{Ctrl}a{Delete}", waitTime=0.05)
-        except Exception:
-            pass
+        if quote:
+            e = self._prepare_quote(quote_target_text)
+            if e is None:
+                return False
+        else:
+            e = self._chat_input()
+            if e is None:
+                return False
+            # 清空草稿（可能有上次失败残留）
+            try:
+                e.Click()
+                e.SendKeys("{Ctrl}a{Delete}", waitTime=0.05)
+            except Exception:
+                pass
         for name in names:
             try:
                 e.SendKeys("@", waitTime=0.05)
@@ -2032,16 +2253,24 @@ class WeChatUIA:
         return walk(win)
 
     def find_in_message_list(self, predicate, match_last: bool = False,
-                             max_scrolls: int = 40) -> Optional[Tuple]:
+                             max_scrolls: int = 40,
+                             restore_on_miss: bool = True) -> Optional[Tuple]:
         """在消息列表中按谓词查找消息控件，返回 (className, name, rect)。
 
         RecyclerListView 是虚拟化列表，只实例化可视区约 12 条；历史消息需
         滚动。ScrollPattern 不可用（返回空），改用鼠标滚轮驱动列表滚动。
         match_last=True 时滚到底后从底部向上找，用于取最新表情/消息。
+
+        ``restore_on_miss``：找不到时把列表滚回**最新消息**位置。旧实现
+        最多滚 12 次（甚至 60 次）向历史，失败后直接 return，聊天面板就
+        停在历史消息处：随后输入框探测失败、右键点到历史消息、OCR 找不到
+        「引用」菜单，且会污染下一次发送。只有找不到时才复位——找到时右键
+        菜单已弹出，滚轮会把菜单关掉；发送后微信自身会跳回最新。
         """
         lst = self._message_list()
         if lst is None:
             return None
+        scrolls = [0]       # 累计「滚向历史」的滚轮次数，供复位用
 
         def scroll(direction: str, times: int = 1) -> None:
             # direction: 'up'=滚向最新(底部), 'down'=滚向历史(更早)
@@ -2053,9 +2282,27 @@ class WeChatUIA:
                 cy = (r.top + r.bottom) // 2
                 self._set_cursor(cx, cy)
                 delta = -120 if direction == 'up' else 120
+                if direction == 'down':
+                    scrolls[0] += times
                 for _ in range(times):
                     self._mouse_wheel(delta)
                     time.sleep(0.2)
+            except Exception:
+                pass
+
+        def restore() -> None:
+            """快速滚回最新（不逐次等 0.2s，避免 120 次滚动耗掉 24 秒）。"""
+            n = min(scrolls[0] + 2, 160)
+            if n <= 2:
+                return
+            try:
+                r = lst.BoundingRectangle
+                self._set_cursor((r.left + r.right) // 2,
+                                 (r.top + r.bottom) // 2)
+                for _ in range(n):
+                    self._mouse_wheel(-120)
+                    time.sleep(0.02)
+                time.sleep(0.25)
             except Exception:
                 pass
 
@@ -2094,6 +2341,8 @@ class WeChatUIA:
                     except Exception:
                         pass
                 scroll('down', 2)  # 滚向历史找更早匹配
+            if restore_on_miss:
+                restore()
             return None
 
         # 非 match_last：从底部(最新)向历史逐屏扫描
@@ -2111,6 +2360,8 @@ class WeChatUIA:
                 if predicate(cn, nm):
                     return (cn, nm, r)
             scroll('down', 2)
+        if restore_on_miss:
+            restore()
         return None
 
     # ------------------------------------------------------------------ 调试

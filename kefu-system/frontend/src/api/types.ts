@@ -312,7 +312,8 @@ export interface AnalysisLogListOut {
 export interface ReplyPayload {
   text: string
   at: string[]
-  quote?: { local_id: number }
+  /** latest=true：引用「发送执行时」的最新一条，不受页面加载后新消息影响 */
+  quote?: { local_id: number; latest?: boolean }
   /**
    * 回复去向：session=商机会话（群商机即群内回复）；
    * sender=私信发给该条消息的发送人（仅群商机、对方是好友时可用）

@@ -947,7 +947,35 @@ class TestReplyEndpoint:
         assert task.text == "您好，这个订单我们可以做"  # 已 strip
         assert task.at == ["张三"]  # 空白项被过滤
         assert task.quote_local_id == 1234
+        assert task.quote_latest is False      # 旧客户端只传 local_id
         assert task.manual_confirm is False
+
+    def test_reply_quote_latest_intent_forwarded(self, env):
+        """「引用最新一条消息」是意图：latest=true 透传到发送任务。
+
+        后端执行时直接右键当时最新的一条，不受页面加载后新消息（尤其是
+        自己刚发的回复）影响——固定 local_id 会退化成脆弱的文本匹配。
+        """
+        opp = self._prepare(env)
+        resp = env.client.post(f"/api/opportunities/{opp['id']}/reply", json={
+            "text": "报价稍后发您",
+            "quote": {"local_id": 1234, "latest": True},
+            "manual_confirm": False})
+        assert resp.status_code == 202
+        task = env.sender.tasks[0]
+        assert task.quote_local_id == 1234
+        assert task.quote_latest is True
+
+    def test_reply_quote_latest_dropped_in_manual_mode(self, env):
+        """人工确认只填文字：latest 意图也必须丢弃，别让用户以为引用生效。"""
+        opp = self._prepare(env)
+        resp = env.client.post(f"/api/opportunities/{opp['id']}/reply", json={
+            "text": "收到", "quote": {"local_id": 1234, "latest": True}})
+        assert resp.status_code == 202
+        task = env.sender.tasks[0]
+        assert task.manual_confirm is True
+        assert task.quote_local_id is None
+        assert task.quote_latest is False
 
     def test_reply_default_is_manual_confirm(self, env):
         """默认人工确认（第 13 批需求 5）：只填入输入框，不自动发送。

@@ -79,6 +79,10 @@ class SendTask:
     text: str
     at: List[str] = field(default_factory=list)   # @群成员昵称（仅群会话）
     quote_local_id: Optional[int] = None          # 引用回复的消息 local_id
+    # 「引用最新一条消息」意图：执行发送时直接右键当时最新的一条，不用
+    # 文本片段去列表里翻找。页面加载后群里进新消息（尤其是自己刚发的
+    # 回复）会让固定 local_id 退化成「引用更早消息」，那条路径最脆弱。
+    quote_latest: bool = False
     # 人工确认模式（用户反馈：怕发错人）：True = 只把内容填进微信输入框，
     # 由用户自己在微信里核对收件人后点发送；False = 自动发送并按数据库确认。
     manual_confirm: bool = False
@@ -309,6 +313,22 @@ class Sender:
                         reason = str(getter() or "")
                 except Exception:
                     reason = ""
+                if reason == "uia_unavailable":
+                    # 窗口被关闭到托盘/最小化时 Qt 不物化控件树。发送链路
+                    # 已按用户要求禁用截图/OCR 兜底，直接给出可操作提示，
+                    # 不再让用户白等 30 秒唤醒 + 20 秒 OCR。
+                    self._fail(
+                        task,
+                        "微信控件树不可用（窗口可能被关闭到托盘或最小化），"
+                        "已取消发送；请点开微信窗口、等 1~2 秒后重试。"
+                        "为避免发错会话，本次未做任何截图兜底操作", stage)
+                    return
+                if reason == "chat_mismatch":
+                    self._fail(
+                        task,
+                        "微信当前打开的会话与目标不一致，已取消发送以免发错人；"
+                        "请在微信里手动打开目标会话后重试", stage)
+                    return
                 if reason == "tree_not_ready":
                     # 微信 UIA 控件树被回收后重新物化实测要 15~30 秒，这期间
                     # 搜索框根本找不到。不能说「无法定位会话」——会话其实在。
@@ -369,7 +389,26 @@ class Sender:
             # 「已操作发送但数据库未确认」：UI 层发送已完成（输入框回车成功），
             # 只是数据库回读超时——微信重启后消息分片重建首分钟很慢，8s 轮询
             # 不够。按已回复处理：用户看到失败去重发就是重复消息（实测隐患）。
-            unconfirmed = (not ok) and ("消息已操作发送" in message)
+            #
+            # 2026-11-15 收紧：窗口从托盘/最小化恢复后，旧实现可能把消息
+            # 打进「另一个会话」，DB 回读自然查不到，却仍被当成成功标记
+            # replied（用户实测事故）。现在只有当组件层明确给出
+            # ``chat_verified=True``（发送前用 UIA 实时校验过会话）才允许
+            # 按已回复处理；否则一律判失败，绝不误标。
+            payload_data = {}
+            if isinstance(resp, dict):
+                val = resp.get("data")
+                if isinstance(val, dict):
+                    payload_data = val
+            verified = bool(payload_data.get("chat_verified"))
+            # 组件层对不同接口用了不同前缀（消息 / 引用 / @消息 / 文件 /
+            # 图片 / 回复「已操作发送，但数据库未确认」）。旧代码只认
+            # 「消息已操作发送」一种，引用回复 DB 未确认时会被当成真失败 →
+            # 用户看到失败去重发 → 重复消息。统一按两个关键词识别，且
+            # 仍严格要求发送前实时校验过会话（chat_verified=True）。
+            db_unconfirmed = ("已操作发送" in message
+                              and "数据库未确认" in message)
+            unconfirmed = not ok and db_unconfirmed and verified
             if ok or unconfirmed:
                 self._db.set_opportunity_replied(
                     task.opportunity_id, task.text, target=task.target)
@@ -393,6 +432,14 @@ class Sender:
                             "（私信）" if task.target == "sender" else "",
                             stage.summary(), stage.total_ms() / 1000.0)
             else:
+                if db_unconfirmed and not verified:
+                    # 会话没实时校验过：消息可能发到了别的会话，绝不能让
+                    # 用户以为只是「DB 慢」而放任不管（2026-11-15 事故）。
+                    message = (
+                        "微信可能已把消息发到了别的会话（发送前未能确认目标"
+                        "会话），数据库回读未确认；已阻止标记为已回复。"
+                        "请先在微信里核对该消息发给了谁，确认无误后手动处理"
+                        "该商机，不要直接重发")
                 self._fail(task, f"发送失败：{message or '未知原因，请重试'}", stage)
         except Exception as exc:
             logger.exception("发送任务执行异常（商机 #%d）", task.opportunity_id)
@@ -480,13 +527,35 @@ class Sender:
             who: 搜索/校验用的会话名（与企业微信账号已剥离 @企业名 后缀）。
         """
         chat = who or self._chat_name(task)
+        want_quote = bool(task.quote_local_id or task.quote_latest)
         if task.at:
             members = [m.strip() for m in task.at if m.strip()]
-            # 新版一次 @ 多个成员（同一条消息）；旧版按「逐个 @」兜底
-            if hasattr(gui, "at_members"):
-                return gui.at_members(members, task.text,
-                                      who=chat, verify=True,
-                                      who_username=task.session_username)
+            # 组合回复（同时选了 @发送人 + 引用最新一条）必须走同一条草稿：
+            # 旧实现是 if/return 互斥，@ 分支先返回 → 引用被静默丢弃但接口
+            # 仍报成功（2026-11-15 实测）。这里把引用意图一并交给 at_members。
+            # 必须用 callable：旧组件/测试桩可能把 at_members 定义成 None，
+            # hasattr 仍为 True，直接调用会抛 TypeError（组合分支实测踩坑）。
+            at_batch = getattr(gui, "at_members", None)
+            if callable(at_batch):
+                if want_quote:
+                    target_text = self._quote_target_text(task)
+                    logger.info("组合回复：@%s + 引用（target=%s）",
+                                "、".join(members) or "成员",
+                                "最新一条" if target_text is None else target_text[:20])
+                    return at_batch(members, task.text,
+                                    who=chat, verify=True,
+                                    who_username=task.session_username,
+                                    quote=True,
+                                    quote_target_text=target_text)
+                return at_batch(members, task.text,
+                                who=chat, verify=True,
+                                who_username=task.session_username)
+            # 旧组件没有 at_members：逐个 @ 兜底，此时无法安全叠加引用，
+            # 明确失败好过静默只发 @。
+            if want_quote:
+                from wechatauto.param import WxResponse
+                return WxResponse.failure(
+                    "当前微信自动化组件不支持「引用 + @」组合发送，请升级组件")
             resp = None
             for i, member in enumerate(members):
                 text = task.text if i == len(members) - 1 else ""
@@ -494,7 +563,7 @@ class Sender:
                                      verify=True,
                                      who_username=task.session_username)
             return resp
-        if task.quote_local_id:
+        if want_quote:
             target_text = self._quote_target_text(task)
             return gui.quote_msg(task.text, who=chat,
                                  target_text=target_text, verify=True,
@@ -537,12 +606,17 @@ class Sender:
     def _quote_target_text(self, task: SendTask) -> Optional[str]:
         """引用回复：定位被引用消息。
 
+        - ``quote_latest``（用户点了「引用最新一条消息」）→ 恒返回 None，
+          执行时直接右键当时的最新一条；不受页面加载后新消息影响；
         - 目标就是该会话最新一条 → 返回 None，直接引用最新消息（不依赖
           文本匹配，图片/小程序/链接消息也能引用）；
         - 更早的消息 → 返回清洗后的文本片段供 UIA 在消息列表里定位；
         - 更早且无可识别文字 → 抛 QuoteTargetUnavailable，提示用户改用
           「引用最新一条」，绝不默默引用错消息。
         """
+        if task.quote_latest:
+            logger.debug("引用回复：latest 意图 → 执行时直接右键最新一条")
+            return None
         if not task.quote_local_id:
             return None
         msg = None
@@ -555,6 +629,10 @@ class Sender:
         if latest and latest == task.quote_local_id:
             return None
         snippet = self._quote_snippet((msg or {}).get("content", ""))
+        # 走「历史文本定位」是故障高发路径，日志里必须一眼能认出来：
+        # 页面加载后群里进了新消息（含自己刚发的回复）就会退化到这里。
+        logger.info("引用回复目标已非最新（quote=%s latest=%s）→ 按文本定位：%s",
+                    task.quote_local_id, latest, snippet[:30])
         if not snippet:
             raise QuoteTargetUnavailable(
                 "这条消息没有可识别的文字（图片/小程序/文件等），无法在微信"

@@ -140,6 +140,8 @@ class TestReadyGate:
     def test_ensure_window_fails_when_tree_never_materialises(self):
         win = _Win(mainview=False)
         uia = _raw_uia(win)
+        # 窗口可见性恢复有真实系统副作用，单测一律打桩隔离
+        uia._restore_window_visible = lambda: True  # type: ignore[assignment]
         uia.is_ready = lambda: False            # type: ignore[assignment]
         uia._wake_and_wait_ready = (
             lambda *a, **k: False)          # type: ignore[assignment]
@@ -150,6 +152,7 @@ class TestReadyGate:
     def test_ensure_window_waits_for_tree(self):
         win = _Win()
         uia = _raw_uia(win)
+        uia._restore_window_visible = lambda: True  # type: ignore[assignment]
         ready = {"n": 0}
 
         def fake_ready():

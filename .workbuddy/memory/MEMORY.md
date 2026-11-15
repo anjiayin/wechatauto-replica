@@ -6,11 +6,11 @@
 - 用户偏好：简体中文；重视真实数据/实机验证，不接受只凭推断的结论。
 
 ## 当前交接入口
-- **2026-11-13 第 13 批：`D:/Git/wechatauto-replica/HANDOVER-2026-11-13-batch13.md`**（7 项全完成，未提交）；前序 `HANDOVER-2026-11-13.md`（第 8~12 批，已提交）。
-- 基线 `HEAD=89fd98a`；测试基线 **1115 passed**（2026-11-14 第 23 节后，全量约 10 分钟）。
+- **2026-11-15 第 4 轮（发送链路 fail-closed）：`.workbuddy/memory/2026-11-15.md` 末段「09:52~09:57」**（大批改动在工作区、未提交）；第 2/3 轮结论在同一文件。前序 `HANDOVER-2026-11-13-batch13.md` / `HANDOVER-2026-11-14-reply-targets.md`。
+- 基线 `HEAD=501fbcd`；测试基线 **1193 passed**（2026-11-15 第 4 批后，全量 483s、仅 4 条 FastAPI on_event 弃用警告）；测试环境 `/d/my_conda_envs/wechatauto/python.exe`。
 
 ## 铁律 / 常踩的坑
-- pytest 必须 `--basetemp=D:/tmp/...`（本机 safe-delete 守卫会拦临时目录清理）；全量约 4~5 分钟。
+- pytest 用 `/d/my_conda_envs/wechatauto/python.exe -m pytest`（只有这个环境装了 pytest 9.2.0 + 项目依赖，PATH 里的 python 没有）；必须 `--basetemp=D:/tmp/pt-新目录名`（本机 safe-delete 守卫会拦临时目录清理，复用旧目录会报一堆 tmp_path fixture 错）；全量约 9 分钟。
 - UIA 实机测试只允许「文件传输助手」，**禁止向真实联系人/群发消息**。
 - 微信只读探查用 `WeChatDB(workdir=r'D:\wechatauto_cache')`；真实微信库在 E 盘 `E:\xwechat_files\...`，`auto_detect_db_dir()` 返回的 `E:xwechat_files` 缺反斜杠，必须 `os.path.abspath()`。
 - 时间口径一律交给 SQLite `datetime('now','localtime',...)`；Python 拼 `T` 分隔时间字符串会因 TEXT memcmp 误删整日数据。
@@ -19,6 +19,9 @@
 
 ## 领域结论（已实测，别再推翻）
 - **「回复时好时坏 / 界面卡死」先查窗口状态与热激活配额，别查会话名、网络、AI**（2026-11-14 23:39~23:51 实测）：①最小化窗口 `IsWindowVisible` 仍 True，但 `GetWindowRect` 是 `(-32000,-32000,-31840,-31972)` 即 160×28 伪矩形；被绑成 `main_hwnd` 后布局/输入框/侧栏全错（日志「校准=1108 vs 当前=280」），3 轮重试耗 60~80s。②`_hot_activate_accessibility` 曾把 gate 已为 1（什么都没写）也返回 True 并计入限流，日志只见 3 次真实 0→1 却报「已热激活 5 次」→ 300s 内强制 OCR 兜底；配额重置后立刻流畅，这就是「时好时坏」的时钟。③sender 每次发送两次 `bring_to_front` 翻转 Z 序 + rebind 清 `_uia` 触发预热巡检再打补丁，形成自激循环；补丁写太频会把 Qt 输入系统写挂（界面卡死）。现已修：guia 淘汰 IsIconic/伪矩形 + `_locate_main_window` 自动恢复最小化窗、ensure_visible 缓存校验「微信仍在前台」；uia_driver 三态只计真实写入 + 按 PID 去重 + 等待期间每 6s 重试；sender 置前统一交给 ensure_visible。排查入口 `kefu-system/wechatauto_logs/app_YYYYMMDD.log` 的「热激活」「重绑 hwnd=」「自动最小化遮挡窗口」。
+- **回复「时好时坏」若只有引用失败、纯文本/@ 全正常，查引用路径而不是窗口/树**（2026-11-15 00:21~00:28 实测）：①微信 @ 消息原文是 `@昵称\u20055`（U+2005 四分之一 em 空格），`_quote_snippet` 的 `" ".join(text.split())` 把它折成 U+0020，而 UIA 消息行 Name 保留 U+2005 → 包含匹配恒 False；现用 `wechatauto/text_norm.py` 双向归一化。②`find_in_message_list` 向历史滚最多 12 次且**失败不复位** → 面板停在历史消息处（用户看到「滑块在动却不输入」），并让 OCR 兜底的输入框探测/右键/菜单全失败；切换会话才恢复，这就是「时好时坏」。③`_find_row_by_text` 把滚动命中的 rect 当控件传 `_right_click_row`（AttributeError 被吞），且后者返回 bool 却被 `_set_cursor(*pos)` 解包。④「引用最新一条」原本钉死页面加载时的 local_id，自己刚发的回复会让它退化成脆弱的历史文本定位 → 改为 `quote.latest` 意图，执行时右键真正最新。改这块前先只读查微信库原文字符、确认滚动失败会复位。
+- **「关到托盘后卡死」与「@+引用只发 @」是两条独立确定性 bug**（2026-11-15 01:02~01:07 实测）：①微信点 X 关到托盘在 Win32 层是 `IsIconic=True`（160×28 伪矩形）或 `SW_HIDE`（visible=False，另有隐藏 `WxTrayIconMessageWindow`），**Qt accessibility 树只在可见窗口物化**；旧唤醒流程不管窗口状态、对托盘窗口反复写 gate byte → 树不重建且 Qt 输入系统被写挂（界面卡死），31s 超时后 `_get_uia()` 永久置 `_uia_tried` → 整场会话降级 OCR → 93s 失败。现修：`uia_driver._restore_window_visible()`（最小化 SW_RESTORE / 隐藏 SW_SHOW）、唤醒前先恢复、不可见**不打补丁**、单次等待真实写入上限 2 次；`guia.ensure_visible` 覆盖 SW_HIDE、`_find_minimized_main_window` 不再要求 visible、`_get_uia` 失败改 30s 冷却可重试。②`SenderThread._do_send` 的 @/引用是 `if...return` 互斥分支 → 组合时引用被静默丢弃却报成功；现走 `at_members(quote=True)` 同草稿（先建引用卡片、再逐个 @、只回车一次，**引用后绝不能 Ctrl+A/Delete**），UIA 不可用明确失败。另：`hasattr(gui,'at_members')` 对属性值为 None 返回 True，必须用 `callable(getattr(...))`。
+- **发送链路已改为 fail-closed，别再加截图/OCR 兜底**（2026-11-15 09:52~09:57 实测，用户明确要求）：①关到托盘/最小化后 Qt 回收 UIA 树却把 accessibility gate 留在 1，普通热激活返回 `'already'` 什么都不写 → 干等 30s（日志「真实写入补丁 0 次」）；现用 `_hot_activate_accessibility(rearm=True)` 做受控 `1→0→1` 脉冲 + 同 PID 45s 限流，窗口不可见立即失败。②托盘恢复后 `render_rect` 是 160×28 伪矩形，OCR 兜底必然抛 `Coordinate 'right' is less than 'left'` 并白等 20~30s；现 `guia.OCR_FALLBACK_ENABLED=False` + `_require_uia()` 总闸，`send_msg/quote_msg/at_members/input_only/open_chat/open_chat_prefer_openim` 只走 UIA，失败直接判失败（命令行 demo 需显式 `WECHATAUTO_OCR_FALLBACK=1`）。③恢复后真实主窗句柄会变（实测 4000292→1378074），`_current_chat` 缓存 + `assume_open` 会让消息打进别的会话；现 `_rebind_if_window_changed()` 重绑清缓存 + 每次发送 `_confirm_target_chat()` 实时读 `uia.current_chat()`（企业微信不匹配拒绝二次 open_chat，免得开成同名普通好友）。④响应带 `data.chat_verified`，sender 只在 True 时把「已操作发送 + 数据库未确认」按 replied 处理，否则保持 pending 并提示核对收件人；组件层 DB 未确认文案有 6 种前缀（消息/引用/@消息/文件/图片/回复），别只匹配「消息已操作发送」。
 - 微信语音**异步落库**：消息行先到、`media_*.db VoiceInfo.voice_data` 后到；转写失败须进 `voice_retry.py` 退避队列（5/15/45/120/300s），失败直接丢弃会漏商机。
 - 微信 4.x 本地库**不存群名片**；`contact.nick_name` 是全局昵称。群昵称只能从 session.db `last_sender_display_name` 增量学习（`group_cards` 表 + 最后发送者守卫）。
 - 微信 4.x 输入框 Accessibility Name 可能拼上 UI 提示语（如「文件传输助手长按鼠标 语音输入」）；会话校验必须用 `same_chat` 宽松匹配，严格相等会误判失败并落入 OCR 兜底（曾导致发送全链路 56.6s）。
