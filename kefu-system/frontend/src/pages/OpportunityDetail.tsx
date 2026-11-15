@@ -283,6 +283,11 @@ export default function OpportunityDetail(props: {
   const [sendingTarget, setSendingTarget] = useState<ReplyTargetKind>('session')
   const [sendingMs, setSendingMs] = useState(0)
   const timerRef = useRef<number | null>(null)
+  // 本次发送是否已有 WS send_result 结算。0 秒失败（微信关到托盘）时 WS
+  // 结果可能比 HTTP 202 响应更早到：随后到达的 onSuccess 若照常显示
+  // 「已加入发送队列」，就会把失败提示覆盖掉，页面看起来像「只进队列、
+  // 没有任何后续动作」。用同步 ref 判断，不受 React 批处理影响。
+  const sendSettledRef = useRef(false)
 
   // 详情：只读业务库（不查微信库），秒开
   const { data: opp, isLoading } = useQuery({
@@ -411,6 +416,7 @@ export default function OpportunityDetail(props: {
     setAtMembers([])
     setQuoteLocalId(null)
     setQuoteLatest(false)
+    sendSettledRef.current = false
   }, [id])
 
   // 发送结果经 WS → CustomEvent 送达（202 受理后异步反馈）
@@ -418,6 +424,7 @@ export default function OpportunityDetail(props: {
     const handler = (ev: Event) => {
       const data = (ev as CustomEvent<SendResultData>).detail
       if (!id || data.opportunity_id !== id) return
+      sendSettledRef.current = true
       const detail = stageText(data)
       setSnack({
         ok: data.ok,
@@ -475,11 +482,14 @@ export default function OpportunityDetail(props: {
         payload,
       ),
     onSuccess: (resp) => {
-      // 202 受理：最终结果等 WS send_result；这里先提示受理状态
+      // 202 受理：最终结果等 WS send_result。若结果已经先一步送达并显示，
+      // 绝不能用「已加入发送队列」把它覆盖（0 秒失败的时序竞态）。
+      if (sendSettledRef.current) return
       setSnack({ ok: resp.ok, message: resp.message })
     },
     onError: (err: Error) => {
       setSendingSince(null)
+      if (sendSettledRef.current) return
       setSnack({ ok: false, message: err.message })
     },
   })
@@ -500,6 +510,7 @@ export default function OpportunityDetail(props: {
       // 加载后新消息（含自己上一条回复）影响
       payload.quote = { local_id: quoteLocalId, latest: quoteLatest }
     }
+    sendSettledRef.current = false
     setSendingTarget(target)
     setSendingSince(Date.now())
     replyMutation.mutate(payload)

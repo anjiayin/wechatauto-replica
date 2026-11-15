@@ -334,6 +334,8 @@ class TestGateRearm:
     def test_rearm_cooldown_limits_churn(self, monkeypatch):
         uia = object.__new__(WeChatUIA)
         monkeypatch.setattr(WeChatUIA, "_rearm_log", {})
+        # 重触发现在还要求「距任何一次真实补丁 ≥45s」，隔离类级日志
+        monkeypatch.setattr(WeChatUIA, "_patch_log", {})
         monkeypatch.setattr(uia, "_wechat_hwnds", lambda: [111])
         monkeypatch.setattr(uia, "_pid_from_hwnd", lambda h: 10856)
         now = {"t": 1000.0}

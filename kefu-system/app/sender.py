@@ -70,6 +70,22 @@ class _Stages:
         return " · ".join(parts)
 
 
+# 「受理提示必须先于结果」时序保护窗口（秒）。
+#
+# 回复接口是 202 异步受理，结果经 WS ``send_result`` 推送。前端在 HTTP
+# 响应的 onSuccess 里显示「已加入发送队列」，WS 结果到达时覆盖它。但发送
+# 线程可能在 submit() 返回后的几毫秒内就失败（微信关到托盘 = 0.0 秒
+# fail-closed、微信未登录、_gui_lock 被占用等），而 notifier.broadcast()
+# 又是 run_coroutine_threadsafe 投递到主事件循环，结果常常**比 threadpool
+# 里的 202 响应更早**送达浏览器。后到的 onSuccess 就把失败提示覆盖成
+# 「已加入发送队列」——用户看到的就是「只进队列、没有任何后续动作」
+# （2026-11-15 18:26:26 实测）。
+#
+# 让发送线程取到任务后至少等这么久再开工，保证 HTTP 202 先落地；同时
+# 前端也用 settled 标记兜住任何极端调度顺序（见 OpportunityDetail.tsx）。
+ACK_LEAD_SEC = 0.35
+
+
 @dataclass
 class SendTask:
     """一条待发送任务。"""
@@ -90,6 +106,9 @@ class SendTask:
     # sender=私信发给该条消息的发送人（此时 session_username/session_name
     # 已被调用方换成发送人，本字段只用于文案与落库）。
     target: str = "session"
+    # submit() 写入的入队时刻（monotonic）。发送线程据此执行 ACK_LEAD_SEC
+    # 时序保护；手工构造的测试任务保持 0，不引入任何等待。
+    enqueued_mono: float = 0.0
 
 
 class Sender:
@@ -186,6 +205,13 @@ class Sender:
         try:
             if not gui.is_alive():
                 return "no_wechat"
+            # 微信关到托盘（Qt hide）时控件树根本不会物化，warm_up 会白等
+            # 30s 并反复写 gate byte；后台每 15s 巡检一次就能把 Qt 输入
+            # 写挂（2026-11-15 11:34:57 实测：同 PID 连写 6 次后限流）。
+            # 静默跳过、不打补丁，等用户点开窗口后下一轮再预热。
+            tray = getattr(gui, "is_tray_hidden", None)
+            if callable(tray) and tray():
+                return "no_wechat"
             if getattr(gui, "_uia", None) is not None:
                 return "ready"            # 引擎已就绪：零成本巡检
         except Exception:
@@ -219,8 +245,9 @@ class Sender:
         logger.info("发送线程已停止")
 
     def submit(self, task: SendTask) -> bool:
-        """任务入队（串行消费）。"""
+        """任务入队（串行消费），同时打上入队时刻供时序保护使用。"""
         try:
+            task.enqueued_mono = time.monotonic()
             self._queue.put_nowait(task)
             return True
         except queue.Full:  # pragma: no cover - 无界队列实际不会满
@@ -243,11 +270,36 @@ class Sender:
                 continue
             if task is None:
                 break
+            # 极快失败（托盘态 0.0s）不能早于 HTTP 202 受理提示推给前端，
+            # 否则失败结果会被后到的「已加入发送队列」覆盖成「没反应」。
+            # 这一步也在保护伞内：任何异常都不得终止发送线程（共享约定 4）。
+            try:
+                if self._wait_ack_lead(task):
+                    break                 # 停机：不再处理任何发送任务
+            except Exception:
+                logger.exception("发送时序保护异常（忽略，继续处理任务 #%d）",
+                                 task.opportunity_id)
+            if self._stop.is_set():
+                break
             try:
                 self._process(task)
             except Exception:
                 logger.exception("处理发送任务异常（任务 #%d）", task.opportunity_id)
                 self._fail(task, "发送失败：系统内部错误，请查看日志")
+
+    def _wait_ack_lead(self, task: SendTask) -> bool:
+        """给 HTTP 202 一点领先时间；返回 True 表示线程已收到停机信号。
+
+        用 ``Event.wait`` 而不是 ``time.sleep``，stop() 时可立即退出、不会
+        让 Ctrl+C 卡在这 0.35 秒上。
+        """
+        enqueued = float(getattr(task, "enqueued_mono", 0.0) or 0.0)
+        if enqueued <= 0:
+            return False                 # 手工构造的任务：不引入等待
+        remain = ACK_LEAD_SEC - (time.monotonic() - enqueued)
+        if remain <= 0:
+            return False
+        return bool(self._stop.wait(remain))
 
     # ------------------------------------------------------------------
     # 任务处理
@@ -268,12 +320,40 @@ class Sender:
         finally:
             self._gui_lock.release()
 
+    @staticmethod
+    def _window_not_visible_message(gui) -> str:
+        """窗口不可见的失败文案：区分「关到系统托盘」与「遮挡/锁屏」。
+
+        托盘态下 ensure_visible() 会主动 fail-closed（不 ShowWindow、不写
+        补丁），提示必须让用户知道该去点哪个图标，而不是笼统地说
+        「请检查后重试」——用户看不到窗口时根本无从下手（2026-11-15
+        11:33 用户反馈「界面不能动」）。
+        """
+        try:
+            getter = getattr(gui, "last_open_error", None)
+            reason = str(getter() or "") if callable(getter) else ""
+            tray = getattr(gui, "is_tray_hidden", None)
+            if reason == "tray_hidden" or (callable(tray) and tray()):
+                return ("微信已关闭到系统托盘，自动点击托盘图标没能唤起主窗口："
+                        "请手动点击任务栏右下角的微信图标打开主窗口，"
+                        "等 1~2 秒后重试。为避免把微信界面卡死，系统不会"
+                        "强行 SW_SHOW 托盘窗口，本次已取消发送")
+        except Exception:
+            pass
+        return "微信窗口不可见（可能被遮挡或锁屏），请检查后重试"
+
     def _process_locked(self, task: SendTask, stage: _Stages) -> None:
         """发送主流程（调用方已持 ``_gui_lock``）。"""
         gui = self._ensure_gui()
         stage.mark("init")
         if gui is None:
-            return  # _ensure_gui 内已广播失败
+            # _ensure_gui 只广播了全局 status_change，没有 send_result。
+            # 前端等的是 send_result：不补这一条就会永远停在「发送中 /
+            # 已加入发送队列」，看起来像系统没反应（与 0 秒失败被覆盖
+            # 是同一类症状）。
+            self._fail(task, "未找到微信主窗口（微信可能未启动，或自动化组件"
+                             "不可用），请确认微信已登录后重试", stage)
+            return
         try:
             # 校验①：微信窗口可用性（登录态 + 可见性 + 窗口前置）
             if not gui.is_alive():
@@ -284,8 +364,7 @@ class Sender:
             # bring_to_front()（NOTOPMOST），ensure_visible() 又置顶一次，
             # 每次发送把窗口 Z 序翻两遍，是 Qt 控件树反复回收的诱因之一。
             if not gui.ensure_visible():
-                self._fail(task, "微信窗口不可见（可能被遮挡或锁屏），请检查后重试",
-                           stage)
+                self._fail(task, self._window_not_visible_message(gui), stage)
                 return
             stage.mark("front")
             # 校验②：定位并打开目标会话（open_chat 内部有 _chat_open_confirmed）
@@ -698,7 +777,7 @@ class Sender:
             # bring_to_front()（NOTOPMOST），ensure_visible() 又置顶一次，
             # 每次发送把窗口 Z 序翻两遍，是 Qt 控件树反复回收的诱因之一。
             if not gui.ensure_visible():
-                return False, "微信窗口不可见（可能被遮挡或锁屏），请检查后重试"
+                return False, self._window_not_visible_message(gui)
             if openim:
                 opener = getattr(gui, "open_chat_prefer_openim", None)
                 corp = self._corp_hint(name)

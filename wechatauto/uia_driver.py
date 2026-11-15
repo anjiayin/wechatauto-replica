@@ -620,34 +620,44 @@ class WeChatUIA:
     _throttled_at: float = 0.0   # 该次拒绝的 monotonic 时刻（5 分钟内有效）
 
     def _restore_window_visible(self) -> bool:
-        """把最小化 / 关闭到托盘（SW_HIDE）的微信主窗口恢复为可见。
+        """把**真正的 Win32 最小化**主窗口恢复为可见。
 
-        微信 4.1 的 Qt accessibility 树**只在窗口可见时物化**。实测
-        （2026-11-15 01:05）：用户把微信关到托盘后主窗口变成 160x28
-        最小化伪矩形，此时热激活补丁写了 gate byte 树也不会重建 →
-        白等 31s → 降级 OCR 连刷 3 次 → 93s 失败；更糟的是在不可见状态
-        反复写内存会把 Qt 输入系统写挂，表现为「微信卡死、点击没反应」。
+        微信 4.1 的 Qt accessibility 树只在窗口可见时物化。但「关闭到
+        托盘」不是 Win32 最小化，而是 Qt 自己 hide()
+        （``IsWindowVisible=False``）：2026-11-15 11:33:44 实测，用
+        ``SW_SHOW`` 强行显示后 Qt 内部仍是托盘态 → 树死活不物化
+        （16s + 31s 两次唤醒超时），窗口还卡成 visible=True+iconic=True
+        的 -32000 伪矩形（用户看到「界面不能动」）；唤醒流程反复写
+        gate byte 又把 Qt 输入系统写挂（同 PID 6 次写入后配额打满）。
 
-        只恢复可见性、不改 Z 序不置前（尽量不打扰用户）；返回当前是否
-        至少存在一个「可见且非最小化」的主窗口。
+        因此这里只处理 ``iconic=True`` 的真最小化（SW_RESTORE 实测有效）；
+        托盘态**绝不碰窗口**，返回 False 并置 ``_tray_hidden_detected``，
+        让所有唤醒路径直接 fail-closed，一个字节都不写。
+
+        Returns:
+            True  = 至少一个主窗口可见且非最小化，可以安全热激活；
+            False = 托盘隐藏 / 窗口不存在 / 枚举失败，调用方不得唤醒。
         """
+        self._tray_hidden_detected = False
         if not _HAS_WIN32:
             return True                 # 非 Windows（CI）不做窗口操作
         restored = 0
         visible_ok = False
+        tray_hidden = False
 
         def cb(h, _):
-            nonlocal restored, visible_ok
+            nonlocal restored, visible_ok, tray_hidden
             try:
                 if win32gui.GetWindowText(h) not in MAIN_NAMES:
                     return True
-                iconic = bool(win32gui.IsIconic(h))
                 visible = bool(win32gui.IsWindowVisible(h))
+                iconic = bool(win32gui.IsIconic(h))
+                if not visible:
+                    # Qt hide() = 关到托盘：SW_SHOW 只会制造畸形态，不碰
+                    tray_hidden = True
+                    return True
                 if iconic:
                     win32gui.ShowWindow(h, win32con.SW_RESTORE)
-                    restored += 1
-                elif not visible:
-                    win32gui.ShowWindow(h, win32con.SW_SHOW)
                     restored += 1
                 visible_ok = visible_ok or (
                     bool(win32gui.IsWindowVisible(h))
@@ -661,9 +671,12 @@ class WeChatUIA:
         except Exception:
             return False
         if restored:
-            wxlog.info('微信主窗口被最小化/关闭到托盘，已恢复可见（%d 个）',
-                       restored)
-        return visible_ok
+            wxlog.info('微信主窗口被最小化，已恢复可见（%d 个）', restored)
+        if tray_hidden:
+            self._tray_hidden_detected = True
+            wxlog.warning('微信主窗口关闭到系统托盘（Qt 隐藏），'
+                          '跳过窗口恢复与热激活：请点开微信主窗口后重试')
+        return visible_ok and not tray_hidden
 
     def _wake_accessibility(self, rearm: bool = False) -> bool:
         """按 PID 去重地热激活；**只有真实写内存**才消耗限流配额。
@@ -887,6 +900,11 @@ class WeChatUIA:
             # 托盘/最小化窗口在 _wechat_hwnds() 里根本枚举不到；先恢复可见
             # 再判断，否则会误走「微信没开」的 screen reader / wake 分支。
             self._restore_window_visible()
+            if getattr(self, '_tray_hidden_detected', False):
+                # 托盘态下这条分支的 _wake_accessibility()/wake() 也会写
+                # gate byte；必须整体跳过，否则后台巡检会把 Qt 输入写挂。
+                wxlog.warning('微信在托盘，ensure_window 跳过唤醒分支（不写补丁）')
+                return False
             if self._login_window() is not None:
                 self._auto_login()
             elif self._wechat_hwnds():
@@ -1458,11 +1476,15 @@ class WeChatUIA:
         wxlog.info("微信控件树尚未就绪，正在热激活（首次约 15~30 秒，请稍等）")
         visible = self._restore_window_visible()
         if not visible:
-            # 窗口仍不可见（关闭到托盘且恢复失败）：控件树在不可见窗口上
-            # 不会物化，打补丁也无效。**立刻失败**，不要干等满 30 秒——
-            # 老版本在这里只是跳过补丁却继续等，用户白等 30s 才报错。
-            wxlog.warning("微信主窗口不可见（关闭到托盘/最小化且恢复失败），"
-                          "控件树不会物化，本次立即放弃")
+            # 窗口仍不可见：控件树在不可见窗口上不会物化，打补丁也无效。
+            # **立刻失败、一个字节都不写**，不要干等满 30 秒。
+            if getattr(self, '_tray_hidden_detected', False):
+                wxlog.warning("微信已关闭到系统托盘（Qt 隐藏）：控件树不会"
+                              "物化，本次不写任何补丁、立即判失败；"
+                              "请点开微信主窗口后重试")
+            else:
+                wxlog.warning("微信主窗口不可见（最小化且恢复失败），"
+                              "控件树不会物化，本次立即放弃")
             return False
         writes = 0
         self._wake_accessibility()
@@ -1507,7 +1529,10 @@ class WeChatUIA:
                     self._wake_accessibility(rearm=True)
                     rearm_done = True
                     if getattr(self, '_last_patch_written', False):
-                        writes += 1
+                        # 一次 1→0→1 脉冲实际写 **2 个字节**；按 1 次计数
+                        # 会让 MAX_WRITES_IN_WAIT 形同虚设（11:33:49 实测
+                        # 一次 rearm + 后续普通补丁 = 90s 内 4+ 次写入）。
+                        writes += 2
                         wxlog.info("已对「gate=1 但树未物化」做一次受控重触发")
                 elif writes < WeChatUIA.MAX_WRITES_IN_WAIT:
                     self._wake_accessibility()
@@ -1536,6 +1561,14 @@ class WeChatUIA:
         for pid in pids:
             if pid and now - WeChatUIA._rearm_log.get(pid, 0.0) < WeChatUIA.REARM_COOLDOWN:
                 wxlog.debug("距上次 UIA 重触发不足 %.0fs，跳过（PID=%s）",
+                            WeChatUIA.REARM_COOLDOWN, pid)
+                return False
+            # 距**任何一次真实补丁写入**也必须满 45s。否则「刚 0→1 完
+            # 20 秒又来一次 1→0→1」在同一进程里连写 3 个字节，叠加后续
+            # 唤醒就踩中「90s 内 4+ 次写挂 Qt 输入」（11:31~11:34 实测）。
+            rec = WeChatUIA._patch_log.get(pid or 0)
+            if rec and rec[0] and now - rec[1] < WeChatUIA.REARM_COOLDOWN:
+                wxlog.debug("距上次真实补丁不足 %.0fs，跳过重触发（PID=%s）",
                             WeChatUIA.REARM_COOLDOWN, pid)
                 return False
         for pid in pids:

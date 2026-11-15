@@ -1106,6 +1106,47 @@ class WeChatGUI:
                        [(h, self._get_pid(h)) for h in targets[:5]])
         return len(targets)
 
+    def is_tray_hidden(self) -> bool:
+        """主窗口是否被微信「关闭到系统托盘」（Qt hide，visible=False）。
+
+        与 Win32 最小化区分：最小化时 ``IsWindowVisible`` 仍为 True、
+        ``IsIconic`` 为 True（160x28 伪矩形）；关到托盘是 Qt 自己
+        hide()，``IsWindowVisible=False``，此时**不能用 ShowWindow 强行
+        恢复**（见 :meth:`ensure_visible` 的实测说明）。
+
+        供发送线程与后台预热巡检在唤醒控件树之前快速跳过：托盘态打
+        gate byte 既不会让树物化，反复写还会挂掉 Qt 输入系统。
+        """
+        try:
+            u = self._input._user32
+            hwnd = getattr(self, 'main_hwnd', 0)
+            if not hwnd or not u.IsWindow(hwnd):
+                return False
+            return not bool(u.IsWindowVisible(hwnd))
+        except Exception:
+            return False
+
+    def _after_tray_restore(self) -> None:
+        """从系统托盘恢复后，作废所有可能失效的窗口 / UIA / 会话锚点。
+
+        Qt 在托盘期间会回收控件树，缓存的引擎、会话名、输入框矩形、
+        窗口句柄全部可能失效。必须重建并让后续发送重新实时校验会话，
+        否则会用旧锚点操作、甚至把消息打进托盘前打开的那个会话。
+        """
+        self._was_tray_hidden = False
+        self._last_visible_ok = False
+        self._last_open_error = ''
+        self._current_chat = None
+        self._last_input_box = None
+        self._uia = None
+        self._uia_tried = False
+        self._uia_retry_after = 0
+        try:
+            self._rebind_if_window_changed()
+        except Exception as exc:
+            wxlog.debug('托盘恢复后重绑异常（忽略）：%s', exc)
+        wxlog.info('微信已从系统托盘恢复，清空 UIA/会话缓存并重新绑定')
+
     def ensure_visible(self) -> bool:
         """自动最小化遮挡窗口并把微信置于前台。
 
@@ -1129,6 +1170,40 @@ class WeChatGUI:
                 return True, False
 
         visible, iconic = _window_state()
+        # 微信「关闭到托盘」是 Qt 自己 hide()（visible=False），**与 Win32
+        # 最小化（iconic=True 但 visible 仍为 True）是两回事**。
+        # 实测 2026-11-15 11:33:44：用 SW_SHOW 强行把托盘窗口显示出来，
+        # Qt 内部仍是托盘态 → UIA 树死活不物化（16s + 31s 两次唤醒超时），
+        # 窗口还被卡成 visible=True + iconic=True 的 -32000 伪矩形，用户
+        # 看到「界面不能动」；更糟的是唤醒流程反复写 gate byte，把 Qt
+        # 输入系统写挂（同 PID 6 次写入后配额打满，只能重启微信）。
+        # 托盘态不碰窗口、不打补丁、不等待。但**用户要求托盘态也能自动
+        # 发送**：唯一安全的恢复方式是让微信自己 show()——模拟单击系统
+        # 托盘图标（wechatauto.tray_restore，18:56 实机验证：主窗由
+        # visible=False 变 True、rect 保持正常、PID 不变）。
+        # 绝不 SW_SHOW（畸形态 + 树不物化），绝不启动 Weixin.exe 第二实例
+        # （18:53 实测会开新登录窗，旧主窗仍在托盘）。
+        if not visible:
+            try:
+                from wechatauto.tray_restore import restore_wechat_from_tray
+                restored = restore_wechat_from_tray(self.main_hwnd, timeout=3.0)
+            except Exception as exc:
+                wxlog.debug('托盘图标自动唤起异常（按失败处理）：%s', exc)
+                restored = False
+            if restored:
+                self._after_tray_restore()
+                visible, iconic = _window_state()
+            else:
+                self._last_open_error = 'tray_hidden'
+                self._last_visible_ok = False
+                self._was_tray_hidden = True
+                wxlog.warning('微信已关闭到系统托盘，自动点击托盘图标未成功；'
+                              '不强行唤醒、不写补丁，本次直接判失败，'
+                              '请点开微信主窗口后重试 hwnd=%s', self.main_hwnd)
+                return False
+        if getattr(self, '_was_tray_hidden', False):
+            # 用户手动把微信从托盘点开（上一轮发送失败后）：同样要清缓存
+            self._after_tray_restore()
         # 缓存命中还要求微信仍是前台：用户在浏览器点「回复」后浏览器会
         # 抢回焦点，此时必须重新置前，否则后续点击会落到浏览器上。
         try:
@@ -1141,16 +1216,12 @@ class WeChatGUI:
                 and getattr(self, '_last_visible_ts', 0) > time.time() - 15
                 and self.is_alive() and visible and not iconic and still_front):
             return True
-        if not visible or iconic:
-            # 「关闭到托盘」是 SW_HIDE（visible=False），「最小化」是
-            # iconic=True。两者都必须先恢复可见：Qt 控件树只在可见窗口上
-            # 物化，不恢复的话 UIA 唤醒会白等 30s 并反复写补丁把输入挂掉。
-            if not visible:
-                u.ShowWindow(self.main_hwnd, 5)      # SW_SHOW
+        if iconic:
+            # 真正的 Win32 最小化：SW_RESTORE 有效，Qt 会重建控件树
+            # （11:33:26 实测恢复后一次 0→1 热激活即就绪）。
             _restore_keep_maximize(u, self.main_hwnd)
             time.sleep(0.5)
-            wxlog.info('微信主窗口%s，已自动恢复可见 hwnd=%s',
-                       '关闭到托盘（隐藏）' if not visible else '处于最小化状态',
+            wxlog.info('微信主窗口处于最小化状态，已自动恢复可见 hwnd=%s',
                        self.main_hwnd)
             # 微信从托盘恢复 / 主窗口重建时**句柄会变**（实测日志
             # 4000292 → 1378074）。旧代码继续拿旧 main_hwnd 去算
@@ -1579,6 +1650,12 @@ class WeChatGUI:
         """
         if self._uia is not None:
             return True
+        # 托盘态（Qt hide）下控件树不会物化，warm_tree 只会白等 30s 并
+        # 反复写 gate byte；后台巡检每 15s 来一次就能把 Qt 输入写挂
+        # （2026-11-15 11:34:57 实测）。这里静默跳过，等用户点开窗口。
+        if self.is_tray_hidden():
+            wxlog.debug('微信关闭到系统托盘，预热跳过（不打补丁、不唤醒）')
+            return False
         try:
             from wechatauto.uia_driver import WeChatUIA
         except Exception as e:                  # 依赖未装（如 linux CI）

@@ -358,20 +358,28 @@ class TestWindowVisibilityGuards:
         assert restored == [330176]
         assert win_u.shown == []       # 最小化不需要先 SW_SHOW
 
-    def test_ensure_visible_restores_hidden_tray_window(self, monkeypatch):
-        """「关闭到托盘」= SW_HIDE，必须先 SW_SHOW 再恢复，否则树不物化。"""
+    def test_ensure_visible_fails_closed_on_hidden_tray_window(self, monkeypatch):
+        """关到托盘 = Qt hide()：绝不 SW_SHOW，0 秒 fail-closed。
+
+        2026-11-15 11:33 实测：Win32 SW_SHOW 强行显示 Qt 隐藏窗口，只会
+        把窗口卡成 visible=True+iconic=True 的 -32000 伪矩形（界面不能
+        动），UIA 树仍不物化；唤醒流程还会连打补丁把 Qt 输入写挂。
+        现在交给用户点托盘图标，代码一行窗口操作都不做。
+        """
         from wechatauto import guia
         g = self._gui()
         g.main_hwnd = 330176
         g.render_hwnd = 330176
-        vis = iter([False, True, True])   # 隐藏 → SW_SHOW 后可见
+        g._last_open_error = ''
+        g._last_visible_ok = False
+        g._last_visible_ts = 0
 
         class _U:
             def __init__(self):
                 self.shown = []
 
             def IsWindowVisible(self, h):
-                return next(vis, True)
+                return False
 
             def IsIconic(self, h):
                 return False
@@ -384,21 +392,23 @@ class TestWindowVisibilityGuards:
 
         win_u = _U()
         g._input._user32 = win_u
-        restored = []
+        touched = []
         monkeypatch.setattr(guia, "_restore_keep_maximize",
-                            lambda u, h: restored.append(h))
+                            lambda u, h: touched.append("restore"))
         monkeypatch.setattr("wechatauto.guia.time.sleep", lambda s: None)
-        monkeypatch.setattr(g, "_minimize_blockers", lambda: 0)
+        monkeypatch.setattr(g, "_minimize_blockers",
+                            lambda: touched.append("blockers"))
         monkeypatch.setattr(g, "bring_to_front",
-                            lambda keep_topmost=False: True)
-        monkeypatch.setattr(g, "_update_render_rect", lambda: None)
+                            lambda keep_topmost=False: touched.append("front"))
+        monkeypatch.setattr(g, "_update_render_rect",
+                            lambda: touched.append("rect"))
+        monkeypatch.setattr(g, "_rebind_if_window_changed",
+                            lambda: touched.append("rebind") or False)
         monkeypatch.setattr(g, "is_alive", lambda: True)
-        assert g.ensure_visible() is True
-        assert win_u.shown == [(330176, 5)]    # SW_SHOW
-        assert restored == [330176]
-        # 恢复窗口后必须清掉 UIA 冷却，否则继续走 OCR 慢路径
-        assert getattr(g, '_uia_retry_after', 0) == 0
-        assert g._uia_tried is False
+        assert g.ensure_visible() is False
+        assert win_u.shown == []               # 绝不 SW_SHOW
+        assert touched == []                   # 绝不恢复/置前/重绑
+        assert g.last_open_error() == 'tray_hidden'
 
 
 class TestTrayVisibilityPatchGuard:
@@ -461,8 +471,13 @@ class TestTrayVisibilityPatchGuard:
         assert uia._wake_and_wait_ready(timeout=30.0) is False
         assert len(wakes) == WeChatUIA.MAX_WRITES_IN_WAIT
 
-    def test_restore_shows_minimized_and_hidden_only(self, monkeypatch):
-        """最小化→SW_RESTORE；托盘隐藏→SW_SHOW；托盘辅助窗口不动。"""
+    def test_restore_minimized_but_never_shows_hidden_tray(self, monkeypatch):
+        """真最小化→SW_RESTORE；Qt 隐藏的托盘窗口→绝不 SW_SHOW。
+
+        2026-11-15 11:33 实测：SW_SHOW 托盘窗口会让 Qt 内部状态与 Win32
+        不一致，UIA 树不物化且窗口卡成 -32000 伪矩形；此时必须返回 False
+        让唤醒路径直接 fail-closed，一个 gate byte 都不写。
+        """
         from types import SimpleNamespace
         import win32con
         import wechatauto.uia_driver as drv
@@ -492,9 +507,9 @@ class TestTrayVisibilityPatchGuard:
         monkeypatch.setattr(drv, "win32gui", fake)
         uia = object.__new__(WeChatUIA)
 
-        assert uia._restore_window_visible() is True
-        assert shown == [(111, win32con.SW_RESTORE),
-                         (222, win32con.SW_SHOW)]
+        assert uia._restore_window_visible() is False
+        assert shown == [(111, win32con.SW_RESTORE)]   # 222 隐藏窗口不碰
+        assert uia._tray_hidden_detected is True
 
     def test_uia_failure_retries_after_cooldown(self, monkeypatch):
         """一次树回收不能让整场会话永久降级 OCR。"""
