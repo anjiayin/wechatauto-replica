@@ -20,7 +20,7 @@ import logging
 import threading
 import time
 from collections import OrderedDict
-from typing import Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Tuple
 
 from app.db import Database
 
@@ -67,6 +67,34 @@ def _load_group_cards(db: Database, chatroom: str) -> Dict[str, str]:
         while len(_CARD_CACHE) > _CARD_CACHE_MAX:
             _CARD_CACHE.popitem(last=False)     # 淘汰最久未用
     return cards
+
+
+def resolve_wechat_id(svc: Any, username: str) -> str:
+    """username → 微信号（contact.alias），供各路由统一补齐展示字段。
+
+    用户要求界面上原 wxid 的位置统一改显微信号。本函数是**唯一**的路由侧
+    安全包装：委托 ``svc.get_wechat_id``（内部 alias 优先、备注/昵称回退、
+    带进程内缓存），并在服务替身缺方法/读库失败时返回空串——微信号只是
+    显示增强，绝不能让商机/日志/设置页 500。
+
+    Args:
+        svc: 微信服务实例（可能为 None / 测试替身）。
+        username: 联系人/会话 username。
+
+    Returns:
+        微信号（或备注/昵称回退值）；解析不到返回空串。
+    """
+    name = str(username or "")
+    if not name or svc is None:
+        return ""
+    getter = getattr(svc, "get_wechat_id", None)
+    if not callable(getter):
+        return ""
+    try:
+        return str(getter(name) or "")
+    except Exception:
+        logger.debug("读取微信号失败（展示留空）：%s", name)
+        return ""
 
 
 def clear_cache() -> None:

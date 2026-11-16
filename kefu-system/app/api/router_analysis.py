@@ -18,7 +18,8 @@ from fastapi import APIRouter, Depends, Query
 from app.api.deps import get_db, get_wechat_service
 from app.db import Database
 from app.schemas import AnalysisLogListOut, AnalysisLogOut
-from app.sender_display import resolve_sender_display
+from app.sender_display import (resolve_sender_display,
+                                resolve_wechat_id as _alias_of)
 from app.wechat_service import WeChatService
 
 logger = logging.getLogger(__name__)
@@ -70,7 +71,9 @@ def _match_log_sessions(db: Database, svc: WeChatService,
         except Exception:
             logger.warning("解析会话显示名失败（跳过该条）：%s", uid)
             continue
-        if key in uid.lower() or key in display.lower():
+        # 微信号（alias）同样可搜——界面上展示的就是它，用户自然按它找人
+        alias = _alias_of(svc, uid).lower()
+        if key in uid.lower() or key in display.lower() or key in alias:
             hits.append(uid)
     return hits
 
@@ -113,7 +116,8 @@ def _match_log_senders(db: Database, svc: WeChatService,
         except Exception:  # pragma: no cover - resolve 内部已兜底，双保险
             logger.warning("解析发送人显示名失败（跳过该条）：%s", uid)
             continue
-        if key in uid.lower() or key in display.lower():
+        if key in uid.lower() or key in display.lower() \
+                or key in _alias_of(svc, uid).lower():
             hits.append(uid)
     return hits
 
@@ -180,6 +184,9 @@ def list_analysis_logs(
             str(row.get("input_text") or ""))
         items.append(AnalysisLogOut(
             **row, session_display=session_display,
+            session_alias=_alias_of(
+                svc, str(row.get("session_username") or "")),
+            sender_alias=_alias_of(svc, str(row.get("sender_wxid") or "")),
             input_text_display=text_display,
             sender_display=sender_display))
     return AnalysisLogListOut(total=total, items=items)

@@ -77,6 +77,9 @@ class StatusOut(BaseModel):
 class SessionItemOut(BaseModel):
     username: str
     display_name: str
+    # 微信号（contact.alias）：界面上凡是原来显示 wxid 的位置改显示它；
+    # alias 为空时后端回退备注/昵称，仍解析不到为空串（不回退内部 wxid）。
+    alias: str = ""
     kind: str                          # group / friend
     openim: bool = False               # 企业微信/客服联系人（一对一同为 friend）
     corp: str = ""                     # 企业微信所属企业简称（显示名「昵称@企业」）
@@ -106,6 +109,8 @@ class MonitorTargetOut(BaseModel):
     id: int
     username: str
     display_name: str
+    # 微信号（contact.alias），设置页监控对象列表展示用；回退规则同 SessionItemOut
+    alias: str = ""
     kind: str
     enabled: int
 
@@ -425,6 +430,9 @@ class OpportunityListItem(BaseModel):
     # 企业名（用户反馈：来源列看起来只有前半截）。
     session_display: str = ""
     sender_display: str = ""
+    # 微信号（contact.alias）：列表/详情里原 wxid 字段处展示，避免泄露内部 ID
+    session_alias: str = ""
+    sender_alias: str = ""
 
 
 class OpportunityListOut(BaseModel):
@@ -499,6 +507,8 @@ class ReplyTargetOut(BaseModel):
     # 该商机消息的发送人（群内回复默认 @ 他，私信回复发给他）
     sender_username: str = ""
     sender_name: str = ""
+    # 发送人微信号（contact.alias）：回复去向区展示「私信发给 xxx」时用
+    sender_alias: str = ""
     # 发送人是否可私信（好友/可聊联系人）；False 时前端把私信按钮置灰
     sender_is_friend: bool = False
     # 不可私信的用户可读原因（空串 = 可以私信）
@@ -509,6 +519,8 @@ class GroupMemberOut(BaseModel):
     """群成员候选（@ 用）。name 为群内显示名，与微信 @ 弹层一致。"""
     name: str = ""
     wxid: str = ""
+    # 微信号（contact.alias），供前端在群成员列表里替换内部 wxid 展示
+    alias: str = ""
     is_owner: bool = False
 
 
@@ -530,6 +542,9 @@ class AnalysisLogOut(BaseModel):
     # 发送人显示名（批次 11 需求 2）：群昵称（group_cards）> 联系人昵称 >
     # wxid 本身；群聊私聊都返回，前端在「来源会话」列下加一行小字展示。
     sender_display: str = ""
+    # 微信号（contact.alias）：来源会话/发送人的「ID」位改显微信号
+    session_alias: str = ""
+    sender_alias: str = ""
     msg_count: int = 0
     input_text: str = ""
     input_text_display: str = ""       # 消息内容展示版（群消息发送者前缀已解析为显示名）

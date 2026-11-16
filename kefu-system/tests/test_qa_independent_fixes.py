@@ -511,11 +511,17 @@ class TestQAOpenimWhitelistHardening:
         assert "wxid_stranger" not in items
 
     def test_real_wxdb_sql_semantics_both_loops(self, tmp_path):
-        """用真实 get_contacts SQL + is_friend 验证 local_type/delete_flag 口径。"""
+        """用真实 get_contacts SQL + is_friend 验证 local_type/delete_flag 口径。
+
+        微信 4.x 实测口径修正：local_type=1 才是通讯录真好友，local_type=3
+        是「群里见过但非好友」（32022 条 alias/remark 全空、flag=4），必须从
+        私聊候选排除；企业微信 5/6/7 保留。
+        """
         path = str(tmp_path / "qa_contact.db")
         rows = [
-            _contact_row("wxid_real_friend", 3, nick="通讯录好友"),
-            _contact_row("wxid_chat_only", 1, nick="仅聊天好友"),
+            _contact_row("wxid_lt3_group_stranger", 3,
+                         nick="群里见过的非好友"),
+            _contact_row("wxid_lt1_friend", 1, nick="通讯录真好友"),
             _contact_row("12345@openim", 5, nick="企业微信好友5"),
             _contact_row("67890@openim", 7, nick="企业微信好友7"),
             _contact_row("999_dirty@openim", 0, nick="脏数据local_type0"),
@@ -528,8 +534,8 @@ class TestQAOpenimWhitelistHardening:
             _contact_row("g1@chatroom", 2, nick="测试群"),
         ]
         sessions = [
-            {"username": "wxid_real_friend"},
-            {"username": "wxid_chat_only"},
+            {"username": "wxid_lt3_group_stranger"},
+            {"username": "wxid_lt1_friend"},
             {"username": "12345@openim"},
             {"username": "67890@openim"},
             {"username": "999_dirty@openim"},
@@ -542,9 +548,11 @@ class TestQAOpenimWhitelistHardening:
         svc = WeChatService(None, None)  # type: ignore[arg-type]
         svc._wxdb = wx  # type: ignore[assignment]
         items = {i["username"]: i for i in svc._build_contact_list()}
-        # 会话路径：真好友与 5/7 企业微信好友保留
-        assert "wxid_real_friend" in items and "wxid_chat_only" in items
+        # 会话路径：local_type=1 真好友与 5/7 企业微信好友保留
+        assert "wxid_lt1_friend" in items
         assert "12345@openim" in items and "67890@openim" in items
+        # local_type=3 群里非好友必须挡掉（旧口径误把它当好友）
+        assert "wxid_lt3_group_stranger" not in items
         # 会话路径：脏数据 / 已删好友 / 非好友临时会话全部挡掉
         assert "999_dirty@openim" not in items
         assert "777_deleted@openim" not in items

@@ -35,6 +35,8 @@ from app.schemas import (
     ReplyTargetOut,
 )
 from app.sender import SendTask
+# 路由侧微信号补齐统一走 sender_display.resolve_wechat_id（唯一实现）
+from app.sender_display import resolve_wechat_id as _alias_of
 from app.wechat_service import WeChatService
 
 logger = logging.getLogger(__name__)
@@ -108,7 +110,13 @@ def _display_with_corp(svc: Any, username: str, stored: str) -> str:
 
 
 def _with_displays(items: List[dict], svc: Any) -> List[dict]:
-    """给一批商机行补 ``session_display`` / ``sender_display``（就地返回拷贝）。"""
+    """给一批商机行补显示字段（就地返回拷贝）：
+
+    - ``session_display`` / ``sender_display``：名字（企业微信带企业简称）；
+    - ``session_alias`` / ``sender_alias``：微信号，界面原 wxid 位改显示它。
+
+    两者严格区分：用户要的是「ID 列从 wxid 变微信号」，不是把名字塞进 ID 列。
+    """
     out: List[dict] = []
     for row in items:
         item = dict(row)
@@ -124,6 +132,9 @@ def _with_displays(items: List[dict], svc: Any) -> List[dict]:
         else:
             item["sender_display"] = _display_with_corp(
                 svc, sender_wxid, sender)
+        # 微信号（alias）：群聊没有微信号，解析不到自然留空，前端据此隐藏。
+        item["session_alias"] = _alias_of(svc, session_username)
+        item["sender_alias"] = _alias_of(svc, sender_wxid)
         out.append(item)
     return out
 
@@ -246,9 +257,17 @@ def list_group_members(opp_id: int,
         logger.warning("读取群成员失败（%s）：%s", username, exc)
         return GroupMembersOut(is_group=True,
                                error=f"读取群成员失败：{exc}")
+    # 群成员候选：@ 仍用群内显示名（name），但列表里原 wxid 位改显微信号。
+    enriched: List[dict] = []
+    for m in members:
+        item = dict(m)
+        item.setdefault("alias", "")
+        if not item["alias"]:
+            item["alias"] = _alias_of(svc, str(item.get("wxid") or ""))
+        enriched.append(item)
     return GroupMembersOut(
         is_group=True,
-        items=[GroupMemberOut(**m) for m in members],
+        items=[GroupMemberOut(**m) for m in enriched],
     )
 
 
@@ -381,6 +400,7 @@ def get_reply_targets(opp_id: int,
         session_name=str(opp.get("session_name") or ""),
         sender_username=sender_username,
         sender_name=stored_sender,
+        sender_alias=_alias_of(svc, sender_username),
     )
     if not is_group:
         return out

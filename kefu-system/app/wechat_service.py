@@ -134,10 +134,19 @@ class WeChatService:
         self._listener_lock = threading.RLock()
         self._available = False      # wechatauto 是否可用
         self._reason = ""            # 降级原因（中文，/api/status 展示）
+        # 本次 start() 的 epoch 水位（秒）；0 = 尚未启动/测试直调，不启用闸门。
+        # Listener 的 sort_seq watermark 只记「上次刷回位置」，客户端停机期间
+        # 收到的消息 sort_seq 更大，重启后会被当新消息全部回放；这里用启动
+        # 时刻做 create_time 闸门，把停机积压挡在聚合/AI 队列之外。
+        self._session_start_ts: float = 0.0
         self._flush_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._name_cache: dict[str, str] = {}   # username → display name 缓存
         self._name_cache_lock = threading.Lock()
+        # username → 微信号(alias) 缓存。用户要求界面上原 wxid 的位置统一
+        # 显示微信里可见的微信号；alias 为空时回退备注/昵称（见 get_wechat_id）。
+        self._alias_cache: dict[str, str] = {}
+        self._alias_cache_lock = threading.Lock()
         # 企业微信联系人 → 企业简称（整张表缓存：读 contact.db 解密很慢，
         # 商机/日志一页几十行逐行读会把接口拖到秒级）
         self._corp_map_cache: tuple[float, dict, bool] = (0.0, None, False)
@@ -313,17 +322,29 @@ class WeChatService:
                 self._degrade(f"微信数据库不可用（微信可能未登录）：{exc}")
                 return
             try:
+                # 记录本次启动时刻（epoch 秒）作为时间闸门下界。必须早于
+                # watermark 推进：推进与 listener.start() 之间到达的真新消息
+                # create_time >= 本水位，不会被误杀。
+                self._session_start_ts = time.time()
                 marks = self._db.load_watermarks()
+                # 治本：把已启用会话的 watermark 推进到当前最新 sort_seq，
+                # 让 Listener 从「最新」开始轮询，根本不回放停机积压。
+                # 推进发生在构造 Listener 之前（而非 add_listener 之后），
+                # 因为 add_listener 只在 user 不在 watermark 时赋值，绝不会
+                # 覆盖这里写入的值（见 wechatauto/db.py:3299）。
+                advanced_marks = self._advance_start_watermarks(marks)
                 self._listener = Listener(self._wxdb, interval=1.0,
-                                          watermark=marks or None)
+                                          watermark=advanced_marks or None)
                 for username in self._db.list_enabled_target_usernames():
                     self._listener.add_listener(username, self._on_message)
                 self._listener.start()
                 self._available = True
                 self._reason = ""
-                logger.info("微信监听已启动（监控会话 %d 个，加载 watermark %d 条）",
+                logger.info("微信监听已启动（监控会话 %d 个，加载 watermark %d 条，"
+                            "推进后水位共 %d 条；启动水位=%.0f）",
                             len(self._db.list_enabled_target_usernames()),
-                            len(marks))
+                            len(marks), len(advanced_marks),
+                            self._session_start_ts)
             except Exception as exc:
                 self._listener = None
                 self._degrade(f"微信监听启动失败：{exc}")
@@ -333,6 +354,50 @@ class WeChatService:
             self._flush_thread = threading.Thread(
                 target=self._flush_loop, name="kefu-wm-flush", daemon=True)
             self._flush_thread.start()
+
+    def _advance_start_watermarks(self,
+                                  marks: Optional[dict]) -> dict[str, int]:
+        """把每个已启用会话的 watermark 推进到「当前最新 sort_seq」。
+
+        wechatauto 的 ``Listener`` 用持久化的 sort_seq watermark 判定新消息。
+        客户端停机期间微信仍在收消息，这些消息的 sort_seq > 上次退出时刷回的
+        watermark，重启后会被 Listener 当「新消息」全部回放。这里在构造
+        Listener 之前把水位推到各会话当前最新 sort_seq，使轮询从最新位置开始，
+        从源头避免停机积压进入 ``_on_message``（时间闸门是第二道兜底）。
+
+        读失败（微信库正忙/会话无消息）时保留传入的持久化水位，不擅自写 0：
+        写 0 反而会导致 Listener 从头回放全部历史。
+
+        Args:
+            marks: ``load_watermarks()`` 返回的持久化水位；None/空字典均可。
+
+        Returns:
+            推进后的水位字典（不修改入参）。
+        """
+        advanced = dict(marks or {})
+        if self._wxdb is None or self._db is None:
+            return advanced
+        try:
+            usernames = self._db.list_enabled_target_usernames()
+        except Exception:
+            logger.debug("读取已启用监控会话失败（跳过 watermark 推进）：",
+                         exc_info=True)
+            return advanced
+        for username in usernames:
+            try:
+                # get_messages 按 sort_seq DESC 跨分片归并，limit=1 即最新一条
+                latest = self._wxdb.get_messages(username, limit=1)
+            except Exception as exc:
+                logger.debug("读取最新消息推进 watermark 失败"
+                             "（沿用持久化水位）：%s：%s", username, exc)
+                continue
+            if not latest:
+                continue
+            seq = latest[0].get("sort_seq") if isinstance(latest[0], dict) \
+                else None
+            if isinstance(seq, (int, float)) and not isinstance(seq, bool):
+                advanced[username] = int(seq)
+        return advanced
 
     def stop(self) -> None:
         """停止监听并把 watermark 刷回数据库。"""
@@ -398,41 +463,52 @@ class WeChatService:
     # 消息回调（Listener 工作线程调用）
     # ------------------------------------------------------------------
     def _is_before_monitor_since(self, username: str, msg: dict) -> bool:
-        """消息是否早于该监控对象的「配置完成时刻」（应丢弃）。
+        """消息是否早于该会话的「有效水位」（应丢弃）。
 
-        wechatauto 的 Listener 用 ``sort_seq`` 做 watermark，与配置时刻完全
-        解耦：watermark 过期或被重置（例如首次读库连续失败后回退 0）时，
-        会把该会话多年历史消息一次性回放给回调。这里以 monitor_targets.
-        monitor_since（配置完成时写入的 epoch 秒）兜底过滤，群聊/私聊统一
-        生效，且在 skipped 日志/聚合窗口之前拦截，不占处理队列。
+        有效水位 = max(配置完成时刻, 本次启动时刻)，两道闸门都要满足才放行：
 
-        仅在「target 存在 + 水位 > 0 + 消息时间有效且早于水位」时返回 True；
-        无 target（测试直调/未配置会话）、存量水位 0、时间缺失或非法一律
-        放行，避免误伤正常消息。
+        1. ``monitor_targets.monitor_since``（配置完成时写入的 epoch 秒）：
+           兜底 Listener 因 watermark 过期/回退 0 而回放的多年历史消息；
+        2. ``self._session_start_ts``（本次 ``start()`` 的 epoch 秒）：兜底
+           **客户端停机期间**收到的消息。这类消息 create_time 晚于配置时刻，
+           第 1 道闸门挡不住；但 sort_seq 大于上次刷回的 watermark，重启后
+           会被 Listener 当新消息回放，必须靠启动水位拦截。
+
+        两道闸门都在 skipped 日志/聚合窗口之前生效，不占处理队列。
+
+        仅在「有效水位 > 0 + 消息时间有效且早于有效水位」时返回 True；
+        未启动（测试直调）、存量水位 0、时间缺失或非法一律放行，避免误伤
+        正常消息与存量行为。
 
         Args:
             username: 消息所属会话 username。
             msg: Listener 原始消息 dict（读取 create_time）。
 
         Returns:
-            True 表示该消息属于配置前历史，应静默丢弃。
+            True 表示该消息属于配置前/启动前历史，应静默丢弃。
         """
-        if not username or self._db is None:
+        if not username:
             return False
+        since = 0.0
+        if self._db is not None:
+            try:
+                target = self._db.get_target_by_username(username)
+            except Exception:
+                # 测试替身/降级场景可能没有该 DAO 或读取失败；不限制。
+                logger.debug("读取监控水位失败（按不过滤处理）：%s", username,
+                             exc_info=True)
+                target = None
+            if target:
+                try:
+                    since = float(int(target.get("monitor_since") or 0))
+                except (TypeError, ValueError):
+                    since = 0.0
+        # 叠加本次启动水位：没有该属性（老替身/降级）时按 0 处理，不误伤。
         try:
-            target = self._db.get_target_by_username(username)
-        except Exception:
-            # 测试替身/降级场景可能没有该 DAO；读不到就不限制。
-            logger.debug("读取监控水位失败（按不过滤处理）：%s", username,
-                         exc_info=True)
-            return False
-        if not target:
-            return False
-        try:
-            since = int(target.get("monitor_since") or 0)
+            session_start = float(getattr(self, "_session_start_ts", 0.0) or 0.0)
         except (TypeError, ValueError):
-            since = 0
-        if since <= 0:
+            session_start = 0.0
+        if since <= 0 and session_start <= 0:
             return False
         raw_ts = msg.get("create_time")
         if raw_ts is None or raw_ts == "":
@@ -446,11 +522,20 @@ class WeChatService:
         # 兼容 create_time 为毫秒的微信版本（秒级水位不要被放大 1000 倍）。
         if epoch > 1e11:
             epoch /= 1000.0
-        if epoch >= since:
-            return False
-        logger.debug("配置前历史消息已过滤：会话=%s create_time=%s < 水位=%s",
-                     username, raw_ts, since)
-        return True
+        # 配置水位用严格比较（沿用既有语义：早 1 秒也算配置前历史）。
+        if since > 0 and epoch < since:
+            logger.debug("配置前历史消息已过滤：会话=%s create_time=%s < 配置水位=%s",
+                         username, raw_ts, since)
+            return True
+        # 启动水位按**秒级口径**比较：create_time 是微信消息库的整数秒，
+        # start() 记录的是浮点秒；对启动时刻向下取整后严格比较，语义明确
+        # 为「同一秒视为启动后」——既不误杀启动瞬间到达的真新消息，也不会
+        # 放过分钟~小时级的停机积压。
+        if session_start > 0 and epoch < int(session_start):
+            logger.debug("停机期间历史消息已过滤：会话=%s create_time=%s < "
+                         "启动水位=%s", username, raw_ts, session_start)
+            return True
+        return False
 
     def _on_message(self, msg: dict, listener=None) -> None:
         """Listener 新消息回调：非文本记 skipped 后丢弃，文本进合并窗口。
@@ -1837,6 +1922,63 @@ class WeChatService:
             self._name_cache[username] = name
         return name
 
+    def get_wechat_id(self, username: str) -> str:
+        """username → 微信号（contact.alias），供界面替换原 wxid 展示。
+
+        用户原话：「用户显示的微信ID，微信上看见的是用户的微信号，这块能不能
+        显示为用户的微信号……统一显示我们能在微信中看见的微信号」。
+
+        显示规则（与「显示名」严格区分）：
+          1. ``contact.alias`` 非空 → 返回微信号（微信资料卡上可见的那一串）；
+          2. alias 为空（部分账号从未设置微信号）→ 回退到备注/昵称
+             （``get_display_name`` 已按 remark > nick_name 解析）；
+             回退值等于 username 本身时视为「解析不到」，返回空串——wxid 是
+             内部 ID，对用户无意义，不往「微信号」列里塞；
+          3. username 为空 / 微信库未就绪 → 返回空串，由前端决定是否整列隐藏。
+
+        结果与 :meth:`get_display_name` 共用各自的进程内缓存，单条查询只读
+        一次 contact.db，适合商机/日志一页几十行逐行补全。
+
+        Args:
+            username: 联系人/会话 username。
+
+        Returns:
+            微信号（或备注/昵称回退值）；解析不到返回空串。
+        """
+        username = str(username or "")
+        if not username:
+            return ""
+        # 群聊没有「微信号」这一标识（contact.alias 恒空），昵称回退会把群名
+        # 塞进微信号位，语义不对且前端会和显示名重复；直接返回空串，让前端
+        # 按各自规则回退到群名或群 ID。
+        if username.endswith("@chatroom"):
+            return ""
+        with self._alias_cache_lock:
+            hit = self._alias_cache.get(username)
+        if hit is not None:
+            return hit
+
+        alias = ""
+        if self._wxdb is not None:
+            getter = getattr(self._wxdb, "get_alias", None)
+            if callable(getter):
+                try:
+                    alias = str(getter(username) or "").strip()
+                except Exception:
+                    logger.debug("读取微信号(alias)失败（回退昵称）：%s",
+                                 username, exc_info=True)
+                    alias = ""
+        if not alias:
+            try:
+                name = str(self.get_display_name(username) or "").strip()
+            except Exception:
+                name = ""
+            # get_display_name 解析不到时会原样返回 username；不再回退 wxid
+            alias = "" if not name or name == username else name
+        with self._alias_cache_lock:
+            self._alias_cache[username] = alias
+        return alias
+
     # ------------------------------------------------------------------
     # 企业微信联系人的显示名（昵称@企业简称）
     # ------------------------------------------------------------------
@@ -1894,12 +2036,64 @@ class WeChatService:
         u = (username or "").strip().lower()
         return u.endswith("@openim") or "@kefu" in u
 
+    @staticmethod
+    def _friend_row_ok(contact: dict) -> bool:
+        """联系人行是否满足「可私信真好友」口径（对齐生产 SQL）。
+
+        生产 ``get_contacts("friend")`` 已在 SQL 里过滤 delete_flag=0、
+        local_type=1、verify_flag=0；这里对白名单行再补一道轻量复核，
+        让替身/降级路径口径一致：即使某个替身未按 verify_flag 过滤，
+        公众号（verify_flag≠0）也不会混进私聊候选。verify_flag 缺失或
+        读不懂时保守放行（不误删已知好友）。
+
+        Args:
+            contact: get_contacts 返回的一条联系人 dict。
+
+        Returns:
+            True = 满足好友口径；False = 已删/公众号等，需排除。
+        """
+        if contact.get("delete_flag"):
+            return False
+        verify_flag = contact.get("verify_flag")
+        if verify_flag is not None:
+            try:
+                if int(verify_flag) != 0:
+                    return False
+            except (TypeError, ValueError):
+                pass
+        return True
+
+    @staticmethod
+    def _alias_from_contact_row(row: dict, display_name: str,
+                                username: str) -> str:
+        """从已取回的 contact 行解析微信号（与 get_wechat_id 口径一致）。
+
+        群聊没有微信号，直接返回空串；alias 非空时用它，否则回退显示名；
+        显示名等于 username（解析不到）时也返回空串。
+
+        Args:
+            row: contact 行 dict（含 alias）。
+            display_name: 已按 remark > nick_name > username 解析的显示名。
+            username: 内部 ID。
+
+        Returns:
+            微信号字符串，解析不到返回空串。
+        """
+        if username.endswith("@chatroom"):
+            return ""
+        alias = str(row.get("alias") or "").strip()
+        if alias:
+            return alias
+        return "" if not display_name or display_name == username \
+            else display_name
+
     def _build_contact_list(self) -> list[dict]:
         """构建全量联系人/会话列表（群 + 好友 + 企业微信联系人，含显示名）。
 
-        会话（≤100 条，最近活跃优先）逐个解析显示名；联系人用
-        wechatauto 自带的 remark/nick_name 快照，免逐个解析（快）。
-        公众号（gh_ 前缀）不参与监控，直接跳过。
+        会话（≤100 条）的显示名/微信号从**已取回的整表联系人映射**一次性
+        解析（原先逐条 get_display_name + get_wechat_id 反复开关 contact.db，
+        100 会话最多 200 次连接，是首屏慢的主因）；contact 表无对应行的
+        会话才回退逐条查询。公众号（gh_ 前缀）不参与监控，直接跳过。
 
         好友与群聊均取**全量**（``limit=0``）：本机好友可达 3 万条，
         原先固定 ``limit=2000`` 会把按 username 排序后的绝大多数好友
@@ -1908,10 +2102,15 @@ class WeChatService:
         私聊候选严格限定为**真实好友**：``get_sessions`` 里出现的非好友
         临时会话（群成员、已删好友）原先一律被标成 kind="friend"，搜索
         时会混进大量非好友。判定复用 ``get_contacts("friend"/"openim")``
-        的 SQL 口径（local_type 3/1/5-7、delete_flag=0，与
-        ``WeChatDB.is_friend`` 一致），整表取回后按集合比对，避免逐条
-        is_friend 反复打开 contact.db（好友可达 3 万条）。给自己发消息的
-        会话（is_self）按既有语义保留；群聊（@chatroom）不受影响。
+        的 SQL 口径（**local_type=1 且 verify_flag=0 才是通讯录真好友**；
+        3 是群内非好友、已排除；lt=1 里 verify_flag≠0 的是公众号——
+        i黑马 wxid_2965349653612 / verify_flag=24 / 无备注 / extra_buffer
+        有公众号实锤；5/6/7 企业微信；delete_flag=0，与 ``WeChatDB.is_friend``
+        一致），整表取回后按集合比对，避免逐条 is_friend 反复打开
+        contact.db（好友可达 3 万条）。实锤：搜「淼淼」命中的 5 个
+        local_type=3 群成员（无微信号/无备注）不再混入，只剩 2 位真好友；
+        搜「黑马」不再返回公众号 i黑马。给自己发消息的会话（is_self）
+        按既有语义保留；群聊不受影响。
 
         企业微信联系人单独取 ``kind="openim"`` 并归入 friend（一对一
         私聊），带 ``openim=True`` 标记供前端区分同名联系人；能解析出
@@ -1941,7 +2140,7 @@ class WeChatService:
         friend_usernames: set[str] = {
             str(c.get("username") or "")
             for c in contacts_by_kind.get("friend", [])
-            if c.get("username")
+            if c.get("username") and self._friend_row_ok(c)
         }
         # openim 一路按 username 后缀（@openim/@kefu）选取，不检查 local_type；
         # 有 is_friend 能力时逐条复核（企业微信好友数量远小于普通好友，成本
@@ -1963,6 +2162,16 @@ class WeChatService:
             friend_usernames.add(username)
         # 好友表读不到时放行会话里的 friend 候选（降级不误伤）；读到了才严格过滤。
         strict_friend_filter = friend_ok and openim_ok
+        # 一次性把三路 contact 结果建成 username→行 映射：近期会话的显示名
+        # /微信号直接从中解析，避免逐个 get_display_name + get_wechat_id
+        # 反复开关 contact.db（100 个会话最多 200 次连接，首屏主要耗时点）。
+        # 全量列表本来就已取回，此映射不增加任何 DB 查询，也不改变结果。
+        contact_rows: dict[str, dict] = {}
+        for rows in contacts_by_kind.values():
+            for row in rows:
+                row_user = str(row.get("username") or "")
+                if row_user and row_user not in contact_rows:
+                    contact_rows[row_user] = row
         items: list[dict] = []
         seen: set[str] = set()
         for s in self._wxdb.get_sessions(limit=100):
@@ -1979,9 +2188,23 @@ class WeChatService:
                 continue
             openim = self.is_openim(username)
             corp = corp_map.get(username, "")
+            row = contact_rows.get(username)
+            if row is not None:
+                # 与 get_nickname 同口径：remark > nick_name > username，
+                # 直接复用已取回的整表行，不再逐条打开 contact.db。
+                raw_name = (str(row.get("remark") or "")
+                            or str(row.get("nick_name") or "") or username)
+                alias = self._alias_from_contact_row(row, raw_name, username)
+            else:
+                # contact 表里没有对应行（给自己发消息、降级放行、替身缺行）
+                # 才回退逐条查询；正常路径不再产生逐条 DB 连接。
+                raw_name = self.get_display_name(username)
+                alias = self.get_wechat_id(username)
             items.append({"username": username,
-                          "display_name": self._with_corp(
-                              self.get_display_name(username), corp),
+                          "display_name": self._with_corp(raw_name, corp),
+                          # 微信号（alias）供界面替换 wxid 显示；已随整表
+                          # 行一并拿到，零额外查询。
+                          "alias": alias,
                           "kind": "group" if is_group else "friend",
                           "openim": openim, "corp": corp,
                           "is_self": is_self})
@@ -2006,8 +2229,15 @@ class WeChatService:
                 # 用户手动备注优先（微信里备注会盖掉「昵称@企业」）；
                 # 无备注且能拿到企业简称时才拼后缀
                 name = remark or self._with_corp(nick or username, corp)
+                # alias 随 get_contacts 一同返回；为空时回退显示名也用已取回
+                # 的行计算（与 get_wechat_id 口径一致）。3 万好友里约 1/4
+                # 无 alias，原先逐个 get_wechat_id 会再开上千次 contact.db。
+                raw_name = (str(c.get("remark") or "")
+                            or str(c.get("nick_name") or "") or username)
+                alias = self._alias_from_contact_row(c, raw_name, username)
                 items.append({"username": username,
                               "display_name": name, "kind": item_kind,
+                              "alias": alias,
                               "openim": c_kind == "openim"
                                         or self.is_openim(username),
                               "corp": corp,
@@ -2074,6 +2304,13 @@ class WeChatService:
         首次调用构建缓存（可能较慢，微信库冷启动解密分片）；
         之后 60 秒内的搜索/翻页/类型切换全部内存过滤（毫秒级）。
 
+        排序（群聊/私聊一致，用户 2026-11 需求）：
+          - 无关键词（首屏）：「最近有消息优先、last_timestamp 降序」，
+            无消息的排最后（组内按原缓存顺序稳定）；
+          - 有关键词：匹配质量 ``_match_rank`` 主排序，同组内时间降序，
+            保证搜「淼淼」精确匹配排前。
+        两种情况都先对**全量候选**排序再截 ``limit``，不能边收集边截断。
+
         Args:
             keyword: 显示名/username 子串匹配，空串返回全部。
             kind: `all` / `group` / `friend`，按类型过滤返回结果。
@@ -2088,16 +2325,24 @@ class WeChatService:
         kw = (keyword or "").strip()
         items = self._get_cached_contact_list()
         if not kw:
-            # 默认列表（打开面板时的首屏）：不用排序，按缓存顺序取够即止，
-            # 避免对 3 万条全量排序
-            out: list[dict] = []
-            for item in items:
+            # 首屏（无关键词）：按「有消息优先 + last_timestamp 降序」排列，
+            # 群聊/私聊口径一致。关键正确性：先对**全量**候选排序，再截
+            # limit（前端传 50）——若边收集边截断，全量里时间最靠前的会话
+            # 可能落在被丢弃的尾部，用户就看不到最近联系人。
+            # 无消息的排后面（has_msg=1），组内按原缓存顺序稳定（order）。
+            # 3 万条内存排序仅几十毫秒，不是瓶颈（实测 SQL/建表才是）。
+            times = self._get_session_time_map()
+            ranked: list[tuple[int, int, int, dict]] = []
+            for order, item in enumerate(items):
                 if kind != "all" and item["kind"] != kind:
                     continue
-                out.append(dict(item))
-                if len(out) >= limit:
-                    break
-            return out
+                try:
+                    ts = int(times.get(item["username"], 0) or 0)
+                except (TypeError, ValueError):
+                    ts = 0
+                ranked.append((0 if ts else 1, -ts, order, item))
+            ranked.sort(key=lambda t: (t[0], t[1], t[2]))
+            return [dict(t[3]) for t in ranked[:limit]]
         # 有关键词：先收集全部命中，按匹配质量排序后再按 limit 截断。
         # 好友基数很大（本机约 3 万条），若边收集边截断，会出现
         # 「名字完全一致的联系人」被一堆昵称含同字的账号挤出前 50 条。
@@ -2109,10 +2354,13 @@ class WeChatService:
             if kind != "all" and item["kind"] != kind:
                 continue
             name = item["display_name"]
-            if kw not in name and kw not in item["username"]:
+            alias = str(item.get("alias") or "")
+            # 微信号（alias）也纳入搜索：用户在微信里记住的常是微信号而非昵称。
+            if kw not in name and kw not in alias \
+                    and kw not in item["username"]:
                 continue
             ts = times.get(item["username"], 0)
-            hits.append((self._match_rank(name, item["username"], kw),
+            hits.append((self._match_rank(name, item["username"], kw, alias),
                          0 if ts else 1, -ts, order, item))
         hits.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
         return [dict(t[4]) for t in hits[:limit]]
@@ -2138,23 +2386,33 @@ class WeChatService:
         return self._session_times
 
     @staticmethod
-    def _match_rank(name: str, username: str, kw: str) -> int:
+    def _match_rank(name: str, username: str, kw: str,
+                    alias: str = "") -> int:
         """搜索匹配质量排序权重：越小越靠前。
 
-        0 = 显示名完全等于关键词（用户最可能想找的人）
-        1 = 显示名以关键词开头
-        2 = 显示名包含关键词
-        3 = 仅 username 命中（wxid / openim id 等）
+        0 = 显示名/微信号完全等于关键词（用户最可能想找的人）
+        1 = 显示名/微信号以关键词开头
+        2 = 显示名/微信号包含关键词
+        3 = 仅 username 命中（wxid / openim id 等内部 ID）
+        4 = 未命中（调用方一般已过滤）
 
         企业微信联系人的显示名是「昵称@企业简称」，匹配时把 ``@`` 之后的
         企业名视作后缀：搜「邢不行」应命中原名并获得与普通好友相同的权重。
+
+        Args:
+            name: 显示名。
+            username: 内部 ID（wxid / openim id）。
+            kw: 搜索关键词。
+            alias: 微信号（可选；缺省时保持旧调用方行为不变）。
         """
         base = name.split("@", 1)[0] if "@" in name else name
-        if name == kw or base == kw:
+        wxid = str(alias or "").strip()
+        if name == kw or base == kw or (wxid and wxid.lower() == kw.lower()):
             return 0
-        if name.startswith(kw) or base.startswith(kw):
+        if name.startswith(kw) or base.startswith(kw) \
+                or (wxid and wxid.lower().startswith(kw.lower())):
             return 1
-        if kw in name:
+        if kw in name or (wxid and kw.lower() in wxid.lower()):
             return 2
         return 3 if kw in username else 4
 
@@ -2348,6 +2606,13 @@ class WeChatService:
 
     def is_friend(self, username: str) -> bool:
         """该账号是否可私信的好友（群商机「私信回复」按钮是否可用）。
+
+        口径完全委托 ``WeChatDB.is_friend``（local_type=1 且 verify_flag=0
+        通讯录真好友 + 5/6/7 企业微信；local_type=3 群内非好友、
+        verify_flag≠0 的公众号如 i黑马 均不可私信）。原先把 local_type=3
+        当好友、把 local_type=1 里的公众号也当好友，导致群商机里给群内
+        陌生人/公众号开的「私信回复」按钮点了必失败；修正后该按钮对
+        lt=3 与公众号自动置灰，符合微信真实语义。
 
         微信库未就绪（降级）或读失败时一律返回 False：宁可把私信按钮置灰
         让人走群内回复，也不要在界面上承诺一个点了会失败的按钮。

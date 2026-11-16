@@ -170,22 +170,25 @@ function QuoteCell(props: { opp: OpportunityListItem }) {
  *
  * 背景（用户反馈）：加了「发送人」一列后表格太宽，操作列四个按钮被挤到
  * 换行。两列信息高度相关（谁在哪个会话说的），合并成一列最省横向空间：
- * - 群消息：第一行群名称，第二行发送人（不显示微信 ID，ID 放悬浮提示）；
+ * - 群消息：第一行群名称，第二行发送人（不显示 ID，微信号放悬浮提示）；
  * - 私聊：只显示对方名字（企业微信联系人为「昵称@企业简称」）。
- * 悬浮提示里给出会话 username / 发送人 wxid，排查时仍能拿到原始标识。
+ * 悬浮提示里给出会话/发送人的**微信号**（contact.alias，微信里可见的
+ * 那一串），不再暴露 wxid_xxx 这类内部 ID。
  */
 function SourceCell(props: { opp: OpportunityListItem }) {
   const { opp } = props
   const isGroup = (opp.session_username || '').endsWith('@chatroom')
   const sessionName = opp.session_display || opp.session_name || opp.session_username
   const senderName = opp.sender_display || opp.sender_name
+  const sessionWechatId = opp.session_alias || ''
+  const senderWechatId = opp.sender_alias || ''
   const tip = [
     `会话：${sessionName}`,
-    opp.session_username && opp.session_username !== sessionName
-      ? `会话 ID：${opp.session_username}`
+    sessionWechatId && sessionWechatId !== sessionName
+      ? `会话微信号：${sessionWechatId}`
       : '',
     isGroup && senderName ? `发送人：${senderName}` : '',
-    isGroup && opp.sender_wxid ? `发送人 ID：${opp.sender_wxid}` : '',
+    isGroup && senderWechatId ? `发送人微信号：${senderWechatId}` : '',
   ]
     .filter(Boolean)
     .join('\n')

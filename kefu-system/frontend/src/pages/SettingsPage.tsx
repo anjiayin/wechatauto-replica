@@ -143,7 +143,7 @@ function TargetRow({
             : target.username.endsWith('@openim') || target.username.includes('@kefu')
               ? '企业微信'
               : '私聊'
-        } · ${target.username}${target.enabled === 1 ? '' : '（已停用）'}`}
+        } · ${target.alias || target.username}${target.enabled === 1 ? '' : '（已停用）'}`}
       />
     </ListItem>
   )
@@ -519,7 +519,7 @@ function TargetsTab() {
                         )}
                       </Box>
                     }
-                    secondary={s.username}
+                    secondary={s.alias || s.username}
                   />
                 </ListItem>
               )

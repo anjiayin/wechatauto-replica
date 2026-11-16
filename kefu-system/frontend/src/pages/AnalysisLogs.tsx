@@ -267,7 +267,7 @@ export default function AnalysisLogs() {
           <MenuItem value="below_threshold">低于门槛</MenuItem>
         </TextField>
         <TextField
-          label="来源会话（会话名或微信 ID）"
+          label="来源会话（会话名或微信号）"
           placeholder="如：山东拆车件调货⑤群"
           sx={{ width: 240 }}
           value={sessionInput}
@@ -277,8 +277,8 @@ export default function AnalysisLogs() {
           }}
         />
         <TextField
-          label="发送人（昵称或微信 ID）"
-          placeholder="如：张三 / wxid_zhang"
+          label="发送人（昵称或微信号）"
+          placeholder="如：张三 / zhangsan_88"
           sx={{ width: 220 }}
           value={senderInput}
           onChange={(e) => {
@@ -455,6 +455,16 @@ function LogRow(props: {
     setKwOpen(true)
   }
 
+  // 「来源会话 / 发送人」的 ID 位统一显示微信号（contact.alias）。
+  // 后端 alias 为空时已回退备注/昵称，最后才回退原始 username；
+  // 前端这里按同顺序取值，保证界面上不再出现 wxid_xxx 这类内部 ID。
+  const sessionId = log.session_alias || log.session_display || log.session_username
+  const senderId = log.sender_alias || ''
+  const sourceTip = [
+    `会话：${sessionId}`,
+    senderId ? `发送人微信号：${senderId}` : '',
+  ].filter(Boolean).join('\n')
+
   return (
     <TableRow hover>
       <TableCell sx={{ whiteSpace: 'nowrap' }}>
@@ -468,17 +478,10 @@ function LogRow(props: {
         />
       </TableCell>
       <TableCell>
-        <Tooltip
-          title={
-            log.sender_wxid
-              ? `${log.session_username} · 发送人 ${log.sender_display || log.sender_wxid}（${log.sender_wxid}）`
-              : log.session_username
-          }
-          placement="top"
-        >
+        <Tooltip title={sourceTip} placement="top">
           <Box sx={{ maxWidth: 160 }}>
             <Typography variant="body2" noWrap>
-              {log.session_display || log.session_username}
+              {sessionId}
             </Typography>
             {/* 发送人（批次 11 需求 2）：群聊私聊都显示，让「谁说的」一眼可见 */}
             {log.sender_display && (

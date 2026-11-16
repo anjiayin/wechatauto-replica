@@ -236,7 +236,10 @@ LIST_ITEM_KEYS = {"id", "session_username", "session_name", "sender_wxid",
                   "unread",
                   # 第 13 批需求 1/2：来源列与发送人列合并后，展示名单独给字段
                   # （企业微信联系人补成「昵称@企业简称」，存量商机也能补全）
-                  "session_display", "sender_display"}
+                  "session_display", "sender_display",
+                  # 任务 #2：微信号（contact.alias）单独透出，界面原 wxid 位
+                  # 改显示它；与上面的「显示名」严格区分
+                  "session_alias", "sender_alias"}
 # 契约变更（体验优化 4）：详情与上下文拆分 —— 详情接口不再返回 context 字段，
 # 上下文由独立接口 GET /api/opportunities/{id}/context 提供（items + error）
 DETAIL_EXTRA_KEYS = {"window_start", "merged_count", "raw_text", "key_quote",
@@ -299,8 +302,8 @@ class TestSystemContract:
         assert resp.status_code == 200
         items = resp.json()
         assert len(items) == 1
-        assert set(items[0]) == {"username", "display_name", "kind",
-                                 "openim", "corp", "is_self"}
+        assert set(items[0]) == {"username", "display_name", "alias",
+                                 "kind", "openim", "corp", "is_self"}
         assert items[0]["kind"] == "group"
         assert items[0]["openim"] is False   # 群聊不标记企业微信
         assert items[0]["corp"] == ""        # 群聊无企业简称
@@ -1172,6 +1175,8 @@ class TestAnalysisLogsContract:
                                  "session_display", "sender_wxid",
                                  # 批次 11 需求 2：发送人显示名（群昵称优先）
                                  "sender_display",
+                                 # 任务 #2：微信号（contact.alias）替换 wxid 展示
+                                 "session_alias", "sender_alias",
                                  "msg_count", "input_text",
                                  "input_text_display", "result", "status",
                                  "error", "model", "latency_ms",

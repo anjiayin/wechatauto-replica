@@ -71,6 +71,8 @@ export interface CacheShardStatus {
 export interface SessionItem {
   username: string
   display_name: string
+  /** 微信号（contact.alias）：界面上原 wxid 位改显示它；为空时后端回退备注/昵称 */
+  alias: string
   kind: 'group' | 'friend'
   /** 企业微信/客服联系人：kind 仍是 friend，用标签区分同名联系人 */
   openim?: boolean
@@ -97,6 +99,8 @@ export interface MonitorTarget {
   id: number
   username: string
   display_name: string
+  /** 微信号（contact.alias），设置页监控列表展示用 */
+  alias: string
   kind: 'group' | 'friend'
   enabled: number
 }
@@ -210,6 +214,10 @@ export interface OpportunityListItem {
   session_display?: string
   /** 展示用发送人：企业微信联系人为「昵称@企业简称」 */
   sender_display?: string
+  /** 来源会话微信号（contact.alias）：替换 wxid 展示；空串表示无微信号 */
+  session_alias?: string
+  /** 发送人微信号（contact.alias）：替换 wxid 展示；空串表示无微信号 */
+  sender_alias?: string
 }
 
 export interface OpportunityListOut {
@@ -261,6 +269,10 @@ export interface AnalysisLogItem {
   sender_wxid: string
   /** 发送人显示名（群昵称 > 联系人昵称 > wxid；批次 11 需求 2） */
   sender_display: string
+  /** 来源会话微信号（contact.alias）：替换 session_username 展示 */
+  session_alias: string
+  /** 发送人微信号（contact.alias）：替换 sender_wxid 展示 */
+  sender_alias: string
   msg_count: number
   input_text: string
   /** 消息内容展示版（群消息发送者前缀已解析为显示名） */
@@ -334,6 +346,8 @@ export interface ReplyTarget {
   /** 该商机消息的发送人（群内默认 @ 他，私信回复发给他） */
   sender_username: string
   sender_name: string
+  /** 发送人微信号（contact.alias）：私信回复目标处替换 wxid 展示 */
+  sender_alias: string
   /** 发送人是否能私信：false 时「私信回复」按钮置灰 */
   sender_is_friend: boolean
   /** 不能私信的用户可读原因（空串 = 可以私信） */
@@ -344,6 +358,8 @@ export interface ReplyTarget {
 export interface GroupMember {
   name: string
   wxid: string
+  /** 微信号（contact.alias）：群成员列表里替换 wxid 展示 */
+  alias: string
   is_owner: boolean
 }
 

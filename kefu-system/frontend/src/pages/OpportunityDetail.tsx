@@ -578,7 +578,10 @@ export default function OpportunityDetail(props: {
             <Box sx={{ bgcolor: '#f7f7f7', p: 1.5, borderRadius: 1, mb: 1.5 }}>
               <Stack direction="row" spacing={1} sx={{ mb: 1, flexWrap: 'wrap' }} useFlexGap>
                 <Chip size="small" label={`发送人：${opp.sender_display || opp.sender_name}`} />
-                {opp.sender_wxid && <Chip size="small" label={`wxid：${opp.sender_wxid}`} />}
+                {/* 微信号（微信里可见的 ID）取代内部 wxid；解析不到则不展示 */}
+                {opp.sender_alias && (
+                  <Chip size="small" label={`微信号：${opp.sender_alias}`} />
+                )}
                 <Chip size="small" label={`窗口：${opp.window_start.replace('T', ' ')} ~ ${opp.window_end.replace('T', ' ')}`} />
                 <Chip size="small" label={`合并 ${opp.merged_count} 条`} />
                 <Chip size="small" color="primary" label={`置信度 ${opp.confidence}`} />

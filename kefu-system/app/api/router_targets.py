@@ -24,11 +24,26 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from app.api.deps import get_db, get_wechat_service
 from app.db import Database, read_monitor_max_targets
 from app.schemas import MonitorTargetCreate, MonitorTargetOut, MonitorTargetUpdate
+from app.sender_display import resolve_wechat_id
 from app.wechat_service import WeChatService
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/monitor-targets", tags=["monitor-targets"])
+
+
+def _with_alias(target: dict, svc: WeChatService) -> dict:
+    """给监控对象补 ``alias``（微信号），供设置页替换原 wxid 展示。
+
+    微信号是新增的**展示**字段，读失败只留空串，绝不能让监控对象列表 500
+    （后端还有 username 可用于 API/排查）。用 getattr 探测：单测替身/降级
+    实例可能没有 get_wechat_id 方法。
+    """
+    item = dict(target)
+    item.setdefault("alias", "")
+    if not item["alias"]:
+        item["alias"] = resolve_wechat_id(svc, str(item.get("username") or ""))
+    return item
 
 
 def _register_async(svc: WeChatService, username: str) -> None:
@@ -60,7 +75,7 @@ def list_targets(db: Database = Depends(get_db),
         if fresh and fresh != t["username"]:
             db.update_target_display_name(t["id"], fresh)
             t["display_name"] = fresh
-    return [MonitorTargetOut(**t) for t in targets]
+    return [MonitorTargetOut(**_with_alias(t, svc)) for t in targets]
 
 
 @router.post("", response_model=MonitorTargetOut, status_code=201)
@@ -110,7 +125,7 @@ def create_target(body: MonitorTargetCreate,
     if target["enabled"]:
         _register_async(svc, username)
     logger.info("新增监控对象：%s（%s）", display_name, username)
-    return MonitorTargetOut(**target)
+    return MonitorTargetOut(**_with_alias(target, svc))
 
 
 @router.patch("/{target_id}", response_model=MonitorTargetOut)
@@ -135,7 +150,8 @@ def update_target(target_id: int, body: MonitorTargetUpdate,
         svc.unregister_target(target["username"])
     logger.info("监控对象 %s 已%s", target["username"],
                 "启用" if body.enabled else "停用")
-    return MonitorTargetOut(**db.get_target(target_id))  # type: ignore[arg-type]
+    return MonitorTargetOut(
+        **_with_alias(db.get_target(target_id) or {}, svc))
 
 
 @router.delete("/{target_id}", status_code=204)

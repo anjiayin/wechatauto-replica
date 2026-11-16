@@ -2518,9 +2518,9 @@ class WeChatDB:
 
         Args:
             kind: 筛选类别，不区分大小写：
-                - "friend"  : 好友 = 通讯录好友（local_type=3，含企业微信好友）
-                              + 仅聊天联系人（type=1 中的人类账号），
-                              排除公众号/系统号/群聊/自己；
+                - "friend"  : 通讯录真好友 = local_type=1 的人类账号，
+                              排除公众号/系统号/群聊/企业微信/自己；
+                              企业微信好友请用 "openim"（local_type=5/6/7）；
                 - "chatroom": 群聊（username 以 @chatroom 结尾）；
                 - "official": 公众号/服务号（username 以 gh_ 开头）；
                 - "openim"  : 企业微信/客服联系人（@openim / @kefu.openim）；
@@ -2532,18 +2532,58 @@ class WeChatDB:
             description / avatar（大头像 URL）/ local_type。
             已删除（delete_flag=1）的联系人始终排除。
 
-        说明：local_type 实测分布（微信 4.x）：3=通讯录好友（flag=4），
-        2=群聊，1=混合桶（系统号/关注的公众号/仅聊天联系人/自己），
-        0=非好友交互者，5-7=企业微信侧。
+        好友口径（微信 4.x 本机实测，contact.db，delete_flag=0）：
+
+        ============================ 实锤证据 ============================
+        local_type=1：1620 条，其中 1213 条有微信号(alias)、558 条有
+          备注(remark)；用户通讯录里点名的两位真好友
+          wxid_9941039410111（张鹏 / Xiangyanedu / 张鹏 大淼淼爸爸）与
+          wxid_3f76xuokjw8b72（MiKE / uzairsultan / MiKE 淼淼英语老师）
+          都是 local_type=1 + flag=3 + verify_flag=0 + alias/remark 非空。
+          → **local_type=1 才是通讯录真好友**（含 various flag 位变体，
+          但 gh_ 公众号/系统号/自己要按 username 排除）。
+
+        但 local_type=1 仍混有公众号：按 verify_flag 分组（delete_flag=0）
+          verify_flag=0    ：715 条，其中 558 条有 remark → 真好友；
+          verify_flag=8/24/776/520/264/28/29/56/… 合计约 905 条，
+                          **remark 全部为空** → 公众号/服务号/认证订阅号。
+          实锤：i黑马 wxid_2965349653612，local_type=1 但 verify_flag=24，
+          alias=iheima、remark=''，extra_buffer 含「北京创业未来传媒技术
+          有限公司」「<bizuserattr>」「@i黑马」等公众号特征。
+          lt=1 且 verify_flag≠0 的记录里 remark 非空的例外数为 **0**。
+          → 好友必须同时满足 **local_type=1 且 verify_flag=0**。
+          老版本微信库/替身库没有 verify_flag 列时降级为只按 local_type 判
+          定（保守，宁可少过滤也不误删已知好友），见
+          :meth:`_contact_has_verify_flag`。
+        local_type=3：32022 条，alias 与 remark **全表无一条非空**，flag 全
+          为 4；搜「淼淼」命中的 5 个额外账号（淼淼 / 🍎田淼淼 / 肖淼淼 /
+          悠水瑜伽淼淼 / 鑫淼淼）全是 local_type=3、无微信号无备注。
+          → **local_type=3 是「群里见过但非好友」的交互者**，必须从好友
+          候选排除，也不可私信（微信里点其头像开不出私聊框）。
+        local_type=0：805 条，flag 无好友位(0/0x80000000)，remark 全空，
+          仅 239 条有 alias → 判定为「非好友交互/单向」，不属通讯录好友。
+        local_type=2：625 条，username 均 @chatroom → 群聊。
+        local_type=4：18 条，username 均 gh_ → 公众号。
+        local_type=5/6/7：@openim / @kefu.openim → 企业微信/客服联系人。
+        ================================================================
+
+        历史代码把 3 当成通讯录好友、把 1 当混合桶，语义完全颠倒，直接导致
+        搜「淼淼」列出 5 个群内非好友；修正后好友只取 local_type=1；再叠加
+        verify_flag=0 把 lt=1 桶里混进的公众号（i黑马等）挡在私聊候选外。
         """
         kind = (kind or "friend").lower()
         if kind == "friend":
-            where = ("(local_type=3 OR (local_type=1 AND "
+            # 只认 local_type=1 + verify_flag=0（通讯录真好友）；
+            # verify_flag≠0 的同桶记录是公众号（见上方实锤），必须排除。
+            # 企业微信 5/6/7 由 openim 分支单独取；仍按 username 排除
+            # 公众号/系统号/群/自己。verify_flag 过滤在拿到连接后按列存在
+            # 与否动态拼接（老库降级），见下方 SQL 构建。
+            where = ("(local_type=1 AND "
                      "username NOT LIKE '%@chatroom' "
                      "AND username NOT LIKE 'gh\\_%' ESCAPE '\\' "
                      "AND username NOT LIKE '%@openim' "
                      "AND username NOT LIKE '%@kefu%' "
-                     "AND username NOT LIKE '%@app'))")
+                     "AND username NOT LIKE '%@app')")
         elif kind == "chatroom":
             where = "username LIKE '%@chatroom'"
         elif kind == "official":
@@ -2555,13 +2595,24 @@ class WeChatDB:
         else:
             raise ValueError(
                 "kind 仅支持 friend/chatroom/official/openim/all，收到: %r" % kind)
-        sql = ("SELECT username, alias, nick_name, remark, description, "
-               "big_head_url, local_type FROM contact "
-               "WHERE delete_flag=0 AND " + where + " ORDER BY username")
         conn = self._contact_conn()
         if not conn:
             return []
+        has_verify_flag = False
         try:
+            has_verify_flag = self._contact_has_verify_flag(conn)
+            if kind == "friend" and has_verify_flag:
+                # 真好友 = local_type=1 且 verify_flag=0；公众号认证标志
+                # 非 0 的同桶记录（i黑马等）在此挡掉。verify_flag 为 NULL
+                # 时按「无认证标志」保守放行，不误删已知好友。列不存在时
+                # 降级放行（老版本微信库/替身库），保持既有行为。
+                where += " AND (verify_flag=0 OR verify_flag IS NULL)"
+            select_cols = ("username, alias, nick_name, remark, description, "
+                           "big_head_url, local_type")
+            if has_verify_flag:
+                select_cols += ", verify_flag"
+            sql = ("SELECT " + select_cols + " FROM contact "
+                   "WHERE delete_flag=0 AND " + where + " ORDER BY username")
             rows = conn.execute(sql).fetchall()
         finally:
             conn.close()
@@ -2573,9 +2624,12 @@ class WeChatDB:
             "description": r["description"],
             "avatar": r["big_head_url"],
             "local_type": r["local_type"],
+            # 老库无该列时填 0（视作「无认证标志」），供上层 is_friend 统一读取。
+            "verify_flag": (self._parse_verify_flag(r["verify_flag"])
+                            if has_verify_flag else 0),
         } for r in rows]
         if kind == "friend":
-            # 排除系统号与自己（它们与仅聊天联系人同在 local_type=1）
+            # 再兜一刀：系统号与自己（它们与真好友同在 local_type=1）
             self_user = ""
             try:
                 self_user = (self.get_self_info() or {}).get("username") or ""
@@ -2595,7 +2649,8 @@ class WeChatDB:
         在客户机器上可能上万条，逐行 Python 过滤没必要）。
 
         Returns:
-            dict：username / nick_name / remark / local_type / delete_flag。
+            dict：username / nick_name / remark / local_type / delete_flag /
+            verify_flag（老库无该列时补 0，保证 is_friend 读得到字段）。
         """
         username = (username or "").strip()
         if not username:
@@ -2604,24 +2659,41 @@ class WeChatDB:
         if not conn:
             return None
         try:
+            has_verify_flag = self._contact_has_verify_flag(conn)
+            select_cols = ("username, nick_name, remark, local_type, "
+                           "delete_flag")
+            if has_verify_flag:
+                select_cols += ", verify_flag"
             row = conn.execute(
-                "SELECT username, nick_name, remark, local_type, delete_flag "
-                "FROM contact WHERE username=? LIMIT 1", (username,)
+                "SELECT " + select_cols + " FROM contact WHERE username=? "
+                "LIMIT 1", (username,)
             ).fetchone()
         finally:
             conn.close()
-        return dict(row) if row else None
+        if not row:
+            return None
+        data = dict(row)
+        data.setdefault("verify_flag", 0)
+        return data
 
     def is_friend(self, username: str) -> bool:
         """该账号是否「可以私信」的联系人（口径对齐 get_contacts("friend")）。
 
-        群商机要区分「群内回复」与「私信回复」：群成员未必是好友
-        （local_type=0 是「非好友交互者」，微信里点他头像也发不了私信），
-        这种情况前端把私信按钮置灰。
+        群商机要区分「群内回复」与「私信回复」：群里见过的人未必是好友
+        （微信里点非好友头像开不出私聊框），这种情况前端把私信按钮置灰。
 
-        实测 local_type 分布（微信 4.x）：3=通讯录好友，2=群，1=混合桶
-        （公众号/仅聊天好友/系统号/自己），0=非好友交互者，5-7=企业微信
-        联系人。企业微信联系人同样可以私信，按可私信处理。
+        实测 local_type 真实语义（微信 4.x 本机 contact.db，实锤见
+        :meth:`get_contacts` 文档）：
+          - 1  = 通讯录真好友（1213/1620 有微信号、558 有备注）；
+          - 3  = 群里见过的**非好友**（32022 条，alias/remark 全空，
+                 flag=4）——**不可私信**，必须以本判定挡掉；
+          - 0  = 非好友交互/单向（805 条，remark 全空）——不可私信；
+          - 2  = 群、4 = 公众号、5/6/7 = 企业微信；
+          企业微信联系人同样可以私信，按可私信处理。
+        普通好友还要叠加 ``verify_flag=0``：lt=1 里 verify_flag≠0 的约
+        905 条（含 i黑马）全是公众号/服务号，remark 全空、不可私信；
+        verify_flag 读不到（老库/替身）时保守按 local_type 判定，不误删
+        已知好友。历史代码把 3 当好友、1 当混合桶，语义颠倒；此处一并纠正。
         """
         row = self.get_contact(username)
         if not row or row.get("delete_flag"):
@@ -2640,7 +2712,13 @@ class WeChatDB:
             return False
         if uid == str(self.wxid or ""):
             return False                    # 自己
-        return local_type in (1, 3)
+        # 唯一可私信的普通好友口径：local_type=1 且 verify_flag=0。
+        # local_type=3 是群内非好友、0 是非好友交互者，均不可私信；
+        # lt=1 但 verify_flag≠0 的是公众号（i黑马等），同样不可私信。
+        # 读不到/读不懂 verify_flag 时保守放行（不误删已知好友）。
+        if self._parse_verify_flag(row.get("verify_flag")) != 0:
+            return False
+        return local_type == 1
 
     def get_openim_corp_names(self) -> Dict[str, str]:
         """企业微信/客服联系人 → 所属企业名称（还原微信端「昵称@企业名」）。
@@ -2699,6 +2777,36 @@ class WeChatDB:
             break
         return user
 
+    def get_alias(self, user: str) -> str:
+        """取联系人在微信里可见的**微信号**（contact.alias）。
+
+        与 :meth:`get_nickname` 的区别：nick_name/remark 是「名字」，alias
+        才是微信资料卡上的「微信号」。用户要求界面上原 wxid 内部 ID 的位置
+        一律改显微信号，故提供此单点查询。无记录/读库失败一律返回空串，
+        由调用方回退到昵称，绝不能因显示字段把上层接口拖崩。
+
+        Args:
+            user: 联系人 username（wxid / @openim 等）。
+
+        Returns:
+            微信号字符串；无微信号或读失败返回空串。
+        """
+        user = (user or "").strip()
+        if not user:
+            return ""
+        conn = self._contact_conn()
+        if not conn:
+            return ""
+        try:
+            row = conn.execute(
+                "SELECT alias FROM contact WHERE username=? LIMIT 1", (user,)
+            ).fetchone()
+        except Exception:
+            return ""
+        finally:
+            conn.close()
+        return str(row["alias"] or "") if row else ""
+
     def username_by_nickname(self, nickname: str) -> Optional[str]:
         """通过昵称/备注反查微信号（contact.db）。
 
@@ -2738,6 +2846,43 @@ class WeChatDB:
             except Exception:
                 return None
         return None
+
+    @staticmethod
+    def _parse_verify_flag(value: object) -> int:
+        """把 verify_flag 解析为整数；读不懂时按 0（非公众号）保守处理。
+
+        Args:
+            value: contact.verify_flag 的原始值（可能为 None/字符串/垃圾值）。
+
+        Returns:
+            解析后的整数值；无法解析返回 0（宁可放行也不误删好友）。
+        """
+        if value is None or value == "":
+            return 0
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _contact_has_verify_flag(conn: sqlite3.Connection) -> bool:
+        """contact 表是否含 ``verify_flag`` 列（微信认证标志）。
+
+        微信 4.x 的真实 contact.db 有该列；老版本微信库、临时/替身库可能
+        没有。读不到列时调用方按「无该字段」处理：好友判定降级为仅按
+        local_type（保守，宁可少过滤也不误删已知好友）。
+
+        Args:
+            conn: 已打开的 contact.db 连接。
+
+        Returns:
+            True = 表里有 verify_flag 列；False = 没有或探测失败。
+        """
+        try:
+            return any(row[1] == "verify_flag"
+                       for row in conn.execute("PRAGMA table_info(contact)"))
+        except sqlite3.Error:
+            return False
 
     def get_groups(self) -> List[dict]:
         """列出所有群聊。
