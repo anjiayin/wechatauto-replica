@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { MouseEvent as ReactMouseEvent, WheelEvent as ReactWheelEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Alert,
@@ -6,7 +7,9 @@ import {
   Box,
   Button,
   Checkbox,
+  CircularProgress,
   Chip,
+  Dialog,
   Divider,
   Drawer,
   FormControlLabel,
@@ -21,6 +24,9 @@ import {
   Typography,
 } from '@mui/material'
 import CloseIcon from '@mui/icons-material/Close'
+import ChevronLeftIcon from '@mui/icons-material/ChevronLeft'
+import ChevronRightIcon from '@mui/icons-material/ChevronRight'
+import ZoomInIcon from '@mui/icons-material/ZoomIn'
 import RefreshIcon from '@mui/icons-material/Refresh'
 import VisibilityOffIcon from '@mui/icons-material/VisibilityOff'
 import TaskAltIcon from '@mui/icons-material/TaskAlt'
@@ -99,7 +105,166 @@ function saveAtSenderPref(value: boolean): void {
   }
 }
 
-/** 上下文中的图片消息：尝试展示解密真图，加载失败回退占位文本（反馈 2）。 */function ContextImage(props: { username: string; localId: number; fallback: string }) {
+/** 大图查看器里的单张图片：src 走后端解密接口，alt 用原文兜底。 */
+interface LightboxImage {
+  localId: number
+  src: string
+  alt: string
+}
+
+/**
+ * 图片放大查看（仿微信看图）：全屏黑底、图片自适应窗口；滚轮/双击缩放、
+ * 按住拖动平移、按钮或键盘 ← → 切换，Esc / 关闭按钮 / 点击空白处退出。
+ * 基于 MUI Dialog，不引入第三方 lightbox 依赖。
+ */
+function ImageLightbox(props: {
+  images: LightboxImage[]
+  index: number
+  onIndexChange: (index: number) => void
+  onClose: () => void
+}) {
+  const { images, index, onIndexChange, onClose } = props
+  const image = images[index]
+  const [scale, setScale] = useState(1)
+  const [offset, setOffset] = useState({ x: 0, y: 0 })
+  // 用 src 判定加载态，而不是 effect 里无条件重置：缓存图片可能先于 effect
+  // 触发 onLoad，若 effect 随后把 loading 置回 true，图片会一直隐藏。
+  const [loadedSrc, setLoadedSrc] = useState<string | null>(null)
+  const [failedSrc, setFailedSrc] = useState<string | null>(null)
+  const [dragging, setDragging] = useState(false)
+  const dragRef = useRef<{ x: number; y: number; ox: number; oy: number } | null>(null)
+  const loading = image != null && loadedSrc !== image.src && failedSrc !== image.src
+  const failed = image != null && failedSrc === image.src
+
+  // 换图复位：别把上一张的放大/平移状态带过来
+  useEffect(() => {
+    setScale(1)
+    setOffset({ x: 0, y: 0 })
+    dragRef.current = null
+    setDragging(false)
+  }, [index])
+
+  const go = useCallback((delta: number) => {
+    if (images.length <= 1) return
+    onIndexChange((index + delta + images.length) % images.length)
+  }, [images.length, index, onIndexChange])
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'ArrowLeft') { e.preventDefault(); go(-1) }
+      else if (e.key === 'ArrowRight') { e.preventDefault(); go(1) }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [go])
+
+  const zoomBy = (direction: number) => {
+    setScale((s) => Math.min(6, Math.max(1, Math.round((s + direction * 0.25) * 100) / 100)))
+  }
+  const handleWheel = (e: ReactWheelEvent) => {
+    // 容器 overflow:hidden，不 preventDefault 也不会带动背景页面滚动，
+    // 同时避开 React 18 被动监听下 preventDefault 的告警。
+    zoomBy(e.deltaY < 0 ? 1 : -1)
+  }
+  const handleDoubleClick = () => {
+    if (scale > 1) { setScale(1); setOffset({ x: 0, y: 0 }) }
+    else setScale(2)
+  }
+  const handleMouseDown = (e: ReactMouseEvent) => {
+    if (scale <= 1 || e.button !== 0) return
+    dragRef.current = { x: e.clientX, y: e.clientY, ox: offset.x, oy: offset.y }
+    setDragging(true)
+  }
+  const handleMouseMove = (e: ReactMouseEvent) => {
+    const d = dragRef.current
+    if (!d) return
+    setOffset({ x: d.ox + e.clientX - d.x, y: d.oy + e.clientY - d.y })
+  }
+  const endDrag = () => {
+    dragRef.current = null
+    setDragging(false)
+  }
+  const stop = (e: ReactMouseEvent) => e.stopPropagation()
+
+  if (!image) return null
+  return (
+    <Dialog open onClose={onClose} fullScreen PaperProps={{ sx: { bgcolor: '#000' } }}>
+      <Box
+        onClick={onClose}
+        sx={{ position: 'relative', width: '100vw', height: '100vh', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+      >
+        <Tooltip title="关闭 (Esc)">
+          <IconButton onClick={onClose} sx={{ position: 'absolute', top: 12, right: 16, color: '#fff', zIndex: 2 }}>
+            <CloseIcon />
+          </IconButton>
+        </Tooltip>
+        {images.length > 1 && (
+          <Typography variant="body2" sx={{ position: 'absolute', top: 22, left: '50%', transform: 'translateX(-50%)', color: 'rgba(255,255,255,.85)', zIndex: 2 }}>
+            {index + 1} / {images.length}
+          </Typography>
+        )}
+        {images.length > 1 && (
+          <>
+            <Tooltip title="上一张 (←)">
+              <IconButton
+                onClick={(e) => { stop(e); go(-1) }}
+                sx={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: '#fff', zIndex: 2, bgcolor: 'rgba(255,255,255,.12)', '&:hover': { bgcolor: 'rgba(255,255,255,.26)' } }}
+              >
+                <ChevronLeftIcon />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title="下一张 (→)">
+              <IconButton
+                onClick={(e) => { stop(e); go(1) }}
+                sx={{ position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)', color: '#fff', zIndex: 2, bgcolor: 'rgba(255,255,255,.12)', '&:hover': { bgcolor: 'rgba(255,255,255,.26)' } }}
+              >
+                <ChevronRightIcon />
+              </IconButton>
+            </Tooltip>
+          </>
+        )}
+        <Stack direction="row" spacing={0.5} alignItems="center" onClick={stop} sx={{ position: 'absolute', bottom: 14, left: '50%', transform: 'translateX(-50%)', color: 'rgba(255,255,255,.6)', zIndex: 2, whiteSpace: 'nowrap' }}>
+          <ZoomInIcon fontSize="small" />
+          <Typography variant="caption">滚轮缩放 · 双击放大/还原 · 拖动平移{images.length > 1 ? ' · ← → 切换' : ''}</Typography>
+        </Stack>
+
+        {loading && !failed && <CircularProgress size={36} sx={{ position: 'absolute', color: '#fff' }} />}
+        {failed ? (
+          <Typography onClick={stop} sx={{ color: '#fff', textAlign: 'center', px: 3 }}>图片加载失败或本地缓存缺失</Typography>
+        ) : (
+          <Box
+            component="img"
+            src={image.src}
+            alt={image.alt}
+            draggable={false}
+            onClick={stop}
+            onLoad={() => setLoadedSrc(image.src)}
+            onError={() => setFailedSrc(image.src)}
+            onWheel={handleWheel}
+            onDoubleClick={handleDoubleClick}
+            onMouseDown={handleMouseDown}
+            onMouseMove={handleMouseMove}
+            onMouseUp={endDrag}
+            onMouseLeave={endDrag}
+            sx={{
+              maxWidth: 'calc(100vw - 160px)',
+              maxHeight: 'calc(100vh - 110px)',
+              objectFit: 'contain',
+              transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})`,
+              transition: dragging ? 'none' : 'transform .15s ease-out',
+              cursor: scale > 1 ? (dragging ? 'grabbing' : 'grab') : 'zoom-in',
+              userSelect: 'none',
+              opacity: loading ? 0 : 1,
+            }}
+          />
+        )}
+      </Box>
+    </Dialog>
+  )
+}
+
+/** 上下文中的图片消息：尝试展示解密真图，加载失败回退占位文本（反馈 2）。 */
+function ContextImage(props: { username: string; localId: number; fallback: string; onOpen: () => void }) {
   const [failed, setFailed] = useState(false)
   // 图片识别结果（批次 6 需求 5）：是车辆/汽车配件就在图下方标出来。
   // 未识别过（404）或接口失败一律静默——图片很多，不能弹错误。
@@ -122,21 +287,27 @@ function saveAtSenderPref(value: boolean): void {
   }
   return (
     <Box>
-      <Box
-        component="img"
-        src={`/api/messages/${encodeURIComponent(props.username)}/images/${props.localId}`}
-        alt="图片消息"
-        loading="lazy"
-        onError={() => setFailed(true)}
-        sx={{
-          maxWidth: 240,
-          maxHeight: 180,
-          display: 'block',
-          borderRadius: 1,
-          border: '1px solid #e0e0e0',
-          mt: 0.5,
-        }}
-      />
+      <Tooltip title="点击查看大图">
+        <Box
+          component="img"
+          src={`/api/messages/${encodeURIComponent(props.username)}/images/${props.localId}`}
+          alt="图片消息"
+          loading="lazy"
+          onError={() => setFailed(true)}
+          onClick={props.onOpen}
+          sx={{
+            maxWidth: 240,
+            maxHeight: 180,
+            display: 'block',
+            borderRadius: 1,
+            border: '1px solid #e0e0e0',
+            mt: 0.5,
+            cursor: 'zoom-in',
+            transition: 'box-shadow .15s',
+            '&:hover': { boxShadow: '0 0 0 2px #90caf9' },
+          }}
+        />
+      </Tooltip>
       {analysis?.is_vehicle_part && (
         <Stack direction="row" spacing={0.5} sx={{ mt: 0.5, flexWrap: 'wrap' }} useFlexGap>
           <Chip
@@ -277,6 +448,8 @@ export default function OpportunityDetail(props: {
   // 自己点发送；关掉才是「自动发送 + 数据库确认」。
   const [manualConfirm, setManualConfirm] = useState(true)
   const [snack, setSnack] = useState<{ ok: boolean; message: string } | null>(null)
+  // 图片放大查看器当前索引（null=关闭）
+  const [lightboxIndex, setLightboxIndex] = useState<number | null>(null)
   // 发送中耗时（202 受理后要等微信 GUI 操作，必须让用户看到进度）
   const [sendingSince, setSendingSince] = useState<number | null>(null)
   // 这次发往哪里：群内（session）/ 私信（sender），只影响按钮文案
@@ -368,6 +541,32 @@ export default function OpportunityDetail(props: {
   const hasRawImage = rawImageIds.some((localId) => localId !== null)
   // 有语音或有图片才需要逐行渲染；两者都没有时保持原来的整段渲染
   const needLineRender = hasRawVoice || hasRawImage
+
+  // 图片放大查看：原文图片行 + 上下文图片消息汇成一组（按 localId 去重），
+  // 点任意缩略图都能进大图并在组内左右切换，与微信点图体验一致。
+  const lightboxImages = useMemo(() => {
+    const list: LightboxImage[] = []
+    const seen = new Set<number>()
+    const username = opp?.session_username ?? ''
+    const add = (localId: number | null, alt: string) => {
+      if (localId == null || localId <= 0 || seen.has(localId)) return
+      seen.add(localId)
+      list.push({
+        localId,
+        src: `/api/messages/${encodeURIComponent(username)}/images/${localId}`,
+        alt: alt || '图片消息',
+      })
+    }
+    rawImageIds.forEach((localId, idx) => add(localId, rawLines[idx] || ''))
+    contextItems.forEach((m) => { if (m.type === '图片') add(m.local_id, m.content) })
+    return list
+  }, [opp?.session_username, rawImageIds, rawLines, contextItems])
+
+  // 用 localId 反查索引：调用处只需传自己的图片 id，不用关心它在组里的位置
+  const openLightbox = (localId: number) => {
+    const idx = lightboxImages.findIndex((img) => img.localId === localId)
+    setLightboxIndex(idx >= 0 ? idx : 0)
+  }
 
   // @ 群成员候选：群会话才有（后端按会话读微信库成员表，600s 缓存）
   const isGroup = (opp?.session_username ?? '').endsWith('@chatroom')
@@ -615,6 +814,7 @@ export default function OpportunityDetail(props: {
                             username={opp.session_username}
                             localId={imageId}
                             fallback={line}
+                            onOpen={() => openLightbox(imageId)}
                           />
                           <Typography
                             variant="caption"
@@ -717,6 +917,7 @@ export default function OpportunityDetail(props: {
                       username={opp.session_username}
                       localId={m.local_id}
                       fallback={m.content}
+                      onOpen={() => openLightbox(m.local_id)}
                     />
                   ) : m.type === '语音' && opp ? (
                     // 语音消息（反馈 ⑧）：播放按钮 + 转写文本（去掉「[语音]」前缀）
@@ -1011,6 +1212,15 @@ export default function OpportunityDetail(props: {
               )}
             </Stack>
           </>
+        )}
+
+        {lightboxIndex !== null && lightboxImages.length > 0 && (
+          <ImageLightbox
+            images={lightboxImages}
+            index={lightboxIndex}
+            onIndexChange={setLightboxIndex}
+            onClose={() => setLightboxIndex(null)}
+          />
         )}
 
         <Snackbar
