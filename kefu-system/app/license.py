@@ -106,6 +106,7 @@ logger = logging.getLogger(__name__)
 PUBLIC_KEYS: dict[str, str] = {
     # 开发/联调用密钥对，私钥见 tools/license_keys/dev_private.pem
     "dev": "6efHWx5yQieQo3MF9VIDw3vof2HBD3EEqk3AKrSQSgw=",
+	"prod-2026": "WEDZ/3S+jw1mtohsgahZaoKxFfaJ/TbN54TSc7kN00s=",
 }
 
 # ---------------------------------------------------------------------------

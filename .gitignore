@@ -36,3 +36,21 @@ WeChatBot-new/
 
 # 模拟授权服务器的联调数据（含激活码/许可证，不入库）
 kefu-system/tools/mock_license_data.json
+
+# 打包产物：runtime / 229MB 模型 / ffmpeg / staging 绝不进 git，
+# 只提交构建脚本与探针等文本（构建脚本默认输出到 D:/tmp/kefu-p0-bundle）
+packaging/out/
+packaging/staging/
+packaging/runtime/
+packaging/assets/
+packaging/testdata/
+packaging/*.zip
+packaging/*.exe
+packaging/*.onnx
+packaging/*.wav
+packaging/*.json
+
+# 生产授权私钥绝不入库（泄露 = 可伪造生产许可证，全体客户授权失效）。
+# 公钥 prod-2026_public.pem 可入库，供客户端验签；私钥只在发布机保管。
+kefu-system/tools/license_keys/prod-*_private.pem
+
