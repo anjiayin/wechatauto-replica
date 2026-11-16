@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 
@@ -92,10 +93,14 @@ def create_target(body: MonitorTargetCreate,
             logger.debug("判定「给自己发消息」会话失败（忽略）", exc_info=True)
     # 配额上限从 settings 读取（monitor.max_targets，无键时用常量兜底）
     max_targets = read_monitor_max_targets(db)
+    # 监控水位：落库瞬间即锁定「配置完成时刻」，早于该时刻的消息一律不分析。
+    # 用真实 UNIX 秒与 Listener 消息的 create_time 同量纲，直接数值比较。
+    monitor_since = int(time.time())
     # 原子「配额校验 + 插入」（BUG-3 修复：check-then-insert 并发越界）
     try:
         target = db.insert_target_within_limit(username, display_name, kind,
-                                               max_targets)
+                                               max_targets,
+                                               monitor_since=monitor_since)
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=400, detail="该会话已在监控列表中")
     if target is None:
@@ -117,8 +122,14 @@ def update_target(target_id: int, body: MonitorTargetUpdate,
     target = db.get_target(target_id)
     if not target:
         raise HTTPException(status_code=404, detail="监控对象不存在")
+    was_enabled = bool(target.get("enabled"))
     db.update_target_enabled(target_id, body.enabled)
     if body.enabled:
+        # 「停用 → 重新启用」等价于重新配置：水位推进到当前时刻，
+        # 停用期间的历史消息不因 Listener 回放而涌入商机分析。
+        # 已是启用态时重复 PATCH 不刷新，避免把刚到达的消息误判为历史。
+        if not was_enabled:
+            db.reset_target_monitor_since(target_id, int(time.time()))
         _register_async(svc, target["username"])
     else:
         svc.unregister_target(target["username"])

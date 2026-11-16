@@ -112,7 +112,13 @@ DDL_STATEMENTS: tuple[str, ...] = (
       display_name TEXT NOT NULL,
       kind         TEXT NOT NULL CHECK (kind IN ('group','friend')),
       enabled      INTEGER NOT NULL DEFAULT 1,
-      created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+      created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+      -- 监控起始水位（epoch 秒）：只分析 create_time >= 该值的消息。
+      -- Listener 的 watermark 是 sort_seq 水位，与「配置完成时刻」无关，
+      -- 一旦过期/重置会回放该会话多年历史消息；配置时写入当前 epoch，
+      -- 由 _on_message 按此值兜底过滤（群/私聊统一生效）。
+      -- 0 = 存量兼容（不限制），老库升级前的 target 保持原行为。
+      monitor_since INTEGER NOT NULL DEFAULT 0
     )
     """,
     """
@@ -338,6 +344,10 @@ class Database:
             # 图片消息标识：图片「原图未下载完/缩略图不完整」时的重试与
             # 手动补识别都要按 (会话, local_id) 精确定位那张图
             ("analysis_logs", "image_local_id", "INTEGER"),
+            # 监控对象配置时间水位（任务 #1）：只分析配置完成后进入的消息。
+            # 老库 ALTER 时默认 0 = 不限制，避免升级瞬间误伤正在监控的会话。
+            ("monitor_targets", "monitor_since",
+             "INTEGER NOT NULL DEFAULT 0"),
         )
         with self._lock:
             for table, column, col_type in plans:
@@ -494,7 +504,8 @@ class Database:
         """全部监控对象（按创建时间正序）。"""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, username, display_name, kind, enabled, created_at "
+                "SELECT id, username, display_name, kind, enabled, created_at, "
+                "monitor_since "
                 "FROM monitor_targets ORDER BY id"
             ).fetchall()
         return [dict(r) for r in rows]
@@ -503,7 +514,8 @@ class Database:
         """按会话 username 查监控对象。"""
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, username, display_name, kind, enabled, created_at "
+                "SELECT id, username, display_name, kind, enabled, created_at, "
+                "monitor_since "
                 "FROM monitor_targets WHERE username=?",
                 (username,),
             ).fetchone()
@@ -513,27 +525,33 @@ class Database:
         """按 id 查监控对象。"""
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, username, display_name, kind, enabled, created_at "
+                "SELECT id, username, display_name, kind, enabled, created_at, "
+                "monitor_since "
                 "FROM monitor_targets WHERE id=?",
                 (target_id,),
             ).fetchone()
         return dict(row) if row else None
 
     def insert_target(self, username: str, display_name: str, kind: str,
-                      enabled: int = 1) -> dict:
-        """新增监控对象（username 重复抛 sqlite3.IntegrityError）。"""
+                      enabled: int = 1, monitor_since: int = 0) -> dict:
+        """新增监控对象（username 重复抛 sqlite3.IntegrityError）。
+
+        Args:
+            monitor_since: 配置完成时刻（epoch 秒）；0 = 存量/测试默认不限制。
+        """
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO monitor_targets (username, display_name, kind, enabled) "
-                "VALUES (?, ?, ?, ?)",
-                (username, display_name, kind, enabled),
+                "INSERT INTO monitor_targets (username, display_name, kind, "
+                "enabled, monitor_since) VALUES (?, ?, ?, ?, ?)",
+                (username, display_name, kind, enabled, int(monitor_since)),
             )
             self._conn.commit()
             return self.get_target(cur.lastrowid)  # type: ignore[return-value]
 
     def insert_target_within_limit(self, username: str, display_name: str,
                                    kind: str, max_targets: int,
-                                   enabled: int = 1) -> Optional[dict]:
+                                   enabled: int = 1,
+                                   monitor_since: int = 0) -> Optional[dict]:
         """原子「配额校验 + 插入」（修复 BUG-3 并发越界）。
 
         计数与 INSERT 在同一把写锁内完成，并发添加最后 1 个名额时
@@ -550,8 +568,8 @@ class Database:
                 return None
             cur = self._conn.execute(
                 "INSERT INTO monitor_targets (username, display_name, kind, "
-                "enabled) VALUES (?, ?, ?, ?)",
-                (username, display_name, kind, enabled),
+                "enabled, monitor_since) VALUES (?, ?, ?, ?, ?)",
+                (username, display_name, kind, enabled, int(monitor_since)),
             )
             self._conn.commit()
             return self.get_target(cur.lastrowid)  # type: ignore[return-value]
@@ -562,6 +580,19 @@ class Database:
             self._conn.execute(
                 "UPDATE monitor_targets SET enabled=? WHERE id=?",
                 (1 if enabled else 0, target_id),
+            )
+            self._conn.commit()
+
+    def reset_target_monitor_since(self, target_id: int, epoch: int) -> None:
+        """刷新监控起始水位（停用后重新启用时调用）。
+
+        重新启用等价于「重新配置」：停用期间进入的历史消息不应在恢复
+        监控后被 Listener 回放进商机分析，故水位推进到重新启用时刻。
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE monitor_targets SET monitor_since=? WHERE id=?",
+                (int(epoch), target_id),
             )
             self._conn.commit()
 

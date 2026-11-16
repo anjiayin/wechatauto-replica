@@ -397,6 +397,61 @@ class WeChatService:
     # ------------------------------------------------------------------
     # 消息回调（Listener 工作线程调用）
     # ------------------------------------------------------------------
+    def _is_before_monitor_since(self, username: str, msg: dict) -> bool:
+        """消息是否早于该监控对象的「配置完成时刻」（应丢弃）。
+
+        wechatauto 的 Listener 用 ``sort_seq`` 做 watermark，与配置时刻完全
+        解耦：watermark 过期或被重置（例如首次读库连续失败后回退 0）时，
+        会把该会话多年历史消息一次性回放给回调。这里以 monitor_targets.
+        monitor_since（配置完成时写入的 epoch 秒）兜底过滤，群聊/私聊统一
+        生效，且在 skipped 日志/聚合窗口之前拦截，不占处理队列。
+
+        仅在「target 存在 + 水位 > 0 + 消息时间有效且早于水位」时返回 True；
+        无 target（测试直调/未配置会话）、存量水位 0、时间缺失或非法一律
+        放行，避免误伤正常消息。
+
+        Args:
+            username: 消息所属会话 username。
+            msg: Listener 原始消息 dict（读取 create_time）。
+
+        Returns:
+            True 表示该消息属于配置前历史，应静默丢弃。
+        """
+        if not username or self._db is None:
+            return False
+        try:
+            target = self._db.get_target_by_username(username)
+        except Exception:
+            # 测试替身/降级场景可能没有该 DAO；读不到就不限制。
+            logger.debug("读取监控水位失败（按不过滤处理）：%s", username,
+                         exc_info=True)
+            return False
+        if not target:
+            return False
+        try:
+            since = int(target.get("monitor_since") or 0)
+        except (TypeError, ValueError):
+            since = 0
+        if since <= 0:
+            return False
+        raw_ts = msg.get("create_time")
+        if raw_ts is None or raw_ts == "":
+            return False
+        try:
+            epoch = float(raw_ts)
+        except (TypeError, ValueError):
+            return False
+        if epoch <= 0:
+            return False
+        # 兼容 create_time 为毫秒的微信版本（秒级水位不要被放大 1000 倍）。
+        if epoch > 1e11:
+            epoch /= 1000.0
+        if epoch >= since:
+            return False
+        logger.debug("配置前历史消息已过滤：会话=%s create_time=%s < 水位=%s",
+                     username, raw_ts, since)
+        return True
+
     def _on_message(self, msg: dict, listener=None) -> None:
         """Listener 新消息回调：非文本记 skipped 后丢弃，文本进合并窗口。
 
@@ -407,6 +462,11 @@ class WeChatService:
         """
         try:
             username = str(msg.get("username") or "")
+            # 任务 #1：配置完成之前的历史消息不进入商机分析/处理队列。
+            # 过滤必须在任何 skipped 日志、群名片学习、语音转写、图片入队
+            # 之前完成，否则 Listener 回放历史仍会把队列打满。
+            if self._is_before_monitor_since(username, msg):
+                return
             mtype = str(msg.get("type") or "")
             kind = "group" if username.endswith("@chatroom") else "friend"
             sender_wxid, sender_name = self._resolve_sender(username, kind, msg)
@@ -1845,6 +1905,14 @@ class WeChatService:
         原先固定 ``limit=2000`` 会把按 username 排序后的绝大多数好友
         截断掉，表现为「明明有这个人却搜不到」。
 
+        私聊候选严格限定为**真实好友**：``get_sessions`` 里出现的非好友
+        临时会话（群成员、已删好友）原先一律被标成 kind="friend"，搜索
+        时会混进大量非好友。判定复用 ``get_contacts("friend"/"openim")``
+        的 SQL 口径（local_type 3/1/5-7、delete_flag=0，与
+        ``WeChatDB.is_friend`` 一致），整表取回后按集合比对，避免逐条
+        is_friend 反复打开 contact.db（好友可达 3 万条）。给自己发消息的
+        会话（is_self）按既有语义保留；群聊（@chatroom）不受影响。
+
         企业微信联系人单独取 ``kind="openim"`` 并归入 friend（一对一
         私聊），带 ``openim=True`` 标记供前端区分同名联系人；能解析出
         所属企业时显示名按微信端习惯拼成「昵称@企业简称」。
@@ -1854,6 +1922,47 @@ class WeChatService:
         # username 就是自己的 wxid（实测 wxid_xxx 会话里有自己发的消息），
         # 需要标记出来，否则在候选列表里和同名好友长得一模一样。
         self_id = self._self_id()
+        # 先取全量联系人：保持 get_contacts 的调用顺序（chatroom/friend/
+        # openim）与 limit=0 不变，同时用 friend+openim 构造好友白名单。
+        contacts_by_kind: dict[str, list[dict]] = {}
+        friend_ok = True
+        openim_ok = True
+        for c_kind in ("chatroom", "friend", "openim"):
+            try:
+                contacts_by_kind[c_kind] = self._wxdb.get_contacts(
+                    kind=c_kind, limit=0)
+            except Exception as exc:
+                logger.warning("读取联系人（%s）失败：%s", c_kind, exc)
+                contacts_by_kind[c_kind] = []
+                if c_kind == "friend":
+                    friend_ok = False
+                elif c_kind == "openim":
+                    openim_ok = False
+        friend_usernames: set[str] = {
+            str(c.get("username") or "")
+            for c in contacts_by_kind.get("friend", [])
+            if c.get("username")
+        }
+        # openim 一路按 username 后缀（@openim/@kefu）选取，不检查 local_type；
+        # 有 is_friend 能力时逐条复核（企业微信好友数量远小于普通好友，成本
+        # 可控），口径与 WeChatDB.is_friend 的 local_type 5/6/7 + delete_flag
+        # 严格一致，挡掉「@openim 但 local_type=0」的脏数据。
+        # 替身/降级无该方法时沿用 get_contacts 结果，不误伤既有契约。
+        is_friend_check = getattr(self._wxdb, "is_friend", None)
+        for c in contacts_by_kind.get("openim", []):
+            username = str(c.get("username") or "")
+            if not username:
+                continue
+            if callable(is_friend_check):
+                try:
+                    if not is_friend_check(username):
+                        continue
+                except Exception:
+                    logger.debug("复核企业微信好友关系失败（按保留处理）：%s",
+                                 username, exc_info=True)
+            friend_usernames.add(username)
+        # 好友表读不到时放行会话里的 friend 候选（降级不误伤）；读到了才严格过滤。
+        strict_friend_filter = friend_ok and openim_ok
         items: list[dict] = []
         seen: set[str] = set()
         for s in self._wxdb.get_sessions(limit=100):
@@ -1861,30 +1970,35 @@ class WeChatService:
             if not username or username in seen or username.startswith("gh_") \
                     or _is_system_account(username):
                 continue
+            is_group = username.endswith("@chatroom")
+            is_self = bool(self_id) and username == self_id
+            # 群聊候选原样保留；私聊候选只保留真实好友（含企业微信好友），
+            # 非好友的临时会话/已删好友不再混入。self 会话按既有语义保留。
+            if not is_group and strict_friend_filter and not is_self \
+                    and username not in friend_usernames:
+                continue
             openim = self.is_openim(username)
             corp = corp_map.get(username, "")
             items.append({"username": username,
                           "display_name": self._with_corp(
                               self.get_display_name(username), corp),
-                          "kind": "group" if username.endswith("@chatroom")
-                                  else "friend",
+                          "kind": "group" if is_group else "friend",
                           "openim": openim, "corp": corp,
-                          "is_self": bool(self_id)
-                                     and username == self_id})
+                          "is_self": is_self})
             seen.add(username)
         # wechatauto.get_contacts 的群聊取值为 "chatroom"（不是 "group"）；
         # openim 为企业微信/客服联系人，按一对一私聊归入 friend
         for c_kind, item_kind in (("chatroom", "group"), ("friend", "friend"),
                                   ("openim", "friend")):
-            try:
-                contacts = self._wxdb.get_contacts(kind=c_kind, limit=0)
-            except Exception as exc:
-                logger.warning("读取联系人（%s）失败：%s", c_kind, exc)
-                contacts = []
-            for c in contacts:
+            for c in contacts_by_kind.get(c_kind, []):
                 username = str(c.get("username") or "")
                 if not username or username in seen or username.startswith("gh_") \
                         or _is_system_account(username):
+                    continue
+                # 私聊候选（friend/openim）同样受好友白名单约束；openim
+                # 白名单已按 is_friend 复核过 local_type/delete_flag。
+                if c_kind in ("friend", "openim") and strict_friend_filter \
+                        and username not in friend_usernames:
                     continue
                 remark = str(c.get("remark") or "").strip()
                 nick = str(c.get("nick_name") or "").strip()
