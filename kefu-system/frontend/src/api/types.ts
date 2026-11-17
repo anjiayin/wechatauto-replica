@@ -505,6 +505,35 @@ export interface LicenseStatusOut {
   enabled_source?: string
 }
 
+/** GET /api/system/update/check：更新检查（后端已完成验签与判定） */
+export interface UpdateCheckOut {
+  ok: boolean
+  /** none / optional / forced */
+  action: 'none' | 'optional' | 'forced'
+  current_version: string
+  latest: string
+  sequence: number
+  notes: string
+  min_wechat_version: string
+  requires_antivirus_off: boolean
+  released_at: string
+  package_size: number
+  package_type?: string
+  /** 未配置更新地址 / 验签失败等静默原因（不视为错误） */
+  reason?: string
+}
+
+/** GET /api/system/update/status：下载/安装进度 */
+export interface UpdateStatusOut {
+  /** idle / downloading / done / error / applying / applied */
+  state: string
+  done: number
+  total: number
+  message: string
+  version: string
+  action: string
+}
+
 /** GET /api/license/machine-code 返回（deep=1 时带 WMI 明细） */
 export interface MachineCodeOut {
   ok: boolean

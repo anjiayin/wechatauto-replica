@@ -28,6 +28,7 @@ import { setPendingOpportunity } from './hooks/pendingOpportunity'
 import OpportunityList from './pages/OpportunityList'
 import AnalysisLogs from './pages/AnalysisLogs'
 import SettingsPage from './pages/SettingsPage'
+import { UpdateChip, UpdateDialog, useUpdateCheck } from './pages/UpdatePanel'
 import {
   LicenseBlocker,
   LicenseChip,
@@ -64,6 +65,19 @@ export default function App() {
     queryFn: () => apiGet<StatusOut>('/api/status'),
     refetchInterval: 5000,
   })
+
+  // 客户端更新：启动 5s 后检查一次、之后每 12h；发现新版本自动提示一次。
+  const updateCheck = useUpdateCheck(true)
+  const [updateOpen, setUpdateOpen] = useState(false)
+  const updateAutoOpened = useRef(false)
+  useEffect(() => {
+    const u = updateCheck.data
+    if (u && (u.action === 'optional' || u.action === 'forced')
+        && !updateAutoOpened.current) {
+      updateAutoOpened.current = true
+      setUpdateOpen(true)
+    }
+  }, [updateCheck.data])
 
   // 授权状态（未启用授权时 enabled=false，界面完全不打扰）
   const { data: license } = useLicenseStatus()
@@ -189,6 +203,8 @@ export default function App() {
               ? `监听运行中 · 监控 ${status.monitored_count} 个会话`
               : '监听未运行'}
           </Typography>
+          {/* 客户端版本 / 新版本提示（点击查看更新详情） */}
+          <UpdateChip check={updateCheck.data} onClick={() => setUpdateOpen(true)} />
           {/* 授权状态（点击查看机器码/激活码/到期时间） */}
           <LicenseChip status={license} onClick={() => setLicenseOpen(true)} />
           {/* 今日 AI 估算费用（反馈 13；未配置单价时为 0 不展示） */}
@@ -310,6 +326,13 @@ export default function App() {
         open={licenseOpen}
         status={license}
         onClose={() => setLicenseOpen(false)}
+      />
+
+      {/* 系统更新：确认关杀软 → 下载 → 安装（切换后需重启托盘程序） */}
+      <UpdateDialog
+        open={updateOpen}
+        onClose={() => setUpdateOpen(false)}
+        check={updateCheck.data}
       />
     </Box>
   )

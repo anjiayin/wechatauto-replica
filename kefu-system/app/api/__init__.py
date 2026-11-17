@@ -9,6 +9,7 @@ from app.api.router_settings import router as settings_router
 from app.api.router_system import router as system_router
 from app.api.router_targets import router as targets_router
 from app.api.router_types import router as types_router
+from app.api.router_update import router as update_router
 
 ALL_ROUTERS = (
     system_router,
@@ -18,6 +19,7 @@ ALL_ROUTERS = (
     settings_router,
     opportunities_router,
     analysis_router,
+    update_router,
 )
 
 __all__ = ["ALL_ROUTERS"]

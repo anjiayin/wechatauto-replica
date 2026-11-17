@@ -64,6 +64,49 @@ def _acquire_single_instance():
 
 
 # ---------------------------------------------------------------------------
+# 版本层入口：安装包刻意不含 app/current junction，首次启动按 current.json 创建
+# ---------------------------------------------------------------------------
+def _rebuild_junction(link: Path, target: Path) -> tuple[bool, str]:
+    """本进程不能 import 业务模块（此时 junction 可能还不存在），故独立实现。"""
+    ps = (
+        f"$i = Get-Item -LiteralPath '{link}' -Force -ErrorAction SilentlyContinue; "
+        f"if ($i) {{ $i.Delete() }}; "
+        f"New-Item -ItemType Junction -Path '{link}' -Target '{target}' "
+        f"-ErrorAction Stop | Out-Null"
+    )
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           capture_output=True, text=True, timeout=30)
+    except Exception as exc:                      # noqa: BLE001
+        return False, str(exc)
+    return r.returncode == 0, r.stderr.strip()
+
+
+def _ensure_current() -> bool:
+    """确保 app/current 指向 current.json 声明的版本（安装器不随包带 junction）。"""
+    try:
+        version = str(json.loads(CURRENT_JSON.read_text(encoding="utf-8"))["version"]).strip()
+    except Exception:                            # noqa: BLE001
+        return False
+    if not version or any(c in version for c in ('"', "'", "\\", "/", ":")):
+        return False
+    target = BUNDLE / "app" / version
+    run_py = target / "kefu-system" / "run.pyc"
+    if not run_py.is_file() and not (target / "kefu-system" / "run.py").is_file():
+        return False
+    link = BUNDLE / "app" / "current"
+    try:
+        if link.exists() and link.resolve() == target.resolve():
+            return True
+    except OSError:                              # noqa: BLE001
+        pass
+    ok, err = _rebuild_junction(link, target)
+    if not ok:
+        sys.stderr.write(f"[launcher] 创建版本入口失败：{err}\n")
+    return ok
+
+
+# ---------------------------------------------------------------------------
 # 环境装配 + 起后端
 # ---------------------------------------------------------------------------
 def _read_port() -> int:
@@ -237,6 +280,10 @@ def main() -> None:
     mutex = _acquire_single_instance()
     if mutex is None:
         sys.stderr.write("[launcher] 已在运行，退出本次启动。\n")
+        return
+
+    if not _ensure_current():
+        sys.stderr.write("[launcher] 版本层缺失或 current.json 无效，已停止启动。\n")
         return
 
     _state["port"] = _read_port()

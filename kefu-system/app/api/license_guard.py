@@ -9,6 +9,7 @@
 - 非 ``/api/`` 路径：静态资源、SPA 页面、``/ws/events``（前端要显示状态）
 - ``/api/license/*``：否则未授权时连激活接口都调不了，形成死锁
 - ``/api/status``、``/api/health``：前端首屏需要它们渲染授权横幅
+- ``/api/system/update/*``：授权过期时更要能升级修复；检查/下载不碰业务数据
 
 其余 ``/api/*`` 一律 403 + 中文原因 + ``license_state``，前端据此弹激活框。
 """
@@ -32,7 +33,7 @@ ALLOW_EXACT = {
     "/api/license/activate",
     "/api/license/refresh",
 }
-ALLOW_PREFIXES = ("/api/license/",)
+ALLOW_PREFIXES = ("/api/license/", "/api/system/update/")
 
 # 状态缓存（秒）：每个业务请求都验签+读盘没必要，3 秒足够灵敏
 _STATUS_CACHE_SEC = 3.0
