@@ -8,8 +8,19 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # 路径常量
 # ---------------------------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent.parent          # kefu-system/
-DATA_DIR = BASE_DIR / "data"                               # 运行数据目录
+# APP_ROOT：只读资源根（随版本走的 app/<版本>/ 或开发态 kefu-system/）。
+# DATA_DIR：可写数据根，P1 三层布局里由启动器注入 KEFU_DATA_DIR 指向安装根的
+#           data/，**升级永不覆盖**；缺省回退到 APP_ROOT/data（P0 布局兼容）。
+# ASSETS_DIR：只读重资源根（228MB ASR 模型、SILK 解码器、ffmpeg），放稳定的
+#             runtime/ 层，不随版本升级重下；缺省回退到各自的 P0 位置。
+APP_ROOT = Path(os.environ.get("KEFU_APP_ROOT", "").strip() or
+                Path(__file__).resolve().parent.parent)
+BASE_DIR = APP_ROOT                                        # 历史别名，等于 APP_ROOT
+_data_override = os.environ.get("KEFU_DATA_DIR", "").strip()
+DATA_DIR = Path(_data_override) if _data_override else (BASE_DIR / "data")
+_assets_override = os.environ.get("KEFU_ASSETS_DIR", "").strip()
+ASSETS_DIR = Path(_assets_override) if _assets_override else None
+
 DB_PATH = DATA_DIR / "kefu.sqlite3"                        # 业务 SQLite
 SECRET_KEY_PATH = DATA_DIR / "secret.key"                  # Fernet 密钥文件
 LOG_PATH = DATA_DIR / "kefu.log"                           # 滚动日志
@@ -20,10 +31,13 @@ LICENSE_STATE_FILE = DATA_DIR / "license.state.json"
 # 语音消息落盘缓存（微信 SILK 原始文件，转写前临时解码）
 VOICE_CACHE_DIR = DATA_DIR / "voicecache"
 # 离线语音识别模型目录（SenseVoice-Small：model.int8.onnx + tokens.txt）
-ASR_MODEL_DIR = DATA_DIR / "asr_models"
-# 微信 SILK v3 解码器（32 位 exe，仓库内置；缺失时可从镜像下载）
-SILK_DECODER_PATH = BASE_DIR / "tools" / "silk_v3_decoder.exe"
-FRONTEND_DIST = BASE_DIR / "frontend" / "dist"             # 前端构建产物
+# P1：优先 ASSETS_DIR/asr_models（runtime 层，升级不动）；回退 DATA_DIR/asr_models
+ASR_MODEL_DIR = (ASSETS_DIR / "asr_models") if ASSETS_DIR else (DATA_DIR / "asr_models")
+# 微信 SILK v3 解码器（仓库内置；缺失时可从镜像下载）
+# P1：优先 ASSETS_DIR/silk_v3_decoder.exe；回退 APP_ROOT/tools（P0 布局）
+SILK_DECODER_PATH = ((ASSETS_DIR / "silk_v3_decoder.exe") if ASSETS_DIR
+                     else (APP_ROOT / "tools" / "silk_v3_decoder.exe"))
+FRONTEND_DIST = APP_ROOT / "frontend" / "dist"             # 前端构建产物
 
 # 微信数据库解密缓存（SQLCipher 解密副本 + 页哈希 + 密钥缓存）默认目录。
 # 放在客服系统运行目录下，避免落到 %TEMP% 被系统/清理软件删除（删了要全量
