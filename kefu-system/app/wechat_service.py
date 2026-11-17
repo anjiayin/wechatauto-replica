@@ -2473,7 +2473,9 @@ class WeChatService:
         群聊与实时监听同一权威口径：正文首部「发送者ID:\\n」前缀优先
         （SenderName2Id 映射不可靠，反馈 6 群昵称错乱）。只有前缀能对上
         群成员（wxid 或群显示名）时才剥离，避免误伤「9:30 开会」这类正文；
-        私聊发送人即会话对方，sender_id=2 为自己。
+        私聊发送人即会话对方，sender_id=2 为自己；企业微信/客服私聊按会话
+        username 补上企业简称（行内 sender_username 是内部工作号，不可用作
+        展示名，详见下方分支注释）。
 
         批次 6 需求 6：群聊里自己发送的消息 ``sender_id = 2`` 且正文**没有**
         前缀，此前会落到 ``candidate or "未知用户"`` 分支显示「未知用户」。
@@ -2483,7 +2485,18 @@ class WeChatService:
         if not username.endswith("@chatroom"):
             if sender_id in (2, "2"):
                 return "我", text
-            name = self.get_display_name(fallback_wxid) if fallback_wxid else "我"
+            if self.is_openim(username):
+                # 企业微信/客服私聊（反馈：上下文里冒出「杜飞」）：
+                # 微信库消息行的 real_sender_id 解析出来的是**内部工作号**，
+                # 并不是会话对端的 openim username。实测会话
+                # 25984982152595070@openim（安佳胤@我的车车）里，对方消息
+                # sender_username=25984983893057228@openim（昵称「杜飞」）。
+                # 微信 UI、商机列表与详情头部都按「会话对端」显示，这里必须
+                # 同口径：用会话 username 解析「昵称@企业简称」，不能用行内
+                # 的 fallback_wxid。普通好友私聊仍按原逻辑取行内发送人。
+                name = self.display_name_with_corp(username)
+            else:
+                name = self.get_display_name(fallback_wxid) if fallback_wxid else ""
             return name or "我", text
         # 群聊里 sender_id=2 = 自己发送：无前缀，显示「我」
         if sender_id in (2, "2"):
