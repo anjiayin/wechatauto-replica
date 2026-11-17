@@ -8,7 +8,9 @@
   cwd 切到 kefu-system/（param.py 的 os.getcwd() 假设）
 
 验证项：runtime、config 路径、ASR 模型就绪、真实中文语音转写、
-内置 ffmpeg + HEVC 解码、前端 dist、FastAPI app 导入、SILK 解码器可执行。
+内置 ffmpeg + HEVC 解码、前端 dist、FastAPI app 导入、SILK 解码器可执行，
+以及「零注入子进程 import wechatauto.media」（原生启动守门，防 pywin32 DLL
+未随包装配导致媒体功能降级）。
 刻意不启动 uvicorn —— lifespan 会拉起微信监听线程，P0 不碰微信。
 """
 from __future__ import annotations
@@ -154,6 +156,30 @@ def p_app_main():
             "has_openapi": hasattr(app, "openapi")}
 
 
+def p_native_import():
+    """零注入子进程：模拟用户原生 `python kefu-system/run.py` 的启动方式。
+
+    本探针自身做了 add_dll_directory，会掩盖 pywin32 DLL 未随包装配的问题。
+    这里起一个全新 python.exe，只设最小环境变量、不注入任何 DLL 路径，
+    验证 `from wechatauto.media import MediaDownloader` 在原生启动下也成功——
+    正是 2026-11-16 媒体功能降级事故的根因守门。
+    """
+    code = (
+        "import os,sys;"
+        "os.environ.setdefault('KEFU_VERSION_FILE', r'" + str(BUNDLE / "version.txt") + "');"
+        "os.environ.setdefault('KEFU_APP_ROOT', r'" + str(KEFU) + "');"
+        "os.chdir(r'" + str(KEFU) + "');"
+        "from wechatauto.media import MediaDownloader;"
+        "print('NATIVE_IMPORT_OK')"
+    )
+    r = subprocess.run([str(RUNTIME / "python" / "python.exe"), "-c", code],
+                       capture_output=True, timeout=90, cwd=str(BUNDLE))
+    out = (r.stdout + r.stderr).decode("utf-8", "replace")
+    if r.returncode != 0 or "NATIVE_IMPORT_OK" not in out:
+        raise RuntimeError(f"原生启动 import 失败 rc={r.returncode}: {out[-300:]}")
+    return {"native_import": True, "detail": "零注入子进程 import wechatauto.media 成功"}
+
+
 def main() -> None:
     print(f"=== P0 离线包自检  {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
     print(f"runtime : {RUNTIME}\n", flush=True)
@@ -166,6 +192,7 @@ def main() -> None:
     probe("ffmpeg_hevc", p_ffmpeg)
     probe("silk_decoder", p_silk)
     probe("app_main_import", p_app_main)
+    probe("native_import", p_native_import)
 
     # 关键判定
     checks = {
@@ -184,6 +211,7 @@ def main() -> None:
         "SILK 解码器可执行": RESULTS["silk_decoder"]["ok"],
         "FastAPI app 可导入": (RESULTS["app_main_import"]["ok"]
                           and RESULTS["app_main_import"]["value"]["routes"] > 0),
+        "原生启动免注入": RESULTS["native_import"]["ok"],
     }
     report = {
         "elapsed_ms": int((time.monotonic() - STARTED) * 1000),

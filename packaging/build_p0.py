@@ -34,6 +34,7 @@
     <out>/version.txt
     <out>/testdata/test_zh.wav
     <out>/selftest_p0.py
+    <out>/start_kefu.bat              一键启动（用内置 python，避免误用系统 python）
     <out>/build-info.json
 
 注意：P0 用 3.12 embed 是为了与本机 cp312 wheel 的 ABI 一致、完全离线
@@ -175,6 +176,24 @@ def build(args: argparse.Namespace) -> None:
         sizes["site_packages"] = _copy_tree(args.site_packages, site_dir,
                                             "site-packages", args.site_packages)
 
+    # 2b) pywin32 的 DLL 放到 python.exe 同目录（关键，勿删）
+    # 背景：embed python 不执行 site-packages/*.pth，pywin32 的 win32api.pyd /
+    # win32ui.pyd 等扩展依赖 pywintypes312.dll + pythoncom312.dll，这两个 DLL
+    # 默认躺在 site-packages/pywin32_system32/。虽然三个子目录已写进 _pth，
+    # 但 Windows 加载 .pyd 时只按 exe 目录 / PATH / LoadLibrary 路径搜 DLL，
+    # 不会扫 site-packages 子树 → 原生 `python run.py` 启动时 import win32ui
+    # 直接 "DLL load failed"，触发 wechat_service 的媒体功能降级。
+    # 把 DLL 复制到 exe 旁边，Windows 便能命中，启动命令零改动、业务代码零改动。
+    win32_sys = site_dir / "pywin32_system32"
+    if win32_sys.is_dir():
+        n = 0
+        for dll in win32_sys.glob("*.dll"):
+            shutil.copy2(dll, python_dir / dll.name)
+            n += 1
+        print(f"[DLL ] pywin32 → python.exe 同目录：{n} 个 DLL（原生启动免注入）")
+    else:
+        print("[WARN] 未找到 pywin32_system32，原生启动可能降级媒体功能")
+
     # 3) 外部程序与离线资源
     ffmpeg_src = args.ffmpeg or _find_ffmpeg()
     sizes["ffmpeg"] = _copy_file(ffmpeg_src, runtime / "ffmpeg.exe", "ffmpeg.exe")
@@ -203,8 +222,16 @@ def build(args: argparse.Namespace) -> None:
     if args.test_wav and args.test_wav.is_file():
         _copy_file(args.test_wav, out / "testdata" / "test_zh.wav", "test_zh.wav")
 
-    # 5) 自检探针 + 构建信息
+    # 5) 自检探针 + 一键启动脚本 + 构建信息
     _copy_file(REPO_ROOT / "packaging" / "selftest_p0.py", out / "selftest_p0.py", "selftest_p0.py")
+    _copy_file(REPO_ROOT / "packaging" / "start_kefu.bat", out / "start_kefu.bat", "start_kefu.bat")
+    # bat 必须是 GBK + CRLF：CMD 默认按 GBK 解析 .bat，LF 换行会把每行首字符
+    # 与上一行黏连（表现为 'tlocal'/'et' 之类"不是内部或外部命令"）。源文件若被
+    # 编辑器另存成 UTF-8/LF，这里统一纠正，避免重打包后再次踩坑。
+    _bat = out / "start_kefu.bat"
+    _bat_text = _bat.read_bytes().decode("gbk")   # 源必须是 GBK，解码失败即报错
+    _bat.write_bytes(_bat_text.replace("\r\n", "\n").replace("\r", "\n")
+                     .replace("\n", "\r\n").encode("gbk"))
     info = {
         "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "out": str(out),

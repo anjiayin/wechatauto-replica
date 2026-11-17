@@ -469,6 +469,8 @@ export default function OpportunityDetail(props: {
     enabled: id !== null,
   })
 
+  // 上下文消息滚动容器：异步加载完成后自动滚到最底（最新一条）
+  const contextScrollRef = useRef<HTMLDivElement | null>(null)
   // 上下文：独立异步接口（微信库查询 + 后端瞬时故障重试；失败可重新加载）
   const contextQuery = useQuery({
     queryKey: ['opportunity-context', id],
@@ -486,6 +488,15 @@ export default function OpportunityDetail(props: {
       ),
     [contextQuery.data],
   )
+
+  // 上下文异步加载完成、列表真正渲染出来后自动滚到最新一条（时间正序，最新在最下）。
+  // 只在有消息且未处于加载/失败态时滚：骨架屏、错误提示、空列表都不该滚。
+  // 依赖 contextItems：挂载时数据还没到，不能只在挂载时滚一次。
+  useEffect(() => {
+    if (contextQuery.isLoading || contextError || contextItems.length === 0) return
+    const node = contextScrollRef.current
+    if (node) node.scrollTop = node.scrollHeight
+  }, [contextItems, contextQuery.isLoading, contextError])
 
   // 原文（raw_text_display）里语音只是「[语音] 文本」纯文本，没有 local_id，
   // 用户看不到播放按钮（批次 6 需求 4）。用上下文里 type='语音' 的条目按
@@ -857,7 +868,7 @@ export default function OpportunityDetail(props: {
             </Box>
 
             <Typography variant="subtitle2">上下文消息（最近 11 条，时间正序）</Typography>
-            <Box sx={{ maxHeight: 200, overflow: 'auto', border: '1px solid #eee', borderRadius: 1, mb: 1.5 }}>
+            <Box ref={contextScrollRef} sx={{ maxHeight: 200, overflow: 'auto', border: '1px solid #eee', borderRadius: 1, mb: 1.5 }}>
               {/* 上下文独立加载态：Skeleton 骨架屏（详情本身秒开，不互相阻塞） */}
               {contextQuery.isLoading && (
                 <Box sx={{ p: 1.5 }}>
