@@ -59,8 +59,9 @@ class TestUIAAtQuoteCombo:
         monkeypatch.setattr(
             uia, "_prepare_quote",
             lambda t: quote_calls.append(t) or edit)
+        # 兼容 at_members 两阶段调用：第二次回退会带 allow_single=True
         monkeypatch.setattr(uia, "_pick_mention",
-                            lambda name, timeout=2.0: True)
+                            lambda name, timeout=2.0, allow_single=False: True)
         monkeypatch.setattr(uia, "_paste_append", lambda e, t: True)
         monkeypatch.setattr("wechatauto.uia_driver.time.sleep",
                             lambda s: None)

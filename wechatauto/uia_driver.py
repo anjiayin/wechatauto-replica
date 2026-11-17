@@ -1829,47 +1829,170 @@ class WeChatUIA:
 
     # -- @ 群成员 -------------------------------------------------------
     def _mention_popup(self, timeout: float = 2.0):
-        """定位 @ 成员弹层（mmui::XPopover / AutomationId=MentionPopover）。"""
+        """定位 @ 成员弹层（mmui::XPopover / AutomationId=MentionPopover）。
+
+        微信 4.x 的 Qt 弹层**不一定是 WindowControl**：同一份代码里右键菜单
+        ``mmui::XMenuView`` 就只能靠遍历控件树按 ClassName 命中（见
+        :meth:`_uia_find_menu_item`）。旧实现只试 ``WindowControl(...)``，
+        弹层以 Pane/Custom 形态暴露时三个变体全部落空，两次调用各等满
+        timeout（日志：「@ 成员未在弹层中选中」+ 输入发送约 4.9s）。
+        这里保留原快路径，再补「不绑定 ControlType 的通用搜索」和
+        「主窗口子树按 ClassName/AutomationId 遍历」两条兜底；都找不到
+        仍返回 None 由调用方 fail-closed，绝不降级截图/OCR。
+        """
         deadline = time.time() + timeout
-        variants = (
+        win = self._win
+        if win is None:
+            return None
+        window_variants = (
             dict(ClassName="mmui::XPopover", AutomationId="MentionPopover"),
             dict(AutomationId="MentionPopover"),
             dict(ClassName="mmui::XPopover", Name="Weixin"),
         )
+        generic_variants = (
+            dict(ClassName="mmui::XPopover", AutomationId="MentionPopover"),
+            dict(AutomationId="MentionPopover"),
+        )
         while time.time() < deadline:
-            for kw in variants:
+            # 1) 原快路径：只匹配 ControlType.Window 的弹层
+            for kw in window_variants:
                 try:
-                    pop = self._win.WindowControl(searchDepth=0xFFFFFFFF, **kw)
+                    pop = win.WindowControl(searchDepth=0xFFFFFFFF, **kw)
                     if pop.Exists(0.1, 0.1):
                         return pop
                 except Exception:
                     continue
+            # 2) 通用控件搜索：覆盖 Pane/Custom 形态的 Qt 弹层
+            for kw in generic_variants:
+                try:
+                    pop = win.Control(searchDepth=0xFFFFFFFF, **kw)
+                    if pop.Exists(0.1, 0.1):
+                        return pop
+                except Exception:
+                    continue
+            # 3) 主窗口子树遍历：只按 ClassName/AutomationId 认弹层
+            found = self._find_mention_popover_in_tree(win)
+            if found is not None:
+                return found
             time.sleep(0.2)
         return None
 
-    def _pick_mention(self, member: str, timeout: float = 2.0) -> bool:
-        """在已弹出的 @ 成员列表里选中 member（精确名 → 前缀 → 唯一项）。"""
-        pop = self._mention_popup(timeout)
-        if pop is None:
-            return False
+    @staticmethod
+    def _find_mention_popover_in_tree(root, max_depth: int = 8):
+        """在主窗口子树内按 ClassName/AutomationId 找 @ 弹层（不限控件类型）。
+
+        与 :meth:`_uia_find_menu_item` 同思路：Qt 自绘弹层的 UIA ControlType
+        不可靠，ClassName / AutomationId 才是稳定锚点。限深避免整树遍历。
+        """
+        def walk(ctrl: object, depth: int = 0):
+            if depth > max_depth:
+                return None
+            try:
+                children = ctrl.GetChildren()
+            except Exception:
+                return None
+            for child in children:
+                try:
+                    cn = child.ClassName or ""
+                    aid = child.AutomationId or ""
+                    nm = child.Name or ""
+                except Exception:
+                    cn = aid = nm = ""
+                if aid == "MentionPopover" or (
+                        cn == "mmui::XPopover" and nm == "Weixin"):
+                    return child
+                hit = walk(child, depth + 1)
+                if hit is not None:
+                    return hit
+            return None
+
         try:
-            lst = pop.ListControl()
-            if not lst.Exists(0.2, 0.1):
-                return False
-            items = [i for i in lst.GetChildren() if (i.Name or "").strip()]
-        except Exception as exc:
-            wxlog.debug(f"读取 @ 成员列表失败：{exc}")
-            return False
-        if not items:
-            return False
-        target = (member or "").strip()
-        hit = next((i for i in items if (i.Name or "").strip() == target), None)
+            return walk(root)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _match_mention_item(items, target: str,
+                            allow_single: bool = False):
+        """按「归一化精确 → 归一化包含 →（受限）唯一项」匹配成员控件。
+
+        两级调用语义（``allow_single`` 由调用方按弹层可信度传入）：
+
+        * **未过滤**（``allow_single=False``，默认）：弹层是推荐/全量列表，
+          此时「唯一项」毫无可信度——名字与目标完全不符也会选中，等于
+          @ 错人。因此禁用唯一项兜底，匹配不到就返回 ``None``（fail-closed）。
+        * **已过滤**（``allow_single=True``）：调用方已把目标名字敲进搜索框，
+          弹层被过滤到唯一项是可信的，可作为兜底命中；但仍必须通过
+          「最低字符关联」守卫：归一化后 target 与该唯一项 Name 至少共享
+          一个非空白字符，否则视为「完全不符」同样拒绝。
+
+        共享字符只取 :mod:`wechatauto.text_norm` 归一化后字符串的字符集合
+        求交，不做全半角/繁简转换——后者会引入误匹配，与本模块既有约定
+        一致。``target`` 在入口再归一化一次，保证直接调用也自洽（幂等）。
+        """
+        target = normalize_match_text(target)
+        hit = next((i for i in items
+                    if normalize_match_text(getattr(i, "Name", "")) == target),
+                   None)
         if hit is None:
             hit = next((i for i in items
-                        if target and target in (i.Name or "")), None)
-        if hit is None and len(items) == 1:
-            hit = items[0]
+                        if contains_normalized(target,
+                                               getattr(i, "Name", ""))), None)
+        if hit is None and allow_single and len(items) == 1:
+            # 已过滤场景的唯一项兜底：仍需最低字符关联守卫，
+            # 完全无共享字符（=完全不符）时拒绝，绝不猜一个 @ 上去。
+            name_chars = {c for c in normalize_match_text(
+                getattr(items[0], "Name", "")) if not c.isspace()}
+            target_chars = {c for c in target if not c.isspace()}
+            if target_chars and name_chars and target_chars & name_chars:
+                hit = items[0]
+        return hit
+
+    def _pick_mention(self, member: str, timeout: float = 2.0,
+                      allow_single: bool = False) -> bool:
+        """在已弹出的 @ 成员列表里选中 member（精确名 → 归一化包含 → 唯一项）。
+
+        旧实现只读 ``pop.ListControl().GetChildren()`` 的直接子节点，且用裸
+        ``str.strip()`` 比较；弹层成员项被包在更深的容器里、或 Name 带 U+2005
+        等空白时就一个都匹配不上。这里补一层「弹层内按名字做后代
+        ListItemControl 搜索」（与 :class:`wechatauto.ui.chatbox.AtMenu` 同款），
+        并统一用 :mod:`wechatauto.text_norm` 归一化，消除空白差异。
+
+        ``allow_single`` 直接透传给 :meth:`_match_mention_item`：未过滤时
+        保持 ``False`` 以禁用无条件唯一项兜底；已按名字过滤时才传 ``True``，
+        且仍受「最低字符关联」守卫约束。后代 ``ListItemControl(Name=probe)``
+        是精确匹配，本身安全，不受该开关影响。
+        """
+        pop = self._mention_popup(timeout)
+        if pop is None:
+            wxlog.debug("@ 弹层未定位到（WindowControl/通用控件/树遍历均未命中）")
+            return False
+        target = normalize_match_text(member)
+        if not target:
+            return False
+        items = []
+        try:
+            lst = pop.ListControl()
+            if lst.Exists(0.2, 0.1):
+                items = [i for i in lst.GetChildren()
+                         if normalize_match_text(getattr(i, "Name", ""))]
+        except Exception as exc:
+            wxlog.debug("读取 @ 成员列表失败：%s", exc)
+        hit = self._match_mention_item(items, target,
+                                       allow_single=allow_single)
+        # 后代按名字精确搜索：覆盖成员项不在 ListControl 直接子节点的情况
         if hit is None:
+            for probe in (member, target):
+                try:
+                    cand = pop.ListItemControl(Name=probe)
+                    if cand.Exists(0.2, 0.1):
+                        hit = cand
+                        break
+                except Exception:
+                    continue
+        if hit is None:
+            wxlog.debug("@ 弹层成员项与「%s」均不匹配（已读 %d 项）",
+                        member, len(items))
             return False
         try:
             auto.RollIntoView(pop, hit)
@@ -1877,7 +2000,8 @@ class WeChatUIA:
             pass
         try:
             hit.Click()
-        except Exception:
+        except Exception as exc:
+            wxlog.debug("点击 @ 成员项「%s」失败：%s", member, exc)
             return False
         time.sleep(0.25)
         return True
@@ -1927,6 +2051,8 @@ class WeChatUIA:
             except Exception:
                 return False
             time.sleep(0.45)
+            # 第一次：弹层未过滤（推荐/全量列表），唯一项兜底必须禁用，
+            # 否则名字完全不符时也会选中 → @ 错人。
             if not self._pick_mention(name):
                 wxlog.debug(f"@ 成员未在弹层中选中：{name}")
                 # 退一步：输入名字过滤后再选（部分版本 @ 后不弹全量列表）
@@ -1935,7 +2061,10 @@ class WeChatUIA:
                 except Exception:
                     return False
                 time.sleep(0.6)
-                if not self._pick_mention(name, timeout=1.5):
+                # 第二次：弹层已按名字过滤，唯一项可信，但仍受最低字符
+                # 关联守卫约束，完全不符时依旧 fail-closed。
+                if not self._pick_mention(name, timeout=1.5,
+                                          allow_single=True):
                     return False
             time.sleep(0.25)
         if text:
