@@ -39,6 +39,12 @@ SILK_DECODER_PATH = ((ASSETS_DIR / "silk_v3_decoder.exe") if ASSETS_DIR
                      else (APP_ROOT / "tools" / "silk_v3_decoder.exe"))
 FRONTEND_DIST = APP_ROOT / "frontend" / "dist"             # 前端构建产物
 
+# 交付版数据库初始化预设（seed）：鉴权生产地址 + 预置商机类型。
+# 由托盘启动器注入 KEFU_DELIVERY_SEED 指向 bundle 根的 delivery_seed.json；
+# 开发/测试态不设该环境变量 → 文件不存在 → 完全不生效（DB 仍走内置默认）。
+_delivery_seed = os.environ.get("KEFU_DELIVERY_SEED", "").strip()
+DELIVERY_SEED_FILE = Path(_delivery_seed) if _delivery_seed else None
+
 # 微信数据库解密缓存（SQLCipher 解密副本 + 页哈希 + 密钥缓存）默认目录。
 # 放在客服系统运行目录下，避免落到 %TEMP% 被系统/清理软件删除（删了要全量
 # 重新解密，且需重新提取密钥）。可在设置页改为其它磁盘（如 D:\wxcache）。

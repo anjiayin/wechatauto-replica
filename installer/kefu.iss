@@ -38,7 +38,8 @@ SolidCompression=yes
 WizardStyle=modern
 AllowNoIcons=yes
 DirExistsWarning=no
-UninstallDisplayIcon={app}\{#MyAppExeName}
+SetupIconFile={#SourcePath}\app.ico
+UninstallDisplayIcon={app}\app.ico
 UninstallDisplayName={#MyAppName} {#MyAppVersion}
 ; 无代码签名：安装时 SmartScreen/杀软可能提示，欢迎页下方有显式说明
 
@@ -58,6 +59,8 @@ Source: "{#SourcePath}\updater.pyc"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourcePath}\start_kefu.bat"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourcePath}\current.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourcePath}\version.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourcePath}\app.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourcePath}\delivery_seed.json"; DestDir: "{app}"; Flags: ignoreversion
 ; 版本层与稳定层（app\current junction 不在此列，由 launcher 重建）
 Source: "{#SourcePath}\app\*"; DestDir: "{app}\app"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourcePath}\runtime\*"; DestDir: "{app}\runtime"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -71,8 +74,8 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
     Tasks: startup; Flags: uninsdeletevalue
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\app.ico"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\app.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Description: "立即启动{#MyAppName}"; Flags: nowait postinstall skipifsilent

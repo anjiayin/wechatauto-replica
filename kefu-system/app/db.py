@@ -6,10 +6,13 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import sqlite3
 import threading
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from app.config import (
@@ -39,7 +42,12 @@ from app.config import (
     KEY_RUNTIME_MW_MIGRATED,
     KEY_RUNTIME_LOCALTIME_MIGRATED,
     KEY_RUNTIME_AI_USAGE_BACKFILLED,
+    DELIVERY_SEED_FILE,
 )
+
+# 交付 seed 应用标记：值 = seed 文件内容的 SHA256（前 16 位）。
+# 内容不变则跳过（不覆盖用户在界面上的手动修改）；seed 升级（hash 变）时重放一次。
+KEY_DELIVERY_SEED_APPLIED = "runtime.delivery_seed_applied"
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +262,7 @@ class Database:
                 self._conn.execute(ddl)
             self._conn.commit()
         self._init_default_settings()
+        self._apply_delivery_seed()
         self._migrate_merge_window_default()
         self._migrate_opportunity_status_handled()
         self._migrate_add_columns()
@@ -381,6 +390,69 @@ class Database:
                     (key, value),
                 )
             self._conn.commit()
+
+    def _apply_delivery_seed(self) -> None:
+        """交付版首次初始化预设（鉴权生产地址 + 商机类型），开发态完全不生效。
+
+        仅在 ``KEFU_DELIVERY_SEED`` 指向的文件存在时读取。用 seed 文件内容
+        hash 作为幂等标记：
+          - 内容不变 → 跳过，绝不覆盖用户后续在界面上的修改；
+          - 内容变化（交付升级了预设）→ 重放一次 settings 与商机类型。
+
+        商机类型按 name 判重（表无唯一约束），已存在同名则跳过，避免重复。
+        """
+        if not DELIVERY_SEED_FILE:
+            return
+        try:
+            seed_path = Path(DELIVERY_SEED_FILE)
+            if not seed_path.is_file():
+                return
+            payload = seed_path.read_bytes()
+            seed = json.loads(payload.decode("utf-8"))
+        except Exception as exc:                    # noqa: BLE001
+            logger.warning("读取交付 seed 失败，跳过预设：%s", exc)
+            return
+        digest = hashlib.sha256(payload).hexdigest()[:16]
+        if self.get_setting(KEY_DELIVERY_SEED_APPLIED, "") == digest:
+            return
+        with self._lock:
+            try:
+                settings = seed.get("settings", {})
+                if isinstance(settings, dict):
+                    for key, value in settings.items():
+                        self._conn.execute(
+                            "INSERT INTO settings (key, value) VALUES (?, ?) "
+                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                            (str(key), str(value)),
+                        )
+                types = seed.get("opportunity_types", [])
+                if isinstance(types, list):
+                    for t in types:
+                        name = str(t.get("name", "")).strip()
+                        desc = str(t.get("description", "")).strip()
+                        if not name or not desc:
+                            continue
+                        exists = self._conn.execute(
+                            "SELECT 1 FROM opportunity_types WHERE name=?",
+                            (name,),
+                        ).fetchone()
+                        if exists:
+                            continue
+                        enabled = 1 if t.get("enabled", 1) else 0
+                        self._conn.execute(
+                            "INSERT INTO opportunity_types (name, description, enabled) "
+                            "VALUES (?, ?, ?)", (name, desc, enabled),
+                        )
+                self._conn.commit()
+                self.set_setting(KEY_DELIVERY_SEED_APPLIED, digest)
+                logger.info(
+                    "已应用交付 seed：settings=%d 项, 商机类型=%d 项 (hash=%s)",
+                    len(settings) if isinstance(settings, dict) else 0,
+                    len(types) if isinstance(types, list) else 0, digest,
+                )
+            except Exception as exc:                # noqa: BLE001
+                logger.warning("应用交付 seed 失败（不影响启动）：%s", exc)
+                self._conn.rollback()
 
     def _migrate_merge_window_default(self) -> None:
         """一次性迁移（优化 7）：旧版本默认微窗口 60s → 15s。

@@ -91,6 +91,7 @@ def validate(bundle: Path) -> tuple[str, Path]:
     required = [
         bundle / "launcher.pyc", bundle / "updater.pyc",
         bundle / "start_kefu.bat", bundle / "version.txt",
+        bundle / "app.ico", bundle / "delivery_seed.json",
         bundle / "runtime" / "python" / "python.exe",
         bundle / "runtime" / "site-packages",
         bundle / "runtime" / "asr_models" / "model.int8.onnx",

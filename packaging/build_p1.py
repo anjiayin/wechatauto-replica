@@ -250,6 +250,18 @@ def build(args: argparse.Namespace) -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / ".gitkeep").write_text("", encoding="ascii")
 
+    # 8b) 交付预设 seed + 应用图标（随包发布到 bundle 根）
+    #     delivery_seed.json：鉴权生产地址 + 预置商机类型，由 launcher 注入
+    #     KEFU_DELIVERY_SEED 让后端首次初始化时应用；app.ico 供托盘/快捷方式/安装包用。
+    assets = REPO_ROOT / "installer" / "assets"
+    for fname in ("delivery_seed.json", "app.ico"):
+        src = assets / fname
+        if src.is_file():
+            _copy_file(src, out / fname, fname)
+            print(f"[ASSET] {fname} -> bundle 根")
+        else:
+            print(f"[WARN ] 缺少交付资源 {src}（跳过）")
+
     # 9) CMD 启动脚本（GBK + CRLF）
     starter_src = REPO_ROOT / "packaging" / "start_p1.bat"
     if starter_src.is_file():

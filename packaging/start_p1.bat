@@ -6,7 +6,7 @@ REM 由 build_p1.py 复制到离线包根目录并统一为 GBK + CRLF
 REM =====================================================================
 setlocal
 set "BUNDLE=%~dp0"
-set "PYEXE=%BUNDLE%runtime\python\python.exe"
+set "PYEXE=%BUNDLE%runtime\python\pythonw.exe"
 set "LAUNCHER=%BUNDLE%launcher.pyc"
 
 if not exist "%PYEXE%" (
