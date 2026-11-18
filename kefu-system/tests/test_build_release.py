@@ -380,3 +380,94 @@ def test_release_readback_mismatch_is_fail_closed(
     assert "回读校验失败" in str(ei.value)
     assert not any(k.endswith("/manifest.json") or k.endswith("/manifest.json.sig")
                    for k in uploaded)
+
+
+# ---------------------------------------------------------------------------
+# bundle_root：安装根 launcher.pyc / updater.pyc / start_kefu.bat 随增量包下发
+# ---------------------------------------------------------------------------
+def _bundle_root_files(bundle: Path) -> None:
+    (bundle / "launcher.pyc").write_bytes(b"LAUNCHER-NEW")
+    (bundle / "updater.pyc").write_bytes(b"UPDATER-NEW")
+    (bundle / "start_kefu.bat").write_bytes(b"START-BAT-NEW")
+
+
+def test_make_app_zip_includes_bundle_root_files(br, tmp_path):
+    """bundle 根白名单文件以 bundle_root/ 前缀进包，内容与源文件一致。"""
+    bundle = _version_bundle(tmp_path)
+    _bundle_root_files(bundle)
+    vd = bundle / "app" / "1.2.2"
+    zpath = tmp_path / "app-1.2.2.zip"
+    br.make_app_zip(vd, zpath, bundle=bundle)
+    with zipfile.ZipFile(zpath) as zf:
+        names = set(zf.namelist())
+        contents = {n: zf.read(n) for n in names}
+    for name, blob in (("launcher.pyc", b"LAUNCHER-NEW"),
+                       ("updater.pyc", b"UPDATER-NEW"),
+                       ("start_kefu.bat", b"START-BAT-NEW")):
+        assert f"bundle_root/{name}" in names
+        assert contents[f"bundle_root/{name}"] == blob
+    # 版本层照旧
+    assert "kefu-system/app/run.pyc" in names
+
+
+def test_make_app_zip_never_packs_nonwhitelist_bundle_files(br, tmp_path):
+    """严格白名单：bundle 根的 update_config.json / version.txt / data 等
+    绝不进包；bundle_root/ 前缀下只有三个白名单文件。"""
+    bundle = _version_bundle(tmp_path)
+    _bundle_root_files(bundle)
+    (bundle / "update_config.json").write_text("{}", encoding="utf-8")
+    (bundle / "version.txt").write_text("1.2.2", encoding="utf-8")
+    (bundle / "delivery_seed.json").write_text("{}", encoding="utf-8")
+    (bundle / "data").mkdir()
+    (bundle / "data" / "kefu.sqlite3").write_bytes(b"DB")
+    (bundle / "evil.exe").write_bytes(b"EVIL")
+    vd = bundle / "app" / "1.2.2"
+    zpath = tmp_path / "app-1.2.2.zip"
+    br.make_app_zip(vd, zpath, bundle=bundle)
+    with zipfile.ZipFile(zpath) as zf:
+        names = set(zf.namelist())
+    forbidden = {"update_config.json", "version.txt", "delivery_seed.json",
+                 "evil.exe", "data/kefu.sqlite3"}
+    assert not any(n in forbidden or n.startswith("data/") for n in names)
+    assert {n for n in names if n.startswith("bundle_root/")} == {
+        "bundle_root/launcher.pyc", "bundle_root/updater.pyc",
+        "bundle_root/start_kefu.bat"}
+
+
+def test_make_app_zip_skips_missing_bundle_files(br, tmp_path):
+    """bundle 缺白名单文件 → 跳过该项，不报错、不打空条目。"""
+    bundle = _version_bundle(tmp_path)
+    (bundle / "launcher.pyc").write_bytes(b"L")
+    vd = bundle / "app" / "1.2.2"
+    zpath = tmp_path / "app-1.2.2.zip"
+    br.make_app_zip(vd, zpath, bundle=bundle)          # 不抛异常
+    with zipfile.ZipFile(zpath) as zf:
+        names = set(zf.namelist())
+    assert "bundle_root/launcher.pyc" in names
+    assert not any(n.startswith("bundle_root/")
+                   and n != "bundle_root/launcher.pyc" for n in names)
+
+
+def test_make_app_zip_without_bundle_stays_backward_compatible(br, tmp_path):
+    """不传 bundle → 不产生 bundle_root/ 前缀，与旧行为完全一致。"""
+    bundle = _version_bundle(tmp_path)
+    _bundle_root_files(bundle)
+    vd = bundle / "app" / "1.2.2"
+    zpath = tmp_path / "app-1.2.2.zip"
+    br.make_app_zip(vd, zpath)
+    with zipfile.ZipFile(zpath) as zf:
+        names = set(zf.namelist())
+    assert not any(n.startswith("bundle_root/") for n in names)
+
+
+def test_release_end_to_end_carries_bundle_root(br, keypair, tmp_path):
+    """release() 编排：bundle 根白名单文件随 app 增量包一起发布。"""
+    bundle = _version_bundle(tmp_path)
+    _bundle_root_files(bundle)
+    args = _args(tmp_path, keypair)
+    br.release(args)
+    with zipfile.ZipFile(args.out / "packages" / "app-1.2.2.zip") as zf:
+        names = set(zf.namelist())
+    assert "bundle_root/launcher.pyc" in names
+    assert "bundle_root/updater.pyc" in names
+    assert "bundle_root/start_kefu.bat" in names

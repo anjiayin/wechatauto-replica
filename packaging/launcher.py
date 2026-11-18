@@ -67,7 +67,7 @@ except ImportError as exc:                        # pragma: no cover
 
 _state = {
     "hwnd": None, "proc": None, "port": DEFAULT_PORT, "opened": False, "nid": (1,),
-    "log_hwnd": None, "log_edit": None, "log_lines": deque(maxlen=2000),
+    "log_hwnd": None, "log_edit": None, "log_lines": deque(maxlen=3000),
     "log_lock": threading.Lock(), "log_timer": None,
 }
 
@@ -245,6 +245,12 @@ def _log(line: str) -> None:
         _state["log_lines"].append(f"[{stamp}] {line}")
 
 
+# 日志 Edit 控件文本上限：32KB 默认上限会静默吞掉新日志，显式放宽到 1MB
+EDIT_TEXT_LIMIT = 0x100000
+# 追加前文本长度警戒线：接近上限先清空再追加，保证最新日志永远可见
+EDIT_TRIM_THRESHOLD = 900 * 1024
+
+
 def _pump_log() -> None:
     """定时把缓冲里的新日志刷到 Edit 控件（跨线程用 SendMessage 安全）。"""
     edit = _state["log_edit"]
@@ -255,7 +261,16 @@ def _pump_log() -> None:
     if not lines:
         return
     text = "\r\n".join(lines) + "\r\n"
+    # 单批文本本身超警戒线时丢弃最旧的行，避免追加被控件上限静默截断
+    if len(text) > EDIT_TRIM_THRESHOLD:
+        while lines and len("\r\n".join(lines)) + 2 > EDIT_TRIM_THRESHOLD:
+            lines.pop(0)
+        text = "\r\n".join(lines) + "\r\n"
     try:
+        # 控件已有文本接近上限时先清空，防止 EM_REPLACESEL 从尾部静默截断
+        if win32gui.GetWindowTextLength(edit) > EDIT_TRIM_THRESHOLD:
+            win32gui.SendMessage(edit, win32con.EM_SETSEL, 0, -1)
+            win32gui.SendMessage(edit, win32con.EM_REPLACESEL, 0, "")
         win32gui.SendMessage(edit, win32con.EM_SETSEL, -1, -1)
         win32gui.SendMessage(edit, win32con.EM_REPLACESEL, 0, text)
     except Exception:                            # noqa: BLE001
@@ -325,6 +340,12 @@ def _create_log_window():
         win32gui.SendMessage(edit, win32con.WM_SETFONT, hfont, 0)
     except Exception:                            # noqa: BLE001
         pass
+    # 放宽 Edit 文本上限（默认 32KB），配合 _pump_log 的裁剪逻辑，
+    # 保证日志窗口不因默认上限静默失效、永远能滚动看到最新日志
+    try:
+        win32gui.SendMessage(edit, win32con.EM_SETLIMITTEXT, EDIT_TEXT_LIMIT, 0)
+    except Exception:                            # noqa: BLE001
+        pass
     _state["log_hwnd"] = hwnd
     _state["log_edit"] = edit
     win32gui.ShowWindow(hwnd, win32con.SW_HIDE)   # 默认隐藏
@@ -360,6 +381,64 @@ def _load_icon(size: int):
 # ---------------------------------------------------------------------------
 # 起后端（stdout/stderr 捕获到日志窗口）
 # ---------------------------------------------------------------------------
+def _decode_line(raw: bytes) -> str:
+    """把一行原始字节解码为文本，任何字节序列都不抛异常。
+
+    解码策略：先试 utf-8（后端正常输出），失败再试 gbk（历史遗留/控制台
+    本地化输出），仍失败用 utf-8 + errors="replace" 兜底，保证 drain 线程
+    不会因 emoji/特殊字符等非法字节而死（那是导致后端全局瘫痪的根因）。
+
+    Args:
+        raw: 管道里读到的一行原始字节（可含/不含换行符）。
+
+    Returns:
+        解码后的文本（非法字节替换为 U+FFFD），空输入返回空串。
+    """
+    for encoding in ("utf-8", "gbk"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _drain_loop(readline) -> None:
+    """日志读取线程主循环：绝不因异常退出，仅在后端 EOF 时正常结束。
+
+    drain 线程死亡 → 无人排空 stdout 管道 → 管道缓冲写满 → 后端所有写
+    stdout 的线程（含 uvicorn 事件循环）永久阻塞 → 后端全局瘫痪。因此
+    readline 系统错误、解码异常、_log 异常都只记录后继续循环，绝不允许
+    线程退出；EOF（readline 返回 b""，即后端进程退出）才正常退出。
+
+    Args:
+        readline: 无参可调用，返回一行字节（b"" 表示 EOF），可能抛异常。
+    """
+    while True:
+        try:
+            raw = readline()
+        except Exception as exc:                 # noqa: BLE001
+            # 短暂休眠避免流持续报错时空转烧 CPU
+            time.sleep(0.05)
+            try:
+                _log(f"[launcher] 日志读取异常，线程自动恢复：{exc!r}")
+            except Exception:                    # noqa: BLE001
+                pass
+            continue
+        if not raw:
+            try:
+                _log("[launcher] 后端输出流已结束，日志读取线程退出。")
+            except Exception:                    # noqa: BLE001
+                pass
+            return
+        try:
+            _log(_decode_line(raw))
+        except Exception as exc:                 # noqa: BLE001
+            try:
+                _log(f"[launcher] 日志行处理异常，线程继续：{exc!r}")
+            except Exception:                    # noqa: BLE001
+                pass
+
+
 def _start_backend() -> subprocess.Popen:
     py = PYTHON if PYTHON.is_file() else PYTHON_FALLBACK
     if not py.is_file():
@@ -375,15 +454,17 @@ def _start_backend() -> subprocess.Popen:
         creationflags=creationflags,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        bufsize=1, universal_newlines=True,
+        bufsize=0,   # 二进制无缓冲：解码交给 _decode_line，任何字节都不致命
     )
-    # 后台线程逐行读后端输出 → 日志缓冲
+    # 后台线程逐行读后端输出（二进制）→ 解码 → 日志缓冲。
+    # 旧实现用文本模式迭代 proc.stdout，遇到当前 locale 无法解码的字节
+    # （如 cp936 遇到 emoji）会抛 UnicodeDecodeError 静默杀死线程，进而
+    # 管道堵塞拖垮整个后端；这里改为二进制读取 + 永不退出的恢复循环。
     def _drain():
-        try:
-            for line in proc.stdout:
-                _log(line)
-        except Exception:                        # noqa: BLE001
-            pass
+        stdout = proc.stdout
+        if stdout is None:                       # 理论不可达（stdout=PIPE）
+            return
+        _drain_loop(stdout.readline)
     t = threading.Thread(target=_drain, daemon=True)
     t.start()
     return proc

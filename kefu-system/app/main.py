@@ -41,6 +41,7 @@ from app import license as license_mod
 from app.notifier import Notifier
 from app.pipeline import Pipeline
 from app.sender import Sender
+from app.update_service import repair_bundle_root_files
 from app.wechat_service import WeChatService
 
 logger = logging.getLogger("kefu")
@@ -186,6 +187,11 @@ def create_app() -> FastAPI:
     # ------------------------------------------------------------------
     @app.on_event("startup")
     async def _startup() -> None:
+        # 启动自检补写（消除「首跳缺口」）：从旧版升上来的一次 apply 不认识
+        # bundle_root/，版本层里会留下解压产物；这里每次启动检查一次并补写
+        # 安装根白名单文件。幂等 + fail-open（内部吞掉一切异常只打日志），
+        # 必须放在最前面，不依赖数据库与业务组件。
+        repair_bundle_root_files()
         db = Database()
         notifier = Notifier()
         notifier.set_loop(asyncio.get_running_loop())

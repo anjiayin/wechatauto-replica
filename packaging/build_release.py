@@ -3,7 +3,9 @@
 
 一站式（技术方案 7/11 节）：
   1. 读 version.txt（版本唯一真源）→ 作为本次发布的 latest
-  2. 从已构建的 P1 bundle 打 app 增量 zip（仅版本层 kefu-system + wechatauto）
+  2. 从已构建的 P1 bundle 打 app 增量 zip（版本层 kefu-system + wechatauto，
+     并以 bundle_root/ 前缀携带安装根白名单文件 launcher.pyc / updater.pyc /
+     start_kefu.bat）
   3. 算 size / sha256
   4. 生成 manifest.json（channel / sequence / latest / packages / assets …）
   5. 用发布机 Ed25519 私钥对 manifest **原始字节**签名 → manifest.json.sig
@@ -50,6 +52,12 @@ VERSION_RE = __import__("re").compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.\-]+)?$")
 
 # 增量包相对 bundle 的版本层内容：apply() 解压后要求 kefu-system/app 存在
 APP_TREES = ("kefu-system", "wechatauto")
+# 安装根白名单：增量包 bundle_root/ 前缀只允许这三个文件（随包修复安装根的
+# launcher.pyc / updater.pyc / start_kefu.bat）。客户端 apply 侧
+# （app/update_service.py 与 packaging/updater.py）以同一份名单为第二道闸，
+# 白名单之外的内容一律拒绝写入安装根。
+ROOT_BUNDLE_FILES = ("launcher.pyc", "updater.pyc", "start_kefu.bat")
+BUNDLE_ROOT_DIR = "bundle_root"
 # manifest 里 assets 段：runtime 层资源（内容寻址，随 P1 bundle 带出）
 ASSET_FILES = {
     "asr-model": ("runtime/asr_models/model.int8.onnx", "sensevoice-int8"),
@@ -116,8 +124,16 @@ def build_manifest(version: str, sequence: int, channel: str, base_url: str,
     }
 
 
-def make_app_zip(version_dir: Path, dst: Path) -> None:
-    """把 app/<版本>/ 下的版本层内容打成增量 zip（zip 根即 kefu-system/wechatauto）。"""
+def make_app_zip(version_dir: Path, dst: Path,
+                 bundle: Path | None = None) -> None:
+    """把 app/<版本>/ 下的版本层内容打成增量 zip（zip 根即 kefu-system/wechatauto）。
+
+    ``bundle`` 给出安装根路径时，额外把安装根白名单文件（ROOT_BUNDLE_FILES）
+    以 ``bundle_root/`` 前缀打进包内，使自动升级能覆盖安装根的 launcher.pyc /
+    updater.pyc / start_kefu.bat。严格白名单：名单之外的一律不打；bundle 缺
+    某个白名单文件则跳过该项（不报错），绝不把 update_config.json / version.txt
+    / data 等其他安装根内容打进包。
+    """
     dst.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for tree in APP_TREES:
@@ -127,6 +143,13 @@ def make_app_zip(version_dir: Path, dst: Path) -> None:
             for f in sorted(src.rglob("*")):
                 if f.is_file():
                     zf.write(f, f.relative_to(version_dir).as_posix())
+        if bundle is not None:
+            for name in ROOT_BUNDLE_FILES:
+                f = Path(bundle) / name
+                if not f.is_file():
+                    print(f"[PKG ] bundle 根缺少 {name}，跳过（不阻断发布）")
+                    continue
+                zf.write(f, f"{BUNDLE_ROOT_DIR}/{name}")
 
 
 def package_entry(pkg_type: str, version: str, file: Path, url: str,
@@ -262,9 +285,9 @@ def release(args: argparse.Namespace) -> None:
     pkg_dir = out / "packages"
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) 增量包
+    # 1) 增量包（bundle 根白名单文件随 bundle_root/ 前缀一并打进包）
     app_zip = pkg_dir / f"app-{version}.zip"
-    make_app_zip(version_dir, app_zip)
+    make_app_zip(version_dir, app_zip, bundle=bundle)
     print(f"[PKG ] app 增量包：{app_zip}  {app_zip.stat().st_size / 1024 / 1024:.1f} MB")
 
     base = (args.base_url or "").strip().rstrip("/")

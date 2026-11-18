@@ -8,6 +8,8 @@
   4. 下载 app 增量包到 data/update/*.part → Range 续传 → sha256 强校验
      → 校验失败判定「疑似被安全软件拦截」，停在原版本
   5. 解压到 app/<新版本>/（逐 entry 防路径穿越）→ 完整性自检
+     → bundle_root/ 白名单文件写入安装根（launcher.pyc / updater.pyc /
+     start_kefu.bat；白名单外拒绝，替换失败重试后降级跳过）
   6. 原子切换 app/current junction → 写 current.json → 提示重启
   7. 失败任何一步都不写 current.json，旧版继续可跑
 
@@ -16,11 +18,13 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # 判定/验签/下载/解压的纯逻辑在版本层 app/update_core.py，与后端更新接口
@@ -85,6 +89,105 @@ def _public_keys() -> dict[str, str]:
 def _rebuild_junction(link: Path, target: Path) -> bool:
     ok, _err = rebuild_junction(link, target)
     return ok
+
+
+# ---------------------------------------------------------------------------
+# 安装根更新（bundle 根 launcher.pyc / updater.pyc / start_kefu.bat）
+# ---------------------------------------------------------------------------
+# 白名单：与 app/update_service.ROOT_BUNDLE_FILES、
+# packaging/build_release.ROOT_BUNDLE_FILES 三处必须一字不差（测试锁死）。
+# 独立更新器必须自带这份实现（不新增对 app.update_core 的符号依赖）：
+# 历史已部署的 updater.pyc 从旧版本层 import update_core，旧 core 里不存在
+# 新增符号，顶层 from-import 会直接 ImportError 炸掉更新器。
+ROOT_BUNDLE_FILES = ("launcher.pyc", "updater.pyc", "start_kefu.bat")
+BUNDLE_ROOT_DIR = "bundle_root"
+_ROOT_COPY_ATTEMPTS = 3
+_ROOT_COPY_RETRY_WAIT = 0.3
+
+
+def install_bundle_root_files(target: Path, bundle: Path) -> None:
+    """把解压目录里 ``bundle_root/`` 下的白名单文件写入安装根（bundle 根）。
+
+    与 app/update_service.install_bundle_root_files 同一实现、同一语义：
+      - 解压目录无 ``bundle_root/`` 子目录 → 直接返回（旧式 zip 向后兼容）；
+      - ``bundle_root/`` 内出现白名单之外的任何条目（含子目录）→ 抛
+        RuntimeError，由调用方 fail-closed 中止升级；
+      - 白名单文件缺失 → 跳过该文件（部分包/旧包兼容，不视为失败）；
+      - 单个文件替换持续失败（OSError）→ 重试 ``_ROOT_COPY_ATTEMPTS`` 次后
+        打 WARN 降级为跳过该文件，继续升级版本层，绝不让客户卡死在旧版
+        （.pyc/.bat 不是可执行映像，运行中的 pythonw 锁的是 pythonw.exe）。
+    """
+    src_dir = target / BUNDLE_ROOT_DIR
+    if not src_dir.is_dir():
+        return
+    for entry in src_dir.iterdir():
+        if entry.name not in ROOT_BUNDLE_FILES:
+            raise RuntimeError(
+                f"更新包 bundle_root 含白名单外条目，已中止安装：{entry.name}")
+    for name in ROOT_BUNDLE_FILES:
+        src = src_dir / name
+        if not src.is_file():
+            continue
+        dst = bundle / name
+        for attempt in range(1, _ROOT_COPY_ATTEMPTS + 1):
+            try:
+                shutil.copyfile(src, dst)
+                break
+            except OSError as exc:
+                if attempt == _ROOT_COPY_ATTEMPTS:
+                    print(f"[update][WARN] 安装根文件 {name} 替换失败"
+                          f"（重试 {_ROOT_COPY_ATTEMPTS} 次），"
+                          f"跳过该文件继续升级：{exc}")
+                else:
+                    time.sleep(_ROOT_COPY_RETRY_WAIT)
+
+
+def _sha256_file(path: Path) -> str | None:
+    """计算文件 sha256；文件不存在 / 不可读返回 None（用于前后对比）。"""
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def repair_bundle_root_files() -> list[str]:
+    """入口自检补写：把版本层遗留的 ``bundle_root/`` 补写到安装根。
+
+    与 app/update_service.repair_bundle_root_files 同一语义（托盘场景：
+    客户只从托盘触发更新、后端可能长期不重启，靠 run() 入口补一次）。
+    数据源是旧 apply 解压遗留的 ``app/<版本>/bundle_root/``——由
+    current.json 的 version 定位版本层目录；current.json 缺失/损坏时
+    read_current_version 返回 "?"，对应目录不存在 → 安全 no-op。
+
+      - 版本层无 ``bundle_root/`` → 直接返回（no-op）；
+      - 复用 install_bundle_root_files：白名单外 RuntimeError、单文件
+        替换失败重试后降级跳过，与升级路径完全一致；
+      - 幂等：每次 run() 都跑，直接覆盖 + sha256 对比决定是否打印
+        INFO（理由同后端：小文件覆盖开销可忽略，且能收敛半途失败状态）；
+      - fail-open：任何异常只打 WARN，绝不阻断本次更新流程。
+    """
+    try:
+        version_layer = APP_DIR / read_current_version(BUNDLE)
+        if not (version_layer / BUNDLE_ROOT_DIR).is_dir():
+            return []                       # 无旧 apply 遗留，no-op
+        before = {name: _sha256_file(BUNDLE / name)
+                  for name in ROOT_BUNDLE_FILES}
+        install_bundle_root_files(version_layer, BUNDLE)
+        updated = [name for name in ROOT_BUNDLE_FILES
+                   if _sha256_file(BUNDLE / name) != before[name]]
+        if updated:
+            print(f"[update] 启动自检：已把版本层遗留的 bundle_root/ 补写到"
+                  f"安装根，更新文件：{', '.join(updated)}"
+                  f"（launcher 下次重启后生效）")
+        return updated
+    except Exception as exc:                # noqa: BLE001 - fail-open
+        print(f"[update][WARN] 启动自检补写安装根文件失败"
+              f"（不阻断本次更新，下次重试）：{exc}")
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +289,9 @@ def _fetch_manifest() -> tuple[dict | None, dict | None, str]:
 
 
 def run() -> int:
+    # 首跳缺口自检：旧版升级遗留的版本层 bundle_root/ 在入口补写一次
+    # （幂等 + fail-open，见 repair_bundle_root_files 文档）。
+    repair_bundle_root_files()
     m, _sig, err = _fetch_manifest()
     if err:
         print(f"[update] 跳过检查：{err}")
@@ -228,6 +334,15 @@ def run() -> int:
         print("[update] 解压内容不完整；停在原版本")
         shutil.rmtree(target, ignore_errors=True)
         return 5
+
+    # 安装根更新：在切 junction 之前把 bundle_root/ 白名单文件写入安装根。
+    # 白名单外条目 → 清理 target、不切 junction、不写 current.json，旧版继续可跑。
+    try:
+        install_bundle_root_files(target, BUNDLE)
+    except RuntimeError as exc:
+        print(f"[update] {exc}；停在原版本")
+        shutil.rmtree(target, ignore_errors=True)
+        return 7
 
     # 原子切换 junction + 写 current.json
     if not _rebuild_junction(APP_DIR / "current", target):

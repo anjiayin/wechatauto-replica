@@ -281,7 +281,6 @@ export function LicenseDialog(props: {
           </Stack>
 
           <Box sx={{ color: 'text.secondary', fontSize: 12, lineHeight: 1.9 }}>
-            <div>授权服务器：{status?.server_url || '-'}</div>
             <div>许可证号：{status?.license_id || '-'}</div>
             <div>到期时间：{formatDate(status?.expires_at ?? '')}</div>
             <div>最近联网确认：{formatDate(status?.last_ok_at ?? '')}</div>

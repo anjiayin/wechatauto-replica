@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import io
 import json
+import logging
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -270,7 +272,282 @@ def test_update_routes_registered():
     }
 
 
+# ---------------------------------------------------------------------------
+# bundle_root：安装根 launcher.pyc / updater.pyc / start_kefu.bat 更新
+# ---------------------------------------------------------------------------
+def _zip_with_bundle_root(zip_path: Path, *, with_root: bool = True,
+                          extra_root: str | None = None) -> None:
+    """构造真实 zip：版本层 + 可选 bundle_root/ 前缀（可注入白名单外文件）。"""
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("kefu-system/app/marker.pyc", b"v-new")
+        if with_root:
+            zf.writestr("bundle_root/launcher.pyc", b"LAUNCHER-NEW")
+            zf.writestr("bundle_root/updater.pyc", b"UPDATER-NEW")
+            zf.writestr("bundle_root/start_kefu.bat", b"START-BAT-NEW")
+        if extra_root:
+            zf.writestr(f"bundle_root/{extra_root}", b"EVIL")
+    zip_path.write_bytes(buf.getvalue())
+
+
+def _install_old_bundle_root(bundle: Path) -> None:
+    """在安装根放旧版白名单文件，验证升级后确实被替换。"""
+    (bundle / "launcher.pyc").write_bytes(b"LAUNCHER-OLD")
+    (bundle / "updater.pyc").write_bytes(b"UPDATER-OLD")
+
+
+def test_apply_installs_bundle_root_files(monkeypatch, svc, tmp_path):
+    """含 bundle_root/ 的 zip：安装根三个白名单文件被更新，junction 照常切换。"""
+    bundle = tmp_path / "bundle"
+    _make_current_junction(bundle, "1.2.1")
+    _install_old_bundle_root(bundle)
+    (bundle / "current.json").write_text(
+        json.dumps({"version": "1.2.1", "active": "1.2.1"}),
+        encoding="utf-8")
+    _zip_with_bundle_root(bundle / "data" / "update" / "app-1.2.2.zip")
+    monkeypatch.setattr(us, "bundle_root", lambda: bundle)
+    _prepare_done_job(svc, "1.2.2")
+
+    code, payload = svc.apply()
+    assert code == 200, payload
+    assert (bundle / "launcher.pyc").read_bytes() == b"LAUNCHER-NEW"
+    assert (bundle / "updater.pyc").read_bytes() == b"UPDATER-NEW"
+    assert (bundle / "start_kefu.bat").read_bytes() == b"START-BAT-NEW"
+    # 版本层与 junction 照常切换
+    assert (bundle / "app" / "1.2.2" / "kefu-system" / "app" / "marker.pyc").is_file()
+    assert (bundle / "app" / "current").resolve() == \
+        (bundle / "app" / "1.2.2").resolve()
+    assert json.loads((bundle / "current.json").read_text(
+        encoding="utf-8"))["version"] == "1.2.2"
+    assert svc.status()["state"] == "applied"
+
+
+def test_apply_old_style_zip_leaves_bundle_root_untouched(
+        monkeypatch, svc, tmp_path):
+    """向后兼容：zip 无 bundle_root/ 时行为与从前完全一致，安装根不动。"""
+    bundle = tmp_path / "bundle"
+    _make_current_junction(bundle, "1.2.1")
+    _install_old_bundle_root(bundle)
+    (bundle / "current.json").write_text(
+        json.dumps({"version": "1.2.1", "active": "1.2.1"}),
+        encoding="utf-8")
+    _zip_with_bundle_root(bundle / "data" / "update" / "app-1.2.2.zip",
+                          with_root=False)
+    monkeypatch.setattr(us, "bundle_root", lambda: bundle)
+    _prepare_done_job(svc, "1.2.2")
+
+    code, _ = svc.apply()
+    assert code == 200
+    assert (bundle / "launcher.pyc").read_bytes() == b"LAUNCHER-OLD"
+    assert (bundle / "updater.pyc").read_bytes() == b"UPDATER-OLD"
+    assert not (bundle / "start_kefu.bat").exists()
+    assert json.loads((bundle / "current.json").read_text(
+        encoding="utf-8"))["version"] == "1.2.2"
+
+
+def test_apply_aborts_on_nonwhitelist_bundle_root_entry(
+        monkeypatch, svc, tmp_path):
+    """zip 投毒第二道闸：bundle_root 白名单外条目 → 中止，系统零改动。"""
+    bundle = tmp_path / "bundle"
+    _make_current_junction(bundle, "1.2.1")
+    _install_old_bundle_root(bundle)
+    (bundle / "current.json").write_text(
+        json.dumps({"version": "1.2.1", "active": "1.2.1"}),
+        encoding="utf-8")
+    _zip_with_bundle_root(bundle / "data" / "update" / "app-1.2.2.zip",
+                          extra_root="evil.exe")
+    monkeypatch.setattr(us, "bundle_root", lambda: bundle)
+    _prepare_done_job(svc, "1.2.2")
+
+    code, payload = svc.apply()
+    assert code == 500 and "白名单外" in payload["detail"]
+    assert svc.status()["state"] == "error"
+    # 不切 junction、不写 current.json、安装根旧文件完好
+    assert json.loads((bundle / "current.json").read_text(
+        encoding="utf-8"))["version"] == "1.2.1"
+    assert (bundle / "app" / "current").resolve() == \
+        (bundle / "app" / "1.2.1").resolve()
+    assert (bundle / "launcher.pyc").read_bytes() == b"LAUNCHER-OLD"
+    # target 已清理，不留半成品
+    assert not (bundle / "app" / "1.2.2").exists()
+
+
+def test_apply_degrades_to_skip_when_root_file_locked(
+        monkeypatch, svc, tmp_path, caplog):
+    """根文件替换持续失败（如杀软占用）→ 重试 3 次后跳过该文件，升级继续。"""
+    bundle = tmp_path / "bundle"
+    _make_current_junction(bundle, "1.2.1")
+    _install_old_bundle_root(bundle)
+    (bundle / "current.json").write_text(
+        json.dumps({"version": "1.2.1", "active": "1.2.1"}),
+        encoding="utf-8")
+    _zip_with_bundle_root(bundle / "data" / "update" / "app-1.2.2.zip")
+    monkeypatch.setattr(us, "bundle_root", lambda: bundle)
+    _prepare_done_job(svc, "1.2.2")
+
+    real_copyfile = shutil.copyfile
+    attempts = {"launcher.pyc": 0}
+
+    def flaky_copyfile(src, dst, **kwargs):
+        if Path(dst).name == "launcher.pyc":
+            attempts["launcher.pyc"] += 1
+            raise PermissionError(32, "进程无法访问，文件正被另一进程使用")
+        return real_copyfile(src, dst, **kwargs)
+
+    monkeypatch.setattr(shutil, "copyfile", flaky_copyfile)
+    monkeypatch.setattr(us.time, "sleep", lambda *_: None)
+
+    with caplog.at_level(logging.WARNING, logger="app.update_service"):
+        code, _ = svc.apply()
+    assert code == 200                                    # 升级不被卡死
+    assert attempts["launcher.pyc"] == us._ROOT_COPY_ATTEMPTS
+    assert (bundle / "launcher.pyc").read_bytes() == b"LAUNCHER-OLD"  # 跳过
+    assert (bundle / "updater.pyc").read_bytes() == b"UPDATER-NEW"    # 其余照常
+    assert (bundle / "start_kefu.bat").read_bytes() == b"START-BAT-NEW"
+    assert json.loads((bundle / "current.json").read_text(
+        encoding="utf-8"))["version"] == "1.2.2"
+    assert any("跳过该文件" in r.message for r in caplog.records)
+
+
 def test_license_guard_allows_update_endpoints():
     for p in ("/api/system/update/check", "/api/system/update/download",
               "/api/system/update/status", "/api/system/update/apply"):
         assert license_guard._allowed(p) is True
+
+
+# ---------------------------------------------------------------------------
+# 启动自检补写（首跳缺口）：旧 apply 解压遗留的版本层 bundle_root/ 补写安装根
+# ---------------------------------------------------------------------------
+def _seed_leftover_bundle_root(bundle: Path, version: str = "1.2.4") -> Path:
+    """构造「旧 apply 遗留」现场：版本层 bundle_root/ + 安装根旧文件。
+
+    返回版本层目录（repair 通过 APP_ROOT 的父目录定位它）。
+    """
+    version_layer = bundle / "app" / version
+    (version_layer / "kefu-system" / "app").mkdir(parents=True, exist_ok=True)
+    root = version_layer / "bundle_root"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "launcher.pyc").write_bytes(b"LAUNCHER-NEW")
+    (root / "updater.pyc").write_bytes(b"UPDATER-NEW")
+    (root / "start_kefu.bat").write_bytes(b"START-BAT-NEW")
+    (bundle / "launcher.pyc").write_bytes(b"LAUNCHER-OLD")
+    (bundle / "updater.pyc").write_bytes(b"UPDATER-OLD")
+    return version_layer
+
+
+def test_startup_repair_backfills_bundle_root_files(
+        monkeypatch, tmp_path, caplog):
+    """版本层有遗留 bundle_root/ 且安装根是旧内容 → 补写为新内容并记 INFO。"""
+    bundle = tmp_path / "bundle"
+    version_layer = _seed_leftover_bundle_root(bundle)
+    monkeypatch.setattr(us, "APP_ROOT", version_layer / "kefu-system")
+    monkeypatch.setattr(us, "bundle_root", lambda: bundle)
+
+    with caplog.at_level(logging.INFO, logger="app.update_service"):
+        updated = us.repair_bundle_root_files()
+
+    assert set(updated) == {"launcher.pyc", "updater.pyc", "start_kefu.bat"}
+    assert (bundle / "launcher.pyc").read_bytes() == b"LAUNCHER-NEW"
+    assert (bundle / "updater.pyc").read_bytes() == b"UPDATER-NEW"
+    assert (bundle / "start_kefu.bat").read_bytes() == b"START-BAT-NEW"
+    info = [r.message for r in caplog.records if r.levelno == logging.INFO]
+    assert any("补写到安装根" in m and "launcher.pyc" in m for m in info)
+
+
+def test_startup_repair_is_idempotent(monkeypatch, tmp_path, caplog):
+    """每次启动都跑：内容已一致时不再报「更新」，文件内容保持不变。"""
+    bundle = tmp_path / "bundle"
+    version_layer = _seed_leftover_bundle_root(bundle)
+    monkeypatch.setattr(us, "APP_ROOT", version_layer / "kefu-system")
+    monkeypatch.setattr(us, "bundle_root", lambda: bundle)
+
+    us.repair_bundle_root_files()
+    caplog.clear()                             # 只看第二次（幂等）调用的日志
+    with caplog.at_level(logging.INFO, logger="app.update_service"):
+        updated = us.repair_bundle_root_files()
+
+    assert updated == []                       # 内容一致 → 不再列出更新文件
+    assert (bundle / "launcher.pyc").read_bytes() == b"LAUNCHER-NEW"
+    assert (bundle / "updater.pyc").read_bytes() == b"UPDATER-NEW"
+    assert (bundle / "start_kefu.bat").read_bytes() == b"START-BAT-NEW"
+    assert not any("补写到安装根" in r.message for r in caplog.records)
+
+
+def test_startup_repair_noop_without_leftover(monkeypatch, tmp_path):
+    """版本层无 bundle_root/（正常升级路径或全新安装）→ 无动作不报错。"""
+    bundle = tmp_path / "bundle"
+    version_layer = bundle / "app" / "1.2.4"
+    (version_layer / "kefu-system" / "app").mkdir(parents=True)
+    (bundle / "launcher.pyc").write_bytes(b"LAUNCHER-OLD")
+    monkeypatch.setattr(us, "APP_ROOT", version_layer / "kefu-system")
+    monkeypatch.setattr(us, "bundle_root", lambda: bundle)
+
+    assert us.repair_bundle_root_files() == []
+    assert (bundle / "launcher.pyc").read_bytes() == b"LAUNCHER-OLD"
+    assert not (bundle / "start_kefu.bat").exists()
+
+
+def test_startup_repair_skips_nonwhitelist_entry(
+        monkeypatch, tmp_path, caplog):
+    """遗留目录被塞入白名单外文件 → WARN 不阻断启动，且任何文件都不写入。"""
+    bundle = tmp_path / "bundle"
+    version_layer = _seed_leftover_bundle_root(bundle)
+    (version_layer / "bundle_root" / "evil.exe").write_bytes(b"EVIL")
+    monkeypatch.setattr(us, "APP_ROOT", version_layer / "kefu-system")
+    monkeypatch.setattr(us, "bundle_root", lambda: bundle)
+
+    with caplog.at_level(logging.WARNING, logger="app.update_service"):
+        updated = us.repair_bundle_root_files()
+
+    assert updated == []                       # fail-open：返回空列表不抛异常
+    # 拒收发生在任何写入之前：安装根旧文件原样保留
+    assert (bundle / "launcher.pyc").read_bytes() == b"LAUNCHER-OLD"
+    assert (bundle / "updater.pyc").read_bytes() == b"UPDATER-OLD"
+    assert not (bundle / "start_kefu.bat").exists()
+    assert not (bundle / "evil.exe").exists()
+    assert any("白名单外" in r.message for r in caplog.records)
+
+
+def test_startup_repair_noop_in_dev_mode(monkeypatch, tmp_path):
+    """开发态（bundle_root() 返回 None）→ 直接 no-op，绝不碰源码树。"""
+    version_layer = tmp_path / "app" / "1.2.4"
+    (version_layer / "kefu-system").mkdir(parents=True)
+    (version_layer / "bundle_root").mkdir()
+    (version_layer / "bundle_root" / "launcher.pyc").write_bytes(b"X")
+    monkeypatch.delenv("KEFU_BUNDLE_ROOT", raising=False)
+    monkeypatch.setattr(us, "APP_ROOT", version_layer / "kefu-system")
+
+    assert us.repair_bundle_root_files() == []
+    assert not (version_layer / "launcher.pyc").exists()
+
+
+def test_startup_repair_noop_when_current_junction_layout(
+        monkeypatch, tmp_path):
+    """经 app/current junction 启动（abspath 不跟随链接）也能定位版本层。"""
+    bundle = tmp_path / "bundle"
+    version_layer = _seed_leftover_bundle_root(bundle)
+    # 不建真实 junction：APP_ROOT 用字面 current 路径即可覆盖判定逻辑
+    monkeypatch.setattr(us, "APP_ROOT",
+                        bundle / "app" / "current" / "kefu-system")
+    monkeypatch.setattr(us, "bundle_root", lambda: bundle)
+
+    updated = us.repair_bundle_root_files()
+    # 字面 current 下没有 bundle_root/ → no-op（真实 junction 场景由
+    # mklink 用例覆盖；这里锁定「不会误写到 app/ 层」的底线）
+    assert updated == []
+    assert (bundle / "launcher.pyc").read_bytes() == b"LAUNCHER-OLD"
+
+
+def test_startup_repair_through_real_junction(monkeypatch, tmp_path):
+    """发布态主路径：APP_ROOT 经 app/current junction → 补写真实版本层遗留。"""
+    bundle = tmp_path / "bundle"
+    version_layer = _seed_leftover_bundle_root(bundle)
+    link = _make_current_junction(bundle, "1.2.4")
+    monkeypatch.setattr(us, "APP_ROOT", link / "kefu-system")
+    monkeypatch.setattr(us, "bundle_root", lambda: bundle)
+
+    updated = us.repair_bundle_root_files()
+    assert set(updated) == {"launcher.pyc", "updater.pyc", "start_kefu.bat"}
+    assert (bundle / "launcher.pyc").read_bytes() == b"LAUNCHER-NEW"
+    assert (bundle / "start_kefu.bat").read_bytes() == b"START-BAT-NEW"

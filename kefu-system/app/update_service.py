@@ -12,11 +12,13 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import shutil
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +59,127 @@ def bundle_root() -> Path | None:
             and root.parent.parent.name == "app":
         return root.parent.parent.parent
     return None
+
+
+# ---------------------------------------------------------------------------
+# 安装根更新（bundle 根 launcher.pyc / updater.pyc / start_kefu.bat）
+# ---------------------------------------------------------------------------
+# 白名单：增量包 bundle_root/ 前缀允许写入安装根的文件。与
+# packaging/build_release.ROOT_BUNDLE_FILES、packaging/updater.ROOT_BUNDLE_FILES
+# 三处必须一字不差（测试锁死）；白名单之外的内容一律拒绝，防止 zip 投毒
+# 借 bundle_root 写任意路径（safe_extract 防穿越之后的第二道闸）。
+ROOT_BUNDLE_FILES = ("launcher.pyc", "updater.pyc", "start_kefu.bat")
+BUNDLE_ROOT_DIR = "bundle_root"
+# 根文件替换失败（如被杀软短暂占用）的重试策略：重试后降级为跳过该文件，
+# 绝不让升级卡死在旧版（.pyc/.bat 不是可执行映像，运行中的 pythonw 锁的是
+# pythonw.exe，正常情况下替换不会被占用）。
+_ROOT_COPY_ATTEMPTS = 3
+_ROOT_COPY_RETRY_WAIT = 0.3
+
+
+def install_bundle_root_files(target: Path, bundle: Path) -> None:
+    """把解压目录里 ``bundle_root/`` 下的白名单文件写入安装根（bundle 根）。
+
+    语义：
+      - 解压目录无 ``bundle_root/`` 子目录 → 直接返回（旧式 zip 向后兼容）；
+      - ``bundle_root/`` 内出现白名单之外的任何条目（含子目录）→ 抛
+        RuntimeError，由调用方 fail-closed 中止升级；
+      - 白名单文件缺失 → 跳过该文件（部分包/旧包兼容，不视为失败）；
+      - 单个文件替换持续失败（OSError）→ 重试 ``_ROOT_COPY_ATTEMPTS`` 次后
+        打 WARN 降级为跳过该文件，继续升级版本层；
+      - 其他异常向上抛：调用方在切 junction 之前调用本函数，任何失败都意味着
+        不切 junction、不写 current.json，旧版继续可跑。
+    """
+    src_dir = target / BUNDLE_ROOT_DIR
+    if not src_dir.is_dir():
+        return
+    for entry in src_dir.iterdir():
+        if entry.name not in ROOT_BUNDLE_FILES:
+            raise RuntimeError(
+                f"更新包 bundle_root 含白名单外条目，已中止安装：{entry.name}")
+    for name in ROOT_BUNDLE_FILES:
+        src = src_dir / name
+        if not src.is_file():
+            continue
+        dst = bundle / name
+        for attempt in range(1, _ROOT_COPY_ATTEMPTS + 1):
+            try:
+                shutil.copyfile(src, dst)
+                break
+            except OSError as exc:
+                if attempt == _ROOT_COPY_ATTEMPTS:
+                    logger.warning(
+                        "安装根文件 %s 替换失败（重试 %d 次），跳过该文件继续升级：%s",
+                        name, _ROOT_COPY_ATTEMPTS, exc)
+                else:
+                    time.sleep(_ROOT_COPY_RETRY_WAIT)
+
+
+def _sha256_file(path: Path) -> str | None:
+    """计算文件 sha256；文件不存在 / 不可读返回 None（用于前后对比）。"""
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def repair_bundle_root_files(app_root: Path | None = None,
+                             bundle: Path | None = None) -> list[str]:
+    """启动自检补写：把版本层遗留的 ``bundle_root/`` 补写到安装根。
+
+    背景（「首跳缺口」）：执行 1.2.3 -> 1.2.4 升级的是客户端上仍在运行的
+    旧代码，旧 apply 不认识 ``bundle_root/`` 前缀——那一次升级版本层切到
+    1.2.4 了，但 launcher.pyc / updater.pyc / start_kefu.bat 没有被写入
+    安装根。新版本层（1.2.4）解压时留下的 ``app/<版本>/bundle_root/`` 会
+    一直留在磁盘上，正好作为自检数据源：每次启动检查一次，存在就补写。
+
+    语义：
+      - 安装根定位失败（开发态 / 旧布局，``bundle_root()`` 返回 None）→
+        直接返回（开发态源码树里没有 bundle 根可写，绝不能动）；
+      - 版本层无 ``bundle_root/`` → 直接返回（无首跳缺口，no-op）；
+      - 复用 :func:`install_bundle_root_files`：白名单外条目 RuntimeError、
+        单文件替换失败重试后降级跳过，语义与升级路径完全一致；
+      - 幂等：每次启动都跑。采用「直接覆盖 + sha256 对比决定是否记 INFO」
+        而不是「先比再跳过」——三个文件都是 KB 级小文件，copyfile 开销可
+        忽略；无条件覆盖还能把历史上半途失败（部分文件被占用没写上）的
+        状态收敛到一致，避免比对逻辑本身出 bug 漏补；
+      - fail-open：任何异常只打 WARN，绝不阻断后端启动——这不是升级路径，
+        下次启动还会再试；
+      - 补写成功打 INFO 列出被更新的文件名。launcher.pyc / start_kefu.bat /
+        .pyc 不是可执行映像，Windows 只锁 exe，可被运行中进程直接覆盖；
+        新代码在下次重启 launcher 后生效。
+    """
+    try:
+        target_bundle = bundle if bundle is not None else bundle_root()
+        if target_bundle is None:
+            return []                       # 开发态 / 旧布局：无安装根可补写
+        # 版本层目录 = APP_ROOT 的父目录（APP_ROOT = <版本层>/kefu-system）。
+        # 用 abspath 词法归一化而非 resolve()：junction 启动时 resolve 会把
+        # current 解析成版本号，父目录判定失效（见 bundle_root() 的教训）。
+        version_layer = Path(os.path.abspath(str(app_root or APP_ROOT))).parent
+        if not (version_layer / BUNDLE_ROOT_DIR).is_dir():
+            return []                       # 无旧 apply 遗留，no-op
+        before = {name: _sha256_file(target_bundle / name)
+                  for name in ROOT_BUNDLE_FILES}
+        install_bundle_root_files(version_layer, target_bundle)
+        updated = [name for name in ROOT_BUNDLE_FILES
+                   if _sha256_file(target_bundle / name) != before[name]]
+        if updated:
+            logger.info(
+                "启动自检：已把版本层遗留的 bundle_root/ 补写到安装根，"
+                "更新文件：%s（launcher 下次重启后生效）", ", ".join(updated))
+        else:
+            logger.debug("启动自检：bundle_root/ 遗留目录存在，"
+                         "安装根文件已一致，无需补写")
+        return updated
+    except Exception as exc:                # noqa: BLE001 - fail-open
+        logger.warning(
+            "启动自检补写安装根文件失败（不阻断启动，下次启动将重试）：%s", exc)
+        return []
 
 
 class UpdateService:
@@ -197,6 +320,14 @@ class UpdateService:
             if not (target / "kefu-system" / "app").is_dir():
                 shutil.rmtree(target, ignore_errors=True)
                 raise RuntimeError("解压内容不完整（缺少后端代码）")
+            # 安装根更新：在切 junction 之前把 bundle_root/ 白名单文件写入
+            # bundle 根。本阶段任何异常 → 清理 target、不切 junction、
+            # 不写 current.json，旧版继续可跑（fail-closed）。
+            try:
+                install_bundle_root_files(target, bundle)
+            except Exception:
+                shutil.rmtree(target, ignore_errors=True)
+                raise
             ok, err = core.rebuild_junction(bundle / "app" / "current", target)
             if not ok:
                 raise RuntimeError(err)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -299,3 +300,175 @@ def test_main_no_messagebox_when_mutex_acquired(launcher, monkeypatch):
 
     launcher.main()
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# drain 线程健壮性：任何字节序列/异常都不允许杀死读取线程
+# （drain 死 → 管道堵塞 → 后端事件循环阻塞 → 全局瘫痪）
+# ---------------------------------------------------------------------------
+def test_decode_line_never_raises(launcher):
+    """utf-8/gbk/非法字节/空输入全部返回 str，绝不抛 UnicodeDecodeError。"""
+    assert launcher._decode_line("中文日志".encode("utf-8")) == "中文日志"
+    assert launcher._decode_line("中文日志".encode("gbk")) == "中文日志"
+    # 非法字节（截断的 emoji 头 0xF0 0x9F、非法序列）→ replace 兜底
+    out = launcher._decode_line(b"\xf0\x9f bad")
+    assert isinstance(out, str)
+    # emoji 本身合法 utf-8，应原样保留
+    assert launcher._decode_line("😀".encode("utf-8")) == "😀"
+    assert launcher._decode_line(b"") == ""
+    # 混合：utf-8 前缀 + 尾部非法字节
+    assert launcher._decode_line("ok ".encode("utf-8") + b"\xff\xfe").startswith("ok ")
+
+
+def test_decode_line_prefers_utf8_over_gbk(launcher):
+    """utf-8 可解时优先 utf-8（gbk 对部分 utf-8 字节也能蒙混解码）。"""
+    text = "商机分析完成"
+    assert launcher._decode_line(text.encode("utf-8")) == text
+
+
+class _FakeStdout:
+    """假 stdout：按预设序列返回字节行，耗尽后返回 b"" 模拟 EOF。"""
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    def readline(self) -> bytes:
+        if not self._chunks:
+            return b""
+        return self._chunks.pop(0)
+
+
+class _FlakyStdout:
+    """前 fail_times 次 readline 抛 OSError，之后正常吐预设行直至 EOF。"""
+
+    def __init__(self, fail_times: int, chunks):
+        self._fails = fail_times
+        self._chunks = list(chunks)
+
+    def readline(self) -> bytes:
+        if self._fails > 0:
+            self._fails -= 1
+            raise OSError("simulated pipe error")
+        if not self._chunks:
+            return b""
+        return self._chunks.pop(0)
+
+
+def _run_drain(launcher, readline_obj) -> list[str]:
+    """在线程里跑 _drain_loop，等待退出后返回日志缓冲快照。"""
+    launcher._state["log_lines"].clear()
+    t = threading.Thread(target=launcher._drain_loop, args=(readline_obj.readline,),
+                         daemon=True)
+    t.start()
+    t.join(timeout=5.0)
+    assert not t.is_alive(), "drain 线程必须正常退出，不允许卡死或挂起"
+    return list(launcher._state["log_lines"])
+
+
+def test_drain_loop_survives_invalid_bytes(launcher):
+    """混合合法/非法字节 + 结尾不换行的数据：全部入缓冲，线程正常退出。"""
+    chunks = [
+        b"INFO start\n",
+        "微信消息😀".encode("utf-8") + b"\n",
+        b"\xf0\x9f broken-emoji\n",          # 截断的 emoji 头（非法 utf-8/gbk）
+        b"ok\xff\xfe mixed\n",
+        b"no trailing newline",
+        b"",
+    ]
+    logs = _run_drain(launcher, _FakeStdout(chunks))
+    # 5 行数据 + 1 条 EOF 退出日志（空行被 _log 过滤）
+    assert len(logs) == 6
+    joined = "\n".join(logs)
+    assert "INFO start" in joined
+    assert "微信消息" in joined and "\U0001F600" in joined
+    assert "broken-emoji" in joined, "非法字节行必须被替换/兜底解码，不能杀死线程"
+    assert "no trailing newline" in joined
+    assert any("输出流已结束" in line for line in logs), "EOF 须有退出日志"
+
+
+def test_drain_loop_recovers_from_readline_errors(launcher):
+    """readline 连续抛 OSError 后恢复：后续行仍能读到，线程最终正常退出。"""
+    chunks = [
+        b"before-failure\n",
+        b"after-recovery\n",
+        b"",
+    ]
+    logs = _run_drain(launcher, _FlakyStdout(fail_times=3, chunks=chunks))
+    joined = "\n".join(logs)
+    assert "before-failure" in joined
+    assert "after-recovery" in joined, "异常恢复后必须继续读到后续行"
+    assert len([ln for ln in logs if "自动恢复" in ln]) == 3
+
+
+def test_drain_loop_logs_instead_of_dying_on_log_failure(launcher, monkeypatch):
+    """_log 抛异常也不能让线程退出：记一条继续，直到 EOF。"""
+    launcher._state["log_lines"].clear()
+    calls: list[str] = []
+
+    def flaky_log(line: str) -> None:
+        calls.append(line)
+        if len(calls) <= 2:
+            raise RuntimeError("simulated log failure")
+
+    monkeypatch.setattr(launcher, "_log", flaky_log)
+    chunks = [b"line-one\n", b"line-two\n", b"line-three\n", b""]
+    t = threading.Thread(target=launcher._drain_loop,
+                         args=(_FakeStdout(chunks).readline,), daemon=True)
+    t.start()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+    # 3 行 + 2 次失败后的恢复日志 + 1 条 EOF 退出日志；失败吞掉的行允许丢失，
+    # 但线程必须活到 EOF，后续行必须正常入账
+    assert len(calls) == 5
+    joined_calls = "\n".join(calls)
+    assert "line-two" in joined_calls and "line-three" in joined_calls
+
+
+def test_drain_loop_tolerates_log_failure_in_recovery_path(launcher, monkeypatch):
+    """恢复路径里的 _log 也抛异常时线程仍继续（不因嵌套异常死亡）。"""
+    launcher._state["log_lines"].clear()
+    calls: list[int] = []
+
+    def always_broken_log(line: str) -> None:
+        calls.append(1)
+        raise RuntimeError("log subsystem down")
+
+    monkeypatch.setattr(launcher, "_log", always_broken_log)
+    chunks = [b"a\n", b""]
+    t = threading.Thread(target=launcher._drain_loop,
+                         args=(_FakeStdout(chunks).readline,), daemon=True)
+    t.start()
+    t.join(timeout=5.0)
+    assert not t.is_alive(), "即使 _log 全坏，线程也必须撑到 EOF 才退出"
+
+
+def test_log_lines_deque_maxlen(launcher):
+    """log_lines 用 maxlen 防内存无限增长：超限丢旧行、长度不超上限。"""
+    maxlen = launcher._state["log_lines"].maxlen
+    assert maxlen == 3000
+    launcher._state["log_lines"].clear()
+    for i in range(maxlen + 500):
+        launcher._log(f"line-{i}")
+    with launcher._state["log_lock"]:
+        lines = list(launcher._state["log_lines"])
+    assert len(lines) == maxlen
+    assert "line-0" not in lines[-1], "最旧的行必须被丢弃"
+    assert f"line-{maxlen + 499}" in lines[-1], "最新日志必须保留"
+
+
+def test_start_backend_uses_binary_pipe(launcher):
+    """Popen 必须二进制无缓冲读取（回归守门：禁止文本模式复活）。"""
+    src = LAUNCHER.read_text(encoding="utf-8")
+    start_block = src.split("def _start_backend")[1].split("def _status_url")[0]
+    assert "bufsize=0" in start_block
+    assert "universal_newlines" not in start_block
+    assert "text=True" not in start_block
+    # drain 主循环必须自带恢复逻辑且以 EOF 为唯一退出条件
+    assert "_drain_loop(stdout.readline)" in src
+    loop_block = src.split("def _drain_loop(")[1].split("def _start_backend")[0]
+    assert "while True" in loop_block
+    assert "return" in loop_block and "not raw" in loop_block
+    # 解码兜底永不抛异常
+    assert 'errors="replace"' in src
+    # Edit 控件须显式放宽文本上限
+    assert "EM_SETLIMITTEXT" in src

@@ -37,7 +37,7 @@ Windows 更新打坏并不罕见——一旦它坏了机器码就会漂移、全
 | `active` | 正常，已联网确认 | ✅ |
 | `offline_grace` | 服务器不可达，仍在宽限期内 | ✅ |
 | `unlicensed` | 从未激活 | ❌ |
-| `expired` | 超过许可证到期日 | ❌ |
+| `expired` | 超过许可证到期日，或服务器心跳明确判定过期 | ❌ |
 | `offline_expired` | 离线超过宽限期 | ❌ |
 | `invalid` | 签名错 / 机器码不符 / 格式坏 | ❌ |
 | `revoked` | 服务器明确吊销 | ❌ |
@@ -706,7 +706,7 @@ class LicenseClient:
             return doc
 
     def _load_state(self) -> dict:
-        """读本地状态（last_ok_at / max_seen_ts / revoked 标记）。"""
+        """读本地状态（last_ok_at / max_seen_ts / revoked / server_expired 标记）。"""
         return _read_json(self.state_path) or {}
 
     def _save_state(self, **fields: Any) -> None:
@@ -788,6 +788,18 @@ class LicenseClient:
             return self._finish(LicenseStatus(
                 state="revoked", ok=False,
                 message=f"授权已于 {revoked_at} 被吊销，请联系供应商", **merged))
+
+        # 服务器明确判定过期的持久化标记（fail-closed）：优先于本地 expires_at
+        # 与离线宽限计算。否则供应商在后台把有效期调短/标记过期后，客户端仍会
+        # 拿本地旧证走 7 天宽限继续放行（现场实测踩过）。续期后重新激活、或
+        # 心跳成功拿到新许可证时该标记被清除（见 _install_license / refresh）。
+        server_expired_at = str(
+            state_data.get("server_expired_at") or "").strip()
+        if server_expired_at:
+            return self._finish(LicenseStatus(
+                state="expired", ok=False, days_left=0,
+                message=(f"授权服务器已判定该授权过期（{server_expired_at}），"
+                         "请续费后重新激活"), **merged))
 
         if expires is None:
             return self._finish(LicenseStatus(
@@ -912,7 +924,7 @@ class LicenseClient:
             self._doc_mtime = -1.0
         current = now().isoformat()
         self._save_state(last_ok_at=current, last_error="",
-                         revoked_at="",
+                         revoked_at="", server_expired_at="",
                          max_seen_ts=time.time())
         self._max_seen_ts = time.time()
         logger.info("授权已生效：%s（到期 %s）",
@@ -947,6 +959,8 @@ class LicenseClient:
         """向服务器确认一次（心搏）。成功刷新 last_ok_at，失败改判离线状态。
 
         网络失败**不抛异常**：调用方（后台线程/前端按钮）只需要拿回状态。
+        服务器明确拒绝（``revoked``/``expired``）时会立即停用并落持久化标记，
+        只有网络不可达才走离线宽限。
         """
         if not self.enabled():
             return self.status()
@@ -964,13 +978,20 @@ class LicenseClient:
             self._save_state(last_error=str(exc))
             if exc.code == "revoked":
                 self._save_state(revoked_at=now().strftime("%Y-%m-%d %H:%M"))
-                return self.status(touch=True)
+            elif exc.code == "expired":
+                # 服务器明确说已过期：立即停用（fail-closed），绝不按「断网宽限」
+                # 处理——宽限只保留给网络不可达（code="network" 等）。
+                self._save_state(
+                    server_expired_at=now().strftime("%Y-%m-%d %H:%M"))
             return self.status(touch=True)
         if not data.get("ok", True):
             err = self._server_error(data)
             self._save_state(last_error=str(err))
             if err.code == "revoked":
                 self._save_state(revoked_at=now().strftime("%Y-%m-%d %H:%M"))
+            elif err.code == "expired":
+                self._save_state(
+                    server_expired_at=now().strftime("%Y-%m-%d %H:%M"))
             return self.status(touch=True)
         # 服务端可能顺带续期：返回体里带 license 时覆盖本地
         if isinstance(data.get("license"), dict):
@@ -978,7 +999,8 @@ class LicenseClient:
                 self._install_license(data)
             except LicenseError as exc:
                 logger.warning("服务器续期许可证无效（保留原证）：%s", exc)
-        self._save_state(last_ok_at=now().isoformat(), last_error="")
+        self._save_state(last_ok_at=now().isoformat(), last_error="",
+                         server_expired_at="")
         return self.status(touch=True)
 
 
