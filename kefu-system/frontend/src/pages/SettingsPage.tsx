@@ -1969,6 +1969,9 @@ function DataBillingTab() {
 
       <Divider sx={{ my: 2 }} />
       <Typography variant="subtitle2" sx={{ mb: 1 }}>AI 账单估算</Typography>
+      <Alert severity="info" sx={{ mb: 1.5, py: 0.5 }}>
+        费用为预估，以实际账单为准。
+      </Alert>
       <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
         填写所用 AI 接口的输入/输出单价（当前单价单位：{unitLabel}），系统按每次调用的实际 token 用量自动累计每日估算费用（仅本机估算，非官方账单）。
         用量单独存档，清理分析日志不会影响账单历史；显示 ¥0.00 表示当天没有产生 AI 调用。

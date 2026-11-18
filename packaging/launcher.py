@@ -9,8 +9,8 @@
     「打开操作界面」可再次打开；菜单「查看/隐藏日志」「检查更新」「退出」
   - 日志窗口：自建 GUI 窗口（默认隐藏），捕获后端 stdout/stderr；点关闭按钮
     只隐藏不退进程；只有托盘「退出」才真正停后端并退出
-  - 注入全部环境变量：PATH、QT_ACCESSIBILITY、KEFU_APP_ROOT/DATA_DIR/ASSETS_DIR/
-    VERSION_FILE、KEFU_DELIVERY_SEED、DLL 搜索目录
+  - 注入全部环境变量：PATH、QT_ACCESSIBILITY、KEFU_APP_ROOT/KEFU_BUNDLE_ROOT/
+    KEFU_DATA_DIR/ASSETS_DIR/VERSION_FILE、KEFU_DELIVERY_SEED、DLL 搜索目录
 
 刻意不在本进程 import 业务代码（避免 UIA/COM 线程）；只做进程管理 + 托盘 + 日志。
 """
@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -41,6 +42,9 @@ SEED_JSON = BUNDLE / "delivery_seed.json"
 UPDATE_CONFIG = BUNDLE / "update_config.json"             # 自动更新地址/渠道（发布配置）
 ICON_FILE = BUNDLE / "app.ico"
 MUTEX_NAME = "Local\\WeChatKefuLauncher_SingleInstance"
+DEFAULT_PORT = 8765                                          # 与 run.py 的 DEFAULT_PORT 一致
+SETTING_KEY_PORT = "run.port"                                # 与 run.py/router_settings.py 一致
+DB_NAME = "kefu.sqlite3"                                     # 与 app.config.DB_PATH 一致
 
 def _fatal(msg: str) -> None:
     """pythonw 无控制台：致命错误写文件，便于排查。"""
@@ -62,7 +66,7 @@ except ImportError as exc:                        # pragma: no cover
     raise
 
 _state = {
-    "hwnd": None, "proc": None, "port": 8765, "opened": False, "nid": (1,),
+    "hwnd": None, "proc": None, "port": DEFAULT_PORT, "opened": False, "nid": (1,),
     "log_hwnd": None, "log_edit": None, "log_lines": deque(maxlen=2000),
     "log_lock": threading.Lock(), "log_timer": None,
 }
@@ -129,14 +133,70 @@ def _ensure_current() -> bool:
 # ---------------------------------------------------------------------------
 # 环境装配 + 起后端
 # ---------------------------------------------------------------------------
-def _read_port() -> int:
+def _parse_port(value: object) -> int | None:
+    """把端口取值规整为 1~65535 的整数；非法返回 None（fail-safe）。
+
+    Args:
+        value: 环境变量字符串或配置库里的原始值。
+
+    Returns:
+        合法端口号，或 None（空值/非整数/越界/类型异常）。
+    """
     try:
-        s = os.environ.get("KEFU_PORT", "").strip()
-        if s.isdigit() and 1 <= int(s) <= 65535:
-            return int(s)
-    except Exception:                            # noqa: BLE001
-        pass
-    return 8765
+        port = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def _read_saved_port() -> int | None:
+    """只读查询配置库 ``settings.run.port``；任何异常都回退 None。
+
+    配置库路径与后端 ``app.config.DB_PATH`` 保持一致：优先取 KEFU_DATA_DIR，
+    否则用 bundle 的 data 目录（也是 ``_child_env()`` 注入给后端的目录）。
+    使用 URI ``mode=ro`` 连接，绝不创建/写入 DB，也不与后端抢写锁。
+    """
+    raw_dir = os.environ.get("KEFU_DATA_DIR", "").strip()
+    data_dir = Path(raw_dir) if raw_dir else DATA
+    db_path = data_dir / DB_NAME
+    if not db_path.is_file():
+        return None
+    conn: sqlite3.Connection | None = None
+    try:
+        # as_uri() 会转义路径里的空格/# 等字符；ro 模式下缺表/缺库均不报致命错。
+        conn = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro",
+                               uri=True, timeout=1.0)
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (SETTING_KEY_PORT,)
+        ).fetchone()
+        if not row:
+            return None
+        return _parse_port(row[0])
+    except (sqlite3.Error, OSError, ValueError, TypeError):
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:                  # noqa: BLE001
+                pass
+
+
+def _read_port() -> int:
+    """解析启动器端口：环境变量 KEFU_PORT > 配置库 run.port > 默认 8765。
+
+    与后端 ``run.py::_resolve_address_detail`` 的优先级一致（启动器不传
+    ``--port``，且后端继承的环境变量未被改写，因此不存在第四个来源）。
+    刻意**不**把配置库端口写进 ``KEFU_PORT`` 环境变量：那会抬高配置值的
+    优先级，破坏后端既有的「命令行 > 环境变量 > 配置库 > 默认」语义。
+    """
+    env_port = _parse_port(os.environ.get("KEFU_PORT", ""))
+    if env_port is not None:
+        return env_port
+    saved_port = _read_saved_port()
+    if saved_port is not None:
+        return saved_port
+    return DEFAULT_PORT
 
 
 def _child_env() -> dict:
@@ -144,6 +204,10 @@ def _child_env() -> dict:
     env["PATH"] = str(RUNTIME) + os.pathsep + env.get("PATH", "")
     env["QT_ACCESSIBILITY"] = "1"
     env["KEFU_APP_ROOT"] = str(KEFU)
+    # 权威安装根：后端 update_service.bundle_root() 与托盘 updater.py 都优先
+    # 用它。不能只靠 APP_ROOT 反推——Windows 上 app/current 是 junction，
+    # Path.resolve() 会解析成 app/<版本>，导致安装版被误判为开发态而拒绝更新。
+    env["KEFU_BUNDLE_ROOT"] = str(BUNDLE)
     env["KEFU_DATA_DIR"] = str(DATA)
     env["KEFU_ASSETS_DIR"] = str(RUNTIME)
     env["KEFU_VERSION_FILE"] = str(KEFU / "version.txt")
@@ -325,9 +389,19 @@ def _start_backend() -> subprocess.Popen:
     return proc
 
 
+def _status_url(port: int) -> str:
+    """后端就绪探测 URL（集中拼接，便于测试断言端口来源）。"""
+    return f"http://127.0.0.1:{port}/api/status"
+
+
+def _ui_url(port: int) -> str:
+    """操作界面 URL（集中拼接，确保打开的是解析出的真实端口）。"""
+    return f"http://127.0.0.1:{port}/"
+
+
 def _port_ready(port: int, timeout: float = 30.0) -> bool:
     deadline = time.monotonic() + timeout
-    url = f"http://127.0.0.1:{port}/api/status"
+    url = _status_url(port)
     while time.monotonic() < deadline:
         try:
             with urllib.request.urlopen(url, timeout=1) as resp:
@@ -342,7 +416,7 @@ def _port_ready(port: int, timeout: float = 30.0) -> bool:
 
 
 def _open_ui():
-    url = f"http://127.0.0.1:{_state['port']}/"
+    url = _ui_url(_state["port"])
     webbrowser.open(url)
     _state["opened"] = True
 
@@ -461,10 +535,32 @@ def _wnd_proc(hwnd, msg, wparam, lparam):
     return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
 
+MUTEX_ALREADY_RUNNING_TITLE = "微信客服"
+MUTEX_ALREADY_RUNNING_TEXT = (
+    "微信客服已在运行，请查看系统托盘图标（屏幕右下角）。\n\n"
+    "如需重启服务：请先从托盘图标右键菜单「退出」，再重新启动程序。"
+)
+
+
+def _show_already_running_message() -> None:
+    """重复启动拦截时弹模态提示（pythonw 无控制台，这是用户唯一可见反馈）。
+
+    此时日志窗口尚未创建，仅 _log 用户看不到，故必须用 MessageBox 兜底。
+    弹框失败（如无窗口站）不能影响退出路径，异常吞掉即可。
+    """
+    try:
+        win32gui.MessageBox(0, MUTEX_ALREADY_RUNNING_TEXT,
+                            MUTEX_ALREADY_RUNNING_TITLE,
+                            win32con.MB_OK | win32con.MB_ICONINFORMATION)
+    except Exception:                              # noqa: BLE001
+        pass
+
+
 def main() -> None:
     mutex = _acquire_single_instance()
     if mutex is None:
         _log("已在运行，退出本次启动。")
+        _show_already_running_message()
         return
 
     if not _ensure_current():

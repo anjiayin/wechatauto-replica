@@ -177,3 +177,206 @@ def test_no_base_url_yields_no_packages(br, keypair, tmp_path):
     br.release(args)
     m = json.loads((args.out / "manifest.json").read_bytes())
     assert m["packages"] == []
+
+
+def test_release_fails_fast_when_ossutil_missing(br, keypair, tmp_path, monkeypatch):
+    """真实上传但缺 ossutil：应在打包前立即中止，且提示可操作的安装地址。"""
+    _version_bundle(tmp_path)
+    monkeypatch.setattr(br.shutil, "which", lambda name: None)
+    args = _args(tmp_path, keypair)
+    args.oss_base = "oss://chehche-statics1/wechat-kefu"
+    args.dry_run = False
+    with pytest.raises(SystemExit) as ei:
+        br.release(args)
+    msg = str(ei.value)
+    assert "ossutil" in msg
+    assert "PATH" in msg
+    assert "2.4.1-windows-amd64.zip" in msg  # 明确给出下载指引
+
+
+def test_dry_run_needs_no_ossutil(br, keypair, tmp_path, monkeypatch):
+    """--dry-run 不应因缺 ossutil 而失败。"""
+    _version_bundle(tmp_path)
+    monkeypatch.setattr(br.shutil, "which", lambda name: None)
+    args = _args(tmp_path, keypair)
+    args.oss_base = "oss://chehche-statics1/wechat-kefu"
+    args.dry_run = True
+    br.release(args)  # 不抛异常
+
+
+# ---------------------------------------------------------------------------
+# ossutil 1.x/2.x 兼容：全程打桩 subprocess.run，不触碰真实 OSS 网络
+# ---------------------------------------------------------------------------
+class _Completed:
+    """subprocess.CompletedProcess 的最小替身。"""
+
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _stub_ossutil(br, monkeypatch, fake_run) -> list[list[str]]:
+    """把 ossutil 查找与 subprocess.run 全部换成本地桩，返回调用记录。"""
+    calls: list[list[str]] = []
+
+    def run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return fake_run(cmd)
+
+    monkeypatch.setattr(br, "_find_ossutil", lambda: "ossutil")
+    monkeypatch.setattr(br.subprocess, "run", run)
+    return calls
+
+
+def test_oss_upload_2x_uses_cache_control_flag(br, monkeypatch, tmp_path):
+    """ossutil 2.x 新写法一次成功：不再使用已移除的 --meta。"""
+    calls = _stub_ossutil(br, monkeypatch, lambda cmd: _Completed())
+    f = tmp_path / "manifest.json"
+    f.write_text("{}", encoding="utf-8")
+
+    assert br._oss_upload("oss://bucket/kefu", f, "manifest.json", True) is True
+    assert len(calls) == 1
+    assert calls[0][-2:] == ["--cache-control", "no-cache"]
+    assert "--meta" not in calls[0]
+
+
+def test_oss_upload_1x_legacy_meta_flag(br, monkeypatch, tmp_path):
+    """ossutil 1.x 不认 --cache-control 时，回退 --meta 仍可设置 no-cache。"""
+    def fake_run(cmd):
+        if "--cache-control" in cmd:
+            return _Completed(1, stderr="Error: unknown flag: --cache-control")
+        return _Completed()
+
+    calls = _stub_ossutil(br, monkeypatch, fake_run)
+    f = tmp_path / "manifest.json"
+    f.write_text("{}", encoding="utf-8")
+
+    assert br._oss_upload("oss://bucket/kefu", f, "manifest.json", True) is True
+    assert len(calls) == 2
+    assert "--meta" in calls[1]
+    assert calls[1][-1] == "Cache-Control:no-cache"
+
+
+def test_oss_upload_falls_back_to_plain_when_headers_unsupported(
+        br, monkeypatch, tmp_path, capsys):
+    """两种 header 写法都被拒时降级为普通上传并告警，发布不应被阻断。"""
+    def fake_run(cmd):
+        for flag in ("--cache-control", "--meta"):
+            if flag in cmd:
+                return _Completed(1, stderr=f"Error: unknown flag: {flag}")
+        return _Completed(stdout="upload ok")
+
+    calls = _stub_ossutil(br, monkeypatch, fake_run)
+    f = tmp_path / "manifest.json"
+    f.write_text("{}", encoding="utf-8")
+
+    assert br._oss_upload("oss://bucket/kefu", f, "manifest.json", True) is True
+    assert len(calls) == 3
+    assert "--cache-control" not in calls[-1] and "--meta" not in calls[-1]
+    out = capsys.readouterr().out
+    assert "[WARN]" in out and "Cache-Control:no-cache" in out
+    assert "降级为普通上传" in out
+
+
+@pytest.mark.parametrize("no_cache", [False, True])
+def test_oss_upload_real_failure_returns_false(
+        br, monkeypatch, tmp_path, capsys, no_cache):
+    """真实上传失败（鉴权/网络）无论是否 no_cache 都必须返回 False。"""
+    def fake_run(cmd):
+        return _Completed(1, stderr="Error: AccessDenied: You have no write permission")
+
+    calls = _stub_ossutil(br, monkeypatch, fake_run)
+    f = tmp_path / "manifest.json"
+    f.write_text("{}", encoding="utf-8")
+
+    assert br._oss_upload("oss://bucket/kefu", f, "manifest.json", no_cache) is False
+    out = capsys.readouterr().out
+    assert "上传失败 manifest.json" in out
+    assert "已上传" not in out
+    assert "AccessDenied" in out
+    assert len(calls) == (3 if no_cache else 1)
+
+
+def test_release_manifest_header_failure_does_not_block(
+        br, keypair, tmp_path, monkeypatch, capsys):
+    """端到端：2.x 拒收 header flag 时 manifest/sig 仍能普通上传，发布完成。"""
+    _version_bundle(tmp_path)
+    uploaded: dict[str, bytes] = {}
+
+    def fake_run(cmd):
+        source, dest = cmd[2], cmd[3]
+        if "--cache-control" in cmd or "--meta" in cmd:
+            return _Completed(1, stderr="Error: unknown flag (ossutil 2.4.1)")
+        if dest.startswith("oss://"):
+            uploaded[dest] = Path(source).read_bytes()
+            return _Completed(stdout="upload ok")
+        # 回读：把上传时记录的内容写回本地，模拟真实下载
+        Path(dest).write_bytes(uploaded[source])
+        return _Completed(stdout="download ok")
+
+    _stub_ossutil(br, monkeypatch, fake_run)
+    args = _args(tmp_path, keypair)
+    args.oss_base = "oss://bucket/kefu/stable"
+    args.dry_run = False
+
+    br.release(args)  # 不得抛 SystemExit
+
+    assert any(k.endswith("/packages/app-1.2.2.zip") for k in uploaded)
+    assert any(k.endswith("/manifest.json") for k in uploaded)
+    assert any(k.endswith("/manifest.json.sig") for k in uploaded)
+    out = capsys.readouterr().out
+    assert "回读校验通过" in out
+    assert "[WARN]" in out and "降级为普通上传" in out
+
+
+def test_release_package_upload_failure_is_fail_closed(
+        br, keypair, tmp_path, monkeypatch):
+    """包上传失败必须中止，manifest 绝不能被发布。"""
+    _version_bundle(tmp_path)
+    uploaded: dict[str, bytes] = {}
+
+    def fake_run(cmd):
+        source, dest = cmd[2], cmd[3]
+        if dest.startswith("oss://"):
+            if "packages/" in dest:
+                return _Completed(1, stderr="Error: AccessDenied")
+            uploaded[dest] = Path(source).read_bytes()
+        return _Completed()
+
+    _stub_ossutil(br, monkeypatch, fake_run)
+    args = _args(tmp_path, keypair)
+    args.oss_base = "oss://bucket/kefu/stable"
+    args.dry_run = False
+
+    with pytest.raises(SystemExit) as ei:
+        br.release(args)
+    assert "包上传失败" in str(ei.value)
+    assert not any(k.endswith("/manifest.json") or k.endswith("/manifest.json.sig")
+                   for k in uploaded)
+
+
+def test_release_readback_mismatch_is_fail_closed(
+        br, keypair, tmp_path, monkeypatch):
+    """回读 sha256 不一致必须中止，manifest 绝不能被发布。"""
+    _version_bundle(tmp_path)
+    uploaded: dict[str, bytes] = {}
+
+    def fake_run(cmd):
+        source, dest = cmd[2], cmd[3]
+        if dest.startswith("oss://"):
+            uploaded[dest] = Path(source).read_bytes()
+            return _Completed()
+        Path(dest).write_bytes(b"CORRUPT")  # 模拟回读内容损坏
+        return _Completed()
+
+    _stub_ossutil(br, monkeypatch, fake_run)
+    args = _args(tmp_path, keypair)
+    args.oss_base = "oss://bucket/kefu/stable"
+    args.dry_run = False
+
+    with pytest.raises(SystemExit) as ei:
+        br.release(args)
+    assert "回读校验失败" in str(ei.value)
+    assert not any(k.endswith("/manifest.json") or k.endswith("/manifest.json.sig")
+                   for k in uploaded)

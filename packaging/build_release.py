@@ -158,27 +158,84 @@ def _refuse_private_key_in(keys: Path, *dirs: Path) -> None:
         pass
 
 
+OSSUTIL_MISSING_HINT = (
+    "[OSS ] 未找到 ossutil（PATH 里既无 ossutil 也无 ossutil64）。"
+    "发布工具靠 PATH 查找 ossutil，不读 ~/.ossutilconfig 定位程序。\n"
+    "       请先安装 ossutil 2.0（Windows x64）：\n"
+    "         https://gosspublic.alicdn.com/ossutil/v2/2.4.1/ossutil-2.4.1-windows-amd64.zip\n"
+    "       解压后把含 ossutil.exe 的目录加入 PATH，重开终端，再执行 "
+    "`ossutil --version` 与 `ossutil ls oss://<bucket>` 验证。" )
+
+
+def _find_ossutil() -> str | None:
+    """定位 ossutil 可执行文件（1.x 叫 ossutil64，2.x 叫 ossutil）。"""
+    return shutil.which("ossutil") or shutil.which("ossutil64")
+
+
+def require_ossutil() -> str:
+    """需要上传时调用：找不到 ossutil 立即给出可操作提示并中止（fail-loud）。"""
+    exe = _find_ossutil()
+    if not exe:
+        raise SystemExit("[FATAL] " + OSSUTIL_MISSING_HINT)
+    return exe
+
+
 def _oss_upload(oss_base: str, local_file: Path, remote_name: str,
                 no_cache: bool = False) -> bool:
-    """用 ossutil 上传单个文件；返回是否成功。"""
-    ossutil = shutil.which("ossutil") or shutil.which("ossutil64")
+    """用 ossutil 上传单个文件；返回是否成功。
+
+    ``no_cache`` 只给 manifest / sig 设置 ``Cache-Control: no-cache``，是防止
+    客户端拿到旧 manifest 的**优化项**，不是发布正确性的前提。ossutil 2.x 用
+    ``--cache-control``（1.x 的 ``--meta`` 已被移除），故依次尝试两种写法；
+    都不可用就降级为普通上传并告警，绝不因 header 设置失败阻断发布。
+
+    降级不吞真实故障：最后兜底的普通上传本身仍严格检查 returncode，网络/
+    权限等真实上传失败一律返回 False；包文件（no_cache=False）只有一次普通
+    上传，行为与修复前完全一致。
+    """
+    ossutil = _find_ossutil()
     if not ossutil:
+        print("[FATAL] " + OSSUTIL_MISSING_HINT)
         return False
     remote = f"{oss_base.rstrip('/')}/{remote_name}"
-    cmd = [ossutil, "cp", str(local_file), remote, "-f"]
-    if no_cache:
-        cmd += ["--meta", "Cache-Control:no-cache"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    base_cmd = [ossutil, "cp", str(local_file), remote, "-f"]
+
+    # 1.x/2.x 写法按新→旧尝试；普通上传（包文件）不参与 header 尝试。
+    variants: tuple[tuple[str, tuple[str, ...]], ...] = (
+        (("2.x", ("--cache-control", "no-cache")),
+         ("1.x", ("--meta", "Cache-Control:no-cache")))
+        if no_cache else (("", ()),)
+    )
+    for label, extra in variants:
+        r = subprocess.run(base_cmd + list(extra), capture_output=True, text=True)
+        # ossutil 2.x 成功信息走 stdout，失败细节可能在任一输出流，二者都带上便于排障
+        detail = (r.stderr.strip() or r.stdout.strip())[:500]
+        if r.returncode == 0:
+            print(f"[OSS ] 已上传 {remote_name}")
+            return True
+        if not no_cache:
+            print(f"[OSS ] 上传失败 {remote_name}：{detail}")
+            return False
+        print(f"[OSS ] 设置 Cache-Control:no-cache 失败（ossutil {label} 写法）："
+              f"{detail[:200]}；继续尝试其它写法")
+
+    # 两种 header 写法均不可用：普通上传兜底。此处失败就是真实上传失败，必须 False。
+    r = subprocess.run(base_cmd, capture_output=True, text=True)
+    detail = (r.stderr.strip() or r.stdout.strip())[:500]
     if r.returncode != 0:
-        print(f"[OSS ] 上传失败 {remote_name}：{r.stderr.strip()[:300]}")
+        print(f"[OSS ] 上传失败 {remote_name}：{detail}")
         return False
+    print(f"[WARN] {remote_name} 无法设置 Cache-Control:no-cache"
+          "（当前 ossutil 版本不支持上述写法），已降级为普通上传："
+          "OSS 直连域名默认不强缓存，发布继续。")
     print(f"[OSS ] 已上传 {remote_name}")
     return True
 
 
 def _oss_readback(oss_base: str, remote_name: str, dst: Path) -> bool:
-    r = shutil.which("ossutil") or shutil.which("ossutil64")
+    r = _find_ossutil()
     if not r:
+        print("[FATAL] " + OSSUTIL_MISSING_HINT)
         return False
     p = subprocess.run([r, "cp", f"{oss_base.rstrip('/')}/{remote_name}", str(dst), "-f"],
                        capture_output=True, text=True)
@@ -186,6 +243,10 @@ def _oss_readback(oss_base: str, remote_name: str, dst: Path) -> bool:
 
 
 def release(args: argparse.Namespace) -> None:
+    # 需要真实上传时最先校验 ossutil，避免白跑打包/签名才在上传环节失败
+    if getattr(args, "oss_base", "") and not getattr(args, "dry_run", False):
+        require_ossutil()
+
     version = args.version.strip()
     if not VERSION_RE.match(version):
         raise SystemExit(f"[FATAL] 非法版本号：{version!r}")

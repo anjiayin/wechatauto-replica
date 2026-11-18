@@ -31,7 +31,6 @@
 from __future__ import annotations
 
 import argparse
-import compileall
 import json
 import os
 import shutil
@@ -112,19 +111,45 @@ def _find_ffmpeg() -> Path:
     raise SystemExit("[FATAL] 找不到 ffmpeg.exe，请用 --ffmpeg 指定")
 
 
-def _pyc_all(root: Path, label: str) -> tuple[int, int]:
-    """把 root 下所有 .py 编成 legacy .pyc（与 .py 同目录），再删掉 .py。"""
-    ok = compileall.compile_dir(
-        str(root), quiet=2, legacy=True, force=True,
-        rx=None, workers=1,
-    )
-    if not ok:
-        raise SystemExit(f"[FATAL] {label} 编译存在失败文件")
+def _compiler_python(python_dir: Path) -> Path:
+    """返回用于编译 pyc 的解释器：**必须**是 bundle 内置的 embed python。
+
+    关键（2026-11-18 事故）：pyc 的 magic number 必须与运行时解释器一致，否则
+    启动即 ``Bad magic number in .pyc file`` 秒退。曾因 PATH 里的 python 是
+    3.13（veighna_studio）而 embed 是 3.12.10，重构打包后产出的 pyc 全部无法
+    加载。用 embed 自带的 python.exe 编译可从根本上保证 magic 一致——无论
+    build_p1.py 自身被哪个 Python 运行。
+    """
+    py = python_dir / ("python.exe" if os.name == "nt" else "python")
+    if not py.is_file():
+        raise SystemExit(f"[FATAL] 找不到 embed 解释器，无法编译 pyc：{py}")
+    return py
+
+
+def _assert_magic(py_exe: Path) -> str:
+    """读编译器的 MAGIC_NUMBER；与 embed 运行库一致性由「用它自己编译」保证。"""
+    r = subprocess.run([str(py_exe), "-c",
+                        "import importlib.util,sys;sys.stdout.write(importlib.util.MAGIC_NUMBER.hex())"],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or len(r.stdout.strip()) != 8:
+        raise SystemExit(f"[FATAL] 读取 embed Python magic 失败：{r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def _pyc_all(root: Path, label: str, py_exe: Path) -> tuple[int, int]:
+    """把 root 下所有 .py 编成 legacy .pyc（用 embed python），再删掉 .py。"""
+    # 用 embed 解释器编译：产出 pyc 的 magic 与运行时 100% 一致。
+    r = subprocess.run(
+        [str(py_exe), "-m", "compileall", "-b", "-q", "-f", "-j", "1", str(root)],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit(f"[FATAL] {label} 编译失败：{(r.stderr or r.stdout).strip()[:800]}")
     py_files = list(root.rglob("*.py"))
     for f in py_files:
         f.unlink()
     pyc = len(list(root.rglob("*.pyc")))
-    print(f"[PYC ] {label:<24} 编译并删除 {len(py_files)} 个 .py，现有 {pyc} 个 .pyc")
+    print(f"[PYC ] {label:<24} 编译并删除 {len(py_files)} 个 .py，现有 {pyc} 个 .pyc"
+          f"（embed magic={_assert_magic(py_exe)}）")
     return len(py_files), pyc
 
 
@@ -168,6 +193,9 @@ def build(args: argparse.Namespace) -> None:
     pth_files = list(python_dir.glob("python*._pth"))
     if len(pth_files) != 1:
         raise SystemExit(f"[FATAL] 期望 1 个 ._pth，实际 {pth_files}")
+    # embed 解释器确定后，全程用它编译 pyc（magic 与运行时一致，防启动秒退）。
+    compiler_py = _compiler_python(python_dir)
+    print(f"[PYC ] 编译解释器 = embed {compiler_py.name} magic={_assert_magic(compiler_py)}")
     pth = pth_files[0]
     pth.write_text(
         "python312.zip\n"
@@ -230,15 +258,15 @@ def build(args: argparse.Namespace) -> None:
     # 6) pyc 化，删除所有人工可读 .py
     # site-packages：全量构建才编译；--skip-site 复用时它已是 pyc（无 .py 可编）。
     if not args.skip_site:
-        _pyc_all(site_dir, "site-packages")
+        _pyc_all(site_dir, "site-packages", compiler_py)
     else:
         print("[SKIP] site-packages 已是 pyc，跳过其编译")
     # 业务代码 + 根脚本：每次都重新复制并编译删源（源码随 main 变化）。
-    _pyc_all(app_root, "app/<version>")
+    _pyc_all(app_root, "app/<version>", compiler_py)
     for name in ("launcher.py", "updater.py", "selftest_p1.py"):
         src = REPO_ROOT / "packaging" / name
         _copy_file(src, out / name, name)
-    _pyc_all(out, "bundle 根脚本")   # launcher/updater/selftest 也编译删源
+    _pyc_all(out, "bundle 根脚本", compiler_py)   # launcher/updater/selftest 也编译删源
 
     # 7) current.json + app/current junction
     (out / "current.json").write_text(

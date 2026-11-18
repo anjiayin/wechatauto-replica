@@ -36,13 +36,23 @@ def bundle_root() -> Path | None:
     """定位安装根（三层布局的 bundle）。
 
     发布态 APP_ROOT = <bundle>/app/current/kefu-system；显式环境变量优先。
-    开发态（APP_ROOT = 仓库/kefu-system）返回 None，接口据此报告「未安装为
-    客户端版本」，避免误操作源码目录。
+
+    ⚠️ 关键：**不能**用 ``Path.resolve()`` 做结构判定。Windows 上
+    ``app/current`` 是目录 junction，``resolve()`` 会跟随它并解析成
+    ``app/<版本>``，于是 ``parent.name == "current"`` 永远不成立——所有经
+    junction 启动的安装版都会被误判为开发态，download/apply 被 409 拦住。
+    这里改用 ``os.path.abspath`` 只做词法归一化（不跟随链接，但会消 ``..``
+    并转绝对路径），保留 ``current`` 字面量。
+
+    开发态（APP_ROOT = 仓库/kefu-system）与旧 P0 两层布局仍返回 None，
+    接口据此报告「未安装为客户端版本」，避免误操作源码/旧布局目录。
     """
     explicit = os.environ.get("KEFU_BUNDLE_ROOT", "").strip()
     if explicit:
         return Path(explicit)
-    root = Path(APP_ROOT).resolve()
+    # abspath 不跟随 Windows junction / symlink，只做词法归一化；
+    # Path.resolve() 会把 current 解析成 1.2.1/1.2.2，正是本次故障根因。
+    root = Path(os.path.abspath(str(APP_ROOT)))
     if root.name == "kefu-system" and root.parent.name == "current" \
             and root.parent.parent.name == "app":
         return root.parent.parent.parent

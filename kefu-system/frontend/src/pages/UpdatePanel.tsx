@@ -202,8 +202,7 @@ export function UpdateDialog({ open, onClose, check }: {
       <DialogContent dividers>
         {!update && !applied && (
           <Alert severity="info" sx={{ mb: 2 }}>
-            当前已经是最新版本（v{__APP_VERSION__}）。
-            {c?.reason ? ` ${c.reason}` : ''}
+            当前已经是最新版本（v{__APP_VERSION__}）
           </Alert>
         )}
         {update && c && (
@@ -341,7 +340,7 @@ export function UpdateSettingsTab() {
             <Typography variant="body2" color="text.secondary">
               {hasUpdate(c)
                 ? c.action === 'forced' ? '需要强制更新后才能继续使用' : '发现新版本，可点击「查看更新」安装'
-                : c.reason || '当前已是最新版本'}
+                : `当前已经是最新版本（v${__APP_VERSION__}）`}
             </Typography>
             {c.notes && (
               <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>

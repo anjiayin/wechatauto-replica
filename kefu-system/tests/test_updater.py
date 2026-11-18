@@ -28,6 +28,19 @@ def updater():
     return mod
 
 
+# ---- 安装根定位（与后端 update_service.bundle_root 同一优先级） ----
+def test_resolve_bundle_explicit_wins(updater, monkeypatch, tmp_path):
+    monkeypatch.delenv("KEFU_BUNDLE_ROOT", raising=False)
+    assert updater.resolve_bundle(str(tmp_path)) == tmp_path
+    assert updater.resolve_bundle("   ") == UPDATER.parent
+
+
+def test_resolve_bundle_from_environment(updater, monkeypatch, tmp_path):
+    monkeypatch.setenv("KEFU_BUNDLE_ROOT", str(tmp_path))
+    assert updater.resolve_bundle() == tmp_path
+    assert updater.resolve_bundle("") == tmp_path
+
+
 # ---- 版本比较 ----
 def test_version_numeric_order(updater):
     assert updater.compare_versions("1.9", "1.10") < 0

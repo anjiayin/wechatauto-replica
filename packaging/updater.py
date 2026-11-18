@@ -42,7 +42,21 @@ except ModuleNotFoundError:                      # pragma: no cover - 开发态
         safe_extract, verify_manifest,
     )
 
-BUNDLE = Path(__file__).resolve().parent
+BUNDLE_FILE = Path(__file__).resolve()
+
+
+def resolve_bundle(explicit: str = "") -> Path:
+    """定位安装根：launcher 注入的 KEFU_BUNDLE_ROOT 优先，否则按脚本位置。
+
+    与后端 update_service.bundle_root() 保持同一优先级顺序。updater.pyc 位于
+    bundle 根（不经过 app/current junction），脚本自身位置通常已是安装根；
+    显式环境变量让托盘与界面两条更新链路使用同一个权威来源。
+    """
+    text = str(explicit or "").strip() or os.environ.get("KEFU_BUNDLE_ROOT", "").strip()
+    return Path(text) if text else BUNDLE_FILE.parent
+
+
+BUNDLE = resolve_bundle()
 DATA = BUNDLE / "data"
 CURRENT_JSON = BUNDLE / "current.json"
 APP_DIR = BUNDLE / "app"
