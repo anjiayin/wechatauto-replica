@@ -1,0 +1,5 @@
+{
+  "manifest_url": "https://chehche-statics1.oss-cn-beijing.aliyuncs.com/wechat-kefu",
+  "channel": "stable",
+  "_note": "OSS 上 manifest.json 所在目录的完整地址（末尾不要带 /manifest.json）。留空=不检查更新（fail-safe）。由 build_p1 --manifest-url 或发布流程写入 bundle 根的 update_config.json。"
+}

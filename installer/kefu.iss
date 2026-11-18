@@ -61,6 +61,7 @@ Source: "{#SourcePath}\current.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourcePath}\version.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourcePath}\app.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourcePath}\delivery_seed.json"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourcePath}\update_config.json"; DestDir: "{app}"; Flags: ignoreversion
 ; 版本层与稳定层（app\current junction 不在此列，由 launcher 重建）
 Source: "{#SourcePath}\app\*"; DestDir: "{app}\app"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourcePath}\runtime\*"; DestDir: "{app}\runtime"; Flags: ignoreversion recursesubdirs createallsubdirs

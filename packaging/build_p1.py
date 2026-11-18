@@ -254,13 +254,32 @@ def build(args: argparse.Namespace) -> None:
     #     delivery_seed.json：鉴权生产地址 + 预置商机类型，由 launcher 注入
     #     KEFU_DELIVERY_SEED 让后端首次初始化时应用；app.ico 供托盘/快捷方式/安装包用。
     assets = REPO_ROOT / "installer" / "assets"
-    for fname in ("delivery_seed.json", "app.ico"):
+    for fname in ("delivery_seed.json", "app.ico", "update_config.json"):
         src = assets / fname
         if src.is_file():
             _copy_file(src, out / fname, fname)
             print(f"[ASSET] {fname} -> bundle 根")
         else:
             print(f"[WARN ] 缺少交付资源 {src}（跳过）")
+
+    # 8c) 发布时可命令行覆盖更新地址/渠道（build_release 或手工传参）。
+    #     update_config.json 始终是 bundle 根的一份 JSON；launcher 读取后注入
+    #     KEFU_UPDATE_MANIFEST_URL / KEFU_UPDATE_CHANNEL 给后端与托盘更新器。
+    ucfg_path = out / "update_config.json"
+    if getattr(args, "manifest_url", "") or getattr(args, "channel", ""):
+        try:
+            ucfg = json.loads(ucfg_path.read_text(encoding="utf-8")) \
+                if ucfg_path.is_file() else {}
+        except Exception:                        # noqa: BLE001
+            ucfg = {}
+        if args.manifest_url:
+            ucfg["manifest_url"] = args.manifest_url.strip().rstrip("/")
+        if args.channel:
+            ucfg["channel"] = args.channel.strip()
+        ucfg_path.write_text(json.dumps(ucfg, ensure_ascii=False, indent=2),
+                             encoding="utf-8")
+        print(f"[UPDT ] update_config.json -> url={ucfg.get('manifest_url')!r} "
+              f"channel={ucfg.get('channel')!r}")
 
     # 9) CMD 启动脚本（GBK + CRLF）
     starter_src = REPO_ROOT / "packaging" / "start_p1.bat"
@@ -301,6 +320,8 @@ def main() -> None:
     p.add_argument("--ffmpeg", type=Path, default=None)
     p.add_argument("--test-wav", type=Path, default=DEFAULT_WAV)
     p.add_argument("--skip-site", action="store_true", help="复用已有 site-packages（已 pyc 化）")
+    p.add_argument("--manifest-url", default="", help="OSS manifest.json 所在目录完整地址（发布时填）")
+    p.add_argument("--channel", default="", help="更新渠道，默认 stable")
     build(p.parse_args())
 
 

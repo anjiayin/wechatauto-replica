@@ -76,6 +76,29 @@ def test_child_env_injects_delivery_seed(launcher, monkeypatch, tmp_path):
     assert "KEFU_DELIVERY_SEED" not in env2
 
 
+def test_child_env_injects_update_config(launcher, monkeypatch, tmp_path):
+    """bundle 根 update_config.json 须注入更新地址/渠道；空或非法地址不注入。"""
+    cfg = tmp_path / "update_config.json"
+    monkeypatch.setattr(launcher, "UPDATE_CONFIG", cfg)
+    cfg.write_text(json.dumps({"manifest_url": "https://cdn.example.com/kefu/stable/",
+                               "channel": "beta"}), encoding="utf-8")
+    env = launcher._child_env()
+    assert env["KEFU_UPDATE_MANIFEST_URL"] == "https://cdn.example.com/kefu/stable"
+    assert env["KEFU_UPDATE_CHANNEL"] == "beta"
+
+    # 空地址 fail-safe：不注入 manifest url
+    cfg.write_text(json.dumps({"manifest_url": "", "channel": "stable"}), encoding="utf-8")
+    env2 = launcher._child_env()
+    assert "KEFU_UPDATE_MANIFEST_URL" not in env2
+    assert env2["KEFU_UPDATE_CHANNEL"] == "stable"
+
+    # 非法地址（非 http）不注入；文件损坏也不崩
+    cfg.write_text(json.dumps({"manifest_url": "file:///etc/passwd"}), encoding="utf-8")
+    assert "KEFU_UPDATE_MANIFEST_URL" not in launcher._child_env()
+    cfg.write_text("{broken json", encoding="utf-8")
+    assert "KEFU_UPDATE_MANIFEST_URL" not in launcher._child_env()
+
+
 def test_log_menu_and_close_semantics(launcher):
     """托盘须有查看/隐藏日志菜单；日志窗口 WM_CLOSE 只隐藏不退进程。"""
     src = LAUNCHER.read_text(encoding="utf-8")
@@ -96,7 +119,7 @@ def test_iss_packages_all_root_assets():
     iss = LAUNCHER.parent.parent / "installer" / "kefu.iss"
     txt = iss.read_text(encoding="utf-8")
     for name in ("launcher.pyc", "updater.pyc", "start_kefu.bat", "current.json",
-                 "version.txt", "app.ico", "delivery_seed.json"):
+                 "version.txt", "app.ico", "delivery_seed.json", "update_config.json"):
         assert name in txt, f"ISS 未打包 {name}"
     # 安装包与快捷方式都用 app.ico
     assert "SetupIconFile=" in txt

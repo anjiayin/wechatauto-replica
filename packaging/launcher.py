@@ -38,6 +38,7 @@ KEFU = APP_CURRENT / "kefu-system"
 DATA = BUNDLE / "data"
 CURRENT_JSON = BUNDLE / "current.json"
 SEED_JSON = BUNDLE / "delivery_seed.json"
+UPDATE_CONFIG = BUNDLE / "update_config.json"             # 自动更新地址/渠道（发布配置）
 ICON_FILE = BUNDLE / "app.ico"
 MUTEX_NAME = "Local\\WeChatKefuLauncher_SingleInstance"
 
@@ -150,6 +151,20 @@ def _child_env() -> dict:
     # 交付 seed（鉴权生产地址 + 预置商机类型）；开发态无此文件则不生效
     if SEED_JSON.is_file():
         env["KEFU_DELIVERY_SEED"] = str(SEED_JSON)
+    # 自动更新：bundle 根的 update_config.json 提供 manifest 地址/渠道，
+    # 注入给后端（update_service 模块 import 时读取）与托盘更新器。
+    # 未配置或地址为空则保持 fail-safe（不检查更新）。
+    if UPDATE_CONFIG.is_file():
+        try:
+            cfg = json.loads(UPDATE_CONFIG.read_text(encoding="utf-8"))
+            url = str(cfg.get("manifest_url", "")).strip().rstrip("/")
+            if url.startswith(("http://", "https://")):
+                env["KEFU_UPDATE_MANIFEST_URL"] = url
+            channel = str(cfg.get("channel", "")).strip()
+            if channel:
+                env["KEFU_UPDATE_CHANNEL"] = channel
+        except Exception:                        # noqa: BLE001
+            pass                                  # 配置损坏则保持 fail-safe，不阻断启动
     return env
 
 
