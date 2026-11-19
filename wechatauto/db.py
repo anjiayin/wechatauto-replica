@@ -301,7 +301,13 @@ def _sqlite_text_factory(data: bytes):
 # 主密钥 cfg 提取(ReadWeixinKey-rev 同源; 锚点每版本重采)
 # ---------------------------------------------------------------------------
 def _find_weixin_module(pid: int) -> Optional[Tuple[int, int, str]]:
-    """返回 (模块基址, 模块大小, 路径); weixin.dll 为微信 4.x 主模块"""
+    """返回 (模块基址, 模块大小, 路径)。
+
+    微信 4.1.x 及更早：核心逻辑在 ``weixin.dll`` 主模块；
+    微信 4.2.x 起：``weixin.dll`` 被合并进 ``Weixin.exe`` 主映像，进程里不再
+    有独立 weixin.dll。这里优先找 ``weixin.dll``，找不到则回退到主进程映像
+    ``Weixin.exe``（cfg 地标/指针链/主密钥 XOR 材料都搬到了主映像里）。
+    """
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
     k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
@@ -311,18 +317,22 @@ def _find_weixin_module(pid: int) -> Optional[Tuple[int, int, str]]:
     snap = k32.CreateToolhelp32Snapshot(0x08 | 0x10, pid)
     if not snap or snap == -1 or snap == (1 << 64) - 1:
         return None
+    fallback = None  # (base, size, path) 主映像 Weixin.exe
     try:
         me = _MODULEENTRY32W()
         me.dwSize = ctypes.sizeof(me)
         ok = k32.Module32FirstW(snap, ctypes.byref(me))
         while ok:
-            if me.szModule and me.szModule.lower() == "weixin.dll":
+            name = (me.szModule or "").lower()
+            if name == "weixin.dll":
                 return (me.modBaseAddr or 0), me.modBaseSize, me.szExePath
+            if name == "weixin.exe":
+                fallback = (me.modBaseAddr or 0), me.modBaseSize, me.szExePath
             me.dwSize = ctypes.sizeof(me)
             ok = k32.Module32NextW(snap, ctypes.byref(me))
     finally:
         k32.CloseHandle(snap)
-    return None
+    return fallback
 
 
 def _extract_movabs_xor_key(dll_path: str) -> Optional[bytes]:
@@ -1242,8 +1252,20 @@ class WeChatDB:
         self._stale_warned_at[rel] = now
         fail_streak = int(self._cache_fail_streak.get(rel, 0))
         churn_at = self._cache_churn_at.get(rel, 0.0)
-        if fail_streak == 0 and now - churn_at < SOURCE_CHURN_ACTIVE_SEC:
-            # 源库持续写入：重建还在跑或刚晋升过快照，不是失败。
+        # 后台重建进行中也不能当失败：churn 标记（_record_cache_churn）只在
+        # 一轮构建**结束**且发现源库签名变化时才落，首次全量重建可能长达
+        # 159s（现场 83MB 分片 + 微信持续写库），这期间 stale 早就越过阈值，
+        # 但 fail_streak=0、last_error=空。旧实现据此打出 WARNING
+        # 「连续失败 0 次，最后错误: 无」——自相矛盾却吓人，正是用户看到
+        # 「后台卡住」的来源。重建在跑 = 正在追平，按 INFO 处理。
+        try:
+            with self._rebuild_guard:
+                rebuilding_now = rel in self._rebuilding
+        except AttributeError:      # 测试替身未构造重建字段时按不在重建处理
+            rebuilding_now = False
+        if fail_streak == 0 and (
+                rebuilding_now or now - churn_at < SOURCE_CHURN_ACTIVE_SEC):
+            # 源库持续写入 / 后台正在重建：不是失败。
             sys.stderr.write(
                 "[wechatauto] INFO %s 解密缓存距上次晋升 %.0f 秒；源库在重建期间"
                 "持续写入（微信正常收消息），正在按新签名追平；连续失败 0 次，"

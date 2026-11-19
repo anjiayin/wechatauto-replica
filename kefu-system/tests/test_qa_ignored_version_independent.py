@@ -101,11 +101,15 @@ def patch_update_env(monkeypatch):
 # ---------------------------------------------------------------------------
 def test_field_core_self_heal_with_live_manifest(live_manifest):
     m = live_manifest
-    assert str(m["latest"]) == FIELD_IGNORED, m["latest"]
+    # 线上 manifest 是第一证据源：版本号动态断言，不再硬编码（1.2.7 起线上
+    # 已前进，硬编码断言会随每次发版陈旧）。前提只有两个：版本号合法、
+    # 序列号在前进。
+    assert core.VERSION_RE.match(str(m["latest"])), m["latest"]
     assert int(m["sequence"]) >= 1250, m["sequence"]
     assert core.compare_versions(FIELD_CURRENT,
                                  str(m.get("min_supported", "0.0.0"))) >= 0
 
+    # 现场 DB 忽略的是旧版本（1.2.5），线上已发布更新版本 → 忽略记录不生效
     action = core.decide(FIELD_CURRENT, m, FIELD_IGNORED,
                          FIELD_LAST_SEEN, "stable", None)
     assert action == "optional", (action, m["sequence"], m["latest"])
@@ -113,7 +117,7 @@ def test_field_core_self_heal_with_live_manifest(live_manifest):
     summary = core.public_summary(m, action, FIELD_CURRENT, ignored=False)
     assert summary["action"] == "optional"
     assert summary["ignored"] is False
-    assert summary["latest"] == "1.2.5"
+    assert summary["latest"] == str(m["latest"])
     assert summary["sequence"] == int(m["sequence"])
 
 
@@ -131,7 +135,7 @@ def test_field_service_self_heal_no_db_mutation(live_manifest,
     out = svc.check()
     assert out["action"] == "optional"
     assert out["ignored"] is False
-    assert out["latest"] == "1.2.5"
+    assert out["latest"] == str(live_manifest["latest"])
     assert out["sequence"] == int(live_manifest["sequence"])
     # check 是只读操作，不允许顺手清掉现场数据
     assert db.store[core.KEY_IGNORED_VERSION] == FIELD_IGNORED
@@ -226,10 +230,16 @@ def test_decide_signature_defaults_and_legacy_arity(live_manifest):
     assert sig.parameters["channel"].default == "stable"
 
     m = live_manifest
+    latest = str(m["latest"])
+    # 忽略的是旧版本（1.2.5）≠ 线上最新 → 忽略记录不抑制提醒（参数数量兼容）
     assert core.decide("1.2.4", m, "1.2.5", 0) == "optional"              # 4 参
     assert core.decide("1.2.4", m, "1.2.5", 0, "stable") == "optional"    # 5 参
     assert core.decide("1.2.4", m, "1.2.5", 0, "stable", None) == "optional"
-    assert core.decide("1.2.4", m, "1.2.5", 0, "stable", 1250) == "none"
+    # 忽略版本 == 最新且序列号覆盖当前发布 → 静默（序列号动态取自线上）
+    assert core.decide("1.2.4", m, latest, 0, "stable",
+                       int(m["sequence"])) == "none"
+    # 旧忽略记录的序列号落后于当前发布 → 不再静默（现场自愈语义）
+    assert core.decide("1.2.4", m, latest, 0, "stable", 1250) == "optional"
 
 
 def test_legacy_compiled_pyc_calls_new_core_and_self_heals(

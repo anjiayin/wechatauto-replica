@@ -13,6 +13,7 @@
 - GET /api/system/purge/last                                 上次清理留痕（本轮修复）
 - GET /api/system/billing                                     AI 账单（反馈 13）
 - GET /api/system/image-key-status                            图片解密密钥是否就绪（只读）
+- POST /api/system/image-key-recheck                          图片密钥主动捕获（后台扫描，防重入）
 - GET/PUT /api/system/asr | POST /api/system/asr/download      语音转写（本地离线）
 - POST /api/voice/retry                                       语音补转写（手动重试）
 - POST /api/images/retry                                      图片补识别（手动重试）
@@ -153,8 +154,28 @@ def get_status(db: Database = Depends(get_db),
         today_cost=round(_usage_cost(
             db.usage_by_date(datetime.now().strftime("%Y-%m-%d")),
             _billing_settings(db)), 4),
+        image_key_ready=_image_key_ready(svc),
         cache=_cache_status(svc),
     )
+
+
+def _image_key_ready(svc: WeChatService) -> bool:
+    """只读探测图片解密密钥是否就绪（供顶部横幅提醒，绝不触发内存扫描）。
+
+    ``image_key_status()`` 只读缓存 / 派生 / 持久化，不调用会阻塞 120 秒的
+    内存扫描，放在每 5 秒轮询的 /api/status 里是安全的。任何异常（测试替身
+    没有该方法、媒体库不可用等）一律按 True 处理：宁可少提示一次，也不要
+    在缺少该能力的部署上误挂一条永久「密钥缺失」横幅。
+    """
+    try:
+        method = getattr(svc, "image_key_status", None)
+        if method is None:
+            return True
+        return bool(method().get("ready"))
+    except Exception:
+        logger.debug("读取图片密钥就绪状态失败（按就绪处理，避免误报）",
+                     exc_info=True)
+        return True
 
 
 def _cache_status(svc: WeChatService) -> List[CacheShardStatus]:
@@ -422,6 +443,7 @@ def get_image_key_status(
     """图片解密密钥状态：只读缓存/派生，绝不触发内存扫描等待。
 
     前端据此提醒用户在微信里点开一张图片查看大图；密钥一旦可用即不再提示。
+    响应另带「重新检查」主动捕获状态（recheck_* 字段）供设置页回显。
     """
     try:
         return ImageKeyStatusOut(**svc.image_key_status())
@@ -429,6 +451,34 @@ def get_image_key_status(
         # 状态查询失败不能让设置页报错，按未就绪处理
         logger.exception("读取图片密钥状态失败（按未就绪处理）")
         return ImageKeyStatusOut()
+
+
+@router.post("/api/system/image-key-recheck", response_model=ImageKeyStatusOut)
+def recheck_image_key(
+    svc: WeChatService = Depends(get_wechat_service),
+) -> ImageKeyStatusOut:
+    """「重新检查」：后台线程主动做一次带预算的密钥捕获（1.2.7 修复）。
+
+    旧行为只读状态、点了毫无反应；现在防重入地拉起后台线程做一次**只读**
+    内存扫描（不写内存、不注入），立即返回当前状态（``recheck_running`` =
+    扫描进行中）。扫描结果通过轮询 ``GET /api/system/image-key-status``
+    观察，成功/失败都会落 app 日志并在设置页可见。
+    """
+    try:
+        started = svc.recheck_image_key()
+    except Exception:
+        logger.exception("触发图片密钥主动捕获失败")
+        raise HTTPException(status_code=500,
+                            detail="触发主动捕获失败（详见服务日志）")
+    try:
+        out = ImageKeyStatusOut(**svc.image_key_status())
+    except Exception:
+        logger.exception("主动捕获状态回读失败（按未就绪处理）")
+        out = ImageKeyStatusOut()
+    if not started.get("started"):
+        # 重入被拒：保留已有状态即可，前端能看到 running=True
+        logger.debug("图片密钥主动捕获重入被拒（已有扫描进行中）")
+    return out
 
 
 # ---------------------------------------------------------------------------

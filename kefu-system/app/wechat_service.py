@@ -173,6 +173,16 @@ class WeChatService:
         # 不能每条消息/每张图片都新建一个）。图片与语音共用同一实例。
         self._media_downloader = None
         self._media_lock = threading.Lock()
+        # 图片密钥主动捕获（1.2.7「重新检查」修复）：后台线程做一次带墙钟
+        # 预算的只读内存扫描；防并发重入；状态随 image_key_status() 回显，
+        # 供设置页展示「正在扫描/上次结果」。绝不放在 HTTP 请求线程里跑。
+        self._image_key_recheck_lock = threading.Lock()
+        self._image_key_recheck: dict = {
+            "running": False,      # 是否正在后台扫描
+            "last_ok": None,       # None=从未跑过 / True=捕获成功 / False=未捕获
+            "last_at": "",         # 最近一次扫描结束时刻（ISO）
+            "last_error": "",      # 失败原因（用户可读）
+        }
         # 语音转写的时长上限由 settings 热更（asr.max_seconds），交给转写器
         # 每次识别时实时读取，避免改设置后需要重启服务。
         if database is not None:
@@ -604,6 +614,17 @@ class WeChatService:
                     # 同步跑会把 Listener 回调线程堵死，后续文本消息的入库
                     # 被推迟几十秒。这里只做「开关判断 + 入队」后立刻返回，
                     # 识别/落库/进聚合窗口全部交给独立 worker 线程池。
+                    # 1.2.7 现场教训（openim 图片 40「零痕迹」丢失）：图片
+                    # 链路「收到→入队→worker 开工→落库」各段此前全无日志，
+                    # 任何一段卡住都表现为整体静默。这里在**收到**与入队
+                    # 成功时各留一行 INFO（与 worker 侧「开始处理」呼应），
+                    # 把链路分段 bracket 起来，下次再出现"有收到无处理"
+                    # 可直接定位卡在哪一段。
+                    try:
+                        logger.info("收到图片消息（%s local_id=%s），进入识别链路",
+                                    username, int(msg.get("local_id") or 0))
+                    except (TypeError, ValueError):
+                        logger.info("收到图片消息（%s），进入识别链路", username)
                     self._enqueue_image_message(
                         msg, username=username, kind=kind,
                         sender_wxid=sender_wxid, sender_name=sender_name,
@@ -785,6 +806,9 @@ class WeChatService:
                            "local_id=%s", VISION_QUEUE_MAX, username, local_id)
             return
         self._warn_vision_backlog(self._vision_queue.qsize())
+        logger.info("图片任务已入队（%s local_id=%s，队列 %d/%d）",
+                    username, local_id, self._vision_queue.qsize(),
+                    VISION_QUEUE_MAX)
 
     def _warn_vision_backlog(self, size: int) -> None:
         """队列积压告警（限频 60 秒一次，避免逐条消息刷屏）。"""
@@ -900,6 +924,10 @@ class WeChatService:
             local_id = int(task.get("local_id") or 0)
         except (TypeError, ValueError):
             local_id = 0
+        # 与监听侧「收到图片消息/已入队」呼应：worker 开工时间点留痕。三段
+        # 日志齐备 = 链路健康；缺任何一段即可定位卡点（1.2.7 openim 图片 40
+        # 零痕迹事故的观测性兜底）。
+        logger.info("开始处理图片识别任务（%s local_id=%s）", username, local_id)
         try:
             if local_id <= 0:
                 self._log_image_skipped(username, sender_wxid, mtype,
@@ -1091,8 +1119,10 @@ class WeChatService:
             self._log_image_skipped(
                 str(username or payload.get("username") or ""),
                 sender_wxid, mtype, raw_content,
-                f"已自动重试 {int(attempts)} 次仍取不到原图，已放弃自动补识别"
-                "（微信原图按需下载，需在微信里点开该图片后再点「重新识别」）",
+                f"已自动重试 {int(attempts)} 次仍未识别成功，已放弃自动补识别"
+                "（微信原图按需下载，不会自己好：若上面日志写明「密钥未就绪」，"
+                "请先在微信中打开任意一张图片并到设置页点「重新检查」捕获密钥；"
+                "否则请在微信里点开该图片查看大图），之后可点「重新识别」补回",
                 local_id)
         except Exception:
             logger.exception("写图片补识别最终失败日志失败（已忽略）")
@@ -2738,7 +2768,9 @@ class WeChatService:
         缓存（后三者均用真实密文首块反测，与解密路径同一套校验）。
 
         Returns:
-            ``{"ready": bool, "source": str}``；任一异常降级为未就绪。
+            ``{"ready": bool, "source": str, "recheck_running": bool,
+            "recheck_last_ok": bool|None, "recheck_last_at": str}``；
+            任一异常降级为未就绪。
         """
         result: dict = {"ready": False, "source": ""}
         try:
@@ -2767,7 +2799,82 @@ class WeChatService:
                 return result
         except Exception:
             logger.exception("读取图片密钥状态失败（按未就绪处理）")
+        finally:
+            # 主动捕获状态（设置页「重新检查」回显）；任意分支都要带上，
+            # 否则前端无法区分「扫描进行中」和「从未扫描」。
+            try:
+                with self._image_key_recheck_lock:
+                    recheck = dict(self._image_key_recheck)
+            except Exception:
+                recheck = {}
+            result["recheck_running"] = bool(recheck.get("running"))
+            result["recheck_last_ok"] = recheck.get("last_ok")
+            result["recheck_last_at"] = str(recheck.get("last_at") or "")
+            result["recheck_last_error"] = str(recheck.get("last_error") or "")
         return result
+
+    def recheck_image_key(self, timeout_sec: int = 240) -> dict:
+        """设置页「重新检查」：后台线程主动做一次有预算的密钥捕获。
+
+        1.2.7 之前的「重新检查」只读状态、不触发任何捕获，用户点了毫无反应。
+        现在改为：防重入地拉起后台线程，跑 :meth:`MediaDownloader.
+        detect_image_key(refresh=True)`（只读内存扫描：OpenProcess +
+        ReadProcessMemory，不写内存、不注入），捕获成功会自动持久化
+        image_keys.json 并经就绪回调唤醒图片补识别队列；失败也会落一条
+        app 日志并把原因写进状态（设置页可见）。
+
+        Args:
+            timeout_sec: 扫描墙钟预算（秒）。实测一轮全量扫描约 110s，
+                默认 240s 保证首轮扫描不被截断，且给用户留出「点开图片」
+                的时间窗。
+
+        Returns:
+            ``{"started": bool, "running": bool, "last_ok": ...}``：
+            ``started=False`` 表示已有扫描在跑（重入被拒）。
+        """
+        with self._image_key_recheck_lock:
+            if self._image_key_recheck.get("running"):
+                return {"started": False, **self._image_key_recheck}
+            self._image_key_recheck["running"] = True
+            self._image_key_recheck["last_error"] = ""
+        thread = threading.Thread(target=self._recheck_image_key_worker,
+                                  args=(int(timeout_sec),),
+                                  name="kefu-image-key-recheck", daemon=True)
+        thread.start()
+        logger.info("图片密钥主动捕获已启动（后台只读内存扫描，预算 %d 秒；"
+                    "结果见设置页或稍后日志）", int(timeout_sec))
+        return {"started": True, **self._image_key_recheck}
+
+    def _recheck_image_key_worker(self, timeout_sec: int) -> None:
+        """主动捕获的后台执行体：结果与异常都收敛到 ``_image_key_recheck``。"""
+        ok = False
+        err = ""
+        try:
+            downloader = self._get_media_downloader()
+            if downloader is None:
+                err = "媒体下载器不可用（微信库未就绪，无法扫描）"
+            else:
+                pair = downloader.detect_image_key(
+                    refresh=True, monitor_timeout=max(5.0, float(timeout_sec)))
+                if pair and pair[0]:
+                    ok = True
+                    logger.info("图片密钥主动捕获成功（来源：微信进程内存扫描，"
+                                "已持久化；补识别队列已自动唤醒）")
+                else:
+                    err = ("本次扫描未捕获到密钥：请确认微信已登录，且在微信中"
+                           "打开（查看大图）任意一张图片后重新检查")
+                    logger.warning("图片密钥主动捕获未命中：%s", err)
+        except Exception as exc:                    # 后台线程绝不能带异常退出
+            logger.exception("图片密钥主动捕获异常")
+            err = f"主动捕获异常：{exc}"
+        finally:
+            with self._image_key_recheck_lock:
+                self._image_key_recheck.update({
+                    "running": False,
+                    "last_ok": ok,
+                    "last_at": dbmod.now_iso(),
+                    "last_error": err,
+                })
 
     def get_image_bytes(self, username: str, local_id: int) -> Optional[bytes]:
         """解密会话中指定图片消息，返回图片字节；失败返回 None。
@@ -2813,6 +2920,20 @@ class WeChatService:
             return None, f"图片解密失败：{exc}"
         if not data:
             reason = reason or "未知原因"
+            # 取图失败的底层文案通常是「原图与缩略图均不完整」，它只描述了
+            # 现象。实测用户删掉 image_keys.json 后，真实原因是图片 AES 密钥
+            # 缺失（cfgDword 派生/持久化都不可用），但分析日志里完全看不出来，
+            # 用户既不知道去微信点开图片，也会误以为「图还没下载完」而一直等。
+            # 这里补一次只读密钥探测（不会触发 120s 内存扫描），密钥确实未就绪
+            # 时把原因换成可操作的提示；探测失败则保留原文案，绝不影响主流程。
+            try:
+                status = self.image_key_status()
+                if not status.get("ready"):
+                    reason = ("图片解密密钥未就绪，请在微信中打开任意一张图片"
+                              "查看大图，程序捕获密钥后会自动补识别")
+            except Exception:
+                logger.debug("取图失败原因补充密钥状态失败（保留原原因）",
+                             exc_info=True)
             logger.info("图片不可用（%s local_id=%s）：%s",
                         username, local_id, reason)
             return None, reason

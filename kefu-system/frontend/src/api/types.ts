@@ -52,6 +52,8 @@ export interface StatusOut {
   unread_count: number
   /** 今日 AI 估算费用（元，反馈 13） */
   today_cost: number
+  /** 图片解密密钥是否就绪；false 时图片消息无法识别，需去微信打开一张图片 */
+  image_key_ready: boolean
   /** 各消息分片解密缓存健康度（可选，仅排查"消息停摆"类故障用） */
   cache?: CacheShardStatus[]
 }
@@ -415,6 +417,14 @@ export interface BillingOut {
 export interface ImageKeyStatus {
   ready: boolean
   source: string
+  /** 「重新检查」后台扫描进行中 */
+  recheck_running: boolean
+  /** 最近一次主动捕获结果；null = 从未跑过 */
+  recheck_last_ok: boolean | null
+  /** 最近一次主动捕获结束时刻（ISO） */
+  recheck_last_at: string
+  /** 最近一次主动捕获失败原因（成功/未跑过为空） */
+  recheck_last_error: string
 }
 
 /** /api/system/cache（微信数据库解密缓存目录） */

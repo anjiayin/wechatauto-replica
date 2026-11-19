@@ -1586,13 +1586,36 @@ function DataBillingTab() {
   }, [cacheInfo, cacheLoaded])
 
   // 图片解密密钥状态：未就绪时提醒用户去微信点开一张图片（后端只读缓存，
-  // 不会触发内存扫描等待）。仅在未就绪时低频轮询，就绪后立即停止。
+  // 不会触发内存扫描等待）。仅在未就绪时低频轮询，就绪后立即停止；
+  // 「重新检查」后台扫描进行中时加密轮询，扫描一结束就能看到结果。
   const { data: imageKey, refetch: refetchImageKey } = useQuery({
     queryKey: ['image-key-status'],
     queryFn: () => apiGet<ImageKeyStatus>('/api/system/image-key-status'),
-    refetchInterval: (query) =>
-      query.state.data && !query.state.data.ready ? 20000 : false,
+    refetchInterval: (query) => {
+      const d = query.state.data
+      if (!d) return false
+      if (d.ready) return false
+      return d.recheck_running ? 5000 : 20000
+    },
   })
+
+  // 「重新检查」：触发后端后台密钥捕获（1.2.7 修复——旧实现只读状态，
+  // 点击毫无反应）。扫描在后台线程跑，完成后 refetch 即可看到结果。
+  const recheckKey = useMutation({
+    mutationFn: () =>
+      apiPost<ImageKeyStatus>('/api/system/image-key-recheck'),
+  })
+  const recheckRunning = Boolean(
+    imageKey?.recheck_running || recheckKey.isPending,
+  )
+  const handleRecheckKey = () => {
+    if (recheckRunning) return
+    recheckKey.mutate(undefined, {
+      onSettled: () => {
+        void refetchImageKey()
+      },
+    })
+  }
 
   // 启动端口（设置页直接改，重启服务后生效）
   const { data: serverInfo } = useQuery({
@@ -1856,19 +1879,48 @@ function DataBillingTab() {
         <Alert
           severity="success"
           sx={{ py: 0.5 }}
-          action={<Button size="small" onClick={() => void refetchImageKey()}>重新检查</Button>}
+          action={
+            <Button
+              size="small"
+              onClick={handleRecheckKey}
+              disabled={recheckRunning}
+              startIcon={recheckRunning ? <CircularProgress size={14} /> : undefined}
+            >
+              {recheckRunning ? '扫描中…' : '重新检查'}
+            </Button>
+          }
         >
           图片解密密钥已就绪，聊天图片可正常解密显示。
         </Alert>
       ) : (
-        <Alert
-          severity="warning"
-          sx={{ py: 0.5 }}
-          action={<Button size="small" onClick={() => void refetchImageKey()}>重新检查</Button>}
-        >
-          图片解密密钥尚未获取：请在微信中打开任意一张图片查看大图，程序会自动捕获并缓存，之后无需重复操作
-          （除非更换微信账号、清除缓存或微信升级导致密钥变化）。完成后可点「重新检查」或等待自动刷新。
-        </Alert>
+        <Stack spacing={0.5}>
+          <Alert
+            severity="warning"
+            sx={{ py: 0.5 }}
+            action={
+              <Button
+                size="small"
+                onClick={handleRecheckKey}
+                disabled={recheckRunning}
+                startIcon={recheckRunning ? <CircularProgress size={14} /> : undefined}
+              >
+                {recheckRunning ? '扫描中…' : '重新检查'}
+              </Button>
+            }
+          >
+            {recheckRunning
+              ? '正在后台扫描微信进程内存捕获密钥（约 2~4 分钟），请在微信中打开任意一张图片查看大图以提高命中率…'
+              : '图片解密密钥尚未获取：请在微信中打开任意一张图片查看大图，然后点「重新检查」主动捕获并缓存'
+                + '（除非更换微信账号、清除缓存或微信升级导致密钥变化）。'}
+          </Alert>
+          {imageKey.recheck_last_ok === false && !recheckRunning && (
+            <Typography variant="caption" color="text.secondary">
+              上次检查（{imageKey.recheck_last_at || '时间未知'}）未捕获到密钥
+              {imageKey.recheck_last_error ? `：${imageKey.recheck_last_error}` : ''}
+              ，请在微信中打开一张图片后重试。
+            </Typography>
+          )}
+        </Stack>
       )}
 
       <Divider sx={{ my: 2 }} />

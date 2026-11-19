@@ -688,6 +688,11 @@ class MediaDownloader:
         - ASCII: 非字母数字 + 连续 32 个 [a-zA-Z0-9] + 非字母数字结尾,
           每候选取前 16 字节作 AES-128 key 解密探针, 明文为 JPEG SOI 命中;
         - UTF-16LE: 字母数字与 0x00 交错形式。
+
+        时间预算（1.2.7 修复）：``monitor_timeout`` 现在是**真实墙钟上限**。
+        现场一轮全量扫描约 110s（5 个 Weixin 进程 ~1.3GB），旧实现只在两轮
+        扫描之间查超时，单轮扫多久都不管，导致「120 秒等待」实际拖 10~30
+        分钟。现在每轮扫描内部逐内存区域检查 deadline，到点立即返回。
         """
         probes = self._probe_cts()
         if not probes:
@@ -699,8 +704,18 @@ class MediaDownloader:
         k32 = _dbmod._k32
         MBI = _dbmod._MBI
 
-        ASCII32_RE = re.compile(rb"[^a-zA-Z0-9]([a-zA-Z0-9]{32})[^a-zA-Z0-9]")
-        U16_RE = re.compile(rb"(?:[a-zA-Z0-9]\x00){32}")
+        # 图片 AES 密钥是 16 字节 ASCII（字母/数字），并非 32 字符。
+        # 旧实现 ASCII32_RE 要求「恰好 32 个字母数字」→ 16 字符的正确密钥
+        # 被永久漏掉，内存扫描永远不命中（1.2.7 现场）。
+        #
+        # 密钥真实形态：MD5(str(cfgDword)+wxid) 的前 16 个 hex 字符，即
+        # 16 字节的 [0-9a-f]。这里按两层匹配：
+        #   HEX16_RE —— 恰好 16 字符的纯 hex（最可能，优先且快速）；
+        #   KEY_RE   —— 16~32 字符字母数字（兜底，覆盖其它编码/长度）。
+        # 候选去重后再做 AES 探针验证，避免海量重复候选拖慢扫描。
+        HEX16_RE = re.compile(rb"(?<![0-9a-fA-F])([0-9a-f]{16})(?![0-9a-fA-F])")
+        KEY_RE = re.compile(rb"(?<![0-9a-zA-Z])([0-9a-zA-Z]{16,32})(?![0-9a-zA-Z])")
+        U16_RE = re.compile(rb"(?:[a-zA-Z0-9]\x00){16,32}")
 
         def read_mem(h, addr: int, n: int):
             buf = ctypes.create_string_buffer(n)
@@ -724,20 +739,37 @@ class MediaDownloader:
             return False
 
         def _candidates(buf: bytes):
-            for m in ASCII32_RE.finditer(buf):
-                yield m.group(1)[:16].encode() if isinstance(m.group(1), str) else m.group(1)[:16]
+            seen = set()
+            for m in HEX16_RE.finditer(buf):
+                k = m.group(1)
+                if k not in seen:
+                    seen.add(k)
+                    yield k
+            for m in KEY_RE.finditer(buf):
+                k = m.group(1)[:16]
+                if k not in seen:
+                    seen.add(k)
+                    yield k
             for m in U16_RE.finditer(buf):
-                yield bytes(b for i, b in enumerate(m.group()) if i % 2 == 0)[:16]
+                k = bytes(b for i, b in enumerate(m.group()) if i % 2 == 0)[:16]
+                if k not in seen:
+                    seen.add(k)
+                    yield k
 
         def _scan_once() -> Optional[str]:
-            # 保持微信进程原顺序扫描(主进程靠前, 命中率高)
+            # 保持微信进程原顺序扫描(主进程靠前, 命中率高)；逐区域检查
+            # deadline，保证任何一次扫描都在时间预算内结束。
             for pid in pids:
+                if time.monotonic() > deadline:
+                    return None
                 h = k32.OpenProcess(0x0010 | 0x0400, False, pid)
                 if not h:
                     continue
                 try:
                     addr = 0
                     while True:
+                        if time.monotonic() > deadline:
+                            return None
                         mbi = MBI()
                         r = k32.VirtualQueryEx(h, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi))
                         if r == 0:
@@ -758,25 +790,34 @@ class MediaDownloader:
                     k32.CloseHandle(h)
             return None
 
+        # 时间预算：monitor_timeout 即整个调用（首轮扫描 + monitor 等待循环）
+        # 的墙钟上限。pythonw 打包环境下 print 用户看不到，改走日志。
+        deadline = time.monotonic() + max(5.0, float(monitor_timeout))
+
         found = _scan_once()
         if found or not monitor:
             return found
 
-        print(
-            "未在微信进程内存中找到图片 AES 密钥。\n"
-            "请现在打开微信，进入任意聊天，点击一张图片查看大图，\n"
-            f"本程序将在 {monitor_timeout:.0f} 秒内自动捕获密钥..."
-        )
-        start = time.time()
-        while time.time() - start < monitor_timeout:
+        logger.info(
+            "未在微信进程内存中找到图片 AES 密钥。请现在打开微信，进入任意"
+            "聊天，点击一张图片查看大图，本程序将在 %.0f 秒内自动捕获密钥...",
+            max(0.0, deadline - time.monotonic()))
+        while time.monotonic() < deadline:
             time.sleep(2.0)
             found = _scan_once()
             if found:
                 return found
         return None
 
-    def detect_image_key(self, refresh: bool = False) -> Optional[Tuple[str, int]]:
+    def detect_image_key(self, refresh: bool = False,
+                         monitor_timeout: float = 120.0
+                         ) -> Optional[Tuple[str, int]]:
         """返回 (AES 密钥, XOR 密钥)；失败返回 None。结果缓存，refresh=True 强制重扫。
+
+        Args:
+            refresh: True 强制重新扫描（忽略进程内缓存）。
+            monitor_timeout: 内存扫描的墙钟预算（秒）。一轮全量扫描实测约
+                110s，预算必须给足，否则首轮扫描会被截断漏掉密钥。
 
         总流程:
           定位缓存目录 → 收集 *_t.dat 模板 → 文件尾推 XOR 密钥(众数统计)
@@ -810,7 +851,8 @@ class MediaDownloader:
         if not aes_key:
             aes_key = self._load_persisted_key()
         if not aes_key:
-            aes_key = self._scan_aes_key(monitor=True)
+            aes_key = self._scan_aes_key(monitor=True,
+                                         monitor_timeout=monitor_timeout)
             if aes_key:
                 self._persist_key(aes_key)
         if not aes_key:
@@ -846,7 +888,16 @@ class MediaDownloader:
         raise ValueError("无法识别的图片加密格式: %s" % dat_path)
 
     def _resolve_aes_key(self) -> Optional[str]:
-        """统一密钥解析：显式注入 → cfgDword派生 → 本地缓存 → 内存扫描"""
+        """统一密钥解析：显式注入 → cfgDword派生 → 本地缓存（**不做内存扫描**）。
+
+        1.2.7 现场实测：图片解密路径里做 ``_scan_aes_key(monitor=True)`` 会把
+        单次取图拖到 30+ 分钟（全量扫 5 个 Weixin 进程约 1.3GB 内存，一轮
+        ~110s，monitor 等待循环每轮再扫一次；账号 XOR 学习的「实测」还会对
+        每个候选再触发整套扫描），表现就是「图片永远不处理、日志静默」。
+        解密路径只查**零成本**来源（注入/派生/持久化），查不到立刻抛出可
+        操作的 RuntimeError 让上层快速失败并排队重试；主动内存扫描只保留在
+        :meth:`detect_image_key`（设置页「重新检查」触发，有时间预算）。
+        """
         if self._image_key and self._validate_key(self._image_key):
             self._notify_key_ready(self._image_key)
             return self._image_key
@@ -858,10 +909,7 @@ class MediaDownloader:
         cached = self._load_persisted_key()
         if cached:
             return cached
-        key = self._scan_aes_key(monitor=True)
-        if key:
-            self._persist_key(key)
-        return key
+        return None
 
     def _decrypt_v2(self, data: bytes, dat_path: str,
                     aes_key: Optional[str], xor_key: Optional[int]) -> bytes:
@@ -874,9 +922,9 @@ class MediaDownloader:
             aes_key = self._resolve_aes_key()
             if not aes_key:
                 raise RuntimeError(
-                    "无法获取图片 AES 密钥：请保持微信登录，并先在微信聊天中"
-                    "打开（点击查看大图）任意一张图片，再重试 detect_image_key()；"
-                    "或通过 MediaDownloader(image_key='...') 手动传入密钥。"
+                    "无法获取图片 AES 密钥：请在微信中打开（点击查看大图）任意"
+                    "一张图片，然后到本系统「设置 → 图片解密密钥」点「重新检查」"
+                    "捕获；捕获成功后未识别的图片会自动补识别。"
                 )
         aes_blk = aligned_aes_block_size(aes_size)
         off = 15

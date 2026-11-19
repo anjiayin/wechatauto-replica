@@ -372,6 +372,17 @@ function buildBanner(status?: StatusOut) {
   if (!status.wechat.alive) {
     return { severity: 'warning' as const, text: '微信未登录或数据库不可读，商机监听未启动' }
   }
+  // 图片解密密钥缺失：图片消息会一直取图失败、不进入商机分析。此前该提醒只在
+  // 设置页「数据与账单」tab 内，用户实际在商机列表/分析日志页看不到，误以为
+  // 「图片没抓取」。提升到全局横幅，任何页面都能看到该补救动作。
+  // 注意：必须放在 AI/wechat 致命问题之后，避免盖过更关键的状态提示。
+  if (status.image_key_ready === false) {
+    return {
+      severity: 'warning' as const,
+      text: '图片解密密钥尚未获取：请在微信中打开任意一张图片查看大图，然后到「设置 → 数据与账单」点「重新检查」'
+        + '主动捕获（约 2~4 分钟）；捕获成功后未识别的图片会自动补识别。',
+    }
+  }
   if (!status.wechat.visible) {
     return { severity: 'info' as const, text: '发送功能暂不可用（微信窗口被遮挡或锁屏），商机监听不受影响' }
   }

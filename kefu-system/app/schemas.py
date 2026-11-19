@@ -68,6 +68,10 @@ class StatusOut(BaseModel):
     degraded_reason: str = ""          # 微信接入降级原因（空 = 正常）
     unread_count: int = 0
     today_cost: float = 0.0            # 今日 AI 估算费用（元，反馈 13）
+    # 图片解密 AES 密钥是否就绪（False 时图片消息无法识别；前端据此全局提醒
+    # 用户去微信点开一张图片查看大图）。只读查询，不触发内存扫描等待。
+    # 默认 True：老服务/测试替身无该属性时不误报「密钥缺失」横幅。
+    image_key_ready: bool = True
     # 解密缓存健康度（新增追加字段，默认空列表，不影响既有前端契约）
     cache: List[CacheShardStatus] = Field(default_factory=list)
 
@@ -405,6 +409,13 @@ class ImageKeyStatusOut(BaseModel):
     """图片解密密钥状态（只读查询，不触发内存扫描等待）。"""
     ready: bool = False
     source: str = ""                          # memory/injected/derived/cache
+    # 「重新检查」主动捕获状态（1.2.7）：running=后台扫描进行中；
+    # last_ok=None 表示从未跑过，True/False 为最近一次结果；last_at 为
+    # 最近一次结束时刻；last_error 为失败原因（用户可读，成功时为空）。
+    recheck_running: bool = False
+    recheck_last_ok: Optional[bool] = None
+    recheck_last_at: str = ""
+    recheck_last_error: str = ""
 
 
 # ---------------------------------------------------------------------------

@@ -367,6 +367,30 @@ class TestBackgroundRebuildConvergence(_RebuildHarness):
         self.assertIn("WARNING", real_text)
         self.assertIn("连续失败 1 次", real_text)
 
+    def test_rebuilding_long_first_rebuild_is_not_false_warning(self):
+        """长时首次重建进行中（churn 标记还没落）不能误报 WARNING。
+
+        现场：删缓存后 message_8.db 首次全量重建耗时 159.6s，期间微信持续
+        写库。churn 标记只在构建结束后发现签名变化时才落，所以构建中途
+        stale 越过 120s、fail_streak=0、last_error 为空——旧实现打出
+        「WARNING ... 连续失败 0 次，最后错误: 无」自相矛盾的告警。
+        """
+        self.db._record_cache_ok(self.rel)
+        self.db._cache_ok_at[self.rel] = time.time() - 200
+        # 没有任何 churn 记录：模拟首次重建还没走到签名比对那一步
+        self.db._cache_churn_at.pop(self.rel, None)
+        self.db._rebuilding.add(self.rel)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                self.db._maybe_warn_stale(self.rel)
+            text = buf.getvalue()
+            self.assertIn("[wechatauto] INFO", text)
+            self.assertNotIn("WARNING", text)
+            self.assertNotIn("轮询可能读不到新消息", text)
+        finally:
+            self.db._rebuilding.discard(self.rel)
+
 
 # ---------------------------------------------------------------------------
 # 3. 图片 AES 密钥：account 键一致 + 多探针
