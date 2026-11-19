@@ -2688,6 +2688,22 @@ class WeChatService:
     # ------------------------------------------------------------------
     # 图片消息解密（反馈 2：详情/上下文中的图片显示为真图）
     # ------------------------------------------------------------------
+    def _on_image_key_ready(self, aes_key: str) -> None:
+        """图片 AES 密钥可用：立即唤醒待补识别队列。
+
+        1.2.4 现场是 22:29 取图失败入队，22:33 用户打开图片后密钥才落盘。
+        旧实现只在「下一条新消息」到来时才再次取图，队列里的图片仍按
+        10/30/90/300s 慢慢等，甚至用尽重试。这里把队列整体提前到期，
+        让已缓存失败的图片马上重跑；失败仍走原有退避/放弃逻辑。
+        """
+        try:
+            woken = self._image_retry.wake_all()
+        except Exception:
+            logger.exception("唤醒图片补识别队列失败（已忽略）")
+            return
+        if woken:
+            logger.info("图片 AES 密钥已就绪，立即重试 %d 条待补识别图片", woken)
+
     def _get_media_downloader(self):
         """懒加载并复用 MediaDownloader（图片解密 / 语音下载共用）。
 
@@ -2706,11 +2722,52 @@ class WeChatService:
                 return None
             try:
                 self._media_downloader = MediaDownloader(
-                    self._wxdb, save_dir=str(IMG_CACHE_DIR))
+                    self._wxdb, save_dir=str(IMG_CACHE_DIR),
+                    key_ready_callback=self._on_image_key_ready)
             except Exception:
                 logger.exception("创建 MediaDownloader 失败")
                 return None
             return self._media_downloader
+
+    def image_key_status(self) -> dict:
+        """图片解密 AES 密钥是否就绪（只读查询，供设置页提醒使用）。
+
+        检查顺序与解密时一致，但**绝不**调用 ``_scan_aes_key(monitor=True)``：
+        内存扫描会等用户去微信点开图片，最长阻塞 120 秒，不能放在 HTTP 请求里。
+        这里只看已缓存密钥、显式注入、cfgDword 派生与 image_keys.json 持久化
+        缓存（后三者均用真实密文首块反测，与解密路径同一套校验）。
+
+        Returns:
+            ``{"ready": bool, "source": str}``；任一异常降级为未就绪。
+        """
+        result: dict = {"ready": False, "source": ""}
+        try:
+            downloader = self._get_media_downloader()
+            if downloader is None:
+                return result
+            # 1) 本次进程内已捕获（用户打开图片后由监听线程写入）
+            pair = getattr(downloader, "_img_key", None)
+            if isinstance(pair, (tuple, list)) and len(pair) >= 1 and pair[0]:
+                result.update(ready=True, source="memory")
+                return result
+            # 2) 显式注入密钥（如手工指定）
+            injected = getattr(downloader, "_image_key", None)
+            if injected and downloader._validate_key(injected):
+                result.update(ready=True, source="injected")
+                return result
+            # 3) cfgDword 派生（确定性离线，无需看图）
+            derived = downloader._derive_cfg_key()
+            if derived and derived[0]:
+                result.update(ready=True, source="derived")
+                return result
+            # 4) 本地 image_keys.json 持久化缓存（按账号键，经密文反测）
+            cached = downloader._load_persisted_key()
+            if cached:
+                result.update(ready=True, source="cache")
+                return result
+        except Exception:
+            logger.exception("读取图片密钥状态失败（按未就绪处理）")
+        return result
 
     def get_image_bytes(self, username: str, local_id: int) -> Optional[bytes]:
         """解密会话中指定图片消息，返回图片字节；失败返回 None。

@@ -451,7 +451,9 @@ class VoiceTranscriber:
                    "-Fs_API", str(SAMPLE_RATE)]
             try:
                 proc = subprocess.run(cmd, capture_output=True,
-                                      timeout=DECODE_TIMEOUT_SEC)
+                                      timeout=DECODE_TIMEOUT_SEC,
+                                      # 隐藏 SILK 解码器控制台窗口，避免闪黑框
+                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             except subprocess.TimeoutExpired as exc:
                 raise _AsrError(
                     f"语音解码超时（超过 {DECODE_TIMEOUT_SEC} 秒）") from exc

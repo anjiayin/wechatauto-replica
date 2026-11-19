@@ -394,11 +394,17 @@ class BillingDayOut(BaseModel):
 
 class BillingOut(BaseModel):
     """AI 账单估算（按设置的输入/输出单价计算，元）。"""
-    unit: str = "per_k"                       # per_k=元/千tokens per_m=元/百万tokens
+    unit: str = "per_m"                       # per_k=元/千tokens per_m=元/百万tokens
     input_price: float = 0.0
     output_price: float = 0.0
     today: BillingDayOut = Field(default_factory=lambda: BillingDayOut(date=""))
     series: List[BillingDayOut] = Field(default_factory=list)
+
+
+class ImageKeyStatusOut(BaseModel):
+    """图片解密密钥状态（只读查询，不触发内存扫描等待）。"""
+    ready: bool = False
+    source: str = ""                          # memory/injected/derived/cache
 
 
 # ---------------------------------------------------------------------------

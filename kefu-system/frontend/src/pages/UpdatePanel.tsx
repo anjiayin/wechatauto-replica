@@ -33,6 +33,11 @@ function hasUpdate(c?: UpdateCheckOut): boolean {
   return c?.action === 'optional' || c?.action === 'forced'
 }
 
+/** 有更新但被用户主动忽略：action=none，后端会额外返回 ignored=true。 */
+function isIgnored(c?: UpdateCheckOut): boolean {
+  return c?.action === 'none' && c.ignored === true
+}
+
 function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
@@ -69,11 +74,15 @@ export function UpdateChip({ check, onClick }: {
   onClick: () => void
 }) {
   const update = hasUpdate(check)
+  const ignored = isIgnored(check)
+  const label = update
+    ? `有新版本 ${check!.latest}`
+    : ignored ? `已忽略 ${check!.latest}` : `v${__APP_VERSION__}`
   return (
     <Chip
       size="small"
       icon={<SystemUpdateAltIcon />}
-      label={update ? `有新版本 ${check!.latest}` : `v${__APP_VERSION__}`}
+      label={label}
       color={update ? 'warning' : 'default'}
       onClick={onClick}
       sx={{
@@ -100,6 +109,7 @@ export function UpdateDialog({ open, onClose, check }: {
   const [error, setError] = useState('')
   const [polling, setPolling] = useState(false)
   const [applied, setApplied] = useState(false)
+  const [unignoring, setUnignoring] = useState(false)
 
   const reset = useCallback(() => {
     setAgreed(false)
@@ -107,6 +117,7 @@ export function UpdateDialog({ open, onClose, check }: {
     setError('')
     setPolling(false)
     setApplied(false)
+    setUnignoring(false)
   }, [])
   useEffect(() => {
     if (!open) {
@@ -148,6 +159,7 @@ export function UpdateDialog({ open, onClose, check }: {
 
   const c = check
   const update = hasUpdate(c)
+  const ignored = isIgnored(c)
   const state = status?.state ?? 'idle'
   const downloading = state === 'downloading'
   const pct = status?.total
@@ -178,7 +190,7 @@ export function UpdateDialog({ open, onClose, check }: {
       if (!r.ok) throw new Error('后端未能完成安装')
       setApplied(true)
       qc.setQueryData<UpdateCheckOut>(QUERY_KEY,
-        (old) => (old ? { ...old, action: 'none' } : old))
+        (old) => (old ? { ...old, action: 'none', ignored: false } : old))
     } catch (e) {
       setError(errText(e))
     }
@@ -189,10 +201,27 @@ export function UpdateDialog({ open, onClose, check }: {
     try {
       await apiPost('/api/system/update/ignore', { version: c.latest })
       qc.setQueryData<UpdateCheckOut>(QUERY_KEY,
-        (old) => (old ? { ...old, action: 'none' } : old))
+        (old) => (old ? { ...old, action: 'none', ignored: true } : old))
       onClose()
     } catch (e) {
       setError(errText(e))
+    }
+  }
+
+  // 取消忽略后必须真正重新 check：服务端会依据当前 manifest 重新判定，
+  // 而不是只把前端文案改掉（否则用户仍看不到「立即更新」）。
+  const unignoreVersion = async () => {
+    setError('')
+    setUnignoring(true)
+    try {
+      await apiPost('/api/system/update/unignore')
+      qc.setQueryData<UpdateCheckOut>(QUERY_KEY,
+        (old) => (old ? { ...old, ignored: false } : old))
+      await qc.refetchQueries({ queryKey: QUERY_KEY })
+    } catch (e) {
+      setError(errText(e))
+    } finally {
+      setUnignoring(false)
     }
   }
 
@@ -200,9 +229,15 @@ export function UpdateDialog({ open, onClose, check }: {
     <Dialog open={open} onClose={downloading ? undefined : onClose} maxWidth="sm" fullWidth>
       <DialogTitle>系统更新</DialogTitle>
       <DialogContent dividers>
-        {!update && !applied && (
+        {!update && !ignored && !applied && (
           <Alert severity="info" sx={{ mb: 2 }}>
             当前已经是最新版本（v{__APP_VERSION__}）
+          </Alert>
+        )}
+        {ignored && !applied && (
+          <Alert severity="info" sx={{ mb: 2 }}>
+            已忽略此版本更新（v{c?.latest}）。厂商以更高发布序号重发同版本时会自动提醒，
+            也可以点「取消忽略并重新检查」立即恢复。
           </Alert>
         )}
         {update && c && (
@@ -273,9 +308,17 @@ export function UpdateDialog({ open, onClose, check }: {
         )}
       </DialogContent>
       <DialogActions>
-        <Button onClick={onClose} disabled={downloading}>
+        <Button onClick={onClose} disabled={downloading || unignoring}>
           {applied ? '关闭' : '稍后'}
         </Button>
+        {ignored && !applied && (
+          <Button
+            onClick={() => void unignoreVersion()}
+            disabled={unignoring}
+          >
+            {unignoring ? '正在取消…' : '取消忽略并重新检查'}
+          </Button>
+        )}
         {update && c?.action !== 'forced' && !applied && !downloading && state !== 'done' && (
           <Button onClick={() => void ignoreVersion()} color="inherit">
             忽略此版本
@@ -305,6 +348,7 @@ export function UpdateSettingsTab() {
   const q = useUpdateCheck(false)
   const [open, setOpen] = useState(false)
   const c = q.data
+  const ignored = isIgnored(c)
   return (
     <Box>
       <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 2 }}>
@@ -318,9 +362,9 @@ export function UpdateSettingsTab() {
         >
           {q.isFetching ? '检查中…' : '检查更新'}
         </Button>
-        {hasUpdate(c) && (
+        {(hasUpdate(c) || ignored) && (
           <Button size="small" variant="contained" onClick={() => setOpen(true)}>
-            查看更新
+            {ignored ? '更新详情' : '查看更新'}
           </Button>
         )}
       </Stack>
@@ -340,7 +384,9 @@ export function UpdateSettingsTab() {
             <Typography variant="body2" color="text.secondary">
               {hasUpdate(c)
                 ? c.action === 'forced' ? '需要强制更新后才能继续使用' : '发现新版本，可点击「查看更新」安装'
-                : `当前已经是最新版本（v${__APP_VERSION__}）`}
+                : ignored
+                  ? `已忽略此版本更新（v${c.latest}），可在「更新详情」中取消忽略`
+                  : `当前已经是最新版本（v${__APP_VERSION__}）`}
             </Typography>
             {c.notes && (
               <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>

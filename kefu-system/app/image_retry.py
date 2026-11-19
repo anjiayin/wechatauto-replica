@@ -191,6 +191,29 @@ class ImageRetryQueue:
                             dict(dropped.payload or {}))
         return True
 
+    def wake_all(self) -> int:
+        """把所有在途任务的到期时刻提前到「现在」，立即重试一遍。
+
+        用途（1.2.4 图片商机漏单）：图片 AES key 是用户打开图片后才出现在
+        微信进程内存里的。22:29 取图失败的任务按 10/30/90/300s 退避，
+        22:33 密钥捕获成功但这些任务仍在等下一次退避；如果用户不再发新图，
+        它们会一直等下去甚至用尽重试。密钥一旦可用就调用本方法，让队列
+        立即重跑（不改 attempts 计数，重试语义保持不变）。
+
+        Returns:
+            被唤醒的任务数（0 = 队列为空）。
+        """
+        with self._cv:
+            now = time.monotonic()
+            count = 0
+            for job in self._jobs:
+                if job.due > now:
+                    job.due = now
+                    count += 1
+            if count:
+                self._cv.notify_all()
+            return count
+
     def pending_count(self) -> int:
         """在途任务数（**不含正在执行的那一条**）。
 

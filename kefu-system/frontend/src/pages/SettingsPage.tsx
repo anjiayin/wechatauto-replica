@@ -53,6 +53,7 @@ import type {
   AsrStatus,
   BillingOut,
   CacheDirInfo,
+  ImageKeyStatus,
   ImageSettings,
   ImageSettingsPayload,
   LastPurge,
@@ -1584,6 +1585,15 @@ function DataBillingTab() {
     }
   }, [cacheInfo, cacheLoaded])
 
+  // 图片解密密钥状态：未就绪时提醒用户去微信点开一张图片（后端只读缓存，
+  // 不会触发内存扫描等待）。仅在未就绪时低频轮询，就绪后立即停止。
+  const { data: imageKey, refetch: refetchImageKey } = useQuery({
+    queryKey: ['image-key-status'],
+    queryFn: () => apiGet<ImageKeyStatus>('/api/system/image-key-status'),
+    refetchInterval: (query) =>
+      query.state.data && !query.state.data.ready ? 20000 : false,
+  })
+
   // 启动端口（设置页直接改，重启服务后生效）
   const { data: serverInfo } = useQuery({
     queryKey: ['server-settings'],
@@ -1670,7 +1680,7 @@ function DataBillingTab() {
   })
   const [inputPrice, setInputPrice] = useState('')
   const [outputPrice, setOutputPrice] = useState('')
-  const [priceUnit, setPriceUnit] = useState<'per_k' | 'per_m'>('per_k')
+  const [priceUnit, setPriceUnit] = useState<'per_k' | 'per_m'>('per_m')
   const [billingLoaded, setBillingLoaded] = useState(false)
   useEffect(() => {
     if (billing && !billingLoaded) {
@@ -1837,6 +1847,29 @@ function DataBillingTab() {
           </Alert>
         )}
       </Stack>
+
+      <Divider sx={{ my: 2 }} />
+      <Typography variant="subtitle2" sx={{ mb: 1 }}>图片解密密钥</Typography>
+      {!imageKey ? (
+        <Typography variant="caption" color="text.secondary">正在检查密钥状态…</Typography>
+      ) : imageKey.ready ? (
+        <Alert
+          severity="success"
+          sx={{ py: 0.5 }}
+          action={<Button size="small" onClick={() => void refetchImageKey()}>重新检查</Button>}
+        >
+          图片解密密钥已就绪，聊天图片可正常解密显示。
+        </Alert>
+      ) : (
+        <Alert
+          severity="warning"
+          sx={{ py: 0.5 }}
+          action={<Button size="small" onClick={() => void refetchImageKey()}>重新检查</Button>}
+        >
+          图片解密密钥尚未获取：请在微信中打开任意一张图片查看大图，程序会自动捕获并缓存，之后无需重复操作
+          （除非更换微信账号、清除缓存或微信升级导致密钥变化）。完成后可点「重新检查」或等待自动刷新。
+        </Alert>
+      )}
 
       <Divider sx={{ my: 2 }} />
       <Typography variant="subtitle2" sx={{ mb: 1 }}>启动端口</Typography>

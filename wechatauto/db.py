@@ -60,6 +60,9 @@ FAST_RETRY_INTERVAL_SEC = 0.2
 # 同一分片最多每 CACHE_STALE_WARN_INTERVAL_SEC 秒告警一次
 CACHE_STALE_WARN_SEC = 120.0
 CACHE_STALE_WARN_INTERVAL_SEC = 60.0
+# 源库持续写入导致「重建变慢」的判定窗口：这段时间内出现过签名变化就认为
+# 属于常态写入，告警改用不会误导运维的文案（fail_streak 仍保持真实值）。
+SOURCE_CHURN_ACTIVE_SEC = 600.0
 # last_error 会进 cache_status() → /api/status，必须限长（traceback 可达数 KB）
 MAX_CACHE_ERROR_LEN = 800
 # 临时缓存晋升为正式缓存的重试：Windows 上只要本进程还有只读连接持有
@@ -608,6 +611,7 @@ class WeChatDB:
         self._cache_last_error: Dict[str, str] = {}     # rel -> 最近一次失败原因
         self._cache_fail_streak: Dict[str, int] = {}    # rel -> 连续失败次数
         self._stale_warned_at: Dict[str, float] = {}    # rel -> 上次陈旧告警时刻
+        self._cache_churn_at: Dict[str, float] = {}     # rel -> 最近一次源库持续写入
         self._rebuild_skipped_at: Dict[str, float] = {}  # rel -> 上次因配额跳过
         self._rebuild_sem = _REBUILD_SEMAPHORE
         self._cache_state_ready = True
@@ -1177,6 +1181,8 @@ class WeChatDB:
                 self._cache_fail_streak = {}
             if not hasattr(self, "_stale_warned_at"):
                 self._stale_warned_at = {}
+            if not hasattr(self, "_cache_churn_at"):
+                self._cache_churn_at = {}
             if not hasattr(self, "_rebuild_skipped_at"):
                 self._rebuild_skipped_at = {}
             if not hasattr(self, "_rebuild_sem") or self._rebuild_sem is None:
@@ -1202,11 +1208,23 @@ class WeChatDB:
             _one_line(reason, MAX_CACHE_ERROR_LEN) or "未知错误")
         self._cache_fail_streak[rel] = int(self._cache_fail_streak.get(rel, 0)) + 1
 
+    def _record_cache_churn(self, rel: str) -> None:
+        """记录「源库在构建期间持续写入」这一状态（不算失败）。
+
+        1.2.4 的误报根因之一：源库签名变化走的是 ``continue`` 分支，既不算
+        失败也没有任何留痕，于是运维只看到 stale_seconds 一直涨、
+        fail_streak 恒为 0，无法判断是「重建炸了」还是「微信一直在写」。
+        这里单独记一个时间戳，供告警文案区分两者，绝不改变 fail_streak。
+        """
+        self._ensure_cache_state()
+        self._cache_churn_at[rel] = time.time()
+
     def _maybe_warn_stale(self, rel: str) -> None:
         """源库已变化但缓存长期未成功更新时告警（每分片最多每 60 秒一条）。
 
         线上故障中重建连续失败却无任何日志，轮询读陈旧缓存恒返回空，
         watermark 不推进也没有告警——这条 WARNING 是最外层的兜底信号。
+        源库持续写入属于常态，文案必须与之区分，避免误报成缓存故障。
         """
         self._ensure_cache_state()
         now = time.time()
@@ -1222,10 +1240,21 @@ class WeChatDB:
         if now - last_warn < CACHE_STALE_WARN_INTERVAL_SEC:
             return
         self._stale_warned_at[rel] = now
+        fail_streak = int(self._cache_fail_streak.get(rel, 0))
+        churn_at = self._cache_churn_at.get(rel, 0.0)
+        if fail_streak == 0 and now - churn_at < SOURCE_CHURN_ACTIVE_SEC:
+            # 源库持续写入：重建还在跑或刚晋升过快照，不是失败。
+            sys.stderr.write(
+                "[wechatauto] INFO %s 解密缓存距上次晋升 %.0f 秒；源库在重建期间"
+                "持续写入（微信正常收消息），正在按新签名追平；连续失败 0 次，"
+                "当前读取最近一次校验通过的快照。如长时间无新商机请检查重建耗时。\n"
+                % (rel, stale)
+            )
+            return
         sys.stderr.write(
             "[wechatauto] WARNING %s 解密缓存已 %.0f 秒未成功更新（源库仍在变化），"
             "轮询可能读不到新消息；连续失败 %d 次，最后错误: %s\n"
-            % (rel, stale, int(self._cache_fail_streak.get(rel, 0)),
+            % (rel, stale, fail_streak,
                _one_line(self._cache_last_error.get(rel), 200) or "无")
         )
 
@@ -1289,6 +1318,29 @@ class WeChatDB:
             except OSError:
                 salt, frames = b"", 0
         return (src_mtime, src_size, salt, frames)
+
+    @staticmethod
+    def _source_stamp_sig(src: str,
+                          wal_path: Optional[str]) -> Tuple[float, int, float, int]:
+        """采集 stamp 所需的四项源库签名（mtime/size + WAL mtime/size）。
+
+        与 :meth:`_source_sig` 的区别：stamp 必须记录**构建开始时**看到的源库
+        状态，这样缓存内容比 stamp 新时下轮自然会追平，而不是反过来把新签名
+        盖到旧缓存上、永久吞掉构建期间新写的消息。
+        """
+        try:
+            src_mtime = os.path.getmtime(src)
+            src_size = os.path.getsize(src)
+        except OSError:
+            src_mtime, src_size = 0.0, -1
+        wal_mtime, wal_size = 0.0, 0
+        if wal_path:
+            try:
+                wal_mtime = os.path.getmtime(wal_path)
+                wal_size = os.path.getsize(wal_path)
+            except OSError:
+                wal_mtime, wal_size = 0.0, 0
+        return (src_mtime, src_size, wal_mtime, wal_size)
 
     @contextlib.contextmanager
     def _syncing_cache(self, rel: str):
@@ -1487,11 +1539,12 @@ class WeChatDB:
                     wal_mtime: float, wal_size: int) -> None:
         """后台线程：增量重建解密缓存并原子替换（详见 _open 的旧缓存策略）。
 
-        相对旧实现的修复（对应线上"14:39–17:52 三小时无新商机"故障）：
+        相对旧实现的修复（对应线上"14:39–17:52 三小时无新商机"及
+        1.2.4「stale_seconds 无限增长」故障）：
         1. 三次尝试全部失败必须留痕（分片、耗时、原因、连续失败次数）；
-        2. 每轮结束快速比对源库签名，源库仍在写入时缩短重试间隔并跳过
-           昂贵的整库校验（生产环境实测 3×130s 全花在注定过期的快照上），
-           最后一次尝试仍强制校验，保证能推进出一个可用快照；
+        2. 源库在构建期间持续写入是常态，**不能**因此整轮重来：只记录 churn
+           并继续校验当前已构建的临时库（安全底线仍是 quick_check 通过），
+           通过后晋升并按「构建开始时」的保守签名写 stamp，下一轮再追平；
         3. 全局 Semaphore 限制同时重建的分片数，拿不到配额本轮直接跳过，
            不阻塞轮询线程（加锁顺序：先 semaphore 后 rel_lock，释放反序）。
         """
@@ -1524,6 +1577,12 @@ class WeChatDB:
                 wal_path = self._wal_path(rel)
                 # 构建前记录源库签名，用于"快速失败快速重试"
                 sig = self._source_sig(src, wal_path)
+                # stamp 必须写「构建开始时」的签名：缓存内容不会比这个签名
+                # 更新得更多，源库此后若继续写入，下轮 _open 自然再追平。
+                # 旧实现在源库变化时**完全不写 stamp** → _open 每轮都判定
+                # 过期 → 又起一轮重建 → 微信持续写入时永不收敛。
+                build_sig = self._source_stamp_sig(src, wal_path)
+                source_changed = False
                 verified = False
                 last_error = ""
                 with_stack = ""   # 本轮首次异常的原因 + traceback（进 cache_status）
@@ -1577,14 +1636,19 @@ class WeChatDB:
                     patched = int(stats.get("patched", -1))
                     unchanged = (not stats.get("full", True)) and patched == 0 \
                         and merged_pages == 0
-                    if now_sig != sig and attempt < BG_REBUILD_ATTEMPTS:
-                        # 源库在本轮构建期间又被写入：快照已过期，
-                        # 此时整库校验纯属空转（线上单轮 130s）→ 短间隔重试
+                    if now_sig != sig:
+                        # 源库在本轮构建期间又被写入——微信活跃期这是**常态**，
+                        # 不是失败。旧实现在这里 continue 重做整轮构建（83MB
+                        # 分片实测单轮 2~3 分钟），3 次全"过期"后既不 promote
+                        # 也不写 stamp，下一轮又从头开始 → 永不收敛、告警刷屏。
+                        # 现在只留痕并继续校验当前 tmp：quick_check 通过就
+                        # 晋升这个已验证快照，stamp 用构建开始时的保守签名，
+                        # 下一轮再增量追平（新的签名会自然触发重建）。
+                        source_changed = True
+                        self._record_cache_churn(rel)
                         last_error = ("源库在构建期间持续变化（签名 %s → %s）"
                                       % (sig, now_sig))
-                        sig = now_sig
-                        time.sleep(FAST_RETRY_INTERVAL_SEC)
-                        continue
+                    sig = now_sig
                     if unchanged:
                         # 页级重建未改写任何页、WAL 也未写入任何页：
                         # 缓存与上次已验证状态完全一致，无需重复整库校验
@@ -1629,14 +1693,6 @@ class WeChatDB:
                            _one_line(last_error, 300))
                     )
                     return
-                # 源库在重建期间又被改写 → 不写 stamp（缓存内容与 stamp 描述
-                # 不一致会被误判为最新），下次 _open 会再次触发重建（自愈）。
-                # 页级增量重建成本已很低，连续重建不再是瓶颈。
-                try:
-                    snapshot_fresh = (os.path.getmtime(src) == src_mtime
-                                      and os.path.getsize(src) == src_size)
-                except OSError:
-                    snapshot_fresh = False
                 if not self._promote_cache(tmp, dst):
                     self._record_cache_error(rel, "临时文件晋升正式缓存失败")
                     sys.stderr.write(
@@ -1644,16 +1700,24 @@ class WeChatDB:
                         "耗时 %.1fs，下轮重试\n" % (rel, time.monotonic() - started)
                     )
                     return
-                if snapshot_fresh:
-                    self._write_stamp(stamp=dst + ".stamp", src_mtime=src_mtime,
-                                      src_size=src_size, wal_mtime=wal_mtime,
-                                      wal_size=wal_size, applied=applied)
+                # 无论源库是否在构建期间变化，都必须写 stamp：
+                # - 校验已通过，晋升的缓存可安全使用；
+                # - 用构建开始时采样的保守签名，缓存不会"假装"包含尚未读到的
+                #   新消息；源库继续变化会让下一轮 _open 自然触发追平；
+                # - 旧实现不写 stamp 导致 stale_seconds 单调增长、告警永不停止。
+                self._write_stamp(stamp=dst + ".stamp",
+                                  src_mtime=build_sig[0],
+                                  src_size=build_sig[1],
+                                  wal_mtime=build_sig[2],
+                                  wal_size=build_sig[3],
+                                  applied=applied)
                 self._record_cache_ok(rel)
                 sys.stderr.write(
                     "[wechatauto] %s 缓存重建完成（%s，%.1fs，校验 %.1fs%s）\n"
                     % (rel, verified_how or how, time.monotonic() - started,
                        check_cost,
-                       "" if snapshot_fresh else "，源库持续写入下轮继续"))
+                       "，源库持续写入，已按构建时签名落戳、下轮追平（非失败）"
+                       if source_changed else ""))
         except Exception as exc:  # noqa: BLE001 - 外层兜底，任何逃逸异常都要可见
             # 内层 try 只覆盖"构建 + WAL 合并"。外层的 _wal_path / _source_sig /
             # _promote_cache / _write_stamp（磁盘写满）等仍可能抛异常：

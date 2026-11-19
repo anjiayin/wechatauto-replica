@@ -189,6 +189,9 @@ class UpdateService:
         self.db = db
         self._lock = threading.Lock()
         self._last_manifest: dict[str, Any] | None = None
+        # 最近一次 check 看到的 manifest sequence；ignore() 在没有 manifest
+        # 上下文时用它绑定忽略记录，避免误绑「上次已安装版本」的 last_seen。
+        self._last_check_sequence: int = 0
         self._job: dict[str, Any] = {
             "state": "idle", "done": 0, "total": 0, "message": "",
             "version": "", "action": "none",
@@ -223,9 +226,19 @@ class UpdateService:
                     "latest": "", "reason": err}
         with self._lock:
             ignored = self.db.get_setting(core.KEY_IGNORED_VERSION, "")
+            ignored_seq = core.parse_ignored_sequence(
+                self.db.get_setting(core.KEY_IGNORED_SEQUENCE, ""))
             last_seen = self.db.get_int(core.KEY_LAST_SEQUENCE, 0)
-        action = core.decide(APP_VERSION, m, ignored, last_seen, _channel)
-        summary = core.public_summary(m, action, APP_VERSION)
+        action = core.decide(APP_VERSION, m, ignored, last_seen,
+                             _channel, ignored_seq)
+        # 仅当「确实有新版本、且是被用户的忽略决定挡住」时标 ignored，
+        # 避免 sequence 防重放/已是最新/强制更新等场景误报「已忽略」。
+        ignored_flag = bool(
+            action == "none"
+            and core.update_available(APP_VERSION, m, last_seen, _channel)
+            and core.is_ignored(ignored, ignored_seq, m))
+        summary = core.public_summary(m, action, APP_VERSION,
+                                      ignored=ignored_flag)
         pkg = core.pick_package(m, APP_VERSION)
         if pkg and action != "none":
             summary["package_size"] = int(pkg.get("size", 0) or 0)
@@ -233,8 +246,9 @@ class UpdateService:
         summary["ok"] = True
         with self._lock:
             self._last_manifest = m if action != "none" else None
-        logger.info("检查更新：current=%s latest=%s action=%s",
-                    APP_VERSION, summary.get("latest"), action)
+            self._last_check_sequence = int(summary.get("sequence", 0) or 0)
+        logger.info("检查更新：current=%s latest=%s action=%s ignored=%s",
+                    APP_VERSION, summary.get("latest"), action, ignored_flag)
         return summary
 
     # ------------------------------------------------------------------
@@ -339,6 +353,7 @@ class UpdateService:
                 self.db.set_setting(core.KEY_LAST_SEQUENCE,
                                     str(int(fresh.get("sequence", 0) or 0)))
                 self.db.set_setting(core.KEY_IGNORED_VERSION, "")
+                self.db.set_setting(core.KEY_IGNORED_SEQUENCE, "")
                 self._job.update({"state": "applied", "message": "安装完成，请重启"})
         except Exception as exc:                  # noqa: BLE001
             logger.warning("更新应用失败：%s", exc)
@@ -348,9 +363,27 @@ class UpdateService:
         return 200, {"ok": True, "need_restart": True, "version": version}
 
     def ignore(self, version: str) -> dict[str, Any]:
+        """忽略当前检查到的版本，并记录其 manifest sequence。
+
+        只有厂商用同一版本号、更高 sequence 重发布时才会重新提示；老数据
+        只有版本号没有 sequence，会被 :func:`app.update_core.is_ignored`
+        视为过期，现场机器无需清库即可自愈。
+        """
         with self._lock:
-            self.db.set_setting(core.KEY_IGNORED_VERSION, str(version or ""))
+            m = self._last_manifest
+            seq = int(m.get("sequence", 0) or 0) if m else self._last_check_sequence
+            target = str(version or "")
+            self.db.set_setting(core.KEY_IGNORED_VERSION, target)
+            self.db.set_setting(core.KEY_IGNORED_SEQUENCE,
+                                str(seq) if target else "")
             self._last_manifest = None
             self._job = {"state": "idle", "done": 0, "total": 0,
                          "message": "", "version": "", "action": "none"}
-        return {"ok": True, "ignored": str(version or "")}
+        return {"ok": True, "ignored": target}
+
+    def unignore(self) -> dict[str, Any]:
+        """清除「忽略此版本」记录，使下一次 check 恢复正常判定。"""
+        with self._lock:
+            self.db.set_setting(core.KEY_IGNORED_VERSION, "")
+            self.db.set_setting(core.KEY_IGNORED_SEQUENCE, "")
+        return {"ok": True, "ignored": ""}

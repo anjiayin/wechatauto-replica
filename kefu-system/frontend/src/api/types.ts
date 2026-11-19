@@ -411,6 +411,12 @@ export interface BillingOut {
   series: BillingDay[]
 }
 
+/** /api/system/image-key-status：图片解密密钥是否就绪（只读查询） */
+export interface ImageKeyStatus {
+  ready: boolean
+  source: string
+}
+
 /** /api/system/cache（微信数据库解密缓存目录） */
 export interface CacheDirInfo {
   dir: string
@@ -519,6 +525,8 @@ export interface UpdateCheckOut {
   released_at: string
   package_size: number
   package_type?: string
+  /** 有新版本但被用户主动忽略（action 仍为 none）；后端新增的展示字段 */
+  ignored?: boolean
   /** 未配置更新地址 / 验签失败等静默原因（不视为错误） */
   reason?: string
 }

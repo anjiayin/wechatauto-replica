@@ -6,7 +6,7 @@
 - 用户：简体中文；重视真实数据/实机验证，不接受只凭推断的结论。
 - 交接文件：`.workbuddy/memory/2026-11-15.md`（UIA 第 2~7 轮）、`HANDOVER-*.md`；打包方案 `打包与自动更新技术方案.md`（2026-11-15 定稿，实现未开工）。
 - **2026-11-15 19:33 状态**：分支 `main`、**工作区干净（0 改动）**、`HEAD=670c6ce`「再次优化消息发送，托盘化也能正常发送」，UIA 各批与版本号统一均已提交。测试基线 1234 passed。前端改后必须 `cd kefu-system/frontend && npm run build`（dist 被 gitignore）+ 浏览器 Ctrl+F5；后端改后重启 8766。
-- 版本唯一真源 `version.txt`（当前 **1.2.1**）；发版只跑 `python kefu-system/tools/version_sync.py --bump X.Y.Z`，vite 构建期硬校验 + `tests/test_version_consistency.py` 守门，禁止手改派生的 `1.0.0` 之类字面量。
+- 版本唯一真源 `version.txt`（当前 **1.2.5**，2026-11-18 23:33 已发布 OSS，线上 sequence=125）；发版只跑 `python kefu-system/tools/version_sync.py --bump X.Y.Z`，vite 构建期硬校验 + `tests/test_version_consistency.py` 守门，禁止手改派生的 `1.0.0` 之类字面量。发布命令模板/线上地址见 `.workbuddy/memory/2026-11-18.md`（注意线上 sequence 可能比日志记的大，发版前先 `curl .../manifest.json` 读真实 sequence 再 +1；1.2.4 实际发过两次、sequence 到 124）。
 
 ## 铁律
 - pytest 只用 `/d/my_conda_envs/wechatauto/python.exe -m pytest`（PATH 里的 python 没装 pytest），必须 `--basetemp=D:/tmp/pt-新目录名`（safe-delete 守卫会拦临时目录清理）；全量约 9 分钟。

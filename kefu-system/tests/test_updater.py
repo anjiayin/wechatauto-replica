@@ -77,8 +77,54 @@ def test_decide_channel_and_replay_guard(updater):
 
 
 def test_decide_ignored_version(updater):
-    assert updater.decide("1.2.1", _manifest(), "1.2.2", 0) == "none"
-    assert updater.decide("1.2.1", _manifest(), "1.2.1", 0) == "optional"
+    """忽略绑定 sequence：老记录过期自愈；同 sequence 屏蔽；重发布解除。"""
+    # 老 DB 只有版本号没有 sequence → 视为过期，存量客户端无需清库即可自愈。
+    # （本断言相对旧语义是有意为之的变更，理由同上。）
+    assert updater.decide("1.2.1", _manifest(), "1.2.2", 0) == "optional"
+    # 新格式：忽略时 manifest.sequence=17，原样重查仍屏蔽。
+    assert updater.decide("1.2.1", _manifest(), "1.2.2", 0, "stable", 17) == "none"
+    # 同版本号重发布，sequence 抬高 → 自动解除忽略。
+    assert updater.decide("1.2.1", _manifest(seq=18), "1.2.2", 0,
+                          "stable", 17) == "optional"
+    # 忽略的是别的版本号时不屏蔽。
+    assert updater.decide("1.2.1", _manifest(), "1.2.1", 0, "stable", 17) == "optional"
+    # 强制更新不受忽略影响。
+    assert updater.decide("1.1.9", _manifest(min_sup="1.2.0"), "1.2.2", 0,
+                          "stable", 17) == "forced"
+
+
+def test_parse_ignored_sequence_handles_legacy_and_invalid(updater):
+    assert updater.parse_ignored_sequence("") is None
+    assert updater.parse_ignored_sequence(None) is None
+    assert updater.parse_ignored_sequence("abc") is None
+    assert updater.parse_ignored_sequence(" 1250 ") == 1250
+
+
+def test_updater_ignored_sequence_db_roundtrip(updater, monkeypatch, tmp_path):
+    """托盘链路：忽略 sequence 落库、读取、重发布判定与清理全链路。"""
+    import sqlite3
+    monkeypatch.setattr(updater, "DATA", tmp_path)
+    con = sqlite3.connect(tmp_path / "kefu.sqlite3")
+    con.execute("create table settings(key text primary key, value text)")
+    con.commit()
+    con.close()
+
+    assert updater._ignored_sequence() is None        # 老库无该键
+    updater._save_state("1.2.5", 0, 1250)
+    assert updater._state() == ("1.2.5", 0)
+    assert updater._ignored_sequence() == 1250
+
+    m = {"channel": "stable", "sequence": 1250, "latest": "1.2.5",
+         "min_supported": "0.0.0"}
+    seq = updater._ignored_sequence()
+    assert updater.decide("1.2.4", m, "1.2.5", 0, "stable", seq) == "none"
+    republished = dict(m, sequence=1251)
+    assert updater.decide("1.2.4", republished, "1.2.5", 0,
+                          "stable", seq) == "optional"
+
+    updater._save_state("", 1251)                    # 升级成功后清理
+    assert updater._state() == ("", 1251)
+    assert updater._ignored_sequence() is None
 
 
 def test_pick_package(updater):

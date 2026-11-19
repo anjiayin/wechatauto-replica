@@ -6,7 +6,8 @@
 
   - 数字版本比较（禁止字符串比较）
   - manifest Ed25519 验签
-  - decide() 三级判定（channel / sequence 防重放 / 强制 vs 可选 / ignore）
+  - decide() 三级判定（channel / sequence 防重放 / 强制 vs 可选 /
+    ignore：忽略绑定 sequence，重发布自动解除，老记录视为过期）
   - 选包、Range 下载 + SHA256、防路径穿越解压
 
 网络与磁盘的外部状态（current.json / settings 表 / tkinter 确认 / junction
@@ -31,6 +32,9 @@ VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.\-]+)?$")
 # settings 表里的更新内部键（后端与独立更新器必须一致）
 KEY_IGNORED_VERSION = "update.ignored_version"
 KEY_LAST_SEQUENCE = "update.last_sequence"
+# 「忽略此版本」绑定忽略当时的 manifest sequence；老 DB 没有这个键，
+# 新逻辑把「只有版本号、没有 sequence」的记录视为过期（存量自愈）。
+KEY_IGNORED_SEQUENCE = "update.ignored_sequence"
 
 
 # ---------------------------------------------------------------------------
@@ -116,21 +120,69 @@ def fetch_manifest(url: str, public_keys: dict[str, str],
 # ---------------------------------------------------------------------------
 # 判定（方案 7.2）
 # ---------------------------------------------------------------------------
-def decide(current: str, m: dict, ignored: str, last_seen: int,
-           channel: str = "stable") -> str:
+def update_available(current: str, m: dict, last_seen: int,
+                     channel: str = "stable") -> bool:
+    """manifest 上是否存在值得提示的更新（不含强制/忽略分支）。
+
+    与 :func:`decide` 共用 channel / sequence 防重放 / 版本号三段前置判定，
+    避免「是否有新版本」和「是否提示」两处规则漂移。
+    """
     if str(m.get("channel", "")) != channel:
-        return "none"
+        return False
     if int(m.get("sequence", 0) or 0) <= int(last_seen or 0):
-        return "none"
+        return False
     latest = str(m.get("latest", ""))
     if not VERSION_RE.match(latest):
-        return "none"
-    if compare_versions(current, latest) >= 0:
-        return "none"                              # 已是最新 / 绝不降级
+        return False
+    return compare_versions(current, latest) < 0
+
+
+def parse_ignored_sequence(raw: Any) -> int | None:
+    """把 settings 里的忽略 sequence 解析为 int；缺失/非法返回 None。
+
+    ``None`` 专指「老记录：只存了版本号没有 sequence」。这类记录在新逻辑下
+    一律视为过期，否则现场那台 ``ignored_version=1.2.5`` 的客户端升级后
+    仍会被永久屏蔽，必须手改 DB 才能恢复。
+    """
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def is_ignored(ignored: str, ignored_sequence: int | None, m: dict) -> bool:
+    """用户的「忽略此版本」是否仍然覆盖当前 manifest。
+
+    忽略记录绑定忽略当时的 manifest sequence：只有
+    ``manifest.sequence <= ignored_sequence`` 才继续屏蔽。厂商重发布同版本
+    号但抬高 sequence 时自动解除忽略；老记录（无 sequence）视为过期。
+    """
+    latest = str(m.get("latest", ""))
+    if not ignored or str(ignored) != latest:
+        return False
+    seq = parse_ignored_sequence(ignored_sequence)
+    if seq is None:
+        return False
+    return int(m.get("sequence", 0) or 0) <= seq
+
+
+def decide(current: str, m: dict, ignored: str, last_seen: int,
+           channel: str = "stable",
+           ignored_sequence: int | None = None) -> str:
+    """三级判定：channel / sequence 防重放 / 强制 vs 可选 / ignore。
+
+    ``ignored_sequence`` 为新增的可选参数（默认 None），保持既有 4/5 参数
+    调用方（老 updater.pyc、tests）签名兼容；None 表示老式忽略记录，按过期
+    处理，让存量客户端自愈。
+    """
+    if not update_available(current, m, last_seen, channel):
+        return "none"                              # 已是最新 / 绝不降级 / 防重放
     min_sup = str(m.get("min_supported", "0.0.0"))
     if compare_versions(current, min_sup) < 0:
-        return "forced"
-    if ignored == latest:
+        return "forced"                            # 强制更新不受忽略影响
+    if is_ignored(ignored, ignored_sequence, m):
         return "none"
     return "optional"
 
@@ -241,13 +293,20 @@ def read_current_version(bundle: Path) -> str:
         return "?"
 
 
-def public_summary(m: dict, action: str, current: str) -> dict[str, Any]:
-    """裁出给前端展示的 manifest 字段（不暴露内部 URL / hash）。"""
+def public_summary(m: dict, action: str, current: str,
+                   ignored: bool = False) -> dict[str, Any]:
+    """裁出给前端展示的 manifest 字段（不暴露内部 URL / hash）。
+
+    ``ignored`` 为新增展示字段：仅有新版本但被用户主动忽略时为 True，
+    供前端显示「已忽略此版本更新」而不是误导性的「当前已经是最新版本」。
+    默认 False 保持旧调用方的返回结构兼容。
+    """
     return {
         "action": action,
         "current_version": current,
         "latest": str(m.get("latest", "")),
         "sequence": int(m.get("sequence", 0) or 0),
+        "ignored": bool(ignored),
         "notes": str(m.get("notes", ""))[:1000],
         "min_wechat_version": str(m.get("min_wechat_version", "")),
         # 当前交付件未做代码签名；manifest 未显式关闭时也按「需要关杀软」处理。

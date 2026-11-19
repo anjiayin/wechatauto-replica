@@ -41,7 +41,6 @@ server_id、packed_info），本模块负责把媒体内容从本地取回/解�
 from __future__ import annotations
 
 import ctypes
-import glob
 import hashlib
 import io
 import json
@@ -53,7 +52,7 @@ import tempfile
 import threading
 import time
 from collections import Counter
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +61,19 @@ V2_MAGIC = b"\x07\x08\x56\x32\x08\x07"
 V1_HEADER_SZ = 22  # 6B sig + 16B xor key
 AES16_RE = re.compile(rb"[0-9a-zA-Z]{16,32}")
 DEFAULT_SAVE_PATH = os.path.join(os.path.expanduser("~"), "Documents", "wechatauto_media")
+
+# 缩略图模板扫描缓存：1.2.4 打包版每次 load_image 都会递归列一遍
+# ``msg/attach/*/*/Img``（几十万文件），多个 vision worker 并发时线程长期
+# 卡在 glob→listdir。模板只用于「账号级 XOR 密钥投票」和「AES 探针采样」，
+# 这两者都是账号级、分钟级稳定的数据，完全没必要每张图重扫。
+# TTL 到期后先用缓存下来的目录列表做 mtime 签名校验，签名没变就只延长 TTL；
+# 变了才真正重新列目录，避免每分钟一次全量 I/O。
+TEMPLATE_CACHE_TTL_SEC = 60.0
+TEMPLATE_CACHE_MAX = 64
+IMG_MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
+PROBE_CACHE_HIT_TTL_SEC = 600.0
+PROBE_CACHE_MISS_TTL_SEC = 60.0
+PROBE_SAMPLE_COUNT = 4
 
 
 def _jpeg_like(pt: bytes) -> bool:
@@ -262,17 +274,32 @@ class MediaDownloader:
 
     def __init__(self, db, save_dir: Optional[str] = None,
                  image_key: Optional[str] = None,
-                 cfg_dword: Optional[int] = None):
+                 cfg_dword: Optional[int] = None,
+                 key_ready_callback: Optional[Callable[[str], None]] = None):
         self.db = db
         self.save_dir = save_dir or DEFAULT_SAVE_PATH
         self._image_key = image_key  # 显式注入的图片 AES 密钥
         self._cfg_dword = cfg_dword  # cfg+0x40, 派生图片密钥(最佳方案)
+        # 密钥一旦可用就回调上层（应用层据此立即唤醒待补识别的图片队列），
+        # 避免「用户打开图片→密钥捕获成功→已有的失败图片仍等 10/30/90s」。
+        self._key_ready_callback = key_ready_callback
+        self._notified_keys: Set[str] = set()
         self._xor_key: Optional[int] = None
         self._img_key: Optional[Tuple[str, int]] = None
         self._key_probe: Optional[bytes] = None
+        # AES 探针缓存：多张 .dat 的首块，避免只取 glob 第一个文件（可能是
+        # 半截/非图片）导致正确密钥被 _validate_key 误判为无效。
+        self._probe_cache: Optional[Tuple[float, List[bytes]]] = None
+        self._probe_lock = threading.Lock()
+        # 缩略图模板缓存：base_dir → (过期时刻, 目录签名, 目录列表, 模板路径)。
+        # 所有 vision worker / image_retry 共用同一把锁，扫描期间其他线程等待
+        # 结果而不是各自重复扫盘。
+        self._tpl_cache: Dict[str, Tuple[float, tuple, List[str], List[str]]] = {}
+        self._tpl_lock = threading.Lock()
         # 账号级 XOR 密钥缓存：account_dir → (过期时刻, 密钥)。见
         # :meth:`_learn_account_xor_key`（尾字节反推失手时的兜底）。
         self._acct_key_cache: Dict[str, Tuple[float, Optional[int]]] = {}
+        self._acct_key_flight: Dict[str, threading.Event] = {}
         self._acct_key_lock = threading.Lock()
 
     @staticmethod
@@ -302,48 +329,122 @@ class MediaDownloader:
     # ------------------------------------------------------------------
     # 图片密钥（内存扫描 + 缩略图反推）
     # ------------------------------------------------------------------
+    @staticmethod
+    def _probe_from_path(dat_path: str) -> bytes:
+        """从单个 .dat 读取密文首块（V2: 15:31；V1: 22:38）。"""
+        try:
+            with open(dat_path, "rb") as f:
+                head = f.read(V1_HEADER_SZ + 16)
+        except OSError:
+            return b""
+        if head[:6] == V2_MAGIC and len(head) >= 31:
+            return head[15:31]
+        if len(head) >= V1_HEADER_SZ + 16:
+            return head[V1_HEADER_SZ: V1_HEADER_SZ + 16]
+        return b""
+
     def _probe_ct(self, dat_path: Optional[str] = None) -> bytes:
-        """取一张 V2 图片的密文首块，作为密钥反测试样"""
+        """取一张 V2 图片的密文首块，作为密钥反测试样。
+
+        采样源改为 :meth:`_collect_templates` 的缓存结果，不再单独 glob 一遍
+        全盘（只有一个探针时也复用同一份扫描结果）。
+        """
         if self._key_probe is not None:
             return self._key_probe
         if dat_path is None:
-            base = os.path.join(self.db.account_dir, "msg", "attach")
-            hits = glob.glob(os.path.join(base, "*", "*", "Img", "*.dat"))
+            hits = self._collect_templates(keep=1)
             if not hits:
                 return b""
             dat_path = hits[0]
-        with open(dat_path, "rb") as f:
-            head = f.read(32)
-        if head[:6] == V2_MAGIC:
-            self._key_probe = head[15:31]
-        else:
-            self._key_probe = head[V1_HEADER_SZ: V1_HEADER_SZ + 16]
+        self._key_probe = self._probe_from_path(dat_path)
         return self._key_probe
 
+    def _probe_cts(self) -> List[bytes]:
+        """多张图片的密文首块（去重、带 TTL 缓存）。
+
+        线上故障里 ``image_keys.json`` 已写入正确 AES key，但 ``_validate_key``
+        只拿 glob 命中的第一张 .dat 做探针——那张图可能是半截/非 JPEG，于是
+        正确密钥被判无效，22:33 之后仍持续报「无法获取图片 AES 密钥」。
+        取 4 张模板 + 原探针，任意一个能解出图片头就算密钥有效。
+        """
+        now = time.monotonic()
+        with self._probe_lock:
+            cached = self._probe_cache
+            if cached and now < cached[0] and cached[1]:
+                return list(cached[1])
+        probes: List[bytes] = []
+        for path in self._collect_templates(keep=PROBE_SAMPLE_COUNT):
+            probe = self._probe_from_path(path)
+            if probe and probe not in probes:
+                probes.append(probe)
+        single = self._probe_ct()
+        if single and single not in probes:
+            probes.insert(0, single)
+        ttl = PROBE_CACHE_HIT_TTL_SEC if probes else PROBE_CACHE_MISS_TTL_SEC
+        with self._probe_lock:
+            self._probe_cache = (now + ttl, probes)
+        return list(probes)
+
     def _validate_key(self, aes_key: str) -> bool:
-        """用真实密文首块反测密钥是否有效"""
-        probe = self._probe_ct()
-        if not probe:
+        """用多个真实密文首块反测密钥是否有效（任一命中即可）。"""
+        probes = self._probe_cts()
+        if not probes:
             return False
         try:
             from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-            dec = Cipher(algorithms.AES(aes_key.encode()), modes.ECB()).decryptor()
-            return _jpeg_like(dec.update(probe) + dec.finalize())
+            for probe in probes:
+                dec = Cipher(algorithms.AES(aes_key.encode()),
+                             modes.ECB()).decryptor()
+                if _jpeg_like(dec.update(probe) + dec.finalize()):
+                    return True
         except Exception:
             return False
+        return False
+
+    def _notify_key_ready(self, aes_key: str) -> None:
+        """通知应用层「图片密钥已可用」（同一把密钥只通知一次）。"""
+        if not aes_key or aes_key in self._notified_keys:
+            return
+        self._notified_keys.add(aes_key)
+        callback = self._key_ready_callback
+        if callback is None:
+            return
+        try:
+            callback(aes_key)
+        except Exception:
+            logger.exception("图片密钥就绪回调失败（已忽略，不影响解密）")
 
     def _key_store(self) -> str:
         return os.path.join(self.db.workdir, "image_keys.json")
 
     def _load_persisted_key(self) -> Optional[str]:
+        """读取本账号持久化的 AES 密钥；读写必须用同一个 ``db.account``。
+
+        现场确认 ``image_keys.json`` 的键是 ``wxid_..._ac0e``（微信账号目录
+        名），与 ``WeChatDB.account`` 完全一致，所以键名本身没问题；真正让
+        正确密钥被拒的是旧版只用一张随机 .dat 做探针。这里仍以账号键为第一
+        优先级，仅在它失效时尝试文件里其它账号的键（同一台机器可能切号，
+        AES key 多数情况下跟微信安装而非账号绑定），全部经密文反测。
+        """
         try:
             with open(self._key_store(), "r", encoding="utf-8") as f:
                 saved = json.load(f)
-            key = saved.get(self.db.account)
         except (OSError, ValueError, json.JSONDecodeError):
             return None
-        if key and self._validate_key(key):
-            return key
+        if not isinstance(saved, dict):
+            return None
+        account = str(getattr(self.db, "account", "") or "")
+        ordered: List[str] = []
+        own = saved.get(account)
+        if isinstance(own, str) and own:
+            ordered.append(own)
+        for key in saved.values():
+            if isinstance(key, str) and key and key not in ordered:
+                ordered.append(key)
+        for key in ordered:
+            if self._validate_key(key):
+                self._notify_key_ready(key)
+                return key
         return None
 
     def _persist_key(self, aes_key: str) -> None:
@@ -352,20 +453,131 @@ class MediaDownloader:
                 saved = json.load(f)
         except (OSError, ValueError, json.JSONDecodeError):
             saved = {}
-        saved[self.db.account] = aes_key
+        if not isinstance(saved, dict):
+            saved = {}
+        saved[str(getattr(self.db, "account", "") or "")] = aes_key
         try:
             os.makedirs(os.path.dirname(self._key_store()), exist_ok=True)
             with open(self._key_store(), "w", encoding="utf-8") as f:
                 json.dump(saved, f, indent=2)
         except OSError:
             pass
+        self._notify_key_ready(aes_key)
+
+    @staticmethod
+    def _img_dirs(base: str) -> List[str]:
+        """只遍历已知目录层级 ``attach/<会话>/<YYYY-MM>/Img``。
+
+        绝不递归未知子树（原先的 glob 会为每个会话列出每个月份目录，再进入
+        其中的 Img，实测几十万次 listdir）。同时兼容 ``attach/<会话>/Img``
+        的老布局，避免少采样导致账号 XOR 投票失真。
+        """
+        dirs: List[str] = []
+        try:
+            with os.scandir(base) as chats:
+                chat_entries = [e for e in chats
+                                if e.is_dir(follow_symlinks=False)]
+        except OSError:
+            return dirs
+        for chat in chat_entries:
+            legacy = os.path.join(chat.path, "Img")
+            if os.path.isdir(legacy):
+                dirs.append(legacy)
+            try:
+                with os.scandir(chat.path) as months:
+                    month_entries = [e for e in months
+                                     if e.is_dir(follow_symlinks=False)]
+            except OSError:
+                continue
+            for month in month_entries:
+                if not IMG_MONTH_RE.match(month.name):
+                    continue
+                img = os.path.join(month.path, "Img")
+                if os.path.isdir(img):
+                    dirs.append(img)
+        return dirs
+
+    @staticmethod
+    def _dirs_signature(base: str, dirs: List[str]) -> tuple:
+        """已知目录及其父/祖父目录的 mtime/size 签名（不列文件，只 stat）。
+
+        Img 目录的 mtime 只能反映「新图片写入」；新月份目录建在会话目录下、
+        新会话目录建在 attach 根下，分别只改变会话目录/根的 mtime。因此把
+        每个 Img 目录的父目录（月份）和祖父目录（会话）也纳入签名，否则已
+        有会话下跨月新增的模板会因签名不变而永远不被重新发现。
+        """
+        paths = [base]
+        for img_dir in dirs:
+            paths.append(img_dir)
+            month_dir = os.path.dirname(img_dir)
+            paths.append(month_dir)
+            paths.append(os.path.dirname(month_dir))
+        # 去重但保持插入顺序，保证相同输入产生稳定一致的签名 tuple。
+        unique_paths = list(dict.fromkeys(paths))
+        parts: List[tuple] = []
+        for path in unique_paths:
+            try:
+                st = os.stat(path)
+                parts.append((st.st_mtime_ns, st.st_size))
+            except OSError:
+                parts.append((0, -1))
+        return tuple(parts)
+
+    def _scan_templates(self, base: str, keep: int) -> Tuple[List[str], List[str]]:
+        """实际列一次目录，返回 (模板路径列表, 已发现的 Img 目录列表)。"""
+        dirs = self._img_dirs(base)
+        found: List[Tuple[str, int]] = []
+        for img_dir in dirs:
+            try:
+                with os.scandir(img_dir) as entries:
+                    for entry in entries:
+                        if (not entry.name.endswith("_t.dat")
+                                or not entry.is_file(follow_symlinks=False)):
+                            continue
+                        try:
+                            mtime_ns = entry.stat().st_mtime_ns
+                        except OSError:
+                            mtime_ns = 0
+                        found.append((entry.path, mtime_ns))
+            except OSError:
+                continue
+        found.sort(key=lambda item: item[1], reverse=True)
+        return [path for path, _ in found[:max(0, keep)]], dirs
 
     def _collect_templates(self, limit: int = 32, keep: int = 16) -> List[str]:
-        """递归收集 *_t.dat 缩略图模板: 按修改时间降序取前 keep 个"""
-        base = os.path.join(self.db.account_dir, "msg", "attach")
-        hits = glob.glob(os.path.join(base, "*", "*", "Img", "*_t.dat"))
-        hits.sort(key=os.path.getmtime, reverse=True)
-        return hits[:keep]
+        """收集最新的 ``*_t.dat`` 模板（带 TTL + 目录签名失效的进程内缓存）。
+
+        缓存键是 attach 根目录；TTL 内直接返回（零磁盘 I/O）。TTL 到期后用
+        缓存下来的目录列表做 mtime 签名：新会话/新月份会改父目录 mtime，新图
+        片会改 Img 目录 mtime，任一变化都会触发重新列目录；否则只延长 TTL。
+        整个流程在 ``_tpl_lock`` 内完成，多 worker 并发时只有一个人扫描。
+
+        ``limit`` 为兼容旧调用签名保留（旧实现未使用）；``keep`` 超过缓存容量
+        时直接扫描，保证调用方拿到的数量语义不变。
+        """
+        account_dir = str(getattr(self.db, "account_dir", "") or "")
+        if not account_dir:
+            return []
+        base = os.path.join(account_dir, "msg", "attach")
+        if keep > TEMPLATE_CACHE_MAX:
+            return self._scan_templates(base, keep)[0]
+        now = time.monotonic()
+        with self._tpl_lock:
+            cached = self._tpl_cache.get(base)
+            if cached is not None and now < cached[0]:
+                return list(cached[3][:keep])
+            if cached is not None:
+                signature = self._dirs_signature(base, cached[2])
+                if signature == cached[1]:
+                    self._tpl_cache[base] = (
+                        now + TEMPLATE_CACHE_TTL_SEC, signature,
+                        cached[2], cached[3])
+                    return list(cached[3][:keep])
+            paths, dirs = self._scan_templates(base, TEMPLATE_CACHE_MAX)
+            signature = self._dirs_signature(base, dirs)
+            self._tpl_cache[base] = (
+                now + TEMPLATE_CACHE_TTL_SEC, signature, dirs, paths)
+            return list(paths[:keep])
 
     def _get_xor_key(self, templates: List[str]) -> Optional[int]:
         """文件尾统计推 XOR 密钥: 缩略图明文为 JPEG, 尾部固定 FF D9。
@@ -477,8 +689,8 @@ class MediaDownloader:
           每候选取前 16 字节作 AES-128 key 解密探针, 明文为 JPEG SOI 命中;
         - UTF-16LE: 字母数字与 0x00 交错形式。
         """
-        probe = self._probe_ct()
-        if not probe:
+        probes = self._probe_cts()
+        if not probes:
             return None
         pids = self.db._find_weixin_pids()
         if not pids:
@@ -502,11 +714,14 @@ class MediaDownloader:
                 from cryptography.hazmat.primitives.ciphers import (
                     Cipher, algorithms, modes,
                 )
-                pt = Cipher(algorithms.AES(key16), modes.ECB()).decryptor()
-                out = pt.update(probe) + pt.finalize()
+                for probe in probes:
+                    pt = Cipher(algorithms.AES(key16), modes.ECB()).decryptor()
+                    out = pt.update(probe) + pt.finalize()
+                    if out[:3] == b"\xff\xd8\xff" or _jpeg_like(out):
+                        return True
             except Exception:
                 return False
-            return out[:3] == b"\xff\xd8\xff" or _jpeg_like(out)
+            return False
 
         def _candidates(buf: bytes):
             for m in ASCII32_RE.finditer(buf):
@@ -573,19 +788,21 @@ class MediaDownloader:
         """
         if self._img_key and not refresh:
             return self._img_key
-        probe = self._probe_ct()
-        if not probe:
+        if not self._probe_cts():
             return None
         templates = self._collect_templates()
         # 1) XOR: 模板文件尾众数统计
         xor_key = self._get_xor_key(templates)
         if xor_key is None:
-            dat = self._dbg_last_dat()
+            # 旧实现调用了一个不存在的 _dbg_last_dat()：模板全反推不出时
+            # detect_image_key() 直接 AttributeError。用同一份缓存样本兜底。
+            dat = templates[0] if templates else None
             xor_key = self._derive_xor_key(dat) if dat else 0x88
         # 2) AES: cfgDword 派生优先
         derived = self._derive_cfg_key()
         if derived:
             self._img_key = (derived[0], xor_key)
+            self._notify_key_ready(derived[0])
             return self._img_key
         aes_key = None
         if self._image_key and self._validate_key(self._image_key):
@@ -599,6 +816,7 @@ class MediaDownloader:
         if not aes_key:
             return None
         self._img_key = (aes_key, xor_key)
+        self._notify_key_ready(aes_key)
         return self._img_key
 
     # ------------------------------------------------------------------
@@ -630,10 +848,12 @@ class MediaDownloader:
     def _resolve_aes_key(self) -> Optional[str]:
         """统一密钥解析：显式注入 → cfgDword派生 → 本地缓存 → 内存扫描"""
         if self._image_key and self._validate_key(self._image_key):
+            self._notify_key_ready(self._image_key)
             return self._image_key
         # 尝试cfgDword派生
         derived = self._derive_cfg_key()
         if derived:
+            self._notify_key_ready(derived[0])
             return derived[0]
         cached = self._load_persisted_key()
         if cached:
@@ -764,6 +984,8 @@ class MediaDownloader:
                 r = subprocess.run(
                     [exe, "-y", "-v", "error", "-i", src, "-frames:v", "1", dst],
                     capture_output=True, timeout=30,
+                    # Windows 上不隐藏控制台子进程会闪出 ffmpeg.exe 黑框
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
             except Exception:
                 return None
@@ -1085,11 +1307,33 @@ class MediaDownloader:
             hit = self._acct_key_cache.get(account_dir)
             if hit is not None and now < hit[0]:
                 return hit[1]
-        key = self._detect_account_xor_key()
-        ttl = self._ACCT_KEY_TTL if key is not None else self._ACCT_KEY_NEG_TTL
-        with self._acct_key_lock:
-            self._acct_key_cache[account_dir] = (time.monotonic() + ttl, key)
-        return key
+            flight = self._acct_key_flight.get(account_dir)
+            if flight is None:
+                # 本线程负责探测；其余 vision worker 等结果，不再各自扫盘
+                flight = threading.Event()
+                self._acct_key_flight[account_dir] = flight
+                owner = True
+            else:
+                owner = False
+        if not owner:
+            flight.wait(timeout=10.0)
+            with self._acct_key_lock:
+                hit = self._acct_key_cache.get(account_dir)
+                if hit is not None and time.monotonic() < hit[0]:
+                    return hit[1]
+            return None
+        try:
+            key = self._detect_account_xor_key()
+            ttl = self._ACCT_KEY_TTL if key is not None \
+                else self._ACCT_KEY_NEG_TTL
+            with self._acct_key_lock:
+                self._acct_key_cache[account_dir] = (
+                    time.monotonic() + ttl, key)
+            return key
+        finally:
+            with self._acct_key_lock:
+                self._acct_key_flight.pop(account_dir, None)
+            flight.set()
 
     def _detect_account_xor_key(self) -> Optional[int]:
         """:meth:`_learn_account_xor_key` 的实际探测（不含缓存）。"""

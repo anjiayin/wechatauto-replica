@@ -16,7 +16,9 @@ import pytest
 from app import update_service as us
 from app.api import license_guard
 from app.api.router_update import router as update_router
-from app.update_core import KEY_IGNORED_VERSION, KEY_LAST_SEQUENCE
+from app.update_core import (
+    KEY_IGNORED_SEQUENCE, KEY_IGNORED_VERSION, KEY_LAST_SEQUENCE,
+)
 
 
 class FakeDB:
@@ -82,7 +84,84 @@ def test_ignore_makes_check_return_none(svc):
     assert svc.check()["action"] == "optional"
     svc.ignore("9.9.9")
     assert svc.db.data[KEY_IGNORED_VERSION] == "9.9.9"
+    # 忽略记录必须绑定当时 manifest 的 sequence（本 fixture 为 17）
+    assert svc.db.data[KEY_IGNORED_SEQUENCE] == "17"
+    out = svc.check()
+    assert out["action"] == "none"
+    assert out["ignored"] is True
+    assert out["latest"] == "9.9.9"                 # notes/latest 仍可展示
+
+
+def test_legacy_ignored_record_without_sequence_self_heals(svc):
+    """存量客户端现场：只有 version 没有 sequence → 老记录过期，无需清库。"""
+    svc.db.data[KEY_IGNORED_VERSION] = "9.9.9"
+    assert KEY_IGNORED_SEQUENCE not in svc.db.data
+    out = svc.check()
+    assert out["action"] == "optional"
+    assert out["ignored"] is False
+
+
+def test_field_scenario_legacy_ignored_1250_self_heal(monkeypatch):
+    """现场复现：current=1.2.4、DB ignored=1.2.5/last_sequence=0、
+    manifest latest=1.2.5 seq=1250 → 新代码无需清库即可显示更新。"""
+    monkeypatch.setattr(us, "_manifest_url", "http://example.invalid/kefu")
+    monkeypatch.setattr(us, "APP_VERSION", "1.2.4")
+    db = FakeDB()
+    db.data[KEY_IGNORED_VERSION] = "1.2.5"
+    db.data[KEY_LAST_SEQUENCE] = "0"
+    s = us.UpdateService(db)
+    s._manifest = lambda: (_manifest(latest="1.2.5", seq=1250), "")
+
+    out = s.check()
+    assert out["action"] == "optional"
+    assert out["ignored"] is False
+    assert out["latest"] == "1.2.5" and out["sequence"] == 1250
+
+
+def test_republished_same_version_higher_sequence_restores_prompt(svc):
+    """同版本号 1.2.5 -> sequence 1250 重发布：忽略自动解除。"""
+    assert svc.check()["action"] == "optional"
+    svc.ignore("9.9.9")
     assert svc.check()["action"] == "none"
+
+    republished = _manifest(latest="9.9.9", seq=18)
+    svc._manifest = lambda: (republished, "")
+    out = svc.check()
+    assert out["action"] == "optional"
+    assert out["ignored"] is False
+    assert out["sequence"] == 18
+
+
+def test_same_sequence_keeps_ignore(svc):
+    """未重发布（sequence 不变）时忽略继续生效，不打扰用户。"""
+    svc.check()
+    svc.ignore("9.9.9")
+    for _ in range(2):
+        out = svc.check()
+        assert out["action"] == "none" and out["ignored"] is True
+
+
+def test_unignore_restores_prompt(svc):
+    """取消忽略接口让用户自行恢复，不必手改 DB。"""
+    svc.check()
+    svc.ignore("9.9.9")
+    assert svc.check()["ignored"] is True
+
+    assert svc.unignore() == {"ok": True, "ignored": ""}
+    assert svc.db.data[KEY_IGNORED_VERSION] == ""
+    assert svc.db.data[KEY_IGNORED_SEQUENCE] == ""
+    assert svc.check()["action"] == "optional"
+
+
+def test_forced_update_is_not_suppressed_by_ignore(svc):
+    """低于 min_supported 的客户端即使点过忽略也必须强制更新。"""
+    forced = _manifest(latest="9.9.9", seq=18)
+    forced["min_supported"] = "99.0.0"
+    svc._manifest = lambda: (forced, "")
+    assert svc.check()["action"] == "forced"
+    svc.ignore("9.9.9")
+    assert svc.db.data[KEY_IGNORED_SEQUENCE] == "18"
+    assert svc.check()["action"] == "forced"
 
 
 def test_sequence_replay_guard(svc):
@@ -249,6 +328,9 @@ def test_apply_cross_version_switches_junction_and_current_json(
 
     monkeypatch.setattr(us, "bundle_root", lambda: bundle)
     _prepare_done_job(svc, "1.2.2")
+    # 升级成功后必须同时清掉忽略记录（含 sequence），避免残留脏状态
+    svc.db.data[KEY_IGNORED_VERSION] = "1.2.2"
+    svc.db.data[KEY_IGNORED_SEQUENCE] = "17"
 
     code, payload = svc.apply()
     assert code == 200, payload
@@ -261,6 +343,8 @@ def test_apply_cross_version_switches_junction_and_current_json(
     assert json.loads((bundle / "current.json").read_text(encoding="utf-8")) == {
         "version": "1.2.2", "active": "1.2.2", "previous": "1.2.1"}
     assert svc.status()["state"] == "applied"
+    assert svc.db.data[KEY_IGNORED_VERSION] == ""
+    assert svc.db.data[KEY_IGNORED_SEQUENCE] == ""
 
 
 def test_update_routes_registered():
@@ -268,7 +352,7 @@ def test_update_routes_registered():
     assert paths == {
         "/api/system/update/check", "/api/system/update/download",
         "/api/system/update/status", "/api/system/update/apply",
-        "/api/system/update/ignore",
+        "/api/system/update/ignore", "/api/system/update/unignore",
     }
 
 
@@ -412,7 +496,8 @@ def test_apply_degrades_to_skip_when_root_file_locked(
 
 def test_license_guard_allows_update_endpoints():
     for p in ("/api/system/update/check", "/api/system/update/download",
-              "/api/system/update/status", "/api/system/update/apply"):
+              "/api/system/update/status", "/api/system/update/apply",
+              "/api/system/update/ignore", "/api/system/update/unignore"):
         assert license_guard._allowed(p) is True
 
 

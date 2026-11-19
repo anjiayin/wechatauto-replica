@@ -5,7 +5,8 @@
 - POST /api/system/update/download   确认关杀软后开始下载（202 + 后台进度）
 - GET  /api/system/update/status     查询下载/安装进度
 - POST /api/system/update/apply      校验通过后切换版本（成功后需重启生效）
-- POST /api/system/update/ignore     忽略某个版本
+- POST /api/system/update/ignore     忽略某个版本（绑定当时的 manifest sequence）
+- POST /api/system/update/unignore   取消忽略，恢复更新提示
 
 **这些接口不受授权拦截**：授权过期时客户更要能升级修复，且检查/下载不触碰
 业务数据。真正的写操作（切 junction）只在验签 + 完整性自检通过后执行。
@@ -75,3 +76,8 @@ def apply():
 @router.post("/ignore")
 def ignore(body: IgnoreIn) -> dict[str, Any]:
     return get_service().ignore(body.version)
+
+
+@router.post("/unignore")
+def unignore() -> dict[str, Any]:
+    return get_service().unignore()

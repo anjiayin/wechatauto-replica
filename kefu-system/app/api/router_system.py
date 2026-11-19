@@ -12,6 +12,7 @@
 - GET /api/system/retention | POST /api/system/purge          历史数据（反馈 7）
 - GET /api/system/purge/last                                 上次清理留痕（本轮修复）
 - GET /api/system/billing                                     AI 账单（反馈 13）
+- GET /api/system/image-key-status                            图片解密密钥是否就绪（只读）
 - GET/PUT /api/system/asr | POST /api/system/asr/download      语音转写（本地离线）
 - POST /api/voice/retry                                       语音补转写（手动重试）
 - POST /api/images/retry                                      图片补识别（手动重试）
@@ -51,6 +52,7 @@ from app.schemas import (
     CacheDirUpdate,
     CacheShardStatus,
     ImageAnalysisOut,
+    ImageKeyStatusOut,
     ImageRetryIn,
     ImageRetryOut,
     MessageOut,
@@ -80,9 +82,10 @@ router = APIRouter()
 
 def _billing_settings(db: Database) -> dict:
     """读取账单单价配置：input_price/output_price/unit（per_k|per_m）。"""
-    unit = db.get_setting("billing.unit", "per_k")
+    # 只在未配置（或配置非法）时用「元/百万 tokens」；用户已保存的单位必须尊重
+    unit = db.get_setting("billing.unit", "per_m")
     if unit not in ("per_k", "per_m"):
-        unit = "per_k"
+        unit = "per_m"
     return {
         "unit": unit,
         "input_price": db.get_float("billing.input_price", 0.0),
@@ -410,6 +413,22 @@ def get_billing(db: Database = Depends(get_db)) -> BillingOut:
                             cost=round(_usage_cost(today_usage, billing), 4)),
         series=series,
     )
+
+
+@router.get("/api/system/image-key-status", response_model=ImageKeyStatusOut)
+def get_image_key_status(
+    svc: WeChatService = Depends(get_wechat_service),
+) -> ImageKeyStatusOut:
+    """图片解密密钥状态：只读缓存/派生，绝不触发内存扫描等待。
+
+    前端据此提醒用户在微信里点开一张图片查看大图；密钥一旦可用即不再提示。
+    """
+    try:
+        return ImageKeyStatusOut(**svc.image_key_status())
+    except Exception:
+        # 状态查询失败不能让设置页报错，按未就绪处理
+        logger.exception("读取图片密钥状态失败（按未就绪处理）")
+        return ImageKeyStatusOut()
 
 
 # ---------------------------------------------------------------------------
