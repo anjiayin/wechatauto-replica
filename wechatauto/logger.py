@@ -39,37 +39,47 @@ class WechatautoLogger:
         self.set_debug(False)
 
     def setup_logger(self) -> logging.Logger:
-        """设置日志记录器"""
-        # 配置根记录器
-        root_logger = logging.getLogger()
-        root_logger.setLevel(logging.DEBUG)
+        """设置日志记录器（只操作 ``wechatauto`` 命名 logger，绝不触碰根 logger）。
 
-        # 添加asyncio日志过滤
+        根 logger 的 level 与 handler 归宿主应用管理（例如 kefu-system 的
+        ``setup_logging()`` 把 kefu.log 的 file handler 挂在根 logger 上）。
+        本库一旦 ``root.handlers.clear()`` 或改 root level，就会误伤宿主：
+        生产环境曾因此出现「kefu.log 从启动第二秒起就不再写」的故障（wechatauto
+        被延迟 import 时清掉了 kefu.log 的 handler）。故这里只给 wechatauto
+        自己的命名 logger 挂 handler，并用 ``propagate=False`` 避免日志重复
+        流向根 logger（kefu.log / 根控制台）。
+        """
+        # 第三方库降噪：只调 level、不碰 handler，对全局无副作用
         logging.getLogger('asyncio').setLevel(logging.WARNING)
-
-        # 设置第三方库的日志级别
         logging.getLogger('comtypes').setLevel(logging.WARNING)
         logging.getLogger('urllib3').setLevel(logging.WARNING)
         logging.getLogger('requests').setLevel(logging.WARNING)
 
-        # 清除现有处理器
-        root_logger.handlers.clear()
+        logger = logging.getLogger(self.name)
+        logger.setLevel(logging.DEBUG)
+        # 独立日志：不向根 logger 传播，避免与宿主的 kefu.log/控制台重复
+        logger.propagate = False
 
-        # 格式
-        fmt = '%(asctime)s [%(name)s] [%(levelname)s] [%(filename)s:%(lineno)d]  %(message)s'
+        # 控制台处理器（带颜色），幂等：带 _wx_console 标记则不再重复添加
+        existing = next(
+            (h for h in logger.handlers if getattr(h, "_wx_console", False)),
+            None)
+        if existing is not None:
+            self.console_handler = existing
+        else:
+            fmt = ('%(asctime)s [%(name)s] [%(levelname)s] '
+                   '[%(filename)s:%(lineno)d]  %(message)s')
+            self.console_handler = logging.StreamHandler()
+            console_formatter = ColoredFormatter(
+                fmt=fmt,
+                datefmt="%Y-%m-%d %H:%M:%S"
+            )
+            self.console_handler.setFormatter(console_formatter)
+            self.console_handler.setLevel(logging.DEBUG)
+            setattr(self.console_handler, "_wx_console", True)
+            logger.addHandler(self.console_handler)
 
-        # 控制台处理器（带颜色）
-        self.console_handler = logging.StreamHandler()
-        console_formatter = ColoredFormatter(
-            fmt=fmt,
-            datefmt="%Y-%m-%d %H:%M:%S"
-        )
-        self.console_handler.setFormatter(console_formatter)
-        self.console_handler.setLevel(logging.DEBUG)
-
-        root_logger.addHandler(self.console_handler)
-
-        return logging.getLogger(self.name)
+        return logger
 
     def setup_file_logger(self):
         """根据WxParam.ENABLE_FILE_LOGGER决定是否创建文件日志处理器"""
@@ -91,9 +101,11 @@ class WechatautoLogger:
         )
         self.file_handler.setFormatter(file_formatter)
         self.file_handler.setLevel(logging.DEBUG)
+        setattr(self.file_handler, "_wx_file", True)
 
-        # 将文件处理器添加到日志记录器
-        logging.getLogger().addHandler(self.file_handler)
+        # 将文件处理器添加到 wechatauto 命名 logger（而非根 logger），
+        # 避免污染宿主的根 logger handler 集合
+        logging.getLogger(self.name).addHandler(self.file_handler)
 
     def set_debug(self, debug=False):
         """动态设置日志级别"""
