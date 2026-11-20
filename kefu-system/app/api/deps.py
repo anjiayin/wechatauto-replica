@@ -13,6 +13,7 @@ from app.db import Database
 from app.notifier import Notifier
 from app.pipeline import Pipeline
 from app.sender import Sender
+from app.summary import SummaryService
 from app.wechat_service import WeChatService
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,11 @@ def get_sender() -> Sender:
 def get_notifier() -> Notifier:
     """WS 通知中心单例。"""
     return _require(_notifier, "通知中心")
+
+
+def get_summary_service() -> SummaryService:
+    """群消息总结服务（请求级轻量构造，无常驻单例）。"""
+    return SummaryService(get_db(), get_wechat_service())
 
 
 def get_license_client() -> license_mod.LicenseClient:

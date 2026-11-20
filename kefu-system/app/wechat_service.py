@@ -2495,6 +2495,63 @@ class WeChatService:
                            MSG_QUERY_RETRY_INTERVAL_SEC)
             time.sleep(MSG_QUERY_RETRY_INTERVAL_SEC)
 
+    def get_messages_in_range(self, username: str, start_epoch: int,
+                              end_epoch: int, limit: int = 5000
+                              ) -> tuple[list[dict], str]:
+        """按时间范围读取会话消息（群消息总结的数据源）。
+
+        微信库 create_time 是 epoch 秒，SQL 内只做整数比较；逐行复用现有
+        取名链（正文前缀权威解析 + group_cards 学习缓存）、内容友好化与
+        语音转写缓存回填，保证与消息列表/上下文展示口径一致。
+
+        Args:
+            username: 会话 username（群为 xxx@chatroom）。
+            start_epoch: 起始 epoch 秒（含）。
+            end_epoch: 结束 epoch 秒（含）。
+            limit: 条数上限（5000，仅作病态输入兜底）。
+
+        Returns:
+            (msgs, error)：error 为空串表示成功；微信库不可用时返回
+            ( [], MSG_DB_UNAVAILABLE_ERROR )。查询异常返回中文原因。
+        """
+        if self._wxdb is None:
+            return [], MSG_DB_UNAVAILABLE_ERROR
+        try:
+            raw = self._wxdb.get_messages_between(
+                username, int(start_epoch), int(end_epoch), limit=limit)
+        except Exception as exc:
+            logger.warning("按时间范围读取会话消息失败（%s）：%s", username, exc)
+            return [], "微信数据库正忙或不可读，请稍后重试"
+        out: list[dict] = []
+        for row in raw or []:
+            mtype = str(row.get("type") or "")
+            content = str(row.get("content") or "")
+            sender_id = int(row.get("sender_id") or 0)
+            fallback_wxid = str(row.get("sender_username") or "")
+            display, clean_content = self._resolve_row_sender(
+                username, content, fallback_wxid, sender_id)
+            # 群消息正文前缀是权威发送者：能把显示名反解成 wxid 时优先用它，
+            # 否则沿用微信库 sender_id 映射出的 wxid（与消息列表口径一致）。
+            sender_wxid = fallback_wxid
+            if username.endswith("@chatroom") and sender_id not in (2, "2"):
+                candidate = self.extract_content_sender(content)
+                if candidate:
+                    reverse = self._group_member_reverse_names(username)
+                    sender_wxid = reverse.get(candidate, candidate)
+            out.append({
+                "local_id": int(row.get("local_id") or 0),
+                "type": mtype,
+                "type_name": mtype,
+                "sender_id": sender_id,
+                "sender_wxid": sender_wxid,
+                "sender_name": display,
+                "create_time": epoch_to_iso(row.get("create_time")),
+                "content": content_format.format_content(mtype, clean_content),
+                "sort_seq": int(row.get("sort_seq") or 0),
+            })
+        self._fill_voice_texts(username, out)
+        return out, ""
+
     def _resolve_row_sender(self, username: str, content: str,
                             fallback_wxid: str,
                             sender_id: int = 0) -> tuple[str, str]:

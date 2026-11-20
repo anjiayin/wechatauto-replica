@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ---------------------------------------------------------------------------
@@ -260,11 +260,13 @@ class RetentionOut(BaseModel):
     """
     logs_days: int = Field(default=90, ge=1, le=3650)    # analysis_logs 保留最近 N 天（含今天）
     opportunities_days: int = Field(default=365, ge=1, le=3650)  # 商机保留最近 N 天（含今天）
+    summaries_days: int = Field(default=180, ge=1, le=3650)  # 群消息总结（默认 6 个月）
 
 
 class RetentionUpdate(BaseModel):
     logs_days: Optional[int] = Field(default=None, ge=1, le=3650)
     opportunities_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    summaries_days: Optional[int] = Field(default=None, ge=1, le=3650)
 
 
 class PurgeRequest(BaseModel):
@@ -274,7 +276,7 @@ class PurgeRequest(BaseModel):
     dry_run=True 时只预览将被删除的条数（不写库、不可逆操作前先给用户看），
     dry_run=False（默认）才真正执行删除。
     """
-    table: str = Field(pattern="^(analysis_logs|opportunities)$")
+    table: str = Field(pattern="^(analysis_logs|opportunities|group_summaries)$")
     keep_days: int = Field(ge=1, le=3650)
     dry_run: bool = False
 
@@ -614,3 +616,120 @@ class LicenseStatusOut(BaseModel):
 class LicenseActivateIn(BaseModel):
     """激活请求（激活码可空：批量部署时由配置预置）。"""
     activation_code: str = ""
+
+
+# ---------------------------------------------------------------------------
+# 群消息总结（P0）
+# ---------------------------------------------------------------------------
+STYLE_VALUES = ("detailed", "concise", "bullets")  # 全面 / 简洁 / 要点式
+
+
+class SummaryMemberItem(BaseModel):
+    """成员多选列表项（全量，按发言条数倒序）。"""
+    sender_wxid: str
+    display_name: str
+    count: int
+    chars: int
+
+
+class SummaryMembersOut(BaseModel):
+    """统计行：全量成员 + senders 筛选后的消息/预算信息。"""
+    items: List[SummaryMemberItem] = Field(default_factory=list)
+    msg_count: int = 0
+    char_count: int = 0
+    est_prompt_tokens: int = 0
+    est_output_tokens: int = 2000
+    est_tokens: int = 0
+    est_cost: float = 0.0
+    budget_mode: str = "money"
+    budget_value: float = 0.0
+    budget_text: str = ""
+    usage_ratio: float = 0.0
+    over_budget: bool = False
+    action: str = "block"
+    truncate_n: int = 200
+    budget_hint: str = ""
+    error: str = ""
+
+
+class SummaryGenerateIn(BaseModel):
+    """生成请求；start/end 为 ``YYYY-MM-DD HH:MM:SS``。"""
+    session: str = Field(min_length=1)
+    start: str
+    end: str
+    senders: List[str] = Field(default_factory=list)
+    style: str = "detailed"
+    custom_prompt: str = Field(default="", max_length=500)
+
+
+class SummaryOut(BaseModel):
+    """一条总结（content 为六节 JSON 字符串，前端解析后渲染）。"""
+    id: int
+    session_username: str
+    session_name: str
+    time_start: str
+    time_end: str
+    msg_count: int
+    member_count: int
+    sender_wxids: str = "[]"
+    member_names: str = ""
+    style: str
+    custom_prompt: str = ""
+    content: str
+    truncated: bool = False
+    truncated_original: int = 0
+    model: str = ""
+    latency_ms: Optional[int] = None
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    created_at: str = ""
+
+
+class SummaryListOut(BaseModel):
+    """历史分页：时间倒序。"""
+    total: int
+    items: List[SummaryOut] = Field(default_factory=list)
+
+
+class SummarySettingsOut(BaseModel):
+    """设置页预算配置（响应键保持 settings 表的点分字符串）。"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    budget_mode: str = Field(default="money", alias="summary.budget_mode")
+    budget_money: str = Field(default="1.0", alias="summary.budget_money")
+    budget_tokens: str = Field(default="60000", alias="summary.budget_tokens")
+    over_limit_action: str = Field(default="block", alias="summary.over_limit_action")
+    truncate_recent_n: str = Field(default="200", alias="summary.truncate_recent_n")
+
+
+class SummarySettingsUpdate(BaseModel):
+    """设置页预算配置更新（None = 不变更；未知键拒绝）。"""
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    budget_mode: Optional[str] = Field(default=None, alias="summary.budget_mode")
+    budget_money: Optional[str] = Field(default=None, alias="summary.budget_money")
+    budget_tokens: Optional[str] = Field(default=None, alias="summary.budget_tokens")
+    over_limit_action: Optional[str] = Field(
+        default=None, alias="summary.over_limit_action")
+    truncate_recent_n: Optional[str] = Field(
+        default=None, alias="summary.truncate_recent_n")
+
+
+class SummaryScheduleConfig(BaseModel):
+    """按群定时配置（默认每日一次，触发时间 HH:MM）。"""
+    session: str
+    display_name: str = ""
+    enabled: bool = True
+    time: str = "18:00"
+
+
+class SummarySchedulesOut(BaseModel):
+    """定时配置（P1 语义化封装；总开关默认关）。"""
+    enabled: bool = False
+    configs: List[SummaryScheduleConfig] = Field(default_factory=list)
+
+
+class SummarySchedulesUpdate(BaseModel):
+    """定时配置更新（总开关 + 按群列表）。"""
+    enabled: bool = False
+    configs: List[SummaryScheduleConfig] = Field(default_factory=list)

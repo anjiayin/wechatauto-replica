@@ -2341,6 +2341,39 @@ class WeChatDB:
             return [self._msg_row_to_dict(r) for r in rows[offset: offset + limit]]
         return self._run_msg_query(user, build) or []
 
+    def get_messages_between(self, user: str, start_ts: int, end_ts: int,
+                             limit: int = 5000) -> List[dict]:
+        """读取指定会话在 [start_ts, end_ts]（epoch 秒，闭区间）内的消息。
+
+        与 :meth:`get_messages` 同构：各分片先在 SQL 侧按 create_time 过滤，
+        再按 sort_seq 全局升序归并并截取 limit。只读，不改动任何已有行为。
+
+        Args:
+            user: 会话 username（群为 xxx@chatroom）。
+            start_ts: 起始 epoch 秒（含）。
+            end_ts: 结束 epoch 秒（含）。
+            limit: 返回条数上限（病态输入兜底，非预算手段）。
+
+        Returns:
+            按时间正序排列的消息 dict 列表；会话不存在时为空列表。
+        """
+        cap = max(1, int(limit))
+
+        def build(found):
+            rows = []
+            for conn, table in found:
+                rows.extend(conn.execute(
+                    "SELECT local_id, local_type, real_sender_id, create_time, "
+                    "message_content, source, packed_info_data, compress_content, sort_seq "
+                    "FROM %s WHERE create_time BETWEEN ? AND ? "
+                    "ORDER BY sort_seq ASC LIMIT ?" % table,
+                    (int(start_ts), int(end_ts), cap),
+                ).fetchall())
+            rows.sort(key=lambda r: r["sort_seq"])
+            return [self._msg_row_to_dict(r) for r in rows[:cap]]
+
+        return self._run_msg_query(user, build) or []
+
     def get_message_row(self, user: str, local_id: int) -> Optional[dict]:
         """按 local_id 读取一条消息的完整原始字段（媒体下载用，含 server_id/packed_info）。
 

@@ -254,6 +254,22 @@ KEY_LICENSE_REFRESH_INTERVAL = "license.refresh_interval_hours"
 # 本地兜底离线宽限天数（许可证 payload 带 grace_days 时以许可证为准）
 KEY_LICENSE_GRACE_DAYS = "license.grace_days"
 
+# 群消息总结（预算双口径 / 超限双策略 / 定时 P1 / 保留天数）
+KEY_SUMMARY_BUDGET_MODE = "summary.budget_mode"
+KEY_SUMMARY_BUDGET_MONEY = "summary.budget_money"
+KEY_SUMMARY_BUDGET_TOKENS = "summary.budget_tokens"
+KEY_SUMMARY_OVER_LIMIT_ACTION = "summary.over_limit_action"
+KEY_SUMMARY_TRUNCATE_RECENT_N = "summary.truncate_recent_n"
+KEY_SUMMARY_SCHEDULE_ENABLED = "summary.schedule_enabled"
+KEY_SUMMARY_SCHEDULE_CONFIGS = "summary.schedule_configs"
+KEY_SUMMARY_PROMPT_TEMPLATES = "summary.prompt_templates"   # P1
+KEY_RETENTION_SUMMARIES_DAYS = "retention.summaries_days"
+
+# 预算口径 / 超限策略的合法取值（与 schemas.STYLE_VALUES 分属不同概念）
+BUDGET_MODE_VALUES = ("money", "tokens")
+OVER_LIMIT_ACTION_VALUES = ("block", "truncate_recent")
+SUMMARY_SCHEDULE_TIME_DEFAULT = "18:00"   # P1：每日一次，默认 18:00
+
 # ---------------------------------------------------------------------------
 # 默认配置值
 # ---------------------------------------------------------------------------
@@ -288,6 +304,16 @@ DEFAULT_SETTINGS: dict[str, str] = {
     KEY_LICENSE_ACTIVATION_CODE: "",
     KEY_LICENSE_REFRESH_INTERVAL: str(LICENSE_DEFAULT_REFRESH_HOURS),
     KEY_LICENSE_GRACE_DAYS: str(LICENSE_DEFAULT_GRACE_DAYS),
+    # 群消息总结：两值分开存，切换口径无需换算；定时总开关默认关（不打扰）
+    KEY_SUMMARY_BUDGET_MODE: "money",
+    KEY_SUMMARY_BUDGET_MONEY: "1.0",
+    KEY_SUMMARY_BUDGET_TOKENS: "60000",
+    KEY_SUMMARY_OVER_LIMIT_ACTION: "block",
+    KEY_SUMMARY_TRUNCATE_RECENT_N: "200",
+    KEY_SUMMARY_SCHEDULE_ENABLED: "0",
+    KEY_SUMMARY_SCHEDULE_CONFIGS: "[]",
+    KEY_SUMMARY_PROMPT_TEMPLATES: "[]",
+    KEY_RETENTION_SUMMARIES_DAYS: "180",
 }
 
 # 判定严格度取值

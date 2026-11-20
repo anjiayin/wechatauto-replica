@@ -375,6 +375,8 @@ export interface GroupMembers {
 export interface RetentionSettings {
   logs_days: number
   opportunities_days: number
+  /** 群消息总结保留天数（默认 180 天 = 6 个月，仅手动清理） */
+  summaries_days: number
 }
 
 /** POST /api/system/purge 结果：dry_run=true 时 deleted 为「将删除条数」 */
@@ -560,4 +562,111 @@ export interface MachineCodeOut {
   components: string[]
   wmi?: Record<string, unknown>
   wmi_note?: string
+}
+
+// ---------------------------------------------------------------------------
+// 群消息总结（P0）
+// ---------------------------------------------------------------------------
+export type SummaryStyle = 'detailed' | 'concise' | 'bullets'
+export type BudgetMode = 'money' | 'tokens'
+export type OverLimitAction = 'block' | 'truncate_recent'
+
+/** GET /api/summary/members 的列表项 */
+export interface SummaryMemberItem {
+  sender_wxid: string
+  display_name: string
+  count: number
+  chars: number
+}
+
+/** GET /api/summary/members：统计行 + 预算预检 */
+export interface SummaryMembersOut {
+  items: SummaryMemberItem[]
+  msg_count: number
+  char_count: number
+  est_prompt_tokens: number
+  est_output_tokens: number
+  est_tokens: number
+  est_cost: number
+  budget_mode: BudgetMode
+  budget_value: number
+  budget_text: string
+  usage_ratio: number
+  over_budget: boolean
+  action: OverLimitAction
+  truncate_n: number
+  /** 金额口径未配单价时的固定提示，前端原样展示 */
+  budget_hint: string
+  error: string
+}
+
+/** POST /api/summary/generate */
+export interface SummaryGenerateIn {
+  session: string
+  start: string
+  end: string
+  senders: string[]
+  style: SummaryStyle
+  custom_prompt: string
+}
+
+/** 一条总结（content 为六节 JSON 字符串） */
+export interface SummaryOut {
+  id: number
+  session_username: string
+  session_name: string
+  time_start: string
+  time_end: string
+  msg_count: number
+  member_count: number
+  sender_wxids: string
+  member_names: string
+  style: SummaryStyle
+  custom_prompt: string
+  content: string
+  truncated: boolean
+  truncated_original: number
+  model: string
+  latency_ms: number | null
+  prompt_tokens: number | null
+  completion_tokens: number | null
+  created_at: string
+}
+
+export interface SummaryListOut {
+  total: number
+  items: SummaryOut[]
+}
+
+/** GET/PUT /api/summary/settings：设置页预算配置（定时走 /schedules） */
+export interface SummarySettings {
+  'summary.budget_mode': BudgetMode
+  'summary.budget_money': string
+  'summary.budget_tokens': string
+  'summary.over_limit_action': OverLimitAction
+  'summary.truncate_recent_n': string
+}
+
+/** GET/PUT /api/summary/schedules：定时配置（P1 调度，默认关闭） */
+export interface SummaryScheduleConfig {
+  session: string
+  display_name: string
+  enabled: boolean
+  /** HH:MM，默认 18:00 */
+  time: string
+}
+
+export interface SummarySchedulesOut {
+  enabled: boolean
+  configs: SummaryScheduleConfig[]
+}
+
+/** 六节总结正文（解析 content 后） */
+export interface SummaryContent {
+  reminders: string[]
+  topics: string[]
+  comments: string[]
+  followups: string[]
+  others: string[]
+  closing: string
 }

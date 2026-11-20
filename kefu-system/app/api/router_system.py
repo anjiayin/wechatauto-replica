@@ -29,6 +29,7 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 
 from app import voice_asr
+from app.billing import estimate_cost, get_billing_settings
 from app.api.deps import (
     get_db,
     get_notifier,
@@ -81,31 +82,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _billing_settings(db: Database) -> dict:
-    """读取账单单价配置：input_price/output_price/unit（per_k|per_m）。"""
-    # 只在未配置（或配置非法）时用「元/百万 tokens」；用户已保存的单位必须尊重
-    unit = db.get_setting("billing.unit", "per_m")
-    if unit not in ("per_k", "per_m"):
-        unit = "per_m"
-    return {
-        "unit": unit,
-        "input_price": db.get_float("billing.input_price", 0.0),
-        "output_price": db.get_float("billing.output_price", 0.0),
-    }
-
-
-def _usage_cost(usage: dict, billing: dict) -> float:
-    """按单价与单位换算一次调用/一日的费用（元）。
-
-    per_k：元/千 tokens；per_m：元/百万 tokens。未配置单价时为 0。
-    """
-    divisor = 1000.0 if billing["unit"] == "per_k" else 1_000_000.0
-    pt = int(usage.get("prompt_tokens") or 0)
-    ct = int(usage.get("completion_tokens") or 0)
-    return (pt / divisor * billing["input_price"]
-            + ct / divisor * billing["output_price"])
-
-
 # ---------------------------------------------------------------------------
 # GET /api/status
 # ---------------------------------------------------------------------------
@@ -115,6 +91,7 @@ def get_status(db: Database = Depends(get_db),
                pipeline: Pipeline = Depends(get_pipeline)) -> StatusOut:
     """运行状态（顶部横幅数据源）。"""
     notifier = get_notifier()
+    today_usage = db.usage_by_date(datetime.now().strftime("%Y-%m-%d"))
     ai_cfg_base = db.get_setting("ai.base_url", "")
     ai_cfg_model = db.get_setting("ai.model", "")
     ai_key_enc = db.get_setting("ai.api_key_enc", "")
@@ -151,9 +128,10 @@ def get_status(db: Database = Depends(get_db),
         watermark_saved_at=svc.watermark_saved_at,
         degraded_reason=svc.degraded_reason,
         unread_count=notifier.unread_count,
-        today_cost=round(_usage_cost(
-            db.usage_by_date(datetime.now().strftime("%Y-%m-%d")),
-            _billing_settings(db)), 4),
+        today_cost=round(estimate_cost(
+            int(today_usage.get("prompt_tokens") or 0),
+            int(today_usage.get("completion_tokens") or 0),
+            get_billing_settings(db)), 4),
         image_key_ready=_image_key_ready(svc),
         cache=_cache_status(svc),
     )
@@ -335,6 +313,7 @@ def get_retention(db: Database = Depends(get_db)) -> RetentionOut:
     return RetentionOut(
         logs_days=db.get_int("retention.logs_days", 90),
         opportunities_days=db.get_int("retention.opportunities_days", 365),
+        summaries_days=db.get_int("retention.summaries_days", 180),
     )
 
 
@@ -347,6 +326,9 @@ def update_retention(body: RetentionUpdate,
     if body.opportunities_days is not None:
         db.set_setting("retention.opportunities_days",
                        str(int(body.opportunities_days)))
+    if body.summaries_days is not None:
+        db.set_setting("retention.summaries_days",
+                       str(int(body.summaries_days)))
     return get_retention(db)
 
 
@@ -414,14 +396,17 @@ def get_last_purge(db: Database = Depends(get_db)) -> Dict[str, Any]:
 @router.get("/api/system/billing", response_model=BillingOut)
 def get_billing(db: Database = Depends(get_db)) -> BillingOut:
     """AI 账单：今日与近 7 日 token 用量及按单价估算的费用（元）。"""
-    billing = _billing_settings(db)
+    billing = get_billing_settings(db)
     today_str = datetime.now().strftime("%Y-%m-%d")
     today_usage = db.usage_by_date(today_str)
     series = [
         BillingDayOut(date=d["date"], calls=d["calls"],
                       prompt_tokens=d["prompt_tokens"],
                       completion_tokens=d["completion_tokens"],
-                      cost=round(_usage_cost(d, billing), 4))
+                      cost=round(estimate_cost(
+                          int(d.get("prompt_tokens") or 0),
+                          int(d.get("completion_tokens") or 0),
+                          billing), 4))
         for d in db.usage_series(7)
     ]
     return BillingOut(
@@ -431,7 +416,10 @@ def get_billing(db: Database = Depends(get_db)) -> BillingOut:
         today=BillingDayOut(date=today_str, calls=today_usage["calls"],
                             prompt_tokens=today_usage["prompt_tokens"],
                             completion_tokens=today_usage["completion_tokens"],
-                            cost=round(_usage_cost(today_usage, billing), 4)),
+                            cost=round(estimate_cost(
+                                int(today_usage.get("prompt_tokens") or 0),
+                                int(today_usage.get("completion_tokens") or 0),
+                                billing), 4)),
         series=series,
     )
 

@@ -236,6 +236,33 @@ DDL_STATEMENTS: tuple[str, ...] = (
       PRIMARY KEY (username, local_id)
     )
     """,
+    # 群消息总结（用户请求驱动的一次性结果；仅成功生成才落库）
+    """
+    CREATE TABLE IF NOT EXISTS group_summaries (
+      id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_username       TEXT NOT NULL,
+      session_name           TEXT NOT NULL,
+      time_start             TEXT NOT NULL,
+      time_end               TEXT NOT NULL,
+      msg_count              INTEGER NOT NULL DEFAULT 0,
+      member_count           INTEGER NOT NULL DEFAULT 0,
+      sender_wxids           TEXT NOT NULL DEFAULT '[]',
+      member_names           TEXT NOT NULL DEFAULT '',
+      style                  TEXT NOT NULL DEFAULT 'detailed'
+                             CHECK (style IN ('detailed','concise','bullets')),
+      custom_prompt          TEXT NOT NULL DEFAULT '',
+      content                TEXT NOT NULL,
+      truncated              INTEGER NOT NULL DEFAULT 0,
+      truncated_original     INTEGER NOT NULL DEFAULT 0,
+      model                  TEXT NOT NULL DEFAULT '',
+      latency_ms             INTEGER,
+      prompt_tokens          INTEGER,
+      completion_tokens      INTEGER,
+      created_at             TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_gs_created ON group_summaries (created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_gs_session ON group_summaries (session_username, created_at DESC)",
 )
 
 
@@ -1248,9 +1275,87 @@ class Database:
         return int(total), [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
+    # group_summaries DAO（群消息总结，用户请求驱动、仅成功落库）
+    # ------------------------------------------------------------------
+    def insert_group_summary(self, *, session_username: str,
+                             session_name: str, time_start: str, time_end: str,
+                             msg_count: int, member_count: int,
+                             sender_wxids: str = "[]", member_names: str = "",
+                             style: str = "detailed", custom_prompt: str = "",
+                             content: str, truncated: bool = False,
+                             truncated_original: int = 0, model: str = "",
+                             latency_ms: Optional[int] = None,
+                             prompt_tokens: Optional[int] = None,
+                             completion_tokens: Optional[int] = None) -> dict:
+        """落库一条成功生成的群消息总结并返回完整行（含 id/created_at）。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO group_summaries (session_username, session_name, "
+                "time_start, time_end, msg_count, member_count, sender_wxids, "
+                "member_names, style, custom_prompt, content, truncated, "
+                "truncated_original, model, latency_ms, prompt_tokens, "
+                "completion_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, ?, ?, ?, ?)",
+                (session_username, session_name, time_start, time_end,
+                 int(msg_count), int(member_count), sender_wxids or "[]",
+                 member_names or "", style, custom_prompt, content,
+                 1 if truncated else 0, int(truncated_original or 0),
+                 model or "", latency_ms, prompt_tokens, completion_tokens),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM group_summaries WHERE id=?",
+                (cur.lastrowid,),
+            ).fetchone()
+            self._conn.commit()
+        return dict(row) if row else {}
+
+    def list_group_summaries(self, *, page: int = 1, page_size: int = 20,
+                             session: str = "", date: str = ""
+                             ) -> tuple[int, list[dict]]:
+        """分页列出总结（created_at 倒序）；session 精确、date 按天前缀过滤。"""
+        where: list[str] = []
+        params: list[Any] = []
+        if session:
+            where.append("session_username=?")
+            params.append(session)
+        if date:
+            where.append("created_at LIKE ?")
+            params.append(f"{date}%")
+        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+        size = max(1, min(int(page_size), 200))
+        with self._lock:
+            total = self._conn.execute(
+                f"SELECT COUNT(*) FROM group_summaries{where_sql}", params
+            ).fetchone()[0]
+            rows = self._conn.execute(
+                f"SELECT * FROM group_summaries{where_sql} "
+                "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                [*params, size, (max(page, 1) - 1) * size],
+            ).fetchall()
+        return int(total), [dict(r) for r in rows]
+
+    def get_group_summary(self, summary_id: int) -> Optional[dict]:
+        """按 id 取一条总结；不存在返回 None。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM group_summaries WHERE id=?", (summary_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def delete_group_summary(self, summary_id: int) -> int:
+        """按 id 删除一条总结，返回删除行数（0 = 不存在）。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM group_summaries WHERE id=?", (summary_id,))
+            self._conn.commit()
+            return int(cur.rowcount)
+
+    # ------------------------------------------------------------------
     # 历史数据管理（反馈 7）
     # ------------------------------------------------------------------
-    _PURGE_TABLES = ("analysis_logs", "opportunities")
+    # 手动 purge 白名单（供 /api/system/purge 的预览/真删/留痕复用）：
+    # group_summaries 仅在用户点击「立即清理」时才删，系统无任何自动清理任务。
+    _PURGE_TABLES = ("analysis_logs", "opportunities", "group_summaries")
     # 注意：ai_usage（账单数据源）刻意不在清理白名单里 —— 无论用户怎么
     # 清理日志/商机，AI 用量与费用历史都必须保留完整。
     # 同理 voice_texts（语音转写缓存）也不可清理：它是纯缓存，删了只会让

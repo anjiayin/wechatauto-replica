@@ -19,6 +19,7 @@ import {
 } from '@mui/material'
 import Inventory2Icon from '@mui/icons-material/Inventory2'
 import ReceiptLongIcon from '@mui/icons-material/ReceiptLong'
+import SummarizeIcon from '@mui/icons-material/Summarize'
 import SettingsIcon from '@mui/icons-material/Settings'
 import { apiGet } from './api/client'
 import type { StatusOut } from './api/types'
@@ -27,6 +28,7 @@ import { armAudioUnlock, playOpportunitySound } from './hooks/sound'
 import { setPendingOpportunity } from './hooks/pendingOpportunity'
 import OpportunityList from './pages/OpportunityList'
 import AnalysisLogs from './pages/AnalysisLogs'
+import GroupSummary from './pages/GroupSummary'
 import SettingsPage from './pages/SettingsPage'
 import { UpdateChip, UpdateDialog, useUpdateCheck } from './pages/UpdatePanel'
 import {
@@ -248,6 +250,8 @@ export default function App() {
             badge={status?.unread_count ?? 0}
           />
           {/* 消息浏览菜单已按用户要求下线（反馈 8） */}
+          {/* P1 定时产出数 Badge 位：T05 接入 WS summary_new 后填充 */}
+          <NavItem to="/summary" icon={<SummarizeIcon />} label="群消息总结" />
           <NavItem to="/analysis-logs" icon={<ReceiptLongIcon />} label="分析日志" />
           <NavItem to="/settings" icon={<SettingsIcon />} label="设置" />
         </List>
@@ -271,6 +275,7 @@ export default function App() {
         )}
         <Routes>
           <Route path="/" element={<OpportunityList />} />
+          <Route path="/summary" element={<GroupSummary />} />
           <Route path="/analysis-logs" element={<AnalysisLogs />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<OpportunityList />} />

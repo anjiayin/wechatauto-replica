@@ -65,6 +65,8 @@ import type {
   ServerSettings,
   SessionItem,
   StatusOut,
+  SummarySchedulesOut,
+  SummarySettings,
 } from '../api/types'
 import {
   PRESCREEN_PRESETS,
@@ -84,6 +86,7 @@ export default function SettingsPage() {
         <Tab label="商机类型" />
         <Tab label="AI 接口" />
         <Tab label="数据与账单" />
+        <Tab label="群消息总结" />
         <Tab label="授权" />
         <Tab label="系统更新" />
       </Tabs>
@@ -91,8 +94,9 @@ export default function SettingsPage() {
       {tab === 1 && <TypesTab />}
       {tab === 2 && <AiTab />}
       {tab === 3 && <DataBillingTab />}
-      {tab === 4 && <LicenseSettingsTab />}
-      {tab === 5 && <UpdateSettingsTab />}
+      {tab === 4 && <SummarySettingsTab />}
+      {tab === 5 && <LicenseSettingsTab />}
+      {tab === 6 && <UpdateSettingsTab />}
     </Paper>
   )
 }
@@ -1470,7 +1474,202 @@ function AiTab() {
 }
 
 // ---------------------------------------------------------------------------
-// Tab 4：数据与账单（反馈 7 历史数据管理 / 反馈 13 AI 账单估算）
+// Tab 4：群消息总结配置区（预算双口径 / 超限双策略 / 定时 P1）
+// ---------------------------------------------------------------------------
+interface ScheduleConfig {
+  session: string
+  display_name: string
+  enabled: boolean
+  time: string
+}
+
+const NO_PRICE_HINT = '请先在设置页配置模型单价，否则金额预算不生效'
+
+function SummarySettingsTab() {
+  const queryClient = useQueryClient()
+  const [snack, setSnack] = useState<string | null>(null)
+  const { data: saved } = useQuery({
+    queryKey: ['summary-settings'],
+    queryFn: () => apiGet<SummarySettings>('/api/summary/settings'),
+  })
+  const { data: savedSchedules } = useQuery({
+    queryKey: ['summary-schedules'],
+    queryFn: () => apiGet<SummarySchedulesOut>('/api/summary/schedules'),
+  })
+  const { data: billing } = useQuery({
+    queryKey: ['billing'],
+    queryFn: () => apiGet<BillingOut>('/api/system/billing'),
+  })
+  const { data: groups = [] } = useQuery({
+    queryKey: ['summary-config-groups'],
+    queryFn: () => apiGet<SessionItem[]>(
+      `/api/sessions/search${qs({ kind: 'group', limit: 100 })}`),
+  })
+
+  const [budgetMode, setBudgetMode] = useState<'money' | 'tokens'>('money')
+  const [budgetMoney, setBudgetMoney] = useState('1.0')
+  const [budgetTokens, setBudgetTokens] = useState('60000')
+  const [action, setAction] = useState<'block' | 'truncate_recent'>('block')
+  const [truncateN, setTruncateN] = useState('200')
+  const [scheduleEnabled, setScheduleEnabled] = useState(false)
+  const [schedules, setSchedules] = useState<ScheduleConfig[]>([])
+  const [loaded, setLoaded] = useState(false)
+
+  useEffect(() => {
+    if (!saved || !savedSchedules || loaded) return
+    setBudgetMode(saved['summary.budget_mode'] || 'money')
+    setBudgetMoney(saved['summary.budget_money'] || '1.0')
+    setBudgetTokens(saved['summary.budget_tokens'] || '60000')
+    setAction(saved['summary.over_limit_action'] || 'block')
+    setTruncateN(saved['summary.truncate_recent_n'] || '200')
+    setScheduleEnabled(savedSchedules.enabled)
+    setSchedules(savedSchedules.configs.map((c) => ({
+      session: c.session, display_name: c.display_name,
+      enabled: c.enabled, time: c.time || '18:00',
+    })))
+    setLoaded(true)
+  }, [saved, savedSchedules, loaded])
+
+  const saveMutation = useMutation({
+    mutationFn: () => apiPut<SummarySettings>('/api/summary/settings', {
+      'summary.budget_mode': budgetMode,
+      'summary.budget_money': budgetMoney,
+      'summary.budget_tokens': budgetTokens,
+      'summary.over_limit_action': action,
+      'summary.truncate_recent_n': truncateN,
+    }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['summary-settings'] })
+    },
+    onError: (e: Error) => setSnack(`预算配置保存失败：${e.message}`),
+  })
+
+  const saveSchedulesMutation = useMutation({
+    mutationFn: () => apiPut<SummarySchedulesOut>('/api/summary/schedules', {
+      enabled: scheduleEnabled, configs: schedules,
+    }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['summary-schedules'] })
+    },
+    onError: (e: Error) => setSnack(`定时配置保存失败：${e.message}`),
+  })
+
+  const saveAll = () => {
+    saveMutation.mutate(undefined, {
+      onSuccess: () => {
+        saveSchedulesMutation.mutate(undefined, {
+          onSuccess: () => setSnack('群消息总结配置已保存'),
+        })
+      },
+    })
+  }
+
+  const noPrice = budgetMode === 'money'
+    && !billing?.input_price && !billing?.output_price
+
+  return (
+    <Box>
+      <Typography variant="subtitle2" sx={{ mb: 1 }}>预算与超限策略</Typography>
+      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 2 }}>
+        预算支持按金额（元）或按 token 数两种口径，程序按设置页的模型单价自动换算；
+        统计行的「预估」与实际生成后的 token 消耗可能不同。
+      </Typography>
+      <Stack spacing={2} sx={{ maxWidth: 560 }}>
+        <TextField select label="预算口径" size="small" value={budgetMode}
+          onChange={(e) => setBudgetMode(e.target.value as 'money' | 'tokens')}>
+          <MenuItem value="money">按金额（元）</MenuItem>
+          <MenuItem value="tokens">按 token 数</MenuItem>
+        </TextField>
+        <TextField label="金额预算" size="small" type="number"
+          value={budgetMoney} disabled={budgetMode !== 'money'}
+          onChange={(e) => setBudgetMoney(e.target.value)}
+          InputProps={{ startAdornment: <span>¥</span> }} />
+        <TextField label="token 预算" size="small" type="number"
+          value={budgetTokens} disabled={budgetMode !== 'tokens'}
+          onChange={(e) => setBudgetTokens(e.target.value)} />
+        {noPrice && (
+          <Alert severity="warning">{NO_PRICE_HINT}</Alert>
+        )}
+        <TextField select label="超出预算后" size="small" value={action}
+          onChange={(e) => setAction(e.target.value as 'block' | 'truncate_recent')}>
+          <MenuItem value="block">阻止生成</MenuItem>
+          <MenuItem value="truncate_recent">仅取最近 N 条并标注已截断</MenuItem>
+        </TextField>
+        <TextField label="最近 N 条" size="small" type="number"
+          value={truncateN} disabled={action !== 'truncate_recent'}
+          onChange={(e) => setTruncateN(e.target.value)} />
+      </Stack>
+
+      <Divider sx={{ my: 3 }} />
+      <Typography variant="subtitle2" sx={{ mb: 1 }}>定时自动总结（P1）</Typography>
+      <FormControlLabel
+        control={<Switch checked={scheduleEnabled}
+          onChange={(e) => setScheduleEnabled(e.target.checked)} />}
+        label="开启每日定时总结（默认关闭）"
+      />
+      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
+        默认每日 18:00 触发一次，时间可调整；P0 阶段仅保存配置，后台调度在后续版本启用。
+      </Typography>
+      <Stack spacing={1} sx={{ maxWidth: 720 }}>
+        {schedules.map((item, index) => (
+          <Stack key={`${item.session}-${index}`} direction="row" spacing={1} alignItems="center">
+            <TextField select label="群聊" size="small" sx={{ minWidth: 220 }}
+              value={item.session}
+              onChange={(e) => {
+                const next = [...schedules]
+                const group = groups.find((g) => g.username === e.target.value)
+                next[index] = {
+                  ...item, session: e.target.value,
+                  display_name: group?.display_name || e.target.value,
+                }
+                setSchedules(next)
+              }}>
+              {groups.map((g) => (
+                <MenuItem key={g.username} value={g.username}>{g.display_name}</MenuItem>
+              ))}
+            </TextField>
+            <TextField label="触发时间" type="time" size="small"
+              InputLabelProps={{ shrink: true }} value={item.time || '18:00'}
+              onChange={(e) => {
+                const next = [...schedules]
+                next[index] = { ...item, time: e.target.value }
+                setSchedules(next)
+              }} />
+            <FormControlLabel control={<Switch size="small" checked={Boolean(item.enabled)}
+              onChange={(e) => {
+                const next = [...schedules]
+                next[index] = { ...item, enabled: e.target.checked }
+                setSchedules(next)
+              }} />} label="启用" />
+            <Button size="small" color="error"
+              onClick={() => setSchedules(schedules.filter((_, i) => i !== index))}>
+              移除
+            </Button>
+          </Stack>
+        ))}
+        <Button size="small" sx={{ alignSelf: 'flex-start' }}
+          onClick={() => setSchedules([...schedules, {
+            session: groups[0]?.username || '',
+            display_name: groups[0]?.display_name || '',
+            enabled: true, time: '18:00',
+          }])}>
+          添加群聊
+        </Button>
+        <Button variant="contained" sx={{ alignSelf: 'flex-start' }}
+          disabled={saveMutation.isPending || saveSchedulesMutation.isPending
+            || !budgetMoney || !budgetTokens || !truncateN}
+          onClick={saveAll}>
+          保存配置
+        </Button>
+      </Stack>
+      <Snackbar open={Boolean(snack)} autoHideDuration={5000}
+        onClose={() => setSnack(null)} message={snack} />
+    </Box>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Tab 5：数据与账单（反馈 7 历史数据管理 / 反馈 13 AI 账单估算）
 // ---------------------------------------------------------------------------
 const RETENTION_PRESETS = [
   { label: '1 个月', days: 30 },
@@ -1480,7 +1679,9 @@ const RETENTION_PRESETS = [
 
 /** 清理目标表 → 中文名（提示文案用）。 */
 function purgeTableLabel(table: string): string {
-  return table === 'analysis_logs' ? '分析日志' : table === 'opportunities' ? '商机' : table
+  return table === 'analysis_logs' ? '分析日志'
+    : table === 'opportunities' ? '商机'
+      : table === 'group_summaries' ? '群消息总结' : table
 }
 
 /** 字节数 → 人类可读（缓存目录占用展示用）。 */
@@ -1514,11 +1715,13 @@ function DataBillingTab() {
   })
   const [logsDays, setLogsDays] = useState('')
   const [oppsDays, setOppsDays] = useState('')
+  const [summariesDays, setSummariesDays] = useState('')
   const [loaded, setLoaded] = useState(false)
   useEffect(() => {
     if (retention && !loaded) {
       setLogsDays(String(retention.logs_days))
       setOppsDays(String(retention.opportunities_days))
+      setSummariesDays(String(retention.summaries_days ?? 180))
       setLoaded(true)
     }
   }, [retention, loaded])
@@ -1528,6 +1731,7 @@ function DataBillingTab() {
       apiPut<RetentionSettings>('/api/system/retention', {
         logs_days: Number(logsDays),
         opportunities_days: Number(oppsDays),
+        summaries_days: Number(summariesDays),
       }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['retention'] })
@@ -1797,6 +2001,27 @@ function DataBillingTab() {
             color="warning"
             disabled={previewPurgeMutation.isPending || purgeMutation.isPending || !Number(oppsDays)}
             onClick={() => previewPurgeMutation.mutate({ table: 'opportunities', keep_days: Number(oppsDays) })}
+          >
+            立即清理
+          </Button>
+        </Stack>
+        <Stack direction="row" spacing={1} alignItems="center" useFlexGap>
+          <Typography variant="body2" sx={{ width: 90 }}>群消息总结保留</Typography>
+          <TextField
+            size="small"
+            sx={{ width: 110 }}
+            value={summariesDays}
+            onChange={(e) => setSummariesDays(e.target.value.replace(/[^0-9]/g, ''))}
+            InputProps={{ endAdornment: <InputAdornment position="end">天</InputAdornment> }}
+          />
+          <Typography variant="caption" color="text.secondary">
+            默认 180 天（6 个月），仅手动清理，不自动删除
+          </Typography>
+          <Button
+            size="small"
+            color="warning"
+            disabled={previewPurgeMutation.isPending || purgeMutation.isPending || !Number(summariesDays)}
+            onClick={() => previewPurgeMutation.mutate({ table: 'group_summaries', keep_days: Number(summariesDays) })}
           >
             立即清理
           </Button>
