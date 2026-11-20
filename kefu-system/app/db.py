@@ -178,10 +178,12 @@ DDL_STATEMENTS: tuple[str, ...] = (
       model             TEXT NOT NULL DEFAULT '',
       session_username  TEXT NOT NULL DEFAULT '',
       prompt_tokens     INTEGER NOT NULL DEFAULT 0,
-      completion_tokens INTEGER NOT NULL DEFAULT 0
+      completion_tokens INTEGER NOT NULL DEFAULT 0,
+      usage_kind        TEXT NOT NULL DEFAULT 'opportunity'
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_usage_created ON ai_usage (created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_usage_kind ON ai_usage (created_at, usage_kind)",
     """
     CREATE TABLE IF NOT EXISTS watermarks (
       username   TEXT PRIMARY KEY,
@@ -295,6 +297,7 @@ class Database:
         self._migrate_add_columns()
         self._migrate_created_at_localtime()
         self._migrate_ai_usage_backfill()
+        self._migrate_ai_usage_kind()
         logger.info("业务数据库已初始化：%s", self.path)
 
     def _migrate_created_at_localtime(self) -> None:
@@ -354,6 +357,45 @@ class Database:
                 return
         self.set_setting(KEY_RUNTIME_AI_USAGE_BACKFILLED, "1")
         logger.info("已回填历史 AI 用量 %d 条（账单改用独立存档）", cur.rowcount)
+
+    def _migrate_ai_usage_kind(self) -> None:
+        """给 ai_usage 补 usage_kind 列，并按来源表回填存量分项。
+
+        背景：账单要区分「商机分析 / 群消息总结 / 图片识别」三类消耗
+        （用户反馈：顶部费用只有总数，看不出总结花了多少）。存量数据
+        无法直接区分，按来源回填：
+
+        - summary：ai_usage 与 group_summaries 按（同分钟 + prompt_tokens
+          相同 + completion_tokens 相同）关联，token 相同即可视为同一次
+          调用的镜像，分钟级撞车可忽略；
+        - opportunity：其余旧行（此前只有商机分析会镜像写 ai_usage）。
+        """
+        with self._lock:
+            cols = {r["name"] for r in self._conn.execute(
+                "PRAGMA table_info(ai_usage)").fetchall()}
+            if not cols:
+                return
+            if "usage_kind" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE ai_usage ADD COLUMN usage_kind "
+                    "TEXT NOT NULL DEFAULT 'opportunity'")
+                logger.info("已迁移：ai_usage 增加 usage_kind 列")
+            # 存量分项回填（新库已带列时也执行：只回填仍挂着默认值的行）
+            self._conn.execute(
+                "UPDATE ai_usage SET usage_kind='summary' WHERE "
+                "usage_kind='opportunity' AND prompt_tokens IS NOT NULL "
+                "AND completion_tokens IS NOT NULL AND EXISTS ("
+                "SELECT 1 FROM group_summaries g WHERE "
+                "g.prompt_tokens=ai_usage.prompt_tokens AND "
+                "g.completion_tokens=ai_usage.completion_tokens AND "
+                "substr(g.created_at,1,16)=substr(ai_usage.created_at,1,16))")
+            self._conn.execute(
+                "UPDATE ai_usage SET usage_kind='vision' WHERE "
+                "usage_kind='opportunity' AND EXISTS ("
+                "SELECT 1 FROM image_analysis i WHERE "
+                "i.model=ai_usage.model AND "
+                "substr(i.created_at,1,16)=substr(ai_usage.created_at,1,16))")
+            self._conn.commit()
 
     def _migrate_add_columns(self) -> None:
         """幂等加列迁移（反馈 4/13）：老库补 direction 与 token 用量列。
@@ -1021,15 +1063,22 @@ class Database:
     # ------------------------------------------------------------------
     def insert_ai_usage(self, *, prompt_tokens: int,
                         completion_tokens: int, model: str = "",
-                        session_username: str = "") -> int:
-        """写入一条 AI 用量存档（账单数据源，与 analysis_logs 解耦）。"""
+                        session_username: str = "",
+                        usage_kind: str = "opportunity") -> int:
+        """写入一条 AI 用量存档（账单数据源，与 analysis_logs 解耦）。
+
+        ``usage_kind``：opportunity=商机分析 / summary=群消息总结 /
+        vision=图片识别，账单分项展示用。
+        """
+        kind = usage_kind if usage_kind in (
+            "opportunity", "summary", "vision") else "opportunity"
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO ai_usage (model, session_username, prompt_tokens, "
-                "completion_tokens, created_at) "
-                "VALUES (?, ?, ?, ?, datetime('now','localtime'))",
+                "completion_tokens, usage_kind, created_at) "
+                "VALUES (?, ?, ?, ?, ?, datetime('now','localtime'))",
                 (model or "", session_username or "",
-                 int(prompt_tokens or 0), int(completion_tokens or 0)),
+                 int(prompt_tokens or 0), int(completion_tokens or 0), kind),
             )
             self._conn.commit()
             return int(cur.lastrowid or 0)
@@ -1086,8 +1135,9 @@ class Database:
             if prompt_tokens is not None or completion_tokens is not None:
                 self._conn.execute(
                     "INSERT INTO ai_usage (model, session_username, "
-                    "prompt_tokens, completion_tokens, created_at) "
-                    "VALUES (?, ?, ?, ?, datetime('now','localtime'))",
+                    "prompt_tokens, completion_tokens, usage_kind, created_at) "
+                    "VALUES (?, ?, ?, ?, 'opportunity', "
+                    "datetime('now','localtime'))",
                     (model or "", session_username or "",
                      int(prompt_tokens or 0), int(completion_tokens or 0)),
                 )
@@ -1445,26 +1495,45 @@ class Database:
     # ------------------------------------------------------------------
     # AI 账单估算（反馈 13）
     # ------------------------------------------------------------------
-    def usage_by_date(self, date_str: str) -> dict:
+    def usage_by_date(self, date_str: str,
+                      usage_kind: Optional[str] = None) -> dict:
         """某日（YYYY-MM-DD）的 AI token 用量与调用次数汇总。
 
         数据源是 ai_usage 独立存档（不是 analysis_logs）：日志被手工清理
         后账单历史仍然完整。命中但低于置信度门槛（below_threshold）的调用
         同样消耗 token，也计入这里。
 
+        Args:
+            date_str: ``YYYY-MM-DD``。
+            usage_kind: 分项过滤（opportunity/summary/vision）；None = 全部。
+
         Returns:
             {calls, prompt_tokens, completion_tokens}（无数据为 0）。
         """
+        sql = ("SELECT COUNT(*) AS calls, "
+               "COALESCE(SUM(prompt_tokens), 0) AS pt, "
+               "COALESCE(SUM(completion_tokens), 0) AS ct "
+               "FROM ai_usage WHERE substr(created_at, 1, 10) = ?")
+        params: list = [date_str]
+        if usage_kind:
+            sql += " AND usage_kind = ?"
+            params.append(usage_kind)
         with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*) AS calls, "
-                "COALESCE(SUM(prompt_tokens), 0) AS pt, "
-                "COALESCE(SUM(completion_tokens), 0) AS ct "
-                "FROM ai_usage WHERE substr(created_at, 1, 10) = ?",
-                (date_str,),
-            ).fetchone()
+            row = self._conn.execute(sql, params).fetchone()
         return {"calls": int(row["calls"]), "prompt_tokens": int(row["pt"]),
                 "completion_tokens": int(row["ct"])}
+
+    def usage_breakdown_by_date(self, date_str: str) -> dict:
+        """某日按 usage_kind 分项的 token 用量（账单分项展示）。
+
+        Returns:
+            ``{"opportunity": {...}, "summary": {...}, "vision": {...}}``，
+            每项结构与 :meth:`usage_by_date` 一致，无数据的类别为全 0。
+        """
+        out: dict = {}
+        for kind in ("opportunity", "summary", "vision"):
+            out[kind] = self.usage_by_date(date_str, usage_kind=kind)
+        return out
 
     def usage_series(self, days: int = 7) -> list[dict]:
         """近 N 日（含今日）逐日 token 用量序列（账单卡片展示）。"""

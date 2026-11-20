@@ -50,6 +50,7 @@ from app.schemas import (
     AsrUpdate,
     BillingDayOut,
     BillingOut,
+    BillingKindOut,
     CacheDirOut,
     CacheDirUpdate,
     CacheShardStatus,
@@ -91,7 +92,11 @@ def get_status(db: Database = Depends(get_db),
                pipeline: Pipeline = Depends(get_pipeline)) -> StatusOut:
     """运行状态（顶部横幅数据源）。"""
     notifier = get_notifier()
-    today_usage = db.usage_by_date(datetime.now().strftime("%Y-%m-%d"))
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_usage = db.usage_by_date(today_str)
+    billing_cfg = get_billing_settings(db)
+    # 分项费用（商机分析/群消息总结/图片识别）：顶部悬浮说明用
+    breakdown_usage = db.usage_breakdown_by_date(today_str)
     ai_cfg_base = db.get_setting("ai.base_url", "")
     ai_cfg_model = db.get_setting("ai.model", "")
     ai_key_enc = db.get_setting("ai.api_key_enc", "")
@@ -131,7 +136,12 @@ def get_status(db: Database = Depends(get_db),
         today_cost=round(estimate_cost(
             int(today_usage.get("prompt_tokens") or 0),
             int(today_usage.get("completion_tokens") or 0),
-            get_billing_settings(db)), 4),
+            billing_cfg), 4),
+        today_cost_breakdown={
+            kind: round(estimate_cost(
+                int(u.get("prompt_tokens") or 0),
+                int(u.get("completion_tokens") or 0), billing_cfg), 4)
+            for kind, u in breakdown_usage.items()},
         image_key_ready=_image_key_ready(svc),
         cache=_cache_status(svc),
     )
@@ -395,10 +405,25 @@ def get_last_purge(db: Database = Depends(get_db)) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 @router.get("/api/system/billing", response_model=BillingOut)
 def get_billing(db: Database = Depends(get_db)) -> BillingOut:
-    """AI 账单：今日与近 7 日 token 用量及按单价估算的费用（元）。"""
+    """AI 账单：今日与近 7 日 token 用量及按单价估算的费用（元）。
+
+    ``breakdown`` 为今日分项（opportunity=商机分析 / summary=群消息总结 /
+    vision=图片识别），供设置页展示「汇总 + 分项消耗」。
+    """
     billing = get_billing_settings(db)
     today_str = datetime.now().strftime("%Y-%m-%d")
     today_usage = db.usage_by_date(today_str)
+    breakdown_usage = db.usage_breakdown_by_date(today_str)
+    breakdown = {
+        kind: BillingKindOut(
+            calls=u["calls"],
+            prompt_tokens=u["prompt_tokens"],
+            completion_tokens=u["completion_tokens"],
+            cost=round(estimate_cost(
+                int(u.get("prompt_tokens") or 0),
+                int(u.get("completion_tokens") or 0), billing), 4))
+        for kind, u in breakdown_usage.items()
+    }
     series = [
         BillingDayOut(date=d["date"], calls=d["calls"],
                       prompt_tokens=d["prompt_tokens"],
@@ -421,6 +446,7 @@ def get_billing(db: Database = Depends(get_db)) -> BillingOut:
                                 int(today_usage.get("completion_tokens") or 0),
                                 billing), 4)),
         series=series,
+        breakdown=breakdown,
     )
 
 

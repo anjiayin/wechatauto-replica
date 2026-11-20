@@ -52,6 +52,8 @@ export interface StatusOut {
   unread_count: number
   /** 今日 AI 估算费用（元，反馈 13） */
   today_cost: number
+  /** 今日费用分项（元）：商机分析/群消息总结/图片识别 */
+  today_cost_breakdown?: CostBreakdown
   /** 图片解密密钥是否就绪；false 时图片消息无法识别，需去微信打开一张图片 */
   image_key_ready: boolean
   /** 各消息分片解密缓存健康度（可选，仅排查"消息停摆"类故障用） */
@@ -406,13 +408,29 @@ export interface BillingDay {
   cost: number
 }
 
-/** /api/system/billing（反馈 13：AI 账单估算） */
+/** 单个分项（商机分析/群消息总结/图片识别）的当日用量与费用 */
+export interface BillingKind {
+  calls: number
+  prompt_tokens: number
+  completion_tokens: number
+  cost: number
+}
+
+/** /api/system/billing（反馈 13：AI 账单估算；breakdown 为今日分项） */
 export interface BillingOut {
   unit: 'per_k' | 'per_m'
   input_price: number
   output_price: number
   today: BillingDay
   series: BillingDay[]
+  breakdown?: Partial<Record<'opportunity' | 'summary' | 'vision', BillingKind>>
+}
+
+/** /api/status 的今日费用分项（元） */
+export interface CostBreakdown {
+  opportunity?: number
+  summary?: number
+  vision?: number
 }
 
 /** /api/system/image-key-status：图片解密密钥是否就绪（只读查询） */

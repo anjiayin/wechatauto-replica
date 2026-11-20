@@ -209,9 +209,30 @@ export default function App() {
           <UpdateChip check={updateCheck.data} onClick={() => setUpdateOpen(true)} />
           {/* 授权状态（点击查看机器码/激活码/到期时间） */}
           <LicenseChip status={license} onClick={() => setLicenseOpen(true)} />
-          {/* 今日 AI 估算费用（反馈 13；未配置单价时为 0 不展示） */}
+          {/* 今日 AI 估算费用（反馈 13；未配置单价时为 0 不展示）。
+              覆盖商机分析 + 群消息总结 + 图片识别三类消耗（分项见悬浮说明） */}
           {(status?.today_cost ?? 0) > 0 && (
-            <Tooltip title="今日 AI 估算费用（按设置中的单价与实际 token 用量计算）">
+            <Tooltip title={
+              <Box component="div">
+                <div>今日 AI 估算费用（按设置中的单价与实际 token 用量计算）</div>
+                <div style={{ marginTop: 4 }}>
+                  合计 ¥{(status!.today_cost).toFixed(2)}
+                </div>
+                {(() => {
+                  const b = status!.today_cost_breakdown ?? {}
+                  const items: Array<[string, number]> = [
+                    ['商机分析', b.opportunity ?? 0],
+                    ['群消息总结', b.summary ?? 0],
+                    ['图片识别', b.vision ?? 0],
+                  ]
+                  return items.map(([label, v]) => (
+                    <div key={label}>
+                      {label}：¥{v.toFixed(2)}
+                    </div>
+                  ))
+                })()}
+              </Box>
+            }>
               <Typography variant="caption" sx={{ mr: 2, color: 'rgba(255,255,255,0.85)' }}>
                 今日 AI 费用：¥{(status!.today_cost).toFixed(2)}
               </Typography>

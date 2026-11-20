@@ -533,7 +533,8 @@ class SummaryService:
         if pt is not None or ct is not None:
             self._db.insert_ai_usage(
                 prompt_tokens=pt or 0, completion_tokens=ct or 0,
-                model=str(ai_cfg.get("model") or ""), session_username=session)
+                model=str(ai_cfg.get("model") or ""), session_username=session,
+                usage_kind="summary")
         row["truncated"] = bool(row.get("truncated"))
         return row
 

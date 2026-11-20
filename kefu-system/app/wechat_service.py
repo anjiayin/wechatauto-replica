@@ -735,13 +735,18 @@ class WeChatService:
     def _save_image_analysis(self, username: str, local_id: int, *,
                              is_vehicle_part: bool, part_name: str = "",
                              vin: str = "", model: str = "",
-                             error: str = "") -> None:
+                             error: str = "",
+                             prompt_tokens: Optional[int] = None,
+                             completion_tokens: Optional[int] = None) -> None:
         """落库图片识别结果（**只用于成功拿到模型 JSON 的结论**）。
 
         失败（额度/超时/Key/未配置/异常）一律**不落库**：缓存一旦写下
         ``is_vehicle_part=0``，额度恢复后这张图会被永久当成「非配件」不再
         识别（假阴性）。同一个 local_id 本来也不会重复投递，缓存的价值在
         「重投/重试」而不是「记录失败」。
+
+        同时把本次视觉调用消耗的 token 记入 ai_usage（usage_kind=vision），
+        账单分项「图片识别」的数据源；记录失败不影响识别主流程。
         """
         try:
             self._db.save_image_analysis(
@@ -749,6 +754,15 @@ class WeChatService:
                 part_name=part_name, vin=vin, model=model, error=error)
         except Exception:
             logger.exception("保存图片识别结果失败（已忽略）")
+        if prompt_tokens is not None or completion_tokens is not None:
+            try:
+                self._db.insert_ai_usage(
+                    prompt_tokens=int(prompt_tokens or 0),
+                    completion_tokens=int(completion_tokens or 0),
+                    model=model, session_username=username,
+                    usage_kind="vision")
+            except Exception:
+                logger.exception("记录图片识别 token 用量失败（已忽略）")
 
     # ------------------------------------------------------------------
     # 图片识别队列：监听线程侧（入队）与 worker 侧（取图/识别/聚合）
@@ -992,7 +1006,9 @@ class WeChatService:
                 # 下次命中缓存时能直接复用同一段原因，不必再问模型
                 self._save_image_analysis(
                     username, local_id, is_vehicle_part=False,
-                    model=model, error=reason_text)
+                    model=model, error=reason_text,
+                    prompt_tokens=result.get("prompt_tokens"),
+                    completion_tokens=result.get("completion_tokens"))
                 self._log_image_skipped(
                     username, sender_wxid, mtype, raw_content,
                     f"图片非车辆/汽车配件（AI 识别：{reason_text or '不确定'}）",
@@ -1002,7 +1018,9 @@ class WeChatService:
                 username, local_id, is_vehicle_part=True,
                 part_name=str(result.get("part_name") or ""),
                 vin=str(result.get("vin") or ""), model=model,
-                error=self._vin_reject_note(result))
+                error=self._vin_reject_note(result),
+                prompt_tokens=result.get("prompt_tokens"),
+                completion_tokens=result.get("completion_tokens"))
             self._emit_image_sell(task, result)
             return True
         except vision.VisionError as exc:
@@ -1241,7 +1259,9 @@ class WeChatService:
         if not is_part:
             self._save_image_analysis(
                 username, local_id, is_vehicle_part=False,
-                model=model, error=reason_text)
+                model=model, error=reason_text,
+                prompt_tokens=result.get("prompt_tokens"),
+                completion_tokens=result.get("completion_tokens"))
             self._log_image_skipped(
                 username, sender_wxid, mtype, raw_content,
                 f"{tag}图片非车辆/汽车配件（AI 识别：{reason_text or '不确定'}）",
@@ -1251,7 +1271,9 @@ class WeChatService:
             username, local_id, is_vehicle_part=True,
             part_name=str(result.get("part_name") or ""),
             vin=str(result.get("vin") or ""), model=model,
-            error=self._vin_reject_note(result))
+            error=self._vin_reject_note(result),
+            prompt_tokens=result.get("prompt_tokens"),
+            completion_tokens=result.get("completion_tokens"))
         self._emit_image_sell(task, result)
         self._log_image_skipped(
             username, sender_wxid, mtype, raw_content,

@@ -68,6 +68,8 @@ class StatusOut(BaseModel):
     degraded_reason: str = ""          # 微信接入降级原因（空 = 正常）
     unread_count: int = 0
     today_cost: float = 0.0            # 今日 AI 估算费用（元，反馈 13）
+    # 今日费用分项（元）：{opportunity, summary, vision}，追加字段不影响旧前端
+    today_cost_breakdown: dict = Field(default_factory=dict)
     # 图片解密 AES 密钥是否就绪（False 时图片消息无法识别；前端据此全局提醒
     # 用户去微信点开一张图片查看大图）。只读查询，不触发内存扫描等待。
     # 默认 True：老服务/测试替身无该属性时不误报「密钥缺失」横幅。
@@ -398,6 +400,14 @@ class BillingDayOut(BaseModel):
     cost: float = 0.0
 
 
+class BillingKindOut(BaseModel):
+    """单个分项（商机分析/群消息总结/图片识别）的当日用量与费用。"""
+    calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost: float = 0.0
+
+
 class BillingOut(BaseModel):
     """AI 账单估算（按设置的输入/输出单价计算，元）。"""
     unit: str = "per_m"                       # per_k=元/千tokens per_m=元/百万tokens
@@ -405,6 +415,9 @@ class BillingOut(BaseModel):
     output_price: float = 0.0
     today: BillingDayOut = Field(default_factory=lambda: BillingDayOut(date=""))
     series: List[BillingDayOut] = Field(default_factory=list)
+    # 当日分项（反馈：费用要区分商机分析/群消息总结/图片识别）；
+    # 追加字段，旧前端忽略不影响契约。
+    breakdown: dict = Field(default_factory=dict)
 
 
 class ImageKeyStatusOut(BaseModel):

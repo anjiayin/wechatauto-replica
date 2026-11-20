@@ -438,17 +438,16 @@ class TestBilling:
         assert usage["completion_tokens"] == 300
 
     def test_cost_per_k(self):
-        from app.api.router_system import _usage_cost
+        # 5bf9294 起 _usage_cost 收敛为 app.billing.estimate_cost(pt, ct, billing)
+        from app.billing import estimate_cost
         billing = {"unit": "per_k", "input_price": 2.0, "output_price": 8.0}
         # 输入 1500/千×2 + 输出 300/千×8 = 3 + 2.4 = 5.4
-        assert _usage_cost(
-            {"prompt_tokens": 1500, "completion_tokens": 300}, billing) == 5.4
+        assert estimate_cost(1500, 300, billing) == 5.4
 
     def test_cost_per_m(self):
-        from app.api.router_system import _usage_cost
+        from app.billing import estimate_cost
         billing = {"unit": "per_m", "input_price": 2.0, "output_price": 8.0}
-        cost = _usage_cost(
-            {"prompt_tokens": 1_500_000, "completion_tokens": 0}, billing)
+        cost = estimate_cost(1_500_000, 0, billing)
         assert abs(cost - 3.0) < 1e-9
 
     # -- 账单必须独立于 analysis_logs（否则清理日志后历史变成 0）--------
@@ -506,3 +505,112 @@ class TestBilling:
         # 幂等：再跑一次不会重复计数
         db._migrate_ai_usage_backfill()
         assert db.usage_by_date("2026-01-02")["calls"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 费用分项（usage_kind）：商机分析 / 群消息总结 / 图片识别
+# ---------------------------------------------------------------------------
+class TestUsageKind:
+    def test_insert_and_filter_by_kind(self):
+        """insert_ai_usage 带类别写入；usage_by_date 按 kind 过滤。"""
+        from datetime import datetime as _dt
+        db = Database(":memory:")
+        db.insert_ai_usage(prompt_tokens=100, completion_tokens=10,
+                           model="m", session_username="g@chatroom",
+                           usage_kind="summary")
+        db.insert_ai_usage(prompt_tokens=200, completion_tokens=20,
+                           model="m", session_username="g@chatroom",
+                           usage_kind="vision")
+        db.insert_ai_usage(prompt_tokens=300, completion_tokens=30,
+                           model="m", session_username="g@chatroom")
+        day = _dt.now().strftime("%Y-%m-%d")
+        assert db.usage_by_date(day)["calls"] == 3
+        assert db.usage_by_date(day, usage_kind="summary")["prompt_tokens"] == 100
+        assert db.usage_by_date(day, usage_kind="vision")["prompt_tokens"] == 200
+        assert db.usage_by_date(day, usage_kind="opportunity")["prompt_tokens"] == 300
+        # 分项合计 == 总数
+        breakdown = db.usage_breakdown_by_date(day)
+        assert sum(v["calls"] for v in breakdown.values()) == 3
+        assert breakdown["summary"]["completion_tokens"] == 10
+        assert breakdown["vision"]["completion_tokens"] == 20
+        assert breakdown["opportunity"]["completion_tokens"] == 30
+
+    def test_insert_rejects_unknown_kind(self):
+        """未知类别一律归为 opportunity（防御脏数据）。"""
+        db = Database(":memory:")
+        db.insert_ai_usage(prompt_tokens=1, completion_tokens=1,
+                           usage_kind="nonsense")
+        with db._lock:
+            row = db._conn.execute(
+                "SELECT usage_kind FROM ai_usage").fetchone()
+        assert row["usage_kind"] == "opportunity"
+
+    def test_mirror_write_tagged_opportunity(self):
+        """insert_analysis_log 事务镜像的用量标记为 opportunity。"""
+        from datetime import datetime as _dt
+        db = Database(":memory:")
+        db.insert_analysis_log(session_username="a@chatroom", msg_count=1,
+                               status="ok", model="m",
+                               prompt_tokens=1500, completion_tokens=300)
+        day = _dt.now().strftime("%Y-%m-%d")
+        assert db.usage_by_date(day, usage_kind="opportunity")["calls"] == 1
+        assert db.usage_by_date(day, usage_kind="summary")["calls"] == 0
+
+    def test_migrate_adds_column_and_backfills_summary(self):
+        """老库加列迁移 + 按 group_summaries（分钟+token 匹配）回填 summary。"""
+        db = Database(":memory:")
+        # 模拟老库：写入一条镜像默认 opportunity + 一条总结直写（同分钟同 token）
+        with db._lock:
+            db._conn.execute(
+                "INSERT INTO ai_usage (model, session_username, prompt_tokens, "
+                "completion_tokens, created_at) VALUES ('m', 'g@chatroom', "
+                "1000, 100, '2026-11-20 09:05:12')")
+            db._conn.execute(
+                "INSERT INTO ai_usage (model, session_username, prompt_tokens, "
+                "completion_tokens, created_at) VALUES ('m', 'g@chatroom', "
+                "1000, 100, '2026-11-20 09:05:30')")
+            db._conn.execute(
+                "INSERT INTO group_summaries (session_username, session_name, "
+                "time_start, time_end, content, model, prompt_tokens, "
+                "completion_tokens, created_at) VALUES ('g@chatroom', '群', "
+                "'2026-11-20 08:00', '2026-11-20 09:00', '内容', 'm', "
+                "1000, 100, '2026-11-20 09:05:25')")
+            db._conn.commit()
+        db._migrate_ai_usage_kind()
+        with db._lock:
+            kinds = [r["usage_kind"] for r in db._conn.execute(
+                "SELECT usage_kind FROM ai_usage ORDER BY id").fetchall()]
+        # 两条同分钟同 token 都与总结行匹配 → 都判为 summary（可接受误差）
+        assert kinds == ["summary", "summary"]
+        # 幂等：重跑不改变结果
+        db._migrate_ai_usage_kind()
+        with db._lock:
+            kinds2 = [r["usage_kind"] for r in db._conn.execute(
+                "SELECT usage_kind FROM ai_usage ORDER BY id").fetchall()]
+        assert kinds2 == kinds
+
+    def test_migrate_fresh_db_keeps_opportunity(self):
+        """新库（DDL 已带列）上商机分析的镜像行不受回填误伤。"""
+        from datetime import datetime as _dt
+        db = Database(":memory:")
+        db.insert_analysis_log(session_username="a@chatroom", msg_count=1,
+                               status="ok", model="m",
+                               prompt_tokens=700, completion_tokens=70)
+        db._migrate_ai_usage_kind()
+        day = _dt.now().strftime("%Y-%m-%d")
+        assert db.usage_by_date(day, usage_kind="opportunity")["calls"] == 1
+
+    def test_migrate_rejects_unmatched_rows_stay_opportunity(self):
+        """无 group_summaries 匹配的存量行保持 opportunity。"""
+        db = Database(":memory:")
+        with db._lock:
+            db._conn.execute(
+                "INSERT INTO ai_usage (model, session_username, prompt_tokens, "
+                "completion_tokens, created_at) VALUES ('m', 'x@openim', "
+                "500, 50, '2026-11-19 15:00:00')")
+            db._conn.commit()
+        db._migrate_ai_usage_kind()
+        with db._lock:
+            row = db._conn.execute(
+                "SELECT usage_kind FROM ai_usage").fetchone()
+        assert row["usage_kind"] == "opportunity"

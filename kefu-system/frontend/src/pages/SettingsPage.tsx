@@ -2188,7 +2188,7 @@ function DataBillingTab() {
         命令行/环境变量（KEFU_PORT）的优先级高于这里的保存值。
       </Typography>
       <Stack spacing={1.5}>
-        <Stack direction="row" spacing={1} alignItems="center" useFlexGap>
+        <Stack direction="row" spacing={1} alignItems="flex-start" useFlexGap>
           <TextField
             size="small"
             sx={{ width: 150 }}
@@ -2205,6 +2205,7 @@ function DataBillingTab() {
           />
           <Button
             variant="contained"
+            sx={{ height: 40 }}
             disabled={
               saveServerMutation.isPending
               || !serverPort
@@ -2216,6 +2217,7 @@ function DataBillingTab() {
             保存
           </Button>
           <Button
+            sx={{ height: 40 }}
             disabled={saveServerMutation.isPending || !serverInfo}
             onClick={() => {
               setServerPort(String(serverInfo?.default_port ?? 8765))
@@ -2316,7 +2318,7 @@ function DataBillingTab() {
       </Alert>
       <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
         填写所用 AI 接口的输入/输出单价（当前单价单位：{unitLabel}），系统按每次调用的实际 token 用量自动累计每日估算费用（仅本机估算，非官方账单）。
-        用量单独存档，清理分析日志不会影响账单历史；显示 ¥0.00 表示当天没有产生 AI 调用。
+        费用覆盖商机分析、群消息总结、图片识别三类 AI 消耗（分项见下方），用量单独存档，清理分析日志不会影响账单历史；显示 ¥0.00 表示当天没有产生 AI 调用。
       </Typography>
       <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1.5 }} useFlexGap>
         <TextField
@@ -2361,6 +2363,28 @@ function DataBillingTab() {
             {/* 费用单位是「元」；unitLabel 是单价单位（元/千 tokens），不能混用（批次 6 需求 1） */}
             估算费用 <b>¥{billing.today.cost.toFixed(4)}</b>（元）
           </Typography>
+          {/* 汇总 + 分项（反馈：费用要区分商机分析/群消息总结/图片识别） */}
+          {(() => {
+            const b = billing.breakdown ?? {}
+            const kinds: Array<[string, typeof b.opportunity]> = [
+              ['商机分析', b.opportunity],
+              ['群消息总结', b.summary],
+              ['图片识别', b.vision],
+            ]
+            const shown = kinds.filter(([, k]) => k && (k.calls > 0 || k.cost > 0))
+            if (shown.length === 0) return null
+            return (
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 0.5 }}>
+                其中：
+                {shown.map(([label, k], i) => (
+                  <span key={label}>
+                    {label} {k!.calls} 次 ¥{k!.cost.toFixed(4)}
+                    {i < shown.length - 1 ? ' · ' : ''}
+                  </span>
+                ))}
+              </Typography>
+            )
+          })()}
           {billing.series.length > 0 && (
             <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
               近 7 日：{billing.series.map((d) => `${d.date.slice(5)} ¥${d.cost.toFixed(2)}`).join(' · ')}
