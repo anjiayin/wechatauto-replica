@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { NavLink, Route, Routes, useNavigate } from 'react-router-dom'
+import { NavLink, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import {
   Alert,
@@ -56,10 +56,42 @@ interface AnalysisErrorData {
   consecutive_failures: number
 }
 
+/** 定时总结产出事件数据（useEvents 派发 kefu-summary-new） */
+interface SummaryNewData {
+  id?: number
+  session_name?: string
+  created_at?: string
+}
+
 /** 全局框架：左侧导航、WS 事件接入、顶部状态横幅、全局提醒。 */
 export default function App() {
   const navigate = useNavigate()
+  const location = useLocation()
   useEvents() // WS 订阅 + react-query 失效联动
+
+  // 群消息总结角标：定时总结产出（summary_new WS 事件）累计 +1，
+  // 进入 /summary 页面即清零（用户已看到最新历史列表）
+  const [summaryBadge, setSummaryBadge] = useState(0)
+  useEffect(() => {
+    const handler = (ev: Event) => {
+      const d = (ev as CustomEvent<SummaryNewData>).detail
+      // 提示文案进 Snackbar（复用商机 toast 样式），同时角标 +1
+      window.dispatchEvent(new CustomEvent('kefu-opportunity-toast', {
+        detail: {
+          id: d.id ?? 0,
+          title: '定时总结已生成',
+          session_name: d.session_name ?? '群消息总结',
+          summary: '点击左侧「群消息总结」查看最新总结',
+        },
+      }))
+      setSummaryBadge((n) => n + 1)
+    }
+    window.addEventListener('kefu-summary-new', handler)
+    return () => window.removeEventListener('kefu-summary-new', handler)
+  }, [])
+  useEffect(() => {
+    if (location.pathname === '/summary') setSummaryBadge(0)
+  }, [location.pathname])
 
   // 状态轮询：WS 断开时的兜底刷新通道
   const { data: status } = useQuery({
@@ -271,8 +303,13 @@ export default function App() {
             badge={status?.unread_count ?? 0}
           />
           {/* 消息浏览菜单已按用户要求下线（反馈 8） */}
-          {/* P1 定时产出数 Badge 位：T05 接入 WS summary_new 后填充 */}
-          <NavItem to="/summary" icon={<SummarizeIcon />} label="群消息总结" />
+          {/* P1 定时总结产出数角标：WS summary_new 累计，进入页面清零 */}
+          <NavItem
+            to="/summary"
+            icon={<SummarizeIcon />}
+            label="群消息总结"
+            badge={summaryBadge}
+          />
           <NavItem to="/analysis-logs" icon={<ReceiptLongIcon />} label="分析日志" />
           <NavItem to="/settings" icon={<SettingsIcon />} label="设置" />
         </List>

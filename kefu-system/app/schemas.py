@@ -705,7 +705,7 @@ class SummaryListOut(BaseModel):
 
 
 class SummarySettingsOut(BaseModel):
-    """设置页配置区（预算 5 键 + 定时 2 键，响应键为 settings 点分字符串）。"""
+    """设置页配置区（预算 5 键 + 定时 2 键 + 提示词模板 1 键，响应键为 settings 点分字符串）。"""
     model_config = ConfigDict(populate_by_name=True)
 
     budget_mode: str = Field(default="money", alias="summary.budget_mode")
@@ -715,6 +715,7 @@ class SummarySettingsOut(BaseModel):
     truncate_recent_n: str = Field(default="200", alias="summary.truncate_recent_n")
     schedule_enabled: str = Field(default="0", alias="summary.schedule_enabled")
     schedule_configs: str = Field(default="[]", alias="summary.schedule_configs")
+    prompt_templates: str = Field(default="[]", alias="summary.prompt_templates")
 
 
 class SummarySettingsUpdate(BaseModel):
@@ -732,3 +733,26 @@ class SummarySettingsUpdate(BaseModel):
         default=None, alias="summary.schedule_enabled")
     schedule_configs: Optional[str] = Field(
         default=None, alias="summary.schedule_configs")
+    prompt_templates: Optional[str] = Field(
+        default=None, alias="summary.prompt_templates")
+
+
+# ---------------------------------------------------------------------------
+# 群消息总结 P1/P2：回链原文
+# ---------------------------------------------------------------------------
+class SummaryContextMessage(BaseModel):
+    """回链原文的单条消息行（与消息列表口径一致：时间 ISO + 友好化正文）。"""
+    local_id: int = 0
+    sender_wxid: str = ""
+    sender_name: str = ""
+    create_time: str = ""
+    content: str = ""
+
+
+class SummaryContextOut(BaseModel):
+    """按时间范围取原始消息（总结回链入口）。"""
+    session: str
+    start: str
+    end: str
+    total: int = 0
+    items: List[SummaryContextMessage] = Field(default_factory=list)

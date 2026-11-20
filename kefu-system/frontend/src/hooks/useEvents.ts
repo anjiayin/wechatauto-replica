@@ -14,6 +14,8 @@ import type { WsEvent } from '../api/types'
  *   + 失效状态查询（连续失败 ≥3 次时顶部常驻横幅由 /api/status 驱动）
  * - status_change → 失效状态查询（顶部横幅）
  * - send_result → 经 window CustomEvent("kefu-send-result") 分发给详情页
+ * - summary_new → 定时总结产出：失效历史列表查询
+ *   + 派发 kefu-summary-new（App 计角标：非总结页时「群消息总结」NavItem 红点）
  * WS 不可用时页面自动退化为轮询刷新（react-query refetchInterval）。
  */
 interface OpportunityNewData {
@@ -22,6 +24,15 @@ interface OpportunityNewData {
   summary?: string
   /** 命中类型名（汽车配件 / 客户投诉 …），用于提醒标题 */
   type_name?: string | null
+}
+
+/** summary_new 事件数据（定时总结产出） */
+interface SummaryNewData {
+  id?: number
+  session_username?: string
+  session_name?: string
+  created_at?: string
+  msg_count?: number
 }
 
 /**
@@ -190,6 +201,22 @@ export function useEvents(): boolean {
             void queryClient.invalidateQueries({ queryKey: ['opportunities'] })
             void queryClient.invalidateQueries({ queryKey: ['opportunity'] })
             break
+          case 'summary_new': {
+            // 定时总结产出：刷新历史列表（任何 Tab/页面都失效，保证进入即最新）
+            void queryClient.invalidateQueries({ queryKey: ['summary-history'] })
+            void queryClient.invalidateQueries({ queryKey: ['summary-settings'] })
+            const d = (msg.data ?? {}) as SummaryNewData
+            window.dispatchEvent(
+              new CustomEvent('kefu-summary-new', {
+                detail: {
+                  id: d.id,
+                  session_name: d.session_name ?? d.session_username ?? '',
+                  created_at: d.created_at ?? '',
+                },
+              }),
+            )
+            break
+          }
           default:
             break
         }

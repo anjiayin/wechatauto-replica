@@ -41,6 +41,7 @@ from app import license as license_mod
 from app.notifier import Notifier
 from app.pipeline import Pipeline
 from app.sender import Sender
+from app.summary import SummaryScheduler, SummaryService
 from app.update_service import repair_bundle_root_files
 from app.wechat_service import WeChatService
 
@@ -223,6 +224,13 @@ def create_app() -> FastAPI:
         pipeline.set_voice_lookup(wechat.transcribe_voice)
         # 注入 @人 ID 还原（群聊 AI 判定上下文线索，批次 5 需求 ④）
         pipeline.set_at_resolver(wechat.resolve_at_tokens)
+        # 定时总结调度器：常驻 daemon 线程随运行时启停（P1 T05）。
+        # 独立常驻 SummaryService 实例（deps.get_summary_service 是请求级
+        # 轻量构造，调度线程不能每次 tick 重建）；配置未开启时线程空转、
+        # 每分钟只读一次 settings，开销可忽略。
+        summary_scheduler = SummaryScheduler(
+            SummaryService(db, wechat), notifier)
+        globals()["_summary_scheduler"] = summary_scheduler
 
         def _start_runtime() -> None:
             """启动抓取 / 分析 / 发送（授权通过后才会被调用）。"""
@@ -239,6 +247,8 @@ def create_app() -> FastAPI:
                                         name="kefu-wx-start", daemon=True)
             wx_start.start()
             globals()["_wx_start_thread"] = wx_start
+            # 定时总结与业务运行时同生命周期：只在抓取/分析可用后开始轮询
+            summary_scheduler.start()
 
         # 授权通过后（含「首次激活」）由 deps 回调现场拉起运行时，无需重启程序
         deps.configure_runtime(_start_runtime)
@@ -280,6 +290,13 @@ def create_app() -> FastAPI:
         sender = deps.get_sender()
         db = deps.get_db()
         aggregator = globals().get("_aggregator")
+        # 先停定时总结调度器（不再触发 AI 调用），再等微信初始化线程
+        summary_scheduler = globals().get("_summary_scheduler")
+        if summary_scheduler is not None:
+            try:
+                summary_scheduler.stop()
+            except Exception:
+                logger.exception("停止定时总结调度器异常（已忽略）")
         # 等待微信初始化线程结束（避免与 stop 并发竞争）
         wx_start = globals().get("_wx_start_thread")
         if wx_start is not None:

@@ -75,20 +75,37 @@ import {
 import { LicenseSettingsTab } from './LicensePanel'
 import { UpdateSettingsTab } from './UpdatePanel'
 
-/** 设置页：监控对象 / 商机类型 / AI 接口 / 数据与账单 / 授权 / 系统更新 六 tab。 */
+/** 设置页：监控对象 / 商机类型 / AI 接口 / 数据与账单 / 群消息总结 / 授权 / 系统更新 七 tab。 */
 export default function SettingsPage() {
   const [tab, setTab] = useState(0)
   return (
     <Paper variant="outlined" sx={{ p: 2 }}>
-      <Tabs value={tab} onChange={(_, v: number) => setTab(v)} sx={{ mb: 2 }}>
-        <Tab label="监控对象" />
-        <Tab label="商机类型" />
-        <Tab label="AI 接口" />
-        <Tab label="数据与账单" />
-        <Tab label="群消息总结" />
-        <Tab label="授权" />
-        <Tab label="系统更新" />
-      </Tabs>
+      {/* sticky 页签：页面滚动时固定在顶栏下方，可随时切换（顶栏 = dense 48px + 2px 边框） */}
+      <Box
+        sx={{
+          position: 'sticky',
+          top: 50,
+          zIndex: 2,
+          bgcolor: 'background.paper',
+          // 负 margin 抵消 Paper 的 p:2，固定时遮住两侧滚动内容不留缝
+          mx: -2,
+          px: 2,
+          mb: 2,
+          pb: 1,
+          borderBottom: '1px solid',
+          borderColor: 'divider',
+        }}
+      >
+        <Tabs value={tab} onChange={(_, v: number) => setTab(v)}>
+          <Tab label="监控对象" />
+          <Tab label="商机类型" />
+          <Tab label="AI 接口" />
+          <Tab label="数据与账单" />
+          <Tab label="群消息总结" />
+          <Tab label="授权" />
+          <Tab label="系统更新" />
+        </Tabs>
+      </Box>
       {tab === 0 && <TargetsTab />}
       {tab === 1 && <TypesTab />}
       {tab === 2 && <AiTab />}
@@ -1480,6 +1497,8 @@ interface ScheduleConfig {
   display_name: string
   enabled: boolean
   time: string
+  /** 定时生成的总结风格（P1 风格可选；老配置无该字段时后端回退 detailed） */
+  style?: 'detailed' | 'concise' | 'bullets'
 }
 
 const NO_PRICE_HINT = '请先在设置页配置模型单价，否则金额预算不生效'
@@ -1634,7 +1653,8 @@ function SummarySettingsTab() {
         label="开启每日定时总结（默认关闭）"
       />
       <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
-        默认每日 18:00 触发一次，时间可调整；P0 阶段仅保存配置，后台调度在后续版本启用。
+        默认每日 18:00 触发一次，时间与风格均可调整；生成后左侧「群消息总结」
+        出现红点角标，历史列表自动刷新。当天已生成过的群不会重复生成。
       </Typography>
       <Stack spacing={1} sx={{ maxWidth: 720 }}>
         {schedules.map((item, index) => (
@@ -1668,6 +1688,19 @@ function SummarySettingsTab() {
                 next[index] = { ...item, time: e.target.value }
                 setSchedules(next)
               }} />
+            <TextField select label="风格" size="small" sx={{ minWidth: 96 }}
+              value={item.style || 'detailed'}
+              onChange={(e) => {
+                const next = [...schedules]
+                next[index] = {
+                  ...item, style: e.target.value as ScheduleConfig['style'],
+                }
+                setSchedules(next)
+              }}>
+              <MenuItem value="detailed">全面</MenuItem>
+              <MenuItem value="concise">简洁</MenuItem>
+              <MenuItem value="bullets">要点式</MenuItem>
+            </TextField>
             <FormControlLabel control={<Switch size="small" checked={Boolean(item.enabled)}
               onChange={(e) => {
                 const next = [...schedules]
@@ -1684,7 +1717,7 @@ function SummarySettingsTab() {
           onClick={() => setSchedules([...schedules, {
             session: groups[0]?.username || '',
             display_name: groups[0]?.display_name || '',
-            enabled: true, time: '18:00',
+            enabled: true, time: '18:00', style: 'detailed',
           }])}>
           添加群聊
         </Button>
@@ -1982,7 +2015,7 @@ function DataBillingTab() {
       </Typography>
       <Stack spacing={2} sx={{ mb: 2 }}>
         <Stack direction="row" spacing={1} alignItems="center" useFlexGap>
-          <Typography variant="body2" sx={{ width: 90 }}>分析日志保留</Typography>
+          <Typography variant="body2" sx={{ width: 98, flexShrink: 0, whiteSpace: 'nowrap' }}>分析日志保留</Typography>
           <TextField
             size="small"
             sx={{ width: 110 }}
@@ -2010,7 +2043,7 @@ function DataBillingTab() {
           </Button>
         </Stack>
         <Stack direction="row" spacing={1} alignItems="center" useFlexGap>
-          <Typography variant="body2" sx={{ width: 90 }}>商机保留</Typography>
+          <Typography variant="body2" sx={{ width: 98, flexShrink: 0, whiteSpace: 'nowrap' }}>商机保留</Typography>
           <TextField
             size="small"
             sx={{ width: 110 }}
@@ -2038,7 +2071,7 @@ function DataBillingTab() {
           </Button>
         </Stack>
         <Stack direction="row" spacing={1} alignItems="center" useFlexGap>
-          <Typography variant="body2" sx={{ width: 90 }}>群消息总结保留</Typography>
+          <Typography variant="body2" sx={{ width: 98, flexShrink: 0, whiteSpace: 'nowrap' }}>群消息总结保留</Typography>
           <TextField
             size="small"
             sx={{ width: 110 }}

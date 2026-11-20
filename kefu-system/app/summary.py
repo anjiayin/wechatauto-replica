@@ -14,8 +14,9 @@ import html
 import json
 import logging
 import re
+import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
 
 from app import analyzer
@@ -633,28 +634,76 @@ class SummaryService:
 
 
 class SummaryScheduler:
-    """P1 定时总结调度器骨架（T05 接入 main.py 与 WS 通知后启用）。
+    """P1 定时总结调度器：daemon 线程每分钟检查按群配置并生成总结。
 
-    P0 阶段不启动任何后台线程、不产生定时清理或发送行为；配置读取与命中
-    判断集中在这里，T05 只需在 tick() 中调用 SummaryService.generate。
+    生成链完全复用 SummaryService.generate（预算/截断/落库口径一致），
+    时间范围取「昨天 0 点 → 现在」，保证每日一次语义下内容不重复。
+    命中后查询 group_summaries 当日（session_username 精确 + created_at
+    前缀）去重，重试窗口内不重复产出；成功落库后 broadcast("summary_new")
+    通知前端刷新历史列表与角标。生成失败只记 warning 日志，绝不重试轰炸
+    （下一分钟去重判断不会再命中同一天的空档——去重键是「当日已有产出」，
+    失败当天不会再补跑，次日恢复）。
     """
 
-    def __init__(self, service: SummaryService, notifier: Any = None) -> None:
+    #: 调度线程轮询间隔（秒）。触发时间为 HH:MM 精度，60s 轮询即可命中
+    TICK_INTERVAL_SEC = 60
+
+    def __init__(self, service: SummaryService, notifier: Any = None,
+                 now_fn: Optional[Callable[[], datetime]] = None) -> None:
         self._service = service
         self._notifier = notifier
+        self._now_fn = now_fn or datetime.now
         self._started = False
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
 
+    # ------------------------------------------------------------------
+    # 生命周期
+    # ------------------------------------------------------------------
     def start(self) -> None:
-        """标记已启动（P0 不拉起线程；T05 在此创建 daemon 线程）。"""
+        """创建 daemon 轮询线程（幂等：重复 start 不叠加线程）。"""
+        if self._thread is not None and self._thread.is_alive():
+            self._started = True
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._loop, name="kefu-summary-scheduler", daemon=True)
+        self._thread.start()
         self._started = True
-        logger.info("群消息总结定时调度器已标记启动（P0 未启用后台线程）")
+        logger.info("群消息总结定时调度器已启动（每 %ds 检查一次按群配置）",
+                    self.TICK_INTERVAL_SEC)
 
     def stop(self) -> None:
-        """停止标记（P0 无线程可停）。"""
+        """停止轮询线程（等待最多一个轮询周期，线程退出后清引用）。"""
         self._started = False
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=self.TICK_INTERVAL_SEC + 5)
+        self._thread = None
 
+    @property
+    def started(self) -> bool:
+        """调度器是否已标记启动（线程生命周期检查用）。"""
+        return self._started
+
+    def _loop(self) -> None:
+        """轮询主循环：任何异常都不允许杀死线程（只记日志等下轮）。"""
+        while not self._stop_event.wait(self.TICK_INTERVAL_SEC):
+            try:
+                self.tick()
+            except Exception:            # 线程绝不能因异常退出
+                logger.exception("群消息总结定时调度异常（已忽略，等待下一轮）")
+
+    # ------------------------------------------------------------------
+    # 命中判断与生成
+    # ------------------------------------------------------------------
     def tick(self) -> list[dict]:
-        """返回当前已启用且触发时间命中 HH:MM 的按群配置（P0 只检查不生成）。"""
+        """检查当前 HH:MM 命中的启用配置并逐一生成；返回本次产出列表。
+
+        每次调用独立完成「读配置 → 过滤命中 → 当日去重 → 生成 → 广播」，
+        无内部状态依赖（测试可直接调用 tick() 驱动，不必起线程）。
+        """
         db = self._service._db
         if db.get_setting(KEY_SUMMARY_SCHEDULE_ENABLED, "0") != "1":
             return []
@@ -664,12 +713,62 @@ class SummaryScheduler:
             return []
         if not isinstance(configs, list):
             return []
-        now_hm = datetime.now().strftime("%H:%M")
-        return [c for c in configs
-                if isinstance(c, dict) and c.get("enabled")
-                and str(c.get("time") or SUMMARY_SCHEDULE_TIME_DEFAULT) == now_hm]
+        now = self._now_fn()
+        now_hm = now.strftime("%H:%M")
+        produced: list[dict] = []
+        for cfg in configs:
+            if not isinstance(cfg, dict) or not cfg.get("enabled"):
+                continue
+            if str(cfg.get("time") or SUMMARY_SCHEDULE_TIME_DEFAULT) != now_hm:
+                continue
+            session = str(cfg.get("session") or "").strip()
+            if not session:
+                continue
+            if self._already_generated_today(session, now):
+                continue
+            style = str(cfg.get("style") or "detailed")
+            try:
+                row = self._generate_for_config(session, style)
+            except Exception as exc:
+                # 失败仅留痕：当日不再补跑（去重键=当日已有产出），避免
+                # AI 挂掉时每分钟重试一次打爆配额；次日正常恢复。
+                logger.warning(
+                    "定时总结失败（session=%s 风格=%s 当日不补跑）：%s",
+                    session, style, exc)
+                continue
+            produced.append(row)
+            self._notify(row)
+        return produced
 
-    @property
-    def started(self) -> bool:
-        """调度器是否已标记启动（T05 线程生命周期检查用）。"""
-        return self._started
+    def _already_generated_today(self, session: str, now: datetime) -> bool:
+        """当日去重：session 精确 + created_at 当日日期前缀（本地时间）。"""
+        return bool(self._service._db.has_group_summary_on_day(
+            session, now.strftime("%Y-%m-%d")))
+
+    def _generate_for_config(self, session: str, style: str) -> dict:
+        """按群配置生成一条总结：范围 = 昨天 0 点 → 现在。
+
+        昨天 0 点起步保证「每日一次」语义下相邻两天内容不重叠；结束时间
+        取当前时刻，当天早间触发也能覆盖凌晨消息。
+        """
+        now = self._now_fn()
+        start_dt = (now - timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        return self._service.generate(
+            session, start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            now.strftime("%Y-%m-%d %H:%M:%S"), senders=None, style=style)
+
+    def _notify(self, row: dict) -> None:
+        """WS 广播 summary_new（Notifier 线程安全，任意线程可调用）。"""
+        if self._notifier is None:
+            return
+        try:
+            self._notifier.broadcast("summary_new", {
+                "id": row.get("id"),
+                "session_username": row.get("session_username") or "",
+                "session_name": row.get("session_name") or "",
+                "created_at": row.get("created_at") or "",
+                "msg_count": row.get("msg_count") or 0,
+            })
+        except Exception:                # 通知失败不影响已落库结果
+            logger.exception("summary_new 广播失败（已忽略）")

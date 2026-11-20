@@ -29,14 +29,16 @@ import {
   ToggleButtonGroup,
   Typography,
 } from '@mui/material'
-import { apiDelete, apiGet, apiPost, qs } from '../api/client'
+import { apiDelete, apiGet, apiPost, apiPut, qs } from '../api/client'
 import type {
   SessionItem,
   SummaryContent,
+  SummaryContextOut,
   SummaryGenerateIn,
   SummaryMemberItem,
   SummaryMembersOut,
   SummaryOut,
+  SummaryPromptTemplate,
   SummarySettings,
   SummaryStyle,
 } from '../api/types'
@@ -57,6 +59,22 @@ const SECTIONS: { key: keyof SummaryContent; label: string }[] = [
 ]
 
 const NO_PRICE_HINT = '请先在设置页配置模型单价，否则金额预算不生效'
+
+/** 提示词模板上限（与后端 /settings 校验一致），仅用于前端禁用新增按钮 */
+const MAX_TEMPLATES = 50
+
+/** 安全解析 settings 里的提示词模板 JSON（损坏/结构不对一律回退空数组） */
+function parseTemplates(raw: string | undefined): SummaryPromptTemplate[] {
+  try {
+    const parsed = JSON.parse(raw || '[]')
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter(
+      (t): t is SummaryPromptTemplate => Boolean(t) && typeof t.name === 'string',
+    )
+  } catch {
+    return []
+  }
+}
 
 function pad(n: number): string {
   return String(n).padStart(2, '0')
@@ -105,8 +123,10 @@ function parseContent(raw: string): SummaryContent {
   }
 }
 
-/** 总结正文（结果区与详情 Dialog 共用，无发送按钮） */
-function SummaryBody({ row }: { row: SummaryOut }) {
+/** 总结正文（结果区与详情 Dialog 共用，无发送按钮）；onShowContext = P2 回链原文 */
+function SummaryBody(
+  { row, onShowContext }: { row: SummaryOut; onShowContext?: (r: SummaryOut) => void },
+) {
   const content = useMemo(() => parseContent(row.content), [row.content])
   return (
     <Box>
@@ -121,12 +141,20 @@ function SummaryBody({ row }: { row: SummaryOut }) {
           label={`实际 token：${row.prompt_tokens ?? '—'} + ${row.completion_tokens ?? '—'}`}
         />
       </Stack>
-      <Typography variant="caption" color="text.secondary">
-        参数快照：{row.session_name} · {row.time_start} ~ {row.time_end} ·
-        消息 {row.msg_count} 条 / 成员 {row.member_count} 人 · 风格
-        {STYLE_OPTIONS.find((s) => s.value === row.style)?.label ?? row.style}
-        {row.custom_prompt ? ` · 补充要求：${row.custom_prompt}` : ''}
-      </Typography>
+      <Stack direction="row" alignItems="center" spacing={1} flexWrap="wrap" useFlexGap>
+        <Typography variant="caption" color="text.secondary">
+          参数快照：{row.session_name} · {row.time_start} ~ {row.time_end} ·
+          消息 {row.msg_count} 条 / 成员 {row.member_count} 人 · 风格
+          {STYLE_OPTIONS.find((s) => s.value === row.style)?.label ?? row.style}
+          {row.custom_prompt ? ` · 补充要求：${row.custom_prompt}` : ''}
+        </Typography>
+        {onShowContext && (
+          <Button size="small" variant="text" sx={{ ml: 'auto' }}
+            onClick={() => onShowContext(row)}>
+            查看原始消息
+          </Button>
+        )}
+      </Stack>
       <Divider sx={{ my: 2 }} />
       {SECTIONS.map((section) => (
         <Box key={section.key} sx={{ mb: 2 }}>
@@ -163,11 +191,18 @@ export default function GroupSummary() {
   const [result, setResult] = useState<SummaryOut | null>(null)
   const [lastPayload, setLastPayload] = useState<SummaryGenerateIn | null>(null)
   const [snack, setSnack] = useState('')
-  const [historySession, setHistorySession] = useState('')
+  // P1-2 历史筛选：按群名（session_name/username 双列模糊）+ 日期
+  const [historyKeyword, setHistoryKeyword] = useState('')
   const [historyDate, setHistoryDate] = useState('')
   const [historyPage, setHistoryPage] = useState(1)
   const [detail, setDetail] = useState<SummaryOut | null>(null)
   const [pendingDelete, setPendingDelete] = useState<SummaryOut | null>(null)
+  // P1-3 提示词模板管理：管理弹窗开关 + 弹窗内新增表单草稿
+  const [tplOpen, setTplOpen] = useState(false)
+  const [tplName, setTplName] = useState('')
+  const [tplPrompt, setTplPrompt] = useState('')
+  // P2-1 回链原文：查看原始消息弹窗（loading 状态下 row 也非空，防误关提示）
+  const [ctxRow, setCtxRow] = useState<SummaryOut | null>(null)
   const resultRef = useRef<HTMLDivElement>(null)
 
   // 群 / 时间变化防抖 500ms，避免每敲一个字符就查微信库
@@ -183,6 +218,11 @@ export default function GroupSummary() {
     queryFn: () => apiGet<SummarySettings>('/api/summary/settings'),
   })
   const settingsKey = settings ? JSON.stringify(settings) : ''
+  // P1-3 提示词模板列表（settings 只读派生，写操作走 templatesMutation）
+  const templates = useMemo(
+    () => parseTemplates(settings?.['summary.prompt_templates']),
+    [settings],
+  )
 
   const { data: sessions = [] } = useQuery({
     queryKey: ['summary-sessions', sessionKeyword],
@@ -225,11 +265,37 @@ export default function GroupSummary() {
     onError: (error: Error) => setSnack(`删除失败：${error.message}`),
   })
 
+  // P1-3 模板管理：settings 只传 summary.prompt_templates 一个键，
+  // 后端 exclude_none 语义下其余键保持不变
+  const templatesMutation = useMutation({
+    mutationFn: (list: SummaryPromptTemplate[]) =>
+      apiPut<SummarySettings>('/api/summary/settings', {
+        'summary.prompt_templates': JSON.stringify(list),
+      }),
+    onSuccess: (_data, list) => {
+      void queryClient.invalidateQueries({ queryKey: ['summary-settings'] })
+      setSnack(list.length ? '提示词模板已保存' : '已恢复默认（模板已清空）')
+      if (!list.length) setTplOpen(false)
+    },
+    onError: (error: Error) => setSnack(`模板保存失败：${error.message}`),
+  })
+
+  // P2-1 回链原文：打开弹窗即拉取时间范围内的原始消息（与总结同源取数口径）
+  const ctxUsername = ctxRow?.session_username ?? ''
+  const ctxStart = ctxRow?.time_start ?? ''
+  const ctxEnd = ctxRow?.time_end ?? ''
+  const { data: ctxData, isFetching: ctxFetching, error: ctxError } = useQuery({
+    queryKey: ['summary-context', ctxUsername, ctxStart, ctxEnd],
+    queryFn: () => apiGet<SummaryContextOut>(
+      `/api/summary/context${qs({ session: ctxUsername, start: ctxStart, end: ctxEnd })}`),
+    enabled: Boolean(ctxRow),
+  })
+
   const { data: history, isFetching: historyFetching } = useQuery({
-    queryKey: ['summary-history', historySession, historyDate, historyPage],
+    queryKey: ['summary-history', historyKeyword, historyDate, historyPage],
     queryFn: () => apiGet<{ total: number; items: SummaryOut[] }>(
       `/api/summary/history${qs({
-        page: historyPage, page_size: 10, session: historySession, date: historyDate,
+        page: historyPage, page_size: 10, keyword: historyKeyword, date: historyDate,
       })}`),
     enabled: tab === 1,
   })
@@ -356,6 +422,47 @@ export default function GroupSummary() {
                   ))}
                 </ToggleButtonGroup>
               </Box>
+              {/* P1-3 提示词模板：下拉快速选用（选中即填充下方补充要求），右侧入口管理模板 */}
+              <Box>
+                <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 0.5 }}>
+                  <Typography variant="caption" color="text.secondary" sx={{ flex: 1 }}>
+                    提示词模板（选中即填充到下方自定义提示词）
+                  </Typography>
+                  {templates.length > 0 && (
+                    <Button size="small" onClick={() => setCustomPrompt('')}>清空</Button>
+                  )}
+                  <Button size="small" onClick={() => {
+                    setTplName(''); setTplPrompt('')
+                    setTplOpen(true)
+                  }}>
+                    管理模板
+                  </Button>
+                </Stack>
+                <Autocomplete
+                  options={templates}
+                  value={null}
+                  blurOnSelect
+                  getOptionLabel={(t) => t.name}
+                  onChange={(_, t) => { if (t) setCustomPrompt(t.prompt) }}
+                  renderOption={(props, option) => {
+                    const key = props.key ?? option.name
+                    return (
+                      <Box component="li" {...props} key={key} sx={{ display: 'block', py: 0.5 }}>
+                        <Typography variant="body2">{option.name}</Typography>
+                        <Typography variant="caption" color="text.secondary"
+                          sx={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                          {option.prompt}
+                        </Typography>
+                      </Box>
+                    )
+                  }}
+                  renderInput={(params) => (
+                    <TextField {...params} size="small" fullWidth
+                      placeholder={templates.length ? '选择模板快速填充' : '暂无模板，点右上「管理模板」新建'}
+                      helperText="模板长期保存、可复用；生成时仍以下方自定义提示词为准" />
+                  )}
+                />
+              </Box>
               <TextField
                 label="自定义提示词（可选）" multiline minRows={2} maxRows={5}
                 size="small" fullWidth value={customPrompt}
@@ -414,7 +521,7 @@ export default function GroupSummary() {
                     disabled={generateMutation.isPending}>重新生成</Button>
                 </Stack>
               </Stack>
-              <SummaryBody row={result} />
+              <SummaryBody row={result} onShowContext={setCtxRow} />
             </Paper>
           )}
         </Stack>
@@ -423,8 +530,9 @@ export default function GroupSummary() {
       {tab === 1 && (
         <Box>
           <Stack direction="row" spacing={2} sx={{ mb: 2 }} flexWrap="wrap" useFlexGap>
-            <TextField label="群名（username 精确）" size="small" value={historySession}
-              onChange={(e) => { setHistorySession(e.target.value); setHistoryPage(1) }}
+            <TextField label="按群名搜索" size="small" value={historyKeyword}
+              onChange={(e) => { setHistoryKeyword(e.target.value); setHistoryPage(1) }}
+              placeholder="群显示名或 username，模糊匹配"
               sx={{ minWidth: 220 }} />
             <TextField label="生成日期" type="date" size="small" value={historyDate}
               InputLabelProps={{ shrink: true }}
@@ -487,7 +595,7 @@ export default function GroupSummary() {
       <Dialog open={detail !== null} onClose={() => setDetail(null)} maxWidth="md" fullWidth>
         <DialogTitle>总结详情</DialogTitle>
         <DialogContent dividers>
-          {detail && <SummaryBody row={detail} />}
+          {detail && <SummaryBody row={detail} onShowContext={setCtxRow} />}
         </DialogContent>
         <DialogActions>
           {detail && (
@@ -517,6 +625,144 @@ export default function GroupSummary() {
           <Button color="error" onClick={() => pendingDelete && deleteMutation.mutate(pendingDelete.id)}>
             确认删除
           </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* P1-3 提示词模板管理（增删 / 恢复默认=写回 []，恢复前二次确认） */}
+      <Dialog open={tplOpen} onClose={() => setTplOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>提示词模板管理</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.5} sx={{ mb: 2 }}>
+            {templates.map((t) => (
+              <Paper key={t.name} variant="outlined" sx={{ p: 1.5 }}>
+                <Stack direction="row" alignItems="center" spacing={1}>
+                  <Typography variant="body2" sx={{ fontWeight: 700, flex: 1, minWidth: 0 }}>
+                    {t.name}
+                  </Typography>
+                  <Button
+                    size="small"
+                    onClick={() => setCustomPrompt(t.prompt)}
+                  >
+                    填充到表单
+                  </Button>
+                  <Button
+                    size="small" color="error"
+                    disabled={templatesMutation.isPending}
+                    onClick={() => templatesMutation.mutate(
+                      templates.filter((x) => x.name !== t.name),
+                    )}
+                  >
+                    删除
+                  </Button>
+                </Stack>
+                <Typography variant="caption" color="text.secondary"
+                  sx={{ display: 'block', mt: 0.5, whiteSpace: 'pre-wrap' }}>
+                  {t.prompt || '（空）'}
+                </Typography>
+              </Paper>
+            ))}
+            {templates.length === 0 && (
+              <Typography variant="body2" color="text.secondary">
+                暂无模板。常用提示词保存为模板后，可在新建总结时快速选用。
+              </Typography>
+            )}
+          </Stack>
+          <Divider sx={{ mb: 2 }} />
+          <Stack spacing={1.5}>
+            <Typography variant="subtitle2">新增模板</Typography>
+            <TextField
+              label="模板名称" size="small" fullWidth value={tplName}
+              inputProps={{ maxLength: 50 }}
+              onChange={(e) => setTplName(e.target.value)}
+              placeholder="例如：售后投诉专项"
+            />
+            <TextField
+              label="提示词内容" size="small" fullWidth multiline minRows={2} maxRows={6}
+              value={tplPrompt} inputProps={{ maxLength: 500 }}
+              onChange={(e) => setTplPrompt(e.target.value)}
+              placeholder="例如：重点关注价格咨询和售后投诉，忽略闲聊"
+              helperText={`${tplPrompt.length}/500 字`}
+            />
+            <Button
+              size="small" variant="outlined" sx={{ alignSelf: 'flex-start' }}
+              disabled={templatesMutation.isPending
+                || !tplName.trim() || !tplPrompt.trim()
+                || templates.length >= MAX_TEMPLATES}
+              onClick={() => templatesMutation.mutate([
+                ...templates,
+                { name: tplName.trim(), prompt: tplPrompt },
+              ])}
+            >
+              {templates.length >= MAX_TEMPLATES ? '模板数已达上限（50）' : '保存为新模板'}
+            </Button>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            size="small" color="warning"
+            disabled={templatesMutation.isPending || templates.length === 0}
+            onClick={() => {
+              if (window.confirm(
+                `确定恢复默认并清空全部 ${templates.length} 个模板？此操作不可撤销。`,
+              )) templatesMutation.mutate([])
+            }}
+          >
+            恢复默认
+          </Button>
+          <Button onClick={() => setTplOpen(false)}>关闭</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* P2-1 回链原文：按总结时间范围查看原始消息（与总结同源取数口径） */}
+      <Dialog open={ctxRow !== null} onClose={() => setCtxRow(null)} maxWidth="md" fullWidth>
+        <DialogTitle>
+          原始消息（{ctxRow?.session_name || ctxRow?.session_username || ''}
+          ，{ctxStart} ~ {ctxEnd}）
+        </DialogTitle>
+        <DialogContent dividers>
+          {ctxFetching && (
+            <Stack direction="row" spacing={1} alignItems="center" sx={{ py: 4 }}>
+              <CircularProgress size={20} />
+              <Typography variant="body2" color="text.secondary">
+                正在读取原始消息…
+              </Typography>
+            </Stack>
+          )}
+          {!ctxFetching && ctxError && (
+            <Alert severity="error">
+              读取失败：{(ctxError as Error).message}
+            </Alert>
+          )}
+          {!ctxFetching && !ctxError && ctxData && ctxData.items.length === 0 && (
+            <Typography variant="body2" color="text.secondary" sx={{ py: 2 }}>
+              该时间范围内没有原始消息（可能已被微信数据库清理）。
+            </Typography>
+          )}
+          {!ctxFetching && !ctxError && ctxData && ctxData.items.length > 0 && (
+            <Stack spacing={1}>
+              <Typography variant="caption" color="text.secondary">
+                共 {ctxData.total} 条，按发送时间正序排列
+              </Typography>
+              {ctxData.items.map((m) => (
+                <Paper key={`${m.local_id}-${m.create_time}`} variant="outlined" sx={{ p: 1 }}>
+                  <Stack direction="row" spacing={1} alignItems="baseline">
+                    <Typography variant="body2" sx={{ fontWeight: 700, flexShrink: 0 }}>
+                      {m.sender_name || m.sender_wxid || '（未知成员）'}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      {m.create_time}
+                    </Typography>
+                  </Stack>
+                  <Typography variant="body2" sx={{ mt: 0.5, whiteSpace: 'pre-wrap' }}>
+                    {m.content || '（非文本消息，原文不展示）'}
+                  </Typography>
+                </Paper>
+              ))}
+            </Stack>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setCtxRow(null)}>关闭</Button>
         </DialogActions>
       </Dialog>
 

@@ -22,6 +22,7 @@ from app.config import (
     KEY_SUMMARY_BUDGET_MODE,
     KEY_SUMMARY_BUDGET_TOKENS,
     KEY_SUMMARY_OVER_LIMIT_ACTION,
+    KEY_SUMMARY_PROMPT_TEMPLATES,
     KEY_SUMMARY_SCHEDULE_CONFIGS,
     KEY_SUMMARY_SCHEDULE_ENABLED,
     KEY_SUMMARY_TRUNCATE_RECENT_N,
@@ -30,6 +31,8 @@ from app.config import (
 from app.db import Database
 from app.schemas import (
     STYLE_VALUES,
+    SummaryContextMessage,
+    SummaryContextOut,
     SummaryGenerateIn,
     SummaryListOut,
     SummaryMembersOut,
@@ -44,7 +47,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/summary", tags=["summary"])
 
 # 设置页配置区可编辑键（白名单，防任意 settings 写入）
-# 预算 5 键 + 定时 2 键（P0 仅保存配置，SummaryScheduler 不启动线程）。
+# 预算 5 键 + 定时 2 键 + 提示词模板 1 键（P1 起 SummaryScheduler 常驻线程）。
 _SETTINGS_KEYS = (
     KEY_SUMMARY_BUDGET_MODE,
     KEY_SUMMARY_BUDGET_MONEY,
@@ -53,6 +56,7 @@ _SETTINGS_KEYS = (
     KEY_SUMMARY_TRUNCATE_RECENT_N,
     KEY_SUMMARY_SCHEDULE_ENABLED,
     KEY_SUMMARY_SCHEDULE_CONFIGS,
+    KEY_SUMMARY_PROMPT_TEMPLATES,
 )
 _SETTINGS_DEFAULTS = {
     KEY_SUMMARY_BUDGET_MODE: "money",
@@ -62,6 +66,7 @@ _SETTINGS_DEFAULTS = {
     KEY_SUMMARY_TRUNCATE_RECENT_N: "200",
     KEY_SUMMARY_SCHEDULE_ENABLED: "0",
     KEY_SUMMARY_SCHEDULE_CONFIGS: "[]",
+    KEY_SUMMARY_PROMPT_TEMPLATES: "[]",
 }
 
 
@@ -126,8 +131,9 @@ def list_history(page: int = Query(default=1, ge=1),
                  page_size: int = Query(default=20, ge=1, le=200),
                  session: str = "",
                  date: str = "",
+                 keyword: str = "",
                  db: Database = Depends(get_db)) -> SummaryListOut:
-    """历史分页（session 精确、date=YYYY-MM-DD）。"""
+    """历史分页（session 精确、date=YYYY-MM-DD、keyword 群名/username 模糊）。"""
     if date:
         from datetime import datetime
         try:
@@ -135,7 +141,8 @@ def list_history(page: int = Query(default=1, ge=1),
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="日期格式应为 YYYY-MM-DD") from exc
     total, rows = db.list_group_summaries(
-        page=page, page_size=page_size, session=session, date=date)
+        page=page, page_size=page_size, session=session, date=date,
+        keyword=keyword.strip())
     return SummaryListOut(total=total, items=[SummaryOut(**r) for r in rows])
 
 
@@ -194,6 +201,32 @@ def export_history(summary_id: int,
     )
 
 
+@router.get("/context", response_model=SummaryContextOut)
+def summary_context(session: str = Query(min_length=1),
+                    start: str = Query(...),
+                    end: str = Query(...),
+                    svc: SummaryService = Depends(get_summary_service)
+                    ) -> SummaryContextOut:
+    """回链原文：按时间范围取原始消息（复用总结同源取数链，口径一致）。
+
+    供前端「查看原始消息」弹窗使用；时间校验/错误翻译与生成端点同口径
+    （400 参数 / 503 微信库不可读）。
+    """
+    _check_time(start, end)
+    msgs, error = svc._fetch(session, start, end)
+    if error:
+        raise HTTPException(status_code=503, detail=str(error))
+    items = [SummaryContextMessage(**{
+        "local_id": int(m.get("local_id") or 0),
+        "sender_wxid": str(m.get("sender_wxid") or ""),
+        "sender_name": str(m.get("sender_name") or ""),
+        "create_time": str(m.get("create_time") or ""),
+        "content": str(m.get("content") or ""),
+    }) for m in msgs]
+    return SummaryContextOut(session=session, start=start, end=end,
+                             total=len(items), items=items)
+
+
 @router.get("/settings", response_model=SummarySettingsOut)
 def get_summary_settings(db: Database = Depends(get_db)) -> SummarySettingsOut:
     """设置页配置区（预算 5 键 + 定时 2 键，均为 settings 点分键）。"""
@@ -236,5 +269,37 @@ def update_summary_settings(body: SummarySettingsUpdate,
                 if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d",
                                     str(item.get("time") or "18:00")):
                     raise HTTPException(status_code=422, detail="触发时间格式应为 HH:MM")
+                style = str(item.get("style") or "detailed")
+                if style not in STYLE_VALUES:
+                    raise HTTPException(
+                        status_code=422, detail="定时配置的风格仅支持 detailed/concise/bullets")
+        if key == KEY_SUMMARY_PROMPT_TEMPLATES:
+            # 提示词模板：JSON 数组，每项 {name, prompt}；恢复默认 = 写回 []
+            try:
+                templates = json.loads(text)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail="提示词模板必须是 JSON 数组") from exc
+            if not isinstance(templates, list):
+                raise HTTPException(status_code=422, detail="提示词模板必须是 JSON 数组")
+            if len(templates) > 50:
+                raise HTTPException(status_code=422, detail="提示词模板最多 50 个")
+            seen_names: set[str] = set()
+            for item in templates:
+                if not isinstance(item, dict):
+                    raise HTTPException(status_code=422, detail="提示词模板每项必须是对象")
+                name = str(item.get("name") or "").strip()
+                prompt = str(item.get("prompt") or "")
+                if not name:
+                    raise HTTPException(status_code=422, detail="提示词模板缺少名称")
+                if name in seen_names:
+                    raise HTTPException(status_code=422, detail="提示词模板名称重复")
+                seen_names.add(name)
+                if not prompt.strip():
+                    raise HTTPException(
+                        status_code=422, detail=f"模板「{name}」缺少提示词内容")
+                if len(prompt) > 500:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"模板「{name}」的提示词超过 500 字")
         db.set_setting(key, text)
     return get_summary_settings(db)

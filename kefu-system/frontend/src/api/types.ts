@@ -656,7 +656,7 @@ export interface SummaryListOut {
   items: SummaryOut[]
 }
 
-/** GET/PUT /api/summary/settings：设置页配置区（预算 5 键 + 定时 2 键） */
+/** GET/PUT /api/summary/settings：设置页配置区（预算 5 键 + 定时 2 键 + 模板 1 键） */
 export interface SummarySettings {
   'summary.budget_mode': BudgetMode
   'summary.budget_money': string
@@ -664,8 +664,44 @@ export interface SummarySettings {
   'summary.over_limit_action': OverLimitAction
   'summary.truncate_recent_n': string
   'summary.schedule_enabled': string
-  /** JSON 字符串：[{session, display_name, enabled, time}]，默认 '[]' */
+  /** JSON 字符串：[{session, display_name, enabled, time, style}]，默认 '[]' */
   'summary.schedule_configs': string
+  /** JSON 字符串：[{name, prompt}]，默认 '[]'（恢复默认 = 写回 '[]'） */
+  'summary.prompt_templates': string
+}
+
+/** 定时总结按群配置（schedule_configs JSON 元素） */
+export interface SummaryScheduleConfig {
+  session: string
+  display_name: string
+  enabled: boolean
+  time: string
+  /** 定时生成的总结风格（P1 用户要求风格可选，默认 detailed） */
+  style?: SummaryStyle
+}
+
+/** 群总结提示词模板（prompt_templates JSON 元素） */
+export interface SummaryPromptTemplate {
+  name: string
+  prompt: string
+}
+
+/** GET /api/summary/context：回链原文的单条消息行 */
+export interface SummaryContextMessage {
+  local_id: number
+  sender_wxid: string
+  sender_name: string
+  create_time: string
+  content: string
+}
+
+/** GET /api/summary/context：按时间范围取原始消息 */
+export interface SummaryContextOut {
+  session: string
+  start: string
+  end: string
+  total: number
+  items: SummaryContextMessage[]
 }
 
 /** 六节总结正文（解析 content 后） */

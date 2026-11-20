@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import re
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import unquote
@@ -137,6 +137,16 @@ class QaWechat:
     def resolve_group_member_display(self, session: str, wxid: str) -> str:
         self.display_calls.append((session, wxid))
         return self.member_display.get(wxid, wxid)
+
+
+class QaNotifier:
+    """Notifier 替身：捕获 broadcast（调度线程与请求线程等效调用点）。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def broadcast(self, event: str, data: dict) -> None:
+        self.calls.append((event, data))
 
 
 @pytest.fixture()
@@ -634,11 +644,46 @@ class TestQaSecurityAndErrors:
             "summary.schedule_configs": json.dumps([
                 {"session": QA_SESSION, "display_name": "QA群",
                  "enabled": True, "time": "18:30"}], ensure_ascii=False),
+            "summary.prompt_templates": json.dumps([
+                {"name": "QA 模板", "prompt": "重点看售后投诉"}],
+                ensure_ascii=False),
         }
         r = env.client.put("/api/summary/settings", json=all_keys)
         assert r.status_code == 200 and r.json() == all_keys
         assert env.client.get("/api/summary/settings").json() == all_keys
         assert env.client.get("/api/summary/schedules").status_code == 404
+
+    @pytest.mark.parametrize("payload", [
+        {"summary.prompt_templates": "{}"},
+        {"summary.prompt_templates": "[]%"},
+        {"summary.prompt_templates": json.dumps(
+            [{"name": "", "prompt": "x"}], ensure_ascii=False)},
+        {"summary.prompt_templates": json.dumps(
+            [{"name": "重复", "prompt": "x"}, {"name": "重复", "prompt": "y"}],
+            ensure_ascii=False)},
+        {"summary.prompt_templates": json.dumps(
+            [{"name": f"t{i}", "prompt": "x"} for i in range(51)])},
+        {"summary.prompt_templates": json.dumps(
+            [{"name": "超长", "prompt": "x" * 501}], ensure_ascii=False)},
+        {"summary.prompt_templates": json.dumps(
+            [{"name": "缺prompt"}], ensure_ascii=False)},
+    ])
+    def test_prompt_templates_invalid_values_422(self, qa_api, payload):
+        """提示词模板校验：结构/名称/去重/数量/长度逐项 422。"""
+        assert qa_api.client.put("/api/summary/settings",
+                                 json=payload).status_code == 422
+
+    def test_prompt_templates_partial_update_keeps_other_keys(self, qa_api):
+        """exclude_none 语义：只传模板键时其余设置键保持不变（前端增量保存依赖）。"""
+        env = qa_api
+        env.db.set_setting("summary.budget_mode", "tokens")
+        templates = json.dumps([{"name": "A", "prompt": "看价格"}],
+                               ensure_ascii=False)
+        r = env.client.put("/api/summary/settings",
+                           json={"summary.prompt_templates": templates})
+        assert r.status_code == 200
+        assert r.json()["summary.prompt_templates"] == templates
+        assert r.json()["summary.budget_mode"] == "tokens"
 
     def test_ai_failure_never_persists(self, qa_api):
         env = qa_api
@@ -663,6 +708,12 @@ class TestQaSecurityAndErrors:
 # ===========================================================================
 class TestQaGlobalContract:
     def test_no_send_chain_and_no_auto_cleanup_registration(self):
+        """全局契约（P1 版）：总结模块只产出不发送、不注册自动清理。
+
+        P1 调度器线程化后，summary.py 允许 threading（SummaryScheduler），
+        但发送链（Sender/SendTask）与 purge/cleanup 注册仍然绝不允许；
+        调度器必须在 main.py 装配（globals 注入 + start/stop 接线）。
+        """
         summary_src = (APP_ROOT / "app/summary.py").read_text(encoding="utf-8")
         router_src = (APP_ROOT / "app/api/router_summary.py").read_text(
             encoding="utf-8")
@@ -671,9 +722,10 @@ class TestQaGlobalContract:
             encoding="utf-8")
         for src in (summary_src, router_src):
             assert "Sender" not in src and "SendTask" not in src
-            assert "threading" not in src and "Thread(" not in src
             assert "purge" not in src.lower()
-        assert "SummaryScheduler" not in main_src, "P0 不得在 main 注册调度器"
+        assert "SummaryScheduler" in main_src, "P1 调度器必须在 main.py 装配"
+        assert "summary_scheduler.start()" in main_src
+        assert "summary_scheduler.stop()" in main_src
         assert not re.search(r"Thread\([^)]*(purge|cleanup)", main_src, re.I)
         assert "发送到群" not in fe_src and "sendToGroup" not in fe_src
 
@@ -685,32 +737,98 @@ class TestQaGlobalContract:
         assert not any("cleanup" in p.lower() or "auto_purge" in p.lower()
                        for p in paths)
 
-    def test_scheduler_p0_marks_only_no_thread_no_generation(self, qa_api,
-                                                             monkeypatch):
+    def test_scheduler_p1_generates_dedups_and_notifies(self, qa_api,
+                                                       monkeypatch):
+        """P1 调度器全链路：命中即生成、当日去重、失败留痕、广播通知。
+
+        假时钟固定在真实「今天」的 06:00（created_at 落库用真实 localtime，
+        假时钟日期必须与真实日期同日，「当日去重」才成立）；只改变时分来
+        模拟触发窗口内外，隔天恢复用 +1 天验证去重键按日期滚动。
+        """
         env = qa_api
         env.db.set_setting("summary.schedule_enabled", "1")
-        now_hm = datetime.now().strftime("%H:%M")
         env.db.set_setting("summary.schedule_configs", json.dumps([
             {"session": QA_SESSION, "display_name": "QA群",
-             "enabled": True, "time": now_hm}], ensure_ascii=False))
-        scheduler = SummaryScheduler(env.svc, SimpleNamespace())
+             "enabled": True, "time": "06:00", "style": "bullets"}],
+            ensure_ascii=False))
 
-        created: list[int] = []
+        real_now = datetime.now()
+        base = datetime(real_now.year, real_now.month, real_now.day, 6, 0, 0)
+        clock = {"now": base}
 
-        def forbidden_thread(*args, **kwargs):
-            created.append(1)
-            raise AssertionError("P0 不应创建任何后台线程")
+        def fake_now() -> datetime:
+            return clock["now"]
+
+        notifier = QaNotifier()
+        scheduler = SummaryScheduler(env.svc, notifier, now_fn=fake_now)
+
+        # ① 命中：生成 1 条（范围 = 昨天 0 点 → 现在），风格/范围/广播逐项断言
+        produced = scheduler.tick()
+        assert len(produced) == 1
+        row = produced[0]
+        assert row["style"] == "bullets"
+        assert row["session_username"] == QA_SESSION
+        _user, start_epoch, end_epoch, _limit = env.wechat.range_calls[-1]
+        yesterday0 = (base - timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+        assert start_epoch == int(datetime.strptime(
+            yesterday0, "%Y-%m-%d %H:%M:%S").timestamp())
+        assert end_epoch == int(base.timestamp())
+        assert [event for event, _ in notifier.calls] == ["summary_new"]
+        assert notifier.calls[0][1]["session_username"] == QA_SESSION
+        assert env.db.list_group_summaries()[0] == 1
+
+        # ② 同日再 tick：当日已有产出 → 去重跳过，不重复生成
+        assert scheduler.tick() == []
+        assert env.db.list_group_summaries()[0] == 1
+
+        # ③ 失败：不落库不广播；触发分钟过后（06:01）时间不匹配、不再调 AI
+        env.db.delete_group_summary(row["id"])
+        env.chat.fail = True
+        assert scheduler.tick() == []           # 触发分钟内失败
+        calls_at_fail = len(env.chat.calls)
+        assert calls_at_fail >= 1               # AI 确实被调用过
+        clock["now"] = base.replace(minute=1)   # 06:01：窗口已过
+        assert scheduler.tick() == []
+        assert len(env.chat.calls) == calls_at_fail  # 不再重试
+        assert [event for event, _ in notifier.calls] == ["summary_new"]
+        assert env.db.list_group_summaries()[0] == 0
+        env.chat.fail = False
+
+        # ④ 次日 06:00 恢复生成（去重键 = 当日产出，隔天不拦截）
+        clock["now"] = base + timedelta(days=1)
+        assert len(scheduler.tick()) == 1
+        assert env.db.list_group_summaries()[0] == 1
+
+        # ⑤ start/stop：创建 daemon 轮询线程；重复 start 不叠加线程。
+        # 用 FakeThread 桩类整体替换 threading.Thread：只 patch Thread.start
+        # 会导致 is_alive() 恒为 False、start() 幂等检查失效（第二次仍会
+        # 真实调用 Thread.start）；桩类 start() 置 _alive=True 才能驱动
+        # 幂等分支，join() 保证 stop() 正常回收。
+        started_flags: list[str] = []
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs) -> None:
+                self._alive = False
+
+            def start(self) -> None:
+                self._alive = True
+                started_flags.append("start")
+
+            def is_alive(self) -> bool:
+                return self._alive
+
+            def join(self, timeout=None) -> None:
+                self._alive = False
 
         with monkeypatch.context() as patch:
-            patch.setattr(threading, "Thread", forbidden_thread)
+            patch.setattr(threading, "Thread", FakeThread)
             scheduler.start()
-            hits = scheduler.tick()
-        assert scheduler.started is True and created == []
-        assert len(hits) == 1, "P1 命中判断就绪，但 P0 只返回配置"
-        assert env.chat.calls == []
-        assert env.db.list_group_summaries()[0] == 0
+            scheduler.start()
+        assert started_flags == ["start"]
+        assert scheduler.started is True
         scheduler.stop()
         assert scheduler.started is False
+        assert scheduler._thread is None
 
     def test_schedule_defaults_retention_manual_only_and_three_styles(self,
                                                                       qa_api):

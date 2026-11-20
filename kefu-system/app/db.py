@@ -1363,9 +1363,15 @@ class Database:
         return dict(row) if row else {}
 
     def list_group_summaries(self, *, page: int = 1, page_size: int = 20,
-                             session: str = "", date: str = ""
+                             session: str = "", date: str = "",
+                             keyword: str = ""
                              ) -> tuple[int, list[dict]]:
-        """分页列出总结（created_at 倒序）；session 精确、date 按天前缀过滤。"""
+        """分页列出总结（created_at 倒序）。
+
+        session 精确（username）、date 按天前缀过滤、keyword 对群显示名
+        与 username 双列 LIKE 模糊匹配（PRD P1「按群名搜索」）；session
+        与 keyword 同时给出时 AND 叠加。
+        """
         where: list[str] = []
         params: list[Any] = []
         if session:
@@ -1374,6 +1380,10 @@ class Database:
         if date:
             where.append("created_at LIKE ?")
             params.append(f"{date}%")
+        if keyword:
+            where.append("(session_name LIKE ? OR session_username LIKE ?)")
+            like = f"%{keyword}%"
+            params.extend([like, like])
         where_sql = (" WHERE " + " AND ".join(where)) if where else ""
         size = max(1, min(int(page_size), 200))
         with self._lock:
@@ -1386,6 +1396,20 @@ class Database:
                 [*params, size, (max(page, 1) - 1) * size],
             ).fetchall()
         return int(total), [dict(r) for r in rows]
+
+    def has_group_summary_on_day(self, session: str, day: str) -> bool:
+        """指定群在指定日期（YYYY-MM-DD）当天是否已有总结产出。
+
+        供定时调度器做「当日去重」：session 精确匹配 + created_at 前缀，
+        只看存在性，不取整行。
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM group_summaries "
+                "WHERE session_username=? AND created_at LIKE ? LIMIT 1",
+                (session, f"{day}%"),
+            ).fetchone()
+        return row is not None
 
     def get_group_summary(self, summary_id: int) -> Optional[dict]:
         """按 id 取一条总结；不存在返回 None。"""
