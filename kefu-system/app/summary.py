@@ -497,7 +497,20 @@ class SummaryService:
             raise analyzer.AIError("AI 接口未配置完整，请在设置页配置")
         client = self._build_client(ai_cfg, api_key)
         started = time.monotonic()
-        raw = client.chat(build_system_prompt(style, custom_prompt), user_message)
+        try:
+            raw = client.chat(build_system_prompt(style, custom_prompt),
+                              user_message)
+        except analyzer.AIError as exc:
+            # AI 失败必须留痕（排障依据）：只记上下文元信息，不打印提示词
+            # 内容与语料本身，避免聊天记录泄漏进日志。
+            logger.warning(
+                "总结 AI 调用失败：session=%s 模型=%s 语料 %d 条/约 %d 字符 "
+                "自定义提示词 %d 字 · %s",
+                session, ai_cfg.get("model") or "", stats["msg_count"],
+                stats.get("char_count") or 0, len(str(custom_prompt or "")),
+                exc,
+            )
+            raise
         latency_ms = int((time.monotonic() - started) * 1000)
         content = parse_summary_json(raw)
         usage = getattr(client, "last_usage", None) or {}

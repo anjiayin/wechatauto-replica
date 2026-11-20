@@ -114,6 +114,7 @@ def generate(body: SummaryGenerateIn,
     except SummaryOverBudgetError as exc:
         raise HTTPException(status_code=413, detail=str(exc)) from exc
     except analyzer.AIError as exc:
+        logger.warning("总结生成 AI 失败（%s）：%s", body.session, exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

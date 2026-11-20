@@ -568,11 +568,16 @@ def _is_unsupported_param_error(exc: BaseException) -> bool:
 
     只在错误信息确实指向思考/附加参数时才判定，避免把 Key 无效、
     模型不存在等 400 误当作参数不支持而重复请求。
+
+    兼容中文网关报错：GLM（智谱 bigmodel）等网关返回中文「参数错误」/
+    「无效的参数」时同样判定为参数不支持，进入无参兜底重试。
     """
     text = str(exc).lower()
     tokens = ("thinking", "extra_body", "enable_thinking",
               "unexpected keyword", "unknown field", "unrecognized",
-              "unsupported parameter", "extra fields")
+              "unsupported parameter", "extra fields",
+              # 中文网关报错（GLM 等对 extra_body 直接回「参数错误」）
+              "参数错误", "无效的参数", "invalid parameters")
     return any(t in text for t in tokens)
 
 

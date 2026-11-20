@@ -808,3 +808,53 @@ def test_frontend_dist_matches_summary_contract():
         ))
     assert min(path.stat().st_mtime for path in bundles) >= newest_src, \
         "构建产物早于相关源文件，需重新 npm run build"
+
+
+# ---------------------------------------------------------------------------
+# 回归：反馈批次修复验证（AI 失败留痕 + 中文参数错误降级）
+# ---------------------------------------------------------------------------
+class TestFeedbackRegression:
+    """用户反馈 3：加自定义提示词报「参数错误」——中文网关 400 必须自动降级重试。"""
+
+    def test_chinese_param_error_triggers_fallback(self):
+        """中文「参数错误」必须被判为参数不支持错误（触发无参兜底重试）。"""
+        from app.analyzer import _is_unsupported_param_error
+        assert _is_unsupported_param_error(Exception("参数错误"))
+        assert _is_unsupported_param_error(Exception("1002: 无效的参数"))
+        assert _is_unsupported_param_error(Exception("Invalid Parameters: thinking"))
+        # 英文既有关键词不受影响
+        assert _is_unsupported_param_error(Exception("extra_body is not supported"))
+        # 与参数无关的错误（Key 无效等）不误判
+        assert not _is_unsupported_param_error(Exception("401 Invalid API key"))
+        assert not _is_unsupported_param_error(Exception("model not found"))
+
+    def test_thinking_plan_retries_with_empty_variant(self):
+        """中文参数错误被拒后，_create 应改用无参形态成功返回（自动降级）。"""
+        from app.analyzer import AIClient
+
+        calls: list[dict] = []
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                if kwargs.get("extra_body"):
+                    raise Exception("400 - 参数错误：thinking 字段无效")
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok":1}'))],
+                    usage=None)
+
+        class FakeChat:
+            completions = FakeCompletions()
+
+        class FakeClient:
+            chat = FakeChat()
+
+        client = AIClient(base_url="https://gw.example/v1", api_key="k",
+                          model="glm-test", client=FakeClient())
+        out = client.chat("sys", "user")
+        assert out == '{"ok":1}'
+        # glm 族按 thinking/enable_thinking/reasoning_effort 逐个试探（均被
+        # 中文「参数错误」拒绝），最后无参兜底成功：共 4 次调用
+        assert len(calls) == 4
+        assert all(c.get("extra_body") for c in calls[:3])
+        assert "extra_body" not in calls[3]

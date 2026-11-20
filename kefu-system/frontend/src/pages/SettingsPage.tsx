@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useState } from 'react'
+import { Fragment, useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Alert,
@@ -1547,6 +1547,25 @@ function SummarySettingsTab() {
   const noPrice = budgetMode === 'money'
     && !billing?.input_price && !billing?.output_price
 
+  // —— 金额预算 ↔ token 预算 双向联动换算 ——
+  // 换算基准：按典型总结任务「输入:输出 ≈ 10000:2000（共 12000 token/单）」
+  // 与当前模型单价折算综合单价 cost_per_12k，再得每元可买的 token 数。
+  // 仅作数量级参考，实际消耗以账单为准；单价未配置（均为 0）时不联动。
+  const priceConfigured = Boolean(billing && (billing.input_price || billing.output_price))
+  const tokensPerYuan = useMemo(() => {
+    if (!billing || !(billing.input_price || billing.output_price)) return 0
+    const divisor = billing.unit === 'per_m' ? 1_000_000 : 1_000
+    const costPer12k = 10_000 / divisor * billing.input_price
+      + 2_000 / divisor * billing.output_price
+    return costPer12k > 0 ? 12_000 / costPer12k : 0
+  }, [billing])
+  /** 金额 → token 数（每元可买 tokensPerYuan 个 token） */
+  const moneyToTokens = (money: number): string =>
+    String(Math.round(money * tokensPerYuan))
+  /** token 数 → 金额（保留 2 位小数） */
+  const tokensToMoney = (tokens: number): string =>
+    String(Math.round((tokens / tokensPerYuan) * 100) / 100)
+
   return (
     <Box>
       <Typography variant="subtitle2" sx={{ mb: 1 }}>预算与超限策略</Typography>
@@ -1562,11 +1581,38 @@ function SummarySettingsTab() {
         </TextField>
         <TextField label="金额预算" size="small" type="number"
           value={budgetMoney} disabled={budgetMode !== 'money'}
-          onChange={(e) => setBudgetMoney(e.target.value)}
+          onChange={(e) => {
+            setBudgetMoney(e.target.value)
+            // 双向联动：改金额 → token 框实时显示换算值（单价未配置时不联动）
+            const money = Number(e.target.value)
+            if (priceConfigured && tokensPerYuan > 0
+              && e.target.value !== '' && Number.isFinite(money) && money >= 0) {
+              setBudgetTokens(moneyToTokens(money))
+            }
+          }}
           InputProps={{ startAdornment: <span>¥</span> }} />
         <TextField label="token 预算" size="small" type="number"
           value={budgetTokens} disabled={budgetMode !== 'tokens'}
-          onChange={(e) => setBudgetTokens(e.target.value)} />
+          onChange={(e) => {
+            setBudgetTokens(e.target.value)
+            // 双向联动：改 token → 金额框实时显示换算值（单价未配置时不联动）
+            const tokens = Number(e.target.value)
+            if (priceConfigured && tokensPerYuan > 0
+              && e.target.value !== '' && Number.isFinite(tokens) && tokens >= 0) {
+              setBudgetMoney(tokensToMoney(tokens))
+            }
+          }} />
+        {priceConfigured ? (
+          <Typography variant="caption" color="text.secondary"
+            sx={{ display: 'block' }}>
+            换算基准：按输入:输出 ≈ 10000:2000 与当前单价折算，仅作数量级参考，实际以账单为准
+          </Typography>
+        ) : (
+          <Typography variant="caption" color="text.secondary"
+            sx={{ display: 'block' }}>
+            配置模型单价后自动换算（数据与账单页共用单价）
+          </Typography>
+        )}
         {noPrice && (
           <Alert severity="warning">{NO_PRICE_HINT}</Alert>
         )}
@@ -1605,7 +1651,14 @@ function SummarySettingsTab() {
                 setSchedules(next)
               }}>
               {groups.map((g) => (
-                <MenuItem key={g.username} value={g.username}>{g.display_name}</MenuItem>
+                // 同名群区分：群名后附 username 辅助文本
+                <MenuItem key={g.username} value={g.username}
+                  sx={{ display: 'block', py: 0.5 }}>
+                  <Typography variant="body2">{g.display_name || g.username}</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    {g.username}
+                  </Typography>
+                </MenuItem>
               ))}
             </TextField>
             <TextField label="触发时间" type="time" size="small"

@@ -283,6 +283,21 @@ export default function GroupSummary() {
                   setSession(value)
                   setSelectedWxids([])
                 }}
+                renderOption={(props, option) => {
+                  // 同名群区分：第二行灰字显示 username（唯一标识）
+                  const key = props.key ?? option.username
+                  return (
+                    <Box component="li" {...props} key={key}
+                      sx={{ display: 'block', py: 0.5 }}>
+                      <Typography variant="body2">
+                        {option.display_name || option.username}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        {option.username}
+                      </Typography>
+                    </Box>
+                  )
+                }}
                 renderInput={(params) => (
                   <TextField {...params} label="选择群聊" size="small"
                     placeholder="输入群名搜索" />
