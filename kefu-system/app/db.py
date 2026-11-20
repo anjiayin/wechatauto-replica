@@ -183,7 +183,6 @@ DDL_STATEMENTS: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_usage_created ON ai_usage (created_at)",
-    "CREATE INDEX IF NOT EXISTS idx_usage_kind ON ai_usage (created_at, usage_kind)",
     """
     CREATE TABLE IF NOT EXISTS watermarks (
       username   TEXT PRIMARY KEY,
@@ -380,6 +379,10 @@ class Database:
                     "ALTER TABLE ai_usage ADD COLUMN usage_kind "
                     "TEXT NOT NULL DEFAULT 'opportunity'")
                 logger.info("已迁移：ai_usage 增加 usage_kind 列")
+            # 索引引用 usage_kind，必须在加列之后创建（老库 DDL 阶段列还不存在）
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_usage_kind "
+                "ON ai_usage (created_at, usage_kind)")
             # 存量分项回填（新库已带列时也执行：只回填仍挂着默认值的行）
             self._conn.execute(
                 "UPDATE ai_usage SET usage_kind='summary' WHERE "

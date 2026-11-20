@@ -614,3 +614,50 @@ class TestUsageKind:
             row = db._conn.execute(
                 "SELECT usage_kind FROM ai_usage").fetchone()
         assert row["usage_kind"] == "opportunity"
+
+    def test_old_db_without_kind_column_opens_clean(self, tmp_path):
+        """老库（ai_usage 无 usage_kind 列）必须能直接启动升级。
+
+        回归：曾把 idx_usage_kind 索引放进 DDL_STATEMENTS，DDL 阶段
+        老库还没有 usage_kind 列，启动即报
+        ``no such column: usage_kind``（用户实测踩中）。索引必须等
+        _migrate_ai_usage_kind 加列后再建。
+        """
+        import sqlite3 as _sq
+        p = tmp_path / "legacy.sqlite3"
+        conn = _sq.connect(str(p))
+        # 完全复刻旧版 ai_usage 结构（无 usage_kind）并放一条存量数据
+        conn.execute(
+            "CREATE TABLE ai_usage (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')), "
+            "model TEXT NOT NULL DEFAULT '', "
+            "session_username TEXT NOT NULL DEFAULT '', "
+            "prompt_tokens INTEGER NOT NULL DEFAULT 0, "
+            "completion_tokens INTEGER NOT NULL DEFAULT 0)")
+        conn.execute(
+            "INSERT INTO ai_usage (model, session_username, prompt_tokens, "
+            "completion_tokens, created_at) "
+            "VALUES ('m', 'a@chatroom', 700, 70, '2026-11-20 10:00:00')")
+        conn.commit()
+        conn.close()
+        # Database.__init__ 走完整 DDL + 迁移链，成功即修复；数据保留
+        db = Database(str(p))
+        try:
+            with db._lock:
+                cols = {r["name"] for r in db._conn.execute(
+                    "PRAGMA table_info(ai_usage)").fetchall()}
+                idx = {r["name"] for r in db._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' "
+                    "AND tbl_name='ai_usage'").fetchall()}
+                kinds = [r["usage_kind"] for r in db._conn.execute(
+                    "SELECT usage_kind FROM ai_usage").fetchall()]
+            assert "usage_kind" in cols
+            assert "idx_usage_kind" in idx
+            assert kinds == ["opportunity"]
+            from datetime import datetime as _dt
+            day = _dt.now().strftime("%Y-%m-%d")
+            # created_at 默认值是插入时刻的本地时间，跨日边界时按列存在即可
+            assert db.usage_by_date(
+                day, usage_kind="opportunity")["calls"] in (0, 1)
+        finally:
+            db.close()
