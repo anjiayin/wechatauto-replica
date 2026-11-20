@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>微信商机监测与客服系统 · 产品演示</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700;900&family=Space+Grotesk:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   设计意图：深色科技风 —— 深空蓝黑底 + 霓虹青/电紫双色光，
+   网格线营造"雷达/控制台"氛围，呼应"AI 商机雷达"的产品隐喻。
+   固定 1920×1080 舞台，等比缩放适配任意视口。
+   ============================================================ */
+:root{
+  --bg-0:#04060e;
+  --bg-1:#0a0f22;
+  --ink:#eaf2ff;
+  --ink-dim:#9fb0d0;
+  --cyan:#26d6ff;
+  --cyan-soft:rgba(38,214,255,.14);
+  --violet:#8f7bff;
+  --violet-soft:rgba(143,123,255,.14);
+  --green:#3ef2b3;
+  --amber:#ffc65c;
+  --line:rgba(140,170,255,.16);
+  --card:rgba(16,24,48,.62);
+  --card-line:rgba(120,160,255,.22);
+  --font-body:'Noto Sans SC',sans-serif;
+  --font-num:'Space Grotesk','Noto Sans SC',sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;background:var(--bg-0);overflow:hidden;
+  font-family:var(--font-body);color:var(--ink);
+  -webkit-font-smoothing:antialiased}
+
+/* === 视口背景层：径向光晕 + 网格 === */
+.backdrop{position:fixed;inset:0;pointer-events:none}
+.backdrop::before{content:'';position:absolute;inset:0;
+  background:
+    radial-gradient(900px 600px at 12% 8%,rgba(38,214,255,.13),transparent 60%),
+    radial-gradient(1000px 700px at 88% 90%,rgba(143,123,255,.13),transparent 60%),
+    radial-gradient(700px 500px at 85% 10%,rgba(38,214,255,.06),transparent 60%),
+    linear-gradient(180deg,var(--bg-0),var(--bg-1) 55%,var(--bg-0));}
+.backdrop::after{content:'';position:absolute;inset:0;
+  background-image:
+    linear-gradient(var(--line) 1px,transparent 1px),
+    linear-gradient(90deg,var(--line) 1px,transparent 1px);
+  background-size:64px 64px;
+  mask-image:radial-gradient(1200px 800px at 50% 45%,rgba(0,0,0,.5),transparent 85%);
+  opacity:.5}
+
+/* === 舞台：固定 1920×1080，JS 等比缩放 === */
+.stage{position:fixed;top:50%;left:50%;width:1920px;height:1080px;
+  transform:translate(-50%,-50%) scale(var(--scale,1));transform-origin:center}
+
+/* === 幻灯片显隐：visibility/opacity，绝不用 display === */
+.slide{position:absolute;inset:0;padding:110px 130px;
+  visibility:hidden;opacity:0;pointer-events:none;
+  transition:opacity .55s ease,visibility .55s ease}
+.slide.active{visibility:visible;opacity:1;pointer-events:auto}
+
+/* === 入场动画：.rv 逐个浮现，--d 控制阶梯延迟 === */
+.rv{opacity:0;transform:translateY(34px);
+  transition:opacity .8s cubic-bezier(.2,.7,.25,1),transform .8s cubic-bezier(.2,.7,.25,1);
+  transition-delay:var(--d,0s)}
+.slide.active .rv{opacity:1;transform:none}
+
+/* === 排版原子 === */
+.kicker{display:inline-flex;align-items:center;gap:12px;
+  font-size:22px;letter-spacing:.35em;color:var(--cyan);font-weight:500}
+.kicker::before{content:'';width:34px;height:2px;background:var(--cyan);
+  box-shadow:0 0 12px var(--cyan)}
+.h1{font-size:88px;font-weight:900;line-height:1.18;letter-spacing:.01em}
+.h2{font-size:64px;font-weight:900;line-height:1.25;margin-top:22px}
+.grad{background:linear-gradient(92deg,var(--cyan) 5%,var(--violet) 90%);
+  -webkit-background-clip:text;background-clip:text;color:transparent}
+.dim{color:var(--ink-dim)}
+.lead{font-size:28px;line-height:1.7;color:var(--ink-dim);margin-top:26px;font-weight:300}
+.lead b{color:var(--ink);font-weight:500}
+
+/* === 卡片体系 === */
+.cards{display:grid;gap:34px;margin-top:64px}
+.cards.c3{grid-template-columns:repeat(3,1fr)}
+.cards.c2{grid-template-columns:repeat(2,1fr)}
+.card{background:var(--card);border:1px solid var(--card-line);
+  border-radius:22px;padding:44px 40px;position:relative;overflow:hidden;
+  backdrop-filter:blur(6px)}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;
+  background:linear-gradient(90deg,var(--cyan),transparent 70%);opacity:.85}
+.card.v::before{background:linear-gradient(90deg,var(--violet),transparent 70%)}
+.card.g::before{background:linear-gradient(90deg,var(--green),transparent 70%)}
+.card .ico{width:72px;height:72px;border-radius:18px;display:flex;
+  align-items:center;justify-content:center;font-size:36px;margin-bottom:26px;
+  background:var(--cyan-soft);border:1px solid var(--card-line)}
+.card.v .ico{background:var(--violet-soft)}
+.card.g .ico{background:rgba(62,242,179,.12)}
+.card h3{font-size:32px;font-weight:700;margin-bottom:14px}
+.card p{font-size:21px;line-height:1.75;color:var(--ink-dim)}
+.card p b{color:var(--ink);font-weight:500}
+
+/* === 徽章 / 标签 === */
+.chip{display:inline-flex;align-items:center;gap:10px;
+  padding:12px 24px;border-radius:999px;font-size:21px;font-weight:500;
+  border:1px solid var(--card-line);background:rgba(12,20,42,.6);color:var(--ink-dim)}
+.chip .dot{width:10px;height:10px;border-radius:50%;background:var(--cyan);
+  box-shadow:0 0 10px var(--cyan)}
+.chip.pu .dot{background:var(--violet);box-shadow:0 0 10px var(--violet)}
+.chip.gr .dot{background:var(--green);box-shadow:0 0 10px var(--green)}
+.chiprow{display:flex;gap:18px;flex-wrap:wrap;margin-top:44px}
+
+/* === 封面专属 === */
+.s-cover{display:flex;flex-direction:column;justify-content:center}
+.cover-title{font-size:118px;font-weight:900;line-height:1.16;letter-spacing:.01em}
+.cover-sub{font-size:34px;color:var(--ink-dim);margin-top:34px;font-weight:300;letter-spacing:.06em}
+.cover-sub b{color:var(--cyan);font-weight:500}
+.cover-foot{margin-top:86px;display:flex;align-items:center;gap:26px;
+  font-size:21px;color:var(--ink-dim);letter-spacing:.2em}
+.cover-foot .rule{width:120px;height:1px;background:linear-gradient(90deg,var(--cyan),transparent)}
+/* 封面右上的雷达环装饰 */
+.radar{position:absolute;top:-180px;right:-160px;width:760px;height:760px;
+  pointer-events:none}
+.radar span{position:absolute;inset:0;border:1px solid rgba(38,214,255,.18);
+  border-radius:50%;animation:ping 6s linear infinite}
+.radar span:nth-child(2){inset:120px;animation-delay:1.4s;border-color:rgba(143,123,255,.22)}
+.radar span:nth-child(3){inset:240px;animation-delay:2.8s}
+.radar span:nth-child(4){inset:330px;animation-delay:4s;border-color:rgba(38,214,255,.3)}
+@keyframes ping{0%{transform:scale(.92);opacity:0}30%{opacity:1}100%{transform:scale(1.06);opacity:0}}
+.radar .sweep{position:absolute;inset:90px;border-radius:50%;
+  background:conic-gradient(from 0deg,rgba(38,214,255,.22),transparent 26%);
+  animation:spin 7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.radar .core{position:absolute;top:50%;left:50%;width:18px;height:18px;
+  transform:translate(-50%,-50%);border-radius:50%;background:var(--cyan);
+  box-shadow:0 0 26px var(--cyan)}
+
+/* === 痛点页：大字卡 === */
+.pain .card{padding:52px 44px}
+.pain-num{font-family:var(--font-num);font-size:30px;color:var(--amber);
+  letter-spacing:.1em;margin-bottom:18px;font-weight:700}
+.pain h3{font-size:44px;font-weight:900;margin-bottom:16px}
+.pain p{font-size:23px}
+.pain .card::before{background:linear-gradient(90deg,var(--amber),transparent 70%)}
+
+/* === 架构页：管线图 === */
+.pipe{display:flex;align-items:stretch;gap:0;margin-top:70px}
+.pipe .node{flex:1;background:var(--card);border:1px solid var(--card-line);
+  border-radius:20px;padding:36px 26px;text-align:center;position:relative}
+.pipe .node h4{font-size:27px;font-weight:700;margin-bottom:10px}
+.pipe .node p{font-size:18px;color:var(--ink-dim);line-height:1.6}
+.pipe .node .t{font-family:var(--font-num);font-size:17px;color:var(--cyan);
+  letter-spacing:.15em;margin-bottom:14px}
+.pipe .arrow{display:flex;align-items:center;padding:0 16px;color:var(--cyan);
+  font-size:34px;text-shadow:0 0 14px rgba(38,214,255,.7)}
+
+/* === 闭环页：四步流程 === */
+.loop{display:grid;grid-template-columns:repeat(4,1fr);gap:26px;margin-top:76px;position:relative}
+.step{background:var(--card);border:1px solid var(--card-line);border-radius:22px;
+  padding:40px 30px;position:relative}
+.step .n{font-family:var(--font-num);font-size:52px;font-weight:700;line-height:1;
+  background:linear-gradient(160deg,var(--cyan),var(--violet));
+  -webkit-background-clip:text;background-clip:text;color:transparent}
+.step h4{font-size:29px;font-weight:700;margin:20px 0 12px}
+.step p{font-size:19px;color:var(--ink-dim);line-height:1.7}
+.step::after{content:'→';position:absolute;right:-26px;top:46%;font-size:30px;
+  color:var(--cyan);text-shadow:0 0 12px rgba(38,214,255,.7);z-index:2}
+.step:last-child::after{content:''}
+
+/* === 工作台页：仿商机列表 === */
+.mock{margin-top:60px;border:1px solid var(--card-line);border-radius:24px;
+  overflow:hidden;background:rgba(10,16,36,.7)}
+.mock .bar{display:flex;align-items:center;gap:10px;padding:18px 26px;
+  border-bottom:1px solid var(--card-line);background:rgba(18,26,54,.6)}
+.mock .bar i{width:14px;height:14px;border-radius:50%;display:inline-block}
+.mock .bar i:nth-child(1){background:#ff5f57}.mock .bar i:nth-child(2){background:#febc2e}
+.mock .bar i:nth-child(3){background:#28c840}
+.mock .bar span{margin-left:14px;font-size:19px;color:var(--ink-dim)}
+.row{display:flex;align-items:center;gap:22px;padding:26px 30px;
+  border-bottom:1px solid rgba(120,160,255,.1);font-size:22px}
+.row:last-child{border-bottom:none}
+.row .unread{width:12px;height:12px;border-radius:50%;background:var(--cyan);
+  box-shadow:0 0 12px var(--cyan);flex:none}
+.row .read{width:12px;height:12px;border-radius:50%;background:rgba(140,170,255,.2);flex:none}
+.row .who{width:150px;font-weight:700;flex:none}
+.row .txt{flex:1;color:var(--ink-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row .txt b{color:var(--cyan);font-weight:500}
+.tag{flex:none;padding:7px 16px;border-radius:8px;font-size:17px;font-weight:500}
+.tag.buy{background:rgba(62,242,179,.12);color:var(--green);border:1px solid rgba(62,242,179,.3)}
+.tag.sell{background:rgba(255,198,92,.1);color:var(--amber);border:1px solid rgba(255,198,92,.3)}
+
+/* === 回复页：功能清单 + 安全徽章 === */
+.split{display:grid;grid-template-columns:1.1fr .9fr;gap:44px;margin-top:64px;align-items:stretch}
+.flist{display:flex;flex-direction:column;gap:22px}
+.fitem{display:flex;gap:20px;align-items:flex-start;background:var(--card);
+  border:1px solid var(--card-line);border-radius:18px;padding:26px 30px}
+.fitem .fi-ico{width:54px;height:54px;flex:none;border-radius:14px;font-size:26px;
+  display:flex;align-items:center;justify-content:center;background:var(--cyan-soft)}
+.fitem.v .fi-ico{background:var(--violet-soft)}
+.fitem.g .fi-ico{background:rgba(62,242,179,.12)}
+.fitem h4{font-size:25px;font-weight:700;margin-bottom:6px}
+.fitem p{font-size:19px;color:var(--ink-dim);line-height:1.6}
+.shield{border:1px solid rgba(62,242,179,.35);border-radius:22px;
+  background:linear-gradient(180deg,rgba(62,242,179,.07),rgba(10,16,36,.5));
+  padding:40px 38px;display:flex;flex-direction:column;justify-content:center;gap:20px}
+.shield h4{font-size:28px;font-weight:900;color:var(--green);letter-spacing:.05em}
+.shield li{list-style:none;font-size:20px;color:var(--ink-dim);line-height:1.6;
+  padding-left:30px;position:relative}
+.shield li::before{content:'✓';position:absolute;left:0;color:var(--green);font-weight:700}
+
+/* === 结尾页 === */
+.s-end{display:flex;flex-direction:column;justify-content:center;align-items:flex-start}
+.end-line{font-size:76px;font-weight:900;line-height:1.3}
+.roadmap{margin-top:56px;display:flex;gap:18px;flex-wrap:wrap}
+.thanks{margin-top:80px;font-size:24px;color:var(--ink-dim);letter-spacing:.3em}
+
+/* === HUD：页码 / 进度条 / 提示 === */
+.hud{position:fixed;right:34px;bottom:26px;font-family:var(--font-num);
+  font-size:17px;color:var(--ink-dim);letter-spacing:.12em;z-index:50}
+.progress{position:fixed;left:0;bottom:0;width:100%;height:4px;background:rgba(120,160,255,.12);z-index:50}
+.progress__bar{height:100%;width:10%;border-radius:0 4px 4px 0;
+  background:linear-gradient(90deg,var(--cyan),var(--violet));
+  box-shadow:0 0 14px rgba(38,214,255,.6);transition:width .45s ease}
+.hint{position:fixed;left:34px;bottom:22px;font-size:15px;color:rgba(159,176,208,.55);
+  letter-spacing:.08em;z-index:50}
+.edit-btn{position:fixed;top:22px;left:22px;z-index:60;padding:9px 18px;
+  border-radius:999px;font-size:15px;font-family:var(--font-body);cursor:pointer;
+  color:var(--ink-dim);background:rgba(16,24,48,.7);border:1px solid var(--card-line);
+  opacity:.45;transition:opacity .3s,color .3s,border-color .3s}
+.edit-btn:hover{opacity:1}
+body.editing .edit-btn{opacity:1;color:var(--cyan);border-color:var(--cyan)}
+body.editing .slide{outline:1px dashed rgba(38,214,255,.3);outline-offset:-6px}
+.edit-note{position:fixed;top:22px;left:50%;transform:translateX(-50%);z-index:60;
+  padding:8px 20px;border-radius:999px;font-size:15px;color:var(--cyan);
+  background:rgba(38,214,255,.1);border:1px solid rgba(38,214,255,.35);
+  display:none}
+body.editing .edit-note{display:block}
+
+/* === 无障碍：尊重减少动效偏好 === */
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important}
+  .rv{opacity:1;transform:none}
+}
+</style>
+</head>
+<body>
+<div class="backdrop"></div>
+<div class="progress"><div class="progress__bar" id="pbar"></div></div>
+<button class="edit-btn" id="editBtn" title="进入/退出编辑模式">✎ 编辑</button>
+<div class="edit-note">编辑模式：直接点击文字修改，按 E 或再点按钮退出</div>
+
+<div class="stage" id="stage">
+
+<!-- ═══ 1 · 封面 ═══ -->
+<section class="slide s-cover active">
+  <div class="radar"><div class="sweep"></div><span></span><span></span><span></span><span></span><div class="core"></div></div>
+  <div class="kicker rv" style="--d:.05s">AI · 微信 · 商机线索</div>
+  <h1 class="cover-title rv" style="--d:.2s;margin-top:34px">微信商机<br><span class="grad">监测与客服系统</span></h1>
+  <p class="cover-sub rv" style="--d:.4s"><b>AI 自动筛选</b> → 集中处理 → <b>一键回复</b>，把刷群找线索变成一条流水线</p>
+  <div class="cover-foot rv" style="--d:.6s"><span>产品演示</span><span class="rule"></span><span>数据本地化 · 离线可用</span></div>
+</section>
+
+<!-- ═══ 2 · 痛点 ═══ -->
+<section class="slide">
+  <div class="kicker rv">WHY · 为什么需要它</div>
+  <h2 class="h2 rv" style="--d:.1s">商机，藏在<span class="grad">刷不完</span>的群消息里</h2>
+  <div class="cards c3 pain">
+    <div class="card rv" style="--d:.25s"><div class="pain-num">PAIN 01</div><h3>漏看</h3><p>一天几百条群消息，<b>关键采购信息眨眼被淹没</b>，发现时早已刷过三屏。</p></div>
+    <div class="card rv" style="--d:.4s"><div class="pain-num">PAIN 02</div><h3>迟到</h3><p>等看到那条「谁有 xxx 货」，<b>同行已经报完价了</b>。商机不讲先来后到，只讲快慢。</p></div>
+    <div class="card rv" style="--d:.55s"><div class="pain-num">PAIN 03</div><h3>错乱</h3><p>文字、图片、语音混在一起，<b>线索碎片散落各群</b>，回头想跟进却找不到上下文。</p></div>
+  </div>
+</section>
+
+<!-- ═══ 3 · 方案总览 ═══ -->
+<section class="slide">
+  <div class="kicker rv">WHAT · 解决方案</div>
+  <h2 class="h2 rv" style="--d:.1s">一台装在<span class="grad">您自己电脑</span>上的 AI 商机雷达</h2>
+  <p class="lead rv" style="--d:.2s">纯本地部署，浏览器打开即用。<b>消息数据、语音识别全部留在本机</b>，AI 接口由您自备，成本与数据主权都握在自己手里。</p>
+  <div class="pipe">
+    <div class="node rv" style="--d:.3s"><div class="t">SOURCE</div><h4>微信 4.x</h4><p>本地数据库解密读取<br>秒级实时监听新消息</p></div>
+    <div class="arrow rv" style="--d:.38s">→</div>
+    <div class="node rv" style="--d:.46s"><div class="t">ANALYZE</div><h4>本地 AI 分析</h4><p>自备 OpenAI 兼容接口<br>判定商机 · 提取要点</p></div>
+    <div class="arrow rv" style="--d:.54s">→</div>
+    <div class="node rv" style="--d:.62s"><div class="t">WORKBENCH</div><h4>浏览器工作台</h4><p>商机列表 · 上下文还原<br>实时提醒</p></div>
+    <div class="arrow rv" style="--d:.7s">→</div>
+    <div class="node rv" style="--d:.78s"><div class="t">REPLY</div><h4>一键回复</h4><p>自动化驱动微信窗口<br>三重校验防误发</p></div>
+  </div>
+  <div class="chiprow rv" style="--d:.9s">
+    <span class="chip"><span class="dot"></span>实时捕获 · 秒级进入分析</span>
+    <span class="chip pu"><span class="dot"></span>自然语言配置 · 改口径不用改代码</span>
+    <span class="chip gr"><span class="dot"></span>闭环回复 · 不切窗口</span>
+  </div>
+</section>
+
+<!-- ═══ 4 · 核心闭环 ═══ -->
+<section class="slide">
+  <div class="kicker rv">HOW · 工作流闭环</div>
+  <h2 class="h2 rv" style="--d:.1s">四步，跑通<span class="grad">商机流水线</span></h2>
+  <div class="loop">
+    <div class="step rv" style="--d:.25s"><div class="n">01</div><h4>添加监控</h4><p>搜索选择要盯的群和好友，配置后<b>新消息自动纳管</b>，历史刷屏不干扰。</p></div>
+    <div class="step rv" style="--d:.4s"><div class="n">02</div><h4>AI 实时判定</h4><p>商机类型自己写、严格度自己调，<b>命中 15~30 秒内可见</b>。</p></div>
+    <div class="step rv" style="--d:.55s"><div class="n">03</div><h4>商机工作台</h4><p>需求要点 + 原文摘录 + 上下文还原，<b>未读角标实时提醒</b>。</p></div>
+    <div class="step rv" style="--d:.7s"><div class="n">04</div><h4>一键回复</h4><p>系统内直接回复目标群/好友，<b>支持 @、引用、私信</b>，全程不切窗口。</p></div>
+  </div>
+  <p class="lead rv" style="--d:.85s">从「消息出现」到「回复发出」，<b>全流程不超过一分钟</b>。</p>
+</section>
+
+<!-- ═══ 5 · 多模态分析 ═══ -->
+<section class="slide">
+  <div class="kicker rv">CAPABILITY · 多模态全覆盖</div>
+  <h2 class="h2 rv" style="--d:.1s">文字、图片、语音，<span class="grad">一个都不漏</span></h2>
+  <div class="cards c3">
+    <div class="card rv" style="--d:.25s"><div class="ico">💬</div><h3>文本消息</h3><p>AI 判定商机方向（<b>求购 / 供货</b>），自动提取标的、数量、时间等<b>需求要点</b>。</p></div>
+    <div class="card v rv" style="--d:.4s"><div class="ico">📷</div><h3>图片消息</h3><p>「只发一张图」的卖货消息不漏判：视觉模型识别实物，还能<b>提取 17 位车架号</b>。</p></div>
+    <div class="card g rv" style="--d:.55s"><div class="ico">🎙️</div><h3>语音消息</h3><p><b>完全离线转写</b>，音频绝不上传外部服务。转写失败自动重试，无需人工干预。</p></div>
+  </div>
+  <p class="lead rv" style="--d:.75s">连续发言<b>自动合并去重</b>——一个人连发十条，只进一条分析，既不漏判也不刷屏。</p>
+</section>
+
+<!-- ═══ 6 · 商机工作台 ═══ -->
+<section class="slide">
+  <div class="kicker rv">WORKBENCH · 商机工作台</div>
+  <h2 class="h2 rv" style="--d:.1s">商机自动上门，<span class="grad">一眼看清轻重</span></h2>
+  <div class="mock rv" style="--d:.3s">
+    <div class="bar"><i></i><i></i><i></i><span>商机列表 · 新商机实时推送</span></div>
+    <div class="row"><span class="unread"></span><span class="who">机加工采购群</span><span class="txt"><b>求购</b>：有没有能加工铝合金外壳的厂？500 件左右，急</span><span class="tag buy">求购 · 采购需求</span></div>
+    <div class="row"><span class="unread"></span><span class="who">配件交流群</span><span class="txt"><b>供货</b>：低价处理一批原厂轮毂，有实物图（已识别 VIN）</span><span class="tag sell">供货 · 图片识别</span></div>
+    <div class="row"><span class="read"></span><span class="who">老客户 · 私聊</span><span class="txt">语音消息已转写：「下个月还要 2000 个垫片，价格能不能再谈」</span><span class="tag buy">求购 · 语音转写</span></div>
+  </div>
+  <div class="chiprow rv" style="--d:.6s">
+    <span class="chip"><span class="dot"></span>未读角标 + 提示音</span>
+    <span class="chip"><span class="dot"></span>按来源 / 类型 / 状态筛选</span>
+    <span class="chip pu"><span class="dot"></span>上下文还原 · 判断不盲目</span>
+    <span class="chip gr"><span class="dot"></span>误报一键隐藏</span>
+  </div>
+</section>
+
+<!-- ═══ 7 · 一键回复（重点页） ═══ -->
+<section class="slide">
+  <div class="kicker rv">CLOSE THE LOOP · 回复闭环</div>
+  <h2 class="h2 rv" style="--d:.1s">看到商机，<span class="grad">当场回复</span></h2>
+  <div class="split">
+    <div class="flist">
+      <div class="fitem rv" style="--d:.25s"><div class="fi-ico">@</div><div><h4>@群成员 · 引用回复</h4><p>自动取对方当前群昵称，引用原文精准回复。</p></div></div>
+      <div class="fitem v rv" style="--d:.4s"><div class="fi-ico">↩</div><div><h4>群内 or 私信，去向自选</h4><p>群商机可选回复群里或私信发送人，系统自动校验好友关系。</p></div></div>
+      <div class="fitem g rv" style="--d:.55s"><div class="fi-ico">✋</div><div><h4>手动确认模式</h4><p>内容填入微信输入框但不自动发送，人工最终把关，最稳妥。</p></div></div>
+    </div>
+    <div class="shield rv" style="--d:.7s">
+      <h4>防误发 · 三重保险</h4>
+      <ul>
+        <li>发送前实时核验目标会话，发错直接拒绝</li>
+        <li>企业微信联系人与同名好友严格区分</li>
+        <li>受理 → 发送中 → 成功，状态全链路可见</li>
+        <li>任何不确定都明确报失败，绝不静默丢失</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ 8 · 越用越准 ═══ -->
+<section class="slide">
+  <div class="kicker rv">GROWTH · 越用越懂您的生意</div>
+  <h2 class="h2 rv" style="--d:.1s">不只是筛选，<span class="grad">还会越来越准</span></h2>
+  <div class="cards c3">
+    <div class="card rv" style="--d:.25s"><div class="ico">🎯</div><h3>漏判修正</h3><p>发现漏掉的消息？一键补成 AI 判定示例，<b>判定口径越用越贴合您的业务</b>。</p></div>
+    <div class="card v rv" style="--d:.4s"><div class="ico">📋</div><h3>分析日志全可查</h3><p>每条消息的判定记录、AI 耗时明细随时可查，<b>可运维、可排查、可复盘</b>。</p></div>
+    <div class="card g rv" style="--d:.55s"><div class="ico">💰</div><h3>AI 用量账单</h3><p>按 tokens 统计用量、估算费用，<b>AI 成本透明可控</b>，接口用您自己的。</p></div>
+  </div>
+  <p class="lead rv" style="--d:.75s">商机类型、判定严格度、置信度门槛——<b>全部由您用自然语言掌控</b>，无需等开发。</p>
+</section>
+
+<!-- ═══ 9 · 交付与安全 ═══ -->
+<section class="slide">
+  <div class="kicker rv">DELIVERY · 交付与安全</div>
+  <h2 class="h2 rv" style="--d:.1s">解压即用，<span class="grad">交付无负担</span></h2>
+  <div class="cards c2">
+    <div class="card rv" style="--d:.25s"><div class="ico">📦</div><h3>离线安装包</h3><p>运行时、离线语音模型全部内置，客户机<b>无需预装任何环境</b>，托盘启动、浏览器即用。</p></div>
+    <div class="card v rv" style="--d:.4s"><div class="ico">🔄</div><h3>签名自动更新</h3><p>新版本签名校验防篡改，升级前自动备份数据，<b>失败自动回滚旧版</b>，永不中断业务。</p></div>
+    <div class="card g rv" style="--d:.55s"><div class="ico">🔐</div><h3>机器码授权</h3><p>许可证签名验证、绑定设备，<b>断网也有 7 天宽限</b>，商业化交付规范可靠。</p></div>
+    <div class="card rv" style="--d:.7s"><div class="ico">🛡️</div><h3>数据本地化</h3><p>消息本地读取、语音离线识别、AI 接口自备——<b>数据主权完整留在客户手里</b>。</p></div>
+  </div>
+</section>
+
+<!-- ═══ 10 · 结尾 ═══ -->
+<section class="slide s-end">
+  <div class="kicker rv">NEXT · 持续进化</div>
+  <p class="end-line rv" style="--d:.15s;margin-top:30px">让每一条商机，<br><span class="grad">都不再错过。</span></p>
+  <div class="roadmap rv" style="--d:.4s">
+    <span class="chip pu"><span class="dot"></span>规划中：AI 回复草稿</span>
+    <span class="chip pu"><span class="dot"></span>规划中：外部消息推送</span>
+    <span class="chip pu"><span class="dot"></span>规划中：商机统计报表</span>
+  </div>
+  <p class="thanks rv" style="--d:.6s">THANKS · 接下来进入现场实操演示</p>
+</section>
+
+</div>
+
+<div class="hud"><span id="pageNum">01 / 10</span></div>
+<div class="hint">← → / 空格 翻页 · 触屏左右滑动 · E 进入编辑</div>
+
+<script>
+/* === 舞台等比缩放：任意视口保持 16:9 不变形 === */
+(function(){
+  const stage=document.getElementById('stage');
+  function fit(){
+    const s=Math.min(innerWidth/1920,innerHeight/1080);
+    stage.style.setProperty('--scale',s);
+  }
+  addEventListener('resize',fit);fit();
+})();
+
+/* === 幻灯片导航：键盘 / 触屏 / 进度同步 === */
+(function(){
+  const slides=[...document.querySelectorAll('.slide')];
+  const bar=document.getElementById('pbar');
+  const num=document.getElementById('pageNum');
+  let cur=0;
+  function pad(n){return String(n).padStart(2,'0')}
+  function go(i){
+    if(i<0||i>=slides.length)return;
+    slides[cur].classList.remove('active');
+    cur=i;
+    slides[cur].classList.add('active');
+    bar.style.width=((cur+1)/slides.length*100)+'%';
+    num.textContent=pad(cur+1)+' / '+pad(slides.length);
+  }
+  go(0);bar.style.width=(1/slides.length*100)+'%';
+  addEventListener('keydown',e=>{
+    if(e.key==='ArrowRight'||e.key===' '||e.key==='PageDown'){e.preventDefault();go(cur+1)}
+    else if(e.key==='ArrowLeft'||e.key==='PageUp'){e.preventDefault();go(cur-1)}
+    else if(e.key==='Home'){go(0)}
+    else if(e.key==='End'){go(slides.length-1)}
+    else if(e.key==='e'||e.key==='E'){toggleEdit()}
+  });
+  let tx=0,ty=0;
+  addEventListener('touchstart',e=>{tx=e.touches[0].clientX;ty=e.touches[0].clientY},{passive:true});
+  addEventListener('touchend',e=>{
+    const dx=e.changedTouches[0].clientX-tx,dy=e.changedTouches[0].clientY-ty;
+    if(Math.abs(dx)>60&&Math.abs(dx)>Math.abs(dy))dx<0?go(cur+1):go(cur-1);
+  },{passive:true});
+})();
+
+/* === 内联编辑：按 E 或左上角按钮进入，直接改文字 === */
+(function(){
+  const slides=[...document.querySelectorAll('.slide')];
+  const btn=document.getElementById('editBtn');
+  let on=false;
+  window.toggleEdit=function(){
+    on=!on;
+    document.body.classList.toggle('editing',on);
+    slides.forEach(s=>s.contentEditable=on?'true':'false');
+    if(on){const a=slides.find(s=>s.classList.contains('active'));a&&a.focus()}
+  };
+  btn.addEventListener('click',toggleEdit);
+})();
+</script>
+</body>
+</html>
