@@ -34,9 +34,6 @@ from app.schemas import (
     SummaryListOut,
     SummaryMembersOut,
     SummaryOut,
-    SummaryScheduleConfig,
-    SummarySchedulesOut,
-    SummarySchedulesUpdate,
     SummarySettingsOut,
     SummarySettingsUpdate,
 )
@@ -46,14 +43,16 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/summary", tags=["summary"])
 
-# 预算配置可编辑键（白名单，防任意 settings 写入）
-# 定时配置走 GET/PUT /api/summary/schedules，不混进本端点。
+# 设置页配置区可编辑键（白名单，防任意 settings 写入）
+# 预算 5 键 + 定时 2 键（P0 仅保存配置，SummaryScheduler 不启动线程）。
 _SETTINGS_KEYS = (
     KEY_SUMMARY_BUDGET_MODE,
     KEY_SUMMARY_BUDGET_MONEY,
     KEY_SUMMARY_BUDGET_TOKENS,
     KEY_SUMMARY_OVER_LIMIT_ACTION,
     KEY_SUMMARY_TRUNCATE_RECENT_N,
+    KEY_SUMMARY_SCHEDULE_ENABLED,
+    KEY_SUMMARY_SCHEDULE_CONFIGS,
 )
 _SETTINGS_DEFAULTS = {
     KEY_SUMMARY_BUDGET_MODE: "money",
@@ -61,6 +60,8 @@ _SETTINGS_DEFAULTS = {
     KEY_SUMMARY_BUDGET_TOKENS: "60000",
     KEY_SUMMARY_OVER_LIMIT_ACTION: "block",
     KEY_SUMMARY_TRUNCATE_RECENT_N: "200",
+    KEY_SUMMARY_SCHEDULE_ENABLED: "0",
+    KEY_SUMMARY_SCHEDULE_CONFIGS: "[]",
 }
 
 
@@ -194,7 +195,7 @@ def export_history(summary_id: int,
 
 @router.get("/settings", response_model=SummarySettingsOut)
 def get_summary_settings(db: Database = Depends(get_db)) -> SummarySettingsOut:
-    """设置页预算配置（定时配置请看 /schedules）。"""
+    """设置页配置区（预算 5 键 + 定时 2 键，均为 settings 点分键）。"""
     data = {key: db.get_setting(key, default)
             for key, default in _SETTINGS_DEFAULTS.items()}
     return SummarySettingsOut(**data)
@@ -203,58 +204,36 @@ def get_summary_settings(db: Database = Depends(get_db)) -> SummarySettingsOut:
 @router.put("/settings", response_model=SummarySettingsOut)
 def update_summary_settings(body: SummarySettingsUpdate,
                             db: Database = Depends(get_db)) -> SummarySettingsOut:
-    """写入预算配置（None=不变更；枚举与数值范围校验）。"""
+    """写入设置页配置（None=不变更；枚举、数值范围与定时 JSON 校验失败 422）。"""
     changes = body.model_dump(by_alias=True, exclude_none=True)
     for key, value in changes.items():
         text = str(value)
         if key == KEY_SUMMARY_BUDGET_MODE and text not in BUDGET_MODE_VALUES:
-            raise HTTPException(status_code=400, detail="预算口径仅支持 money 或 tokens")
+            raise HTTPException(status_code=422, detail="预算口径仅支持 money 或 tokens")
         if key == KEY_SUMMARY_OVER_LIMIT_ACTION and text not in OVER_LIMIT_ACTION_VALUES:
-            raise HTTPException(status_code=400, detail="超限策略仅支持 block 或 truncate_recent")
+            raise HTTPException(status_code=422, detail="超限策略仅支持 block 或 truncate_recent")
         if key in (KEY_SUMMARY_BUDGET_MONEY, KEY_SUMMARY_BUDGET_TOKENS,
                    KEY_SUMMARY_TRUNCATE_RECENT_N):
             try:
                 number = float(text)
             except ValueError as exc:
-                raise HTTPException(status_code=400, detail="预算数值必须为数字") from exc
+                raise HTTPException(status_code=422, detail="预算数值必须为数字") from exc
             if number < 0:
-                raise HTTPException(status_code=400, detail="预算数值不能为负数")
+                raise HTTPException(status_code=422, detail="预算数值不能为负数")
+        if key == KEY_SUMMARY_SCHEDULE_ENABLED and text not in ("0", "1"):
+            raise HTTPException(status_code=422, detail="定时开关仅支持 0 或 1")
+        if key == KEY_SUMMARY_SCHEDULE_CONFIGS:
+            try:
+                configs = json.loads(text)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail="定时配置必须是 JSON 数组") from exc
+            if not isinstance(configs, list):
+                raise HTTPException(status_code=422, detail="定时配置必须是 JSON 数组")
+            for item in configs:
+                if not isinstance(item, dict) or not str(item.get("session") or ""):
+                    raise HTTPException(status_code=422, detail="定时配置缺少群聊")
+                if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d",
+                                    str(item.get("time") or "18:00")):
+                    raise HTTPException(status_code=422, detail="触发时间格式应为 HH:MM")
         db.set_setting(key, text)
     return get_summary_settings(db)
-
-
-@router.get("/schedules", response_model=SummarySchedulesOut)
-def get_schedules(db: Database = Depends(get_db)) -> SummarySchedulesOut:
-    """定时配置：总开关默认关，按群触发时间默认 18:00、每日一次。"""
-    enabled = db.get_setting(KEY_SUMMARY_SCHEDULE_ENABLED, "0") == "1"
-    try:
-        raw = json.loads(db.get_setting(KEY_SUMMARY_SCHEDULE_CONFIGS, "[]"))
-    except (TypeError, ValueError):
-        raw = []
-    configs = []
-    if isinstance(raw, list):
-        for item in raw:
-            if not isinstance(item, dict) or not str(item.get("session") or ""):
-                continue
-            configs.append(SummaryScheduleConfig(
-                session=str(item["session"]),
-                display_name=str(item.get("display_name") or ""),
-                enabled=bool(item.get("enabled")),
-                time=str(item.get("time") or SUMMARY_SCHEDULE_TIME_DEFAULT)))
-    return SummarySchedulesOut(enabled=enabled, configs=configs)
-
-
-@router.put("/schedules", response_model=SummarySchedulesOut)
-def update_schedules(body: SummarySchedulesUpdate,
-                     db: Database = Depends(get_db)) -> SummarySchedulesOut:
-    """保存定时配置（仅存 settings，P0 不启动任何定时线程）。"""
-    for item in body.configs:
-        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", item.time):
-            raise HTTPException(status_code=400, detail="触发时间格式应为 HH:MM")
-        if not item.session:
-            raise HTTPException(status_code=400, detail="定时配置缺少群聊")
-    db.set_setting(KEY_SUMMARY_SCHEDULE_ENABLED, "1" if body.enabled else "0")
-    db.set_setting(KEY_SUMMARY_SCHEDULE_CONFIGS,
-                   json.dumps([item.model_dump() for item in body.configs],
-                              ensure_ascii=False))
-    return get_schedules(db)

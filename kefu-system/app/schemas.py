@@ -692,7 +692,7 @@ class SummaryListOut(BaseModel):
 
 
 class SummarySettingsOut(BaseModel):
-    """设置页预算配置（响应键保持 settings 表的点分字符串）。"""
+    """设置页配置区（预算 5 键 + 定时 2 键，响应键为 settings 点分字符串）。"""
     model_config = ConfigDict(populate_by_name=True)
 
     budget_mode: str = Field(default="money", alias="summary.budget_mode")
@@ -700,10 +700,12 @@ class SummarySettingsOut(BaseModel):
     budget_tokens: str = Field(default="60000", alias="summary.budget_tokens")
     over_limit_action: str = Field(default="block", alias="summary.over_limit_action")
     truncate_recent_n: str = Field(default="200", alias="summary.truncate_recent_n")
+    schedule_enabled: str = Field(default="0", alias="summary.schedule_enabled")
+    schedule_configs: str = Field(default="[]", alias="summary.schedule_configs")
 
 
 class SummarySettingsUpdate(BaseModel):
-    """设置页预算配置更新（None = 不变更；未知键拒绝）。"""
+    """设置页配置更新（None = 不变更；未知键拒绝）。"""
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     budget_mode: Optional[str] = Field(default=None, alias="summary.budget_mode")
@@ -713,23 +715,7 @@ class SummarySettingsUpdate(BaseModel):
         default=None, alias="summary.over_limit_action")
     truncate_recent_n: Optional[str] = Field(
         default=None, alias="summary.truncate_recent_n")
-
-
-class SummaryScheduleConfig(BaseModel):
-    """按群定时配置（默认每日一次，触发时间 HH:MM）。"""
-    session: str
-    display_name: str = ""
-    enabled: bool = True
-    time: str = "18:00"
-
-
-class SummarySchedulesOut(BaseModel):
-    """定时配置（P1 语义化封装；总开关默认关）。"""
-    enabled: bool = False
-    configs: List[SummaryScheduleConfig] = Field(default_factory=list)
-
-
-class SummarySchedulesUpdate(BaseModel):
-    """定时配置更新（总开关 + 按群列表）。"""
-    enabled: bool = False
-    configs: List[SummaryScheduleConfig] = Field(default_factory=list)
+    schedule_enabled: Optional[str] = Field(
+        default=None, alias="summary.schedule_enabled")
+    schedule_configs: Optional[str] = Field(
+        default=None, alias="summary.schedule_configs")

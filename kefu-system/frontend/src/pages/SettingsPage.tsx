@@ -65,7 +65,6 @@ import type {
   ServerSettings,
   SessionItem,
   StatusOut,
-  SummarySchedulesOut,
   SummarySettings,
 } from '../api/types'
 import {
@@ -1492,10 +1491,6 @@ function SummarySettingsTab() {
     queryKey: ['summary-settings'],
     queryFn: () => apiGet<SummarySettings>('/api/summary/settings'),
   })
-  const { data: savedSchedules } = useQuery({
-    queryKey: ['summary-schedules'],
-    queryFn: () => apiGet<SummarySchedulesOut>('/api/summary/schedules'),
-  })
   const { data: billing } = useQuery({
     queryKey: ['billing'],
     queryFn: () => apiGet<BillingOut>('/api/system/billing'),
@@ -1516,19 +1511,21 @@ function SummarySettingsTab() {
   const [loaded, setLoaded] = useState(false)
 
   useEffect(() => {
-    if (!saved || !savedSchedules || loaded) return
+    if (!saved || loaded) return
     setBudgetMode(saved['summary.budget_mode'] || 'money')
     setBudgetMoney(saved['summary.budget_money'] || '1.0')
     setBudgetTokens(saved['summary.budget_tokens'] || '60000')
     setAction(saved['summary.over_limit_action'] || 'block')
     setTruncateN(saved['summary.truncate_recent_n'] || '200')
-    setScheduleEnabled(savedSchedules.enabled)
-    setSchedules(savedSchedules.configs.map((c) => ({
-      session: c.session, display_name: c.display_name,
-      enabled: c.enabled, time: c.time || '18:00',
-    })))
+    setScheduleEnabled(saved['summary.schedule_enabled'] === '1')
+    try {
+      const parsed = JSON.parse(saved['summary.schedule_configs'] || '[]')
+      setSchedules(Array.isArray(parsed) ? parsed as ScheduleConfig[] : [])
+    } catch {
+      setSchedules([])
+    }
     setLoaded(true)
-  }, [saved, savedSchedules, loaded])
+  }, [saved, loaded])
 
   const saveMutation = useMutation({
     mutationFn: () => apiPut<SummarySettings>('/api/summary/settings', {
@@ -1537,32 +1534,15 @@ function SummarySettingsTab() {
       'summary.budget_tokens': budgetTokens,
       'summary.over_limit_action': action,
       'summary.truncate_recent_n': truncateN,
+      'summary.schedule_enabled': scheduleEnabled ? '1' : '0',
+      'summary.schedule_configs': JSON.stringify(schedules),
     }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['summary-settings'] })
+      setSnack('群消息总结配置已保存')
     },
-    onError: (e: Error) => setSnack(`预算配置保存失败：${e.message}`),
+    onError: (e: Error) => setSnack(`保存失败：${e.message}`),
   })
-
-  const saveSchedulesMutation = useMutation({
-    mutationFn: () => apiPut<SummarySchedulesOut>('/api/summary/schedules', {
-      enabled: scheduleEnabled, configs: schedules,
-    }),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['summary-schedules'] })
-    },
-    onError: (e: Error) => setSnack(`定时配置保存失败：${e.message}`),
-  })
-
-  const saveAll = () => {
-    saveMutation.mutate(undefined, {
-      onSuccess: () => {
-        saveSchedulesMutation.mutate(undefined, {
-          onSuccess: () => setSnack('群消息总结配置已保存'),
-        })
-      },
-    })
-  }
 
   const noPrice = budgetMode === 'money'
     && !billing?.input_price && !billing?.output_price
@@ -1656,9 +1636,8 @@ function SummarySettingsTab() {
           添加群聊
         </Button>
         <Button variant="contained" sx={{ alignSelf: 'flex-start' }}
-          disabled={saveMutation.isPending || saveSchedulesMutation.isPending
-            || !budgetMoney || !budgetTokens || !truncateN}
-          onClick={saveAll}>
+          disabled={saveMutation.isPending || !budgetMoney || !budgetTokens || !truncateN}
+          onClick={() => saveMutation.mutate()}>
           保存配置
         </Button>
       </Stack>

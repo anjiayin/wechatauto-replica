@@ -398,19 +398,21 @@ def test_api_history_export_and_settings(api):
     assert updated.json()["summary.budget_mode"] == "tokens"
     assert env.client.put("/api/summary/settings", json={
         "ai.base_url": "http://evil"}).status_code == 422
-    schedules = env.client.get("/api/summary/schedules").json()
-    assert schedules["enabled"] is False and schedules["configs"] == []
-    saved = env.client.put("/api/summary/schedules", json={
-        "enabled": True,
-        "configs": [{"session": "g@chatroom", "display_name": "测试群",
-                     "enabled": True, "time": "18:30"}]})
+    # 设置页唯一通路同时读写预算 5 键 + 定时 2 键（P1 才做语义化 schedules 封装）
+    assert settings["summary.schedule_enabled"] == "0"
+    assert settings["summary.schedule_configs"] == "[]"
+    saved = env.client.put("/api/summary/settings", json={
+        "summary.schedule_enabled": "1",
+        "summary.schedule_configs": json.dumps([{
+            "session": "g@chatroom", "display_name": "测试群",
+            "enabled": True, "time": "18:30"}], ensure_ascii=False)})
     assert saved.status_code == 200
-    assert saved.json()["configs"][0]["time"] == "18:30"
-    assert env.client.put("/api/summary/schedules", json={
-        "enabled": True,
-        "configs": [{"session": "g@chatroom", "time": "25:00"}]}).status_code == 400
-    assert "summary.schedule_enabled" not in env.client.get(
-        "/api/summary/settings").json()
+    assert saved.json()["summary.schedule_enabled"] == "1"
+    assert "18:30" in saved.json()["summary.schedule_configs"]
+    assert env.client.put("/api/summary/settings", json={
+        "summary.schedule_configs": "[]%"}).status_code == 422
+    assert env.client.put("/api/summary/settings", json={
+        "summary.budget_mode": "wrong"}).status_code == 422
 
     assert env.client.delete(f"/api/summary/history/{sid}").json() == {"ok": True}
     assert env.client.delete(f"/api/summary/history/{sid}").status_code == 404

@@ -638,27 +638,16 @@ export interface SummaryListOut {
   items: SummaryOut[]
 }
 
-/** GET/PUT /api/summary/settings：设置页预算配置（定时走 /schedules） */
+/** GET/PUT /api/summary/settings：设置页配置区（预算 5 键 + 定时 2 键） */
 export interface SummarySettings {
   'summary.budget_mode': BudgetMode
   'summary.budget_money': string
   'summary.budget_tokens': string
   'summary.over_limit_action': OverLimitAction
   'summary.truncate_recent_n': string
-}
-
-/** GET/PUT /api/summary/schedules：定时配置（P1 调度，默认关闭） */
-export interface SummaryScheduleConfig {
-  session: string
-  display_name: string
-  enabled: boolean
-  /** HH:MM，默认 18:00 */
-  time: string
-}
-
-export interface SummarySchedulesOut {
-  enabled: boolean
-  configs: SummaryScheduleConfig[]
+  'summary.schedule_enabled': string
+  /** JSON 字符串：[{session, display_name, enabled, time}]，默认 '[]' */
+  'summary.schedule_configs': string
 }
 
 /** 六节总结正文（解析 content 后） */
