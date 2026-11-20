@@ -1,0 +1,66 @@
+# 群消息总结 · 类图（技术方案-群消息总结-2026-11-20.md 第 ④ 节源码）
+classDiagram
+    class Database {
+        +insert_group_summary(...) dict
+        +list_group_summaries(page, page_size, session, date) (int, list)
+        +get_group_summary(id) dict?
+        +delete_group_summary(id) int
+        +insert_ai_usage(...) int
+        +_PURGE_TABLES: tuple
+    }
+    note for Database "_PURGE_TABLES 含 group_summaries：手动 purge 白名单，非自动清理"
+    class WeChatService {
+        +get_messages_in_range(username, start_epoch, end_epoch, limit) (list, str)
+        -_resolve_row_sender(username, content, fallback_wxid, sender_id) (str, str)
+        +resolve_group_member_display(chatroom, member_id) str
+    }
+    class WeChatDB {
+        +get_messages_between(user, start_ts, end_ts, limit) List~dict~
+        +get_messages(user, limit, offset) List~dict~
+    }
+    class Billing {
+        +get_billing_settings(db) dict
+        +estimate_cost(pt, ct, billing) float
+    }
+    class SummaryService {
+        -db: Database
+        -wechat: WeChatService
+        -client_factory: Callable
+        +members(session, start, end, senders) dict
+        +generate(session, start, end, senders, style, custom_prompt) dict
+        -build_system_prompt(style, custom_prompt) str
+        -build_corpus(msgs, senders) (str, dict)
+        -check_budget(stats) dict
+        -parse_summary_json(text) dict
+        +render_txt(row) str
+        +render_html(row) str
+    }
+    class SummaryOverBudgetError
+    class SummaryScheduler {
+        +start() void
+        -tick() void
+    }
+    class AIClient {
+        +chat(system_prompt, user_message) str
+        +last_usage: dict?
+    }
+    class RouterSummary {
+        +GET /api/summary/members
+        +POST /api/summary/generate
+        +GET /api/summary/history
+        +GET /api/summary/history/{id}
+        +DELETE /api/summary/history/{id}
+        +GET /api/summary/history/{id}/export
+        +GET /api/summary/settings
+        +PUT /api/summary/settings
+    }
+    SummaryService --> Database : 落库/用量
+    SummaryService --> WeChatService : 取消息/取名链
+    SummaryService --> Billing : 预算换算(与账单同公式)
+    SummaryService --> AIClient : client_factory 构造并调用
+    WeChatService --> WeChatDB : get_messages_between
+    WeChatService ..> Database : group_cards/voice_texts 缓存
+    RouterSummary ..> SummaryService : deps.get_summary_service()
+    RouterSummary --> Database : get_db()
+    SummaryService ..> SummaryOverBudgetError : 超预算(block)抛出→413
+    SummaryScheduler ..> SummaryService : 定时 generate()

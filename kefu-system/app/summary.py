@@ -139,9 +139,13 @@ def build_user_message(session_name: str, start: str, end: str,
         f"时间范围：{start} ~ {end}",
         f"成员筛选：{member_text}",
     ]
-    if truncated:
-        parts.append(truncation_text(truncated, truncated_original))
     parts.append(f"消息（共 {msg_count} 条，按时间正序）：")
+    # 统一文案由 build_corpus 放在语料首行；仅当调用方传入的语料未带标注时
+    # 才在此补一行，避免同一份 User Message 里出现两次截断提示。
+    if truncated:
+        notice = truncation_text(truncated, truncated_original)
+        if not corpus.startswith(notice):
+            parts.append(notice)
     parts.append(corpus)
     return "\n".join(parts)
 
@@ -413,9 +417,13 @@ class SummaryService:
                     display = str(resolver(session, wxid) or "")
                 except Exception:
                     display = ""
+            # 取名链解析不出来（返回空或原 wxid）时回退消息行显示名，
+            # 成员下拉不该把内部 wxid 当成人名展示。
+            if not display or display == wxid:
+                display = row["display_name"] or wxid
             items.append({
                 "sender_wxid": wxid,
-                "display_name": display or row["display_name"] or wxid,
+                "display_name": display,
                 "count": row["count"],
                 "chars": row["chars"],
             })

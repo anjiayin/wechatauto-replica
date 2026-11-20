@@ -355,7 +355,8 @@ export default function GroupSummary() {
           <Alert severity={blocked ? 'warning' : 'info'}>
             {blockReason || (
               <>
-                {stats?.msg_count ?? 0} 条消息 / {new Set((stats?.items ?? []).map((i) => i.sender_wxid)).size} 位成员，
+                {stats?.msg_count ?? 0} 条消息 /
+                {selectedWxids.length ? selectedMembers.length : memberItems.length} 位成员，
                 预估 token ≈ {(stats?.est_tokens ?? 0).toLocaleString()}，
                 占预算 {((stats?.usage_ratio ?? 0) * 100).toFixed(1)}%
                 （{stats?.budget_text || '—'}；当前策略：

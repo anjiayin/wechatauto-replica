@@ -1,0 +1,48 @@
+# 群消息总结 · 预算预检→生成（含截断）→导出时序图（技术方案-群消息总结-2026-11-20.md 第 ④ 节源码）
+sequenceDiagram
+    participant FE as GroupSummary.tsx
+    participant R as router_summary.py
+    participant S as SummaryService (app/summary.py)
+    participant W as WeChatService
+    participant X as WeChatDB (wechatauto/db.py)
+    participant B as app/billing.py
+    participant A as AIClient (analyzer.py)
+    participant D as Database (app/db.py)
+
+    FE->>R: GET /members?session&start&end&senders
+    R->>S: members(...)
+    S->>W: get_messages_in_range(username, start_ts, end_ts)
+    W->>X: get_messages_between(user, start_ts, end_ts, limit)
+    X-->>W: 范围内消息行(epoch create_time)
+    W-->>S: 消息行(取名链 + 内容友好化 + 语音回填)
+    S->>B: estimate_cost(est_tokens, 单价)
+    B-->>S: 金额估算
+    S-->>R: SummaryMembersOut(成员/统计/预算占比/策略)
+    R-->>FE: 统计行(超预算+block → 禁用生成按钮)
+
+    FE->>R: POST /generate {session,start,end,senders,style,custom_prompt}
+    R->>S: generate(params)
+    S->>W: get_messages_in_range(...)
+    W-->>S: 消息行
+    S->>S: 成员筛选 → 语料组装 → 预算预检
+    alt 超预算 且 策略=block
+        S-->>R: SummaryOverBudgetError → 413 + 收窄建议
+    else 超预算 且 策略=truncate_recent
+        S->>S: 取最近 N 条(必要时递减) → truncated=1 + 标注
+    end
+    S->>A: chat(system_prompt, user_message)
+    Note over A: read_ai_settings + decrypt_api_key<br/>(同 pipeline, 关闭思考模式)
+    A-->>S: JSON 文本 + last_usage
+    S->>S: _parse_summary_json 规整
+    S->>D: insert_group_summary(参数快照+内容+截断标记+token+耗时)
+    S->>D: insert_ai_usage(账单对齐, session_username=群)
+    D-->>S: 完整行
+    S-->>R: SummaryOut
+    R-->>FE: 200(结果区标注截断/实际 token/耗时)
+
+    FE->>R: GET /history/{id}/export?format=txt|html
+    R->>D: get_group_summary(id)
+    D-->>R: 行(404 → 报错)
+    R->>S: render_txt / render_html(行)
+    S-->>R: 文本/HTML(含截断标注, 内联样式)
+    R-->>FE: attachment 下载(离线可开/可打印)
