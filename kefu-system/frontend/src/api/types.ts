@@ -559,6 +559,8 @@ export interface UpdateCheckOut {
   ignored?: boolean
   /** 未配置更新地址 / 验签失败等静默原因（不视为错误） */
   reason?: string
+  /** 上次全量安装只拉起安装器、新版本尚未确认生效：保留重试入口 */
+  retry?: boolean
 }
 
 /** GET /api/system/update/status：下载/安装进度 */
@@ -570,6 +572,8 @@ export interface UpdateStatusOut {
   message: string
   version: string
   action: string
+  /** app（增量 zip）/ full（Inno Setup exe）：安装器文案不同 */
+  package_type?: string
 }
 
 /** GET /api/license/machine-code 返回（deep=1 时带 WMI 明细） */

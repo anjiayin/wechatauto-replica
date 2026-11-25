@@ -35,9 +35,17 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 import zipfile
 from pathlib import Path
+
+# 测试用 importlib 从绝对路径加载本文件，脚本目录不在 sys.path；
+# 显式补一次，避免「命令行能跑、单测加载即 ModuleNotFoundError」。
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+from build_release import assert_frontend_version
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 KEFU = REPO_ROOT / "kefu-system"
@@ -174,6 +182,9 @@ def _make_junction(link: Path, target: Path) -> None:
 
 def build(args: argparse.Namespace) -> None:
     version = _read_version()
+    # 先在源树校验前端版本：bump 后漏跑 npm run build 是最难排查的事故，
+    # 必须在昂贵复制/编译之前直接失败（1.3.2 三版本号同屏的直接成因）。
+    assert_frontend_version(REPO_ROOT, version)
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     runtime = out / "runtime"

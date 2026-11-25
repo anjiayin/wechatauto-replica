@@ -35,6 +35,12 @@ KEY_LAST_SEQUENCE = "update.last_sequence"
 # 「忽略此版本」绑定忽略当时的 manifest sequence；老 DB 没有这个键，
 # 新逻辑把「只有版本号、没有 sequence」的记录视为过期（存量自愈）。
 KEY_IGNORED_SEQUENCE = "update.ignored_sequence"
+# 全量安装包（Inno Setup exe）拉起后、新版本启动自检确认前的「在途」记录。
+# 旧逻辑在 Popen 成功那一刻就推进 KEY_LAST_SEQUENCE，安装器被杀软拦停时
+# sequence 已被吃掉，客户端再也不会提示升级（现场 1.3.2 事故）。现在改为
+# 只记 pending，新版本启动后由 reconcile 确认再推进 last_sequence。
+KEY_PENDING_VERSION = "update.pending_version"
+KEY_PENDING_SEQUENCE = "update.pending_sequence"
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +205,86 @@ def pick_package(m: dict, current: str) -> dict | None:
         if p.get("type") == "full":
             return p
     return None
+
+
+# ---------------------------------------------------------------------------
+# 全量安装包（Inno Setup exe）静默重装
+# ---------------------------------------------------------------------------
+def is_full_package(pkg: dict | None) -> bool:
+    """包条目是否为 Inno Setup 全量安装包（type == 'full'，大小写不敏感）。"""
+    if not isinstance(pkg, dict):
+        return False
+    return str(pkg.get("type", "") or "").strip().lower() == "full"
+
+
+def full_install_confirmed(current: str, pending_version: str) -> bool:
+    """启动自检判定「上次全量安装是否真正落地」。
+
+    只有当前运行版本 >= pending 版本才算确认。版本号必须走数字比较，
+    禁止字符串比较（1.9 < 1.10）。pending 缺失/非法一律返回 False，
+    让客户端保留重试提示，绝不误判成功。
+    """
+    pending = str(pending_version or "").strip()
+    if not pending:
+        return False
+    try:
+        return compare_versions(current, pending) >= 0
+    except ValueError:
+        return False
+
+
+def full_install_args(exe: Path, *, close_apps: bool = True) -> list[str]:
+    """构造 Inno Setup 静默重装命令行参数列表（不含 exe 自身）。
+
+    返回形如：
+    ["/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES",
+     "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"]
+    close_apps=False 时去掉后两项（测试/特殊场景用）。
+    参数顺序固定，便于测试断言。
+
+    ``exe`` 保留在签名里供调用方表达意图并兼容未来按包定制参数；当前
+    Inno Setup 开关与具体文件路径无关，故函数体不使用它。
+    """
+    del exe  # 显式声明未使用，避免静态检查误报
+    args = ["/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES"]
+    if close_apps:
+        args.extend(["/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"])
+    return args
+
+
+def launch_full_installer(exe: Path, *, close_apps: bool = True) -> bool:
+    """以 detached 子进程启动全量安装包，返回是否成功拉起。
+
+    - exe 必须是已下载且已校验 sha256 的本地文件；不存在返回 False。
+    - 使用 subprocess.Popen([str(exe)] + full_install_args(...),
+      close_fds=True, stdin/stdout/stderr=DEVNULL,
+      creationflags=CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)。
+    - 绝不调用 wait()/communicate()：安装器会通过 RestartManager 重启本进程，
+      等待必然失败（子进程等父进程退出，父进程又在等子进程）。
+    - 捕获 OSError 等异常返回 False，不抛出。
+    - 返回 True 仅表示进程已拉起，不代表安装成功。
+
+    Windows 上 ``CREATE_NEW_PROCESS_GROUP`` 与 ``DETACHED_PROCESS`` 均存在；
+    非 Windows 测试环境用其真实的 Windows 数值兜底，保证 flags 恒非 0，
+    便于 monkeypatch 的假 Popen 断言 detached 语义。
+    """
+    try:
+        exe = Path(exe)
+        if not exe.is_file():
+            return False
+        cmd = [str(exe)] + full_install_args(exe, close_apps=close_apps)
+        flags = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                 | getattr(subprocess, "DETACHED_PROCESS", 0x00000008))
+        subprocess.Popen(
+            cmd, close_fds=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+        )
+    except Exception:                            # noqa: BLE001 - fail-closed
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------

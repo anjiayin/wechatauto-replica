@@ -1,0 +1,2 @@
+cd /d D:\Git\wechatauto-replica
+D:\my_conda_envs\wechatauto\python.exe kefu-system\tools\import_wechat_keys.py --probe "把wx_key给的密钥贴这里" --dbstorage "E:\xwechat_files\wxid_XXXXXX\db_storage" --out "kefu-system\data\wechat_cache\keys.json" --verify

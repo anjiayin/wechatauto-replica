@@ -115,6 +115,50 @@ def install_bundle_root_files(target: Path, bundle: Path) -> None:
                     time.sleep(_ROOT_COPY_RETRY_WAIT)
 
 
+# 启动自检的并发保护（Database 自身不是线程安全的；主流程用 self._lock，
+# 这里没有实例，单独用一把模块锁）。
+_RECONCILE_LOCK = threading.Lock()
+
+
+def reconcile_full_install(db: Database, current_version: str = APP_VERSION) -> str:
+    """启动自检：把「已确认落地」的全量安装从 pending 推进为 last_sequence。
+
+    full 包由 Inno Setup 自己覆盖版本层并重启进程，客户端拉起安装器后不能
+    wait()，也无法当场知道安装是否成功。旧逻辑把「Popen 成功」当成安装成功
+    并推进 sequence，杀软一拦就永久吞掉这次更新（现场 1.3.2 事故）。
+
+    现在 full 分支只写 ``update.pending_version/sequence``；新版本启动后调用
+    本函数：运行版本 >= pending 版本才算成功，写入 last_sequence 并清 pending；
+    版本没变则保留 pending 与原有 last_sequence，下一次 check() 会继续提示，
+    用户可以重试安装（fail-closed，绝不吞提示）。
+
+    返回 ``none``（没有在途安装）/ ``confirmed``（已确认）/ ``pending``
+    （尚未落地，保留重试）。任何异常只记 WARN，绝不阻断后端启动。
+    """
+    try:
+        pending = str(db.get_setting(core.KEY_PENDING_VERSION, "") or "").strip()
+        if not pending:
+            return "none"
+        seq = int(db.get_int(core.KEY_PENDING_SEQUENCE, 0) or 0)
+        if not core.full_install_confirmed(current_version, pending):
+            logger.warning(
+                "启动自检：上次全量安装 %s 尚未生效（当前版本 %s），"
+                "保留更新提示以便重试", pending, current_version)
+            return "pending"
+        with _RECONCILE_LOCK:
+            old_seq = int(db.get_int(core.KEY_LAST_SEQUENCE, 0) or 0)
+            if seq > old_seq:
+                db.set_setting(core.KEY_LAST_SEQUENCE, str(seq))
+            db.set_setting(core.KEY_PENDING_VERSION, "")
+            db.set_setting(core.KEY_PENDING_SEQUENCE, "")
+        logger.info("启动自检：全量安装 %s 已确认生效，更新序号推进到 %d",
+                    current_version, max(old_seq, seq))
+        return "confirmed"
+    except Exception as exc:                      # noqa: BLE001 - fail-open
+        logger.warning("启动自检确认全量安装失败（不阻断启动，下次继续）：%s", exc)
+        return "pending"
+
+
 def _sha256_file(path: Path) -> str | None:
     """计算文件 sha256；文件不存在 / 不可读返回 None（用于前后对比）。"""
     try:
@@ -229,8 +273,27 @@ class UpdateService:
             ignored_seq = core.parse_ignored_sequence(
                 self.db.get_setting(core.KEY_IGNORED_SEQUENCE, ""))
             last_seen = self.db.get_int(core.KEY_LAST_SEQUENCE, 0)
+            pending = str(self.db.get_setting(core.KEY_PENDING_VERSION, "")
+                          or "").strip()
         action = core.decide(APP_VERSION, m, ignored, last_seen,
                              _channel, ignored_seq)
+        # 上次 full 安装只拉起了安装器、新版本还没生效：即使 sequence 被旧版
+        # 客户端提前推进过，也必须继续提示，否则用户再也不会收到重试入口。
+        pending_unconfirmed = bool(
+            pending and not core.full_install_confirmed(APP_VERSION, pending))
+        latest = str(m.get("latest", ""))
+        if (pending_unconfirmed and action == "none" and latest
+                and core.VERSION_RE.match(latest)
+                and core.compare_versions(APP_VERSION, latest) < 0):
+            try:
+                min_sup = str(m.get("min_supported", "0.0.0"))
+                action = ("forced" if core.compare_versions(APP_VERSION, min_sup) < 0
+                          else "optional")
+            except ValueError:
+                action = "optional"
+            logger.warning(
+                "检查更新：全量安装 %s 尚未生效（当前 %s），保留重试提示",
+                pending, APP_VERSION)
         # 仅当「确实有新版本、且是被用户的忽略决定挡住」时标 ignored，
         # 避免 sequence 防重放/已是最新/强制更新等场景误报「已忽略」。
         ignored_flag = bool(
@@ -243,6 +306,8 @@ class UpdateService:
         if pkg and action != "none":
             summary["package_size"] = int(pkg.get("size", 0) or 0)
             summary["package_type"] = str(pkg.get("type", ""))
+        # 前端据此显示「上次安装未完成，可重试」；正常升级路径恒为 False。
+        summary["retry"] = pending_unconfirmed
         summary["ok"] = True
         with self._lock:
             self._last_manifest = m if action != "none" else None
@@ -276,10 +341,16 @@ class UpdateService:
             if bundle is None:
                 return 409, {"ok": False, "detail": "当前不是客户端安装版，无法执行更新"}
             version = str(m.get("latest", ""))
+            # full 包是 Inno Setup exe，不是 zip：必须以 .exe 落盘供安装器
+            # 直接执行。app 增量包文件名与后续解压/切 junction 链路保持不变。
+            is_full = core.is_full_package(pkg)
+            package_type = "full" if is_full else "app"
             self._job = {"state": "downloading", "done": 0,
                          "total": int(pkg.get("size", 0) or 0), "message": "",
-                         "version": version, "action": "optional"}
-            dst = bundle / "data" / "update" / f"app-{version}.zip"
+                         "version": version, "action": "optional",
+                         "package_type": package_type}
+            dst = bundle / "data" / "update" / (
+                f"full-{version}.exe" if is_full else f"app-{version}.zip")
             url, sha, size = str(pkg.get("url", "")), str(pkg.get("sha256", "")), int(pkg.get("size", 0) or 0)
 
         def _work() -> None:
@@ -320,47 +391,106 @@ class UpdateService:
             self._job["state"] = "applying"
             dst = bundle / "data" / "update" / f"app-{version}.zip"
 
+        full_install = False
+        can_retry_install = False       # 仅「安装器启动失败」时保留已校验的包
         try:
             # 落地前再验一次 manifest，防止检查后被替换（OSS 公共读也要防投毒）。
             fresh, err = self._manifest()
             if err or fresh is None or str(fresh.get("latest", "")) != version:
                 raise RuntimeError(f"更新信息已变化，已中止：{err or '版本不一致'}")
-            target = bundle / "app" / version
-            if target.exists():
-                shutil.rmtree(target)
-            ok, err = core.safe_extract(dst, target)
-            if not ok:
-                raise RuntimeError(err)
-            if not (target / "kefu-system" / "app").is_dir():
-                shutil.rmtree(target, ignore_errors=True)
-                raise RuntimeError("解压内容不完整（缺少后端代码）")
-            # 安装根更新：在切 junction 之前把 bundle_root/ 白名单文件写入
-            # bundle 根。本阶段任何异常 → 清理 target、不切 junction、
-            # 不写 current.json，旧版继续可跑（fail-closed）。
-            try:
-                install_bundle_root_files(target, bundle)
-            except Exception:
-                shutil.rmtree(target, ignore_errors=True)
-                raise
-            ok, err = core.rebuild_junction(bundle / "app" / "current", target)
-            if not ok:
-                raise RuntimeError(err)
-            prev = core.read_current_version(bundle)
-            (bundle / "current.json").write_text(json.dumps(
-                {"version": version, "active": version, "previous": prev},
-                ensure_ascii=False, indent=2), encoding="utf-8")
+            fresh_pkg = core.pick_package(fresh, APP_VERSION)
+            if fresh_pkg is None:
+                raise RuntimeError("更新信息中无可用安装包，已中止")
+            full_install = core.is_full_package(fresh_pkg)
+            # 下载阶段判定为 full、二次验签却变成 app（或反之）：类型漂移一律停手，
+            # 避免拿错文件去做解压/执行，fail-closed 停在原版本。
+            if self._job.get("package_type") == "full" and not full_install:
+                raise RuntimeError("更新包类型已变化，已中止")
+
+            if full_install:
+                # full 包由 Inno Setup 自己覆盖 bundle 根 + 全部版本层 + runtime，
+                # 并保留 data 目录。客户端只负责「复核已下载 exe + detached 拉起」，
+                # 绝不切 junction、绝不写 current.json、绝不覆盖 bundle 根文件。
+                exe = bundle / "data" / "update" / f"full-{version}.exe"
+                if not exe.is_file():
+                    raise RuntimeError("全量安装包缺失，已中止")
+                size = int(fresh_pkg.get("size", 0) or 0)
+                if size > 0 and exe.stat().st_size != size:
+                    raise RuntimeError("全量安装包大小不符，已中止")
+                sha = str(fresh_pkg.get("sha256", "") or "")
+                actual_sha = _sha256_file(exe) or ""
+                if sha and actual_sha.lower() != sha.lower():
+                    raise RuntimeError("全量安装包 SHA256 校验失败，已中止")
+                if not core.launch_full_installer(exe):
+                    # 包已校验、只是进程没拉起来：保留 done 状态供直接重试安装，
+                    # 绝不推进 sequence，也不写 pending（本次根本没有安装）。
+                    can_retry_install = True
+                    raise RuntimeError("全量安装启动失败，已停在原版本（可重试安装）")
+            else:
+                target = bundle / "app" / version
+                if target.exists():
+                    shutil.rmtree(target)
+                ok, err = core.safe_extract(dst, target)
+                if not ok:
+                    raise RuntimeError(err)
+                if not (target / "kefu-system" / "app").is_dir():
+                    shutil.rmtree(target, ignore_errors=True)
+                    raise RuntimeError("解压内容不完整（缺少后端代码）")
+                # 安装根更新：在切 junction 之前把 bundle_root/ 白名单文件写入
+                # bundle 根。本阶段任何异常 → 清理 target、不切 junction、
+                # 不写 current.json，旧版继续可跑（fail-closed）。
+                try:
+                    install_bundle_root_files(target, bundle)
+                except Exception:
+                    shutil.rmtree(target, ignore_errors=True)
+                    raise
+                ok, err = core.rebuild_junction(bundle / "app" / "current", target)
+                if not ok:
+                    raise RuntimeError(err)
+                prev = core.read_current_version(bundle)
+                (bundle / "current.json").write_text(json.dumps(
+                    {"version": version, "active": version, "previous": prev},
+                    ensure_ascii=False, indent=2), encoding="utf-8")
+
+            # 两条分支的确认口径不同：
+            # - app 增量包：junction 已切、current.json 已写，本机当场确认成功，
+            #   可以推进 sequence；
+            # - full 包：只拉起了安装器，装没装上要等新版本启动自检确认。
+            #   这里只写 pending，绝不推进 sequence（现场 1.3.2 事故的根因）。
             with self._lock:
-                self.db.set_setting(core.KEY_LAST_SEQUENCE,
-                                    str(int(fresh.get("sequence", 0) or 0)))
                 self.db.set_setting(core.KEY_IGNORED_VERSION, "")
                 self.db.set_setting(core.KEY_IGNORED_SEQUENCE, "")
-                self._job.update({"state": "applied", "message": "安装完成，请重启"})
+                if full_install:
+                    self.db.set_setting(core.KEY_PENDING_VERSION, version)
+                    self.db.set_setting(core.KEY_PENDING_SEQUENCE,
+                                        str(int(fresh.get("sequence", 0) or 0)))
+                    self._job.update({
+                        "state": "installing",
+                        "message": "全量安装已启动，等待新版本启动确认",
+                    })
+                else:
+                    self.db.set_setting(core.KEY_LAST_SEQUENCE,
+                                        str(int(fresh.get("sequence", 0) or 0)))
+                    self._job.update({
+                        "state": "applied",
+                        "message": "安装完成，请重启",
+                    })
         except Exception as exc:                  # noqa: BLE001
             logger.warning("更新应用失败：%s", exc)
             with self._lock:
-                self._job.update({"state": "error", "message": str(exc)})
+                if can_retry_install:
+                    self._job.update({
+                        "state": "done",
+                        "message": "全量安装启动失败；已保留安装包，可直接重试安装",
+                    })
+                else:
+                    self._job.update({"state": "error", "message": str(exc)})
             return 500, {"ok": False, "detail": f"安装失败：{exc}（已停在原版本）"}
-        return 200, {"ok": True, "need_restart": True, "version": version}
+        result = {"ok": True, "need_restart": True, "version": version}
+        if full_install:
+            result["full_install"] = True
+            result["install_pending"] = True
+        return 200, result
 
     def ignore(self, version: str) -> dict[str, Any]:
         """忽略当前检查到的版本，并记录其 manifest sequence。

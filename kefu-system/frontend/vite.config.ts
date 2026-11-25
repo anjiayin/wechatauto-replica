@@ -35,9 +35,23 @@ const backendHost = process.env.KEFU_HOST || '127.0.0.1'
 const httpTarget = `http://${backendHost}:${backendPort}`
 const wsTarget = `ws://${backendHost}:${backendPort}`
 
+// dist/version.json：给打包器（build_p1 / build_release）做机器可读的硬校验。
+// 只有注入进 JS 的版本号不够——那需要解析压缩后的 bundle；有了这个文件，
+// 「编了前端但没进包 / 改了 version.txt 忘了重新 build」会在打包时直接失败。
+const emitVersionFile = {
+  name: 'emit-version-file',
+  generateBundle() {
+    this.emitFile({
+      type: 'asset',
+      fileName: 'version.json',
+      source: JSON.stringify({ version: appVersion }) + '\n',
+    })
+  },
+}
+
 // 开发代理 /api、/ws → 本机后端（默认 8765）；构建产物输出 dist（由 FastAPI 托管）
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), emitVersionFile],
   define: {
     __APP_VERSION__: JSON.stringify(appVersion),
   },

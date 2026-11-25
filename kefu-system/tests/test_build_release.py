@@ -48,7 +48,9 @@ def _version_bundle(tmp_path: Path, version: str = "1.2.2") -> Path:
     (vd / "kefu-system" / "app").mkdir(parents=True)
     (vd / "kefu-system" / "app" / "run.pyc").write_bytes(b"PYC")
     (vd / "kefu-system" / "frontend" / "dist").mkdir(parents=True)
-    (vd / "kefu-system" / "frontend" / "dist" / "index.html").write_text("ok")
+    dist = vd / "kefu-system" / "frontend" / "dist"
+    (dist / "index.html").write_text("ok")
+    (dist / "version.json").write_text(json.dumps({"version": version}))
     (vd / "wechatauto" / "uia").mkdir(parents=True)
     (vd / "wechatauto" / "uia" / "driver.pyc").write_bytes(b"PYC")
     (tmp_path / "runtime" / "asr_models").mkdir(parents=True)
@@ -471,3 +473,35 @@ def test_release_end_to_end_carries_bundle_root(br, keypair, tmp_path):
     assert "bundle_root/launcher.pyc" in names
     assert "bundle_root/updater.pyc" in names
     assert "bundle_root/start_kefu.bat" in names
+
+
+# ---------------------------------------------------------------------------
+# 前端版本硬校验：杜绝「编了前端但没进包 / 漏编前端」导致多版本同屏
+# ---------------------------------------------------------------------------
+def test_assert_frontend_version_ok(br, tmp_path):
+    bundle = _version_bundle(tmp_path)
+    br.assert_frontend_version(bundle / "app" / "1.2.2", "1.2.2")  # 不抛异常
+
+
+def test_assert_frontend_version_rejects_stale_build(br, tmp_path):
+    bundle = _version_bundle(tmp_path)
+    with pytest.raises(SystemExit, match="前端版本不一致"):
+        br.assert_frontend_version(bundle / "app" / "1.2.2", "1.3.3")
+
+
+def test_assert_frontend_version_rejects_missing_file(br, tmp_path):
+    bundle = _version_bundle(tmp_path)
+    (bundle / "app" / "1.2.2" / "kefu-system" / "frontend" / "dist"
+     / "version.json").unlink()
+    with pytest.raises(SystemExit, match="npm run build"):
+        br.assert_frontend_version(bundle / "app" / "1.2.2", "1.2.2")
+
+
+def test_release_aborts_on_stale_frontend(br, keypair, tmp_path):
+    bundle = _version_bundle(tmp_path)
+    (bundle / "app" / "1.2.2" / "kefu-system" / "frontend" / "dist"
+     / "version.json").write_text(json.dumps({"version": "1.2.1"}))
+    args = _args(tmp_path, keypair)
+    with pytest.raises(SystemExit, match="前端版本不一致"):
+        br.release(args)
+    assert not (args.out / "manifest.json").exists()

@@ -46,6 +46,33 @@ except ModuleNotFoundError:                      # pragma: no cover - 开发态
         read_current_version, rebuild_junction, safe_extract, verify_manifest,
     )
 
+# 兼容「新 updater.pyc + 旧版本层 update_core」：bundle 根文件会先于 junction
+# 切换被替换，老版本层里没有这些符号。顶层 from-import 一旦炸掉，托盘更新
+# 直接不可用；这里逐个降级：full 能力缺失时 fail-closed（返回 False/提示），
+# app 增量包链路照常工作。
+try:
+    from app.update_core import (KEY_PENDING_VERSION, KEY_PENDING_SEQUENCE,
+                                 full_install_confirmed)
+except ImportError:                              # pragma: no cover - 老版本层
+    KEY_PENDING_VERSION = "update.pending_version"
+    KEY_PENDING_SEQUENCE = "update.pending_sequence"
+
+    def full_install_confirmed(current: str, pending: str) -> bool:
+        try:
+            return bool(pending) and compare_versions(current, pending) >= 0
+        except ValueError:
+            return False
+
+try:
+    from app.update_core import is_full_package, launch_full_installer
+except ImportError:                              # pragma: no cover - 老版本层
+    def is_full_package(pkg: dict | None) -> bool:
+        return bool(pkg) and str(pkg.get("type", "")).strip().lower() == "full"
+
+    def launch_full_installer(exe: Path) -> bool:
+        print("[update] 当前版本层不支持全量安装，已停在原版本")
+        return False
+
 BUNDLE_FILE = Path(__file__).resolve()
 
 
@@ -312,6 +339,48 @@ def _save_state(ignored: str, last_seen: int,
         pass
 
 
+def _pending() -> str:
+    """读「上次全量安装在途」记录（新版本启动自检确认前有效）。"""
+    db = DATA / "kefu.sqlite3"
+    if not db.is_file():
+        return ""
+    try:
+        import sqlite3
+        con = sqlite3.connect(db)
+        try:
+            row = con.execute(
+                "select value from settings where key=?",
+                (KEY_PENDING_VERSION,)).fetchone()
+        finally:
+            con.close()
+        return str(row[0] or "").strip() if row else ""
+    except Exception:                            # noqa: BLE001
+        return ""
+
+
+def _save_pending(version: str, sequence: int) -> None:
+    """full 安装器拉起后只记 pending，绝不推进 last_sequence。
+
+    推进由新版本启动自检完成（app.update_service.reconcile_full_install）。
+    这样杀软拦停安装器时，下一次检查仍会提示升级，用户可重试。
+    """
+    db = DATA / "kefu.sqlite3"
+    if not db.is_file():
+        return
+    try:
+        import sqlite3
+        con = sqlite3.connect(db)
+        con.executemany(
+            "insert into settings(key,value) values(?,?) "
+            "on conflict(key) do update set value=excluded.value",
+            [(KEY_PENDING_VERSION, str(version)),
+             (KEY_PENDING_SEQUENCE, str(int(sequence)))])
+        con.commit()
+        con.close()
+    except Exception:                            # noqa: BLE001
+        pass
+
+
 def _fetch_manifest() -> tuple[dict | None, dict | None, str]:
     m, err = fetch_manifest(MANIFEST_URL, _public_keys())
     return m, None, err
@@ -328,8 +397,17 @@ def run() -> int:
     current = _current_version()
     ignored, last_seen = _state()
     ignored_sequence = _ignored_sequence()
+    pending = _pending()
     action = decide(current, m, ignored, last_seen,
                     ignored_sequence=ignored_sequence)
+    # 上次全量安装尚未生效：即使 sequence 被旧版客户端提前推进，也要继续
+    # 提示，给用户重试入口（与后端 check() 同一语义）。
+    if (pending and not full_install_confirmed(current, pending)
+            and action == "none" and VERSION_RE.match(str(m.get("latest", "")))
+            and compare_versions(current, str(m["latest"])) < 0):
+        action = "forced" if compare_versions(
+            current, str(m.get("min_supported", "0.0.0"))) < 0 else "optional"
+        print(f"[update] 上次全量安装 {pending} 尚未生效，保留重试提示")
     print(f"[update] current={current} latest={m.get('latest')} action={action}")
     if action == "none":
         return 0
@@ -347,14 +425,30 @@ def run() -> int:
             print("[update] 用户取消")
         return 0
 
-    dst = DATA / "update" / f"app-{m['latest']}.zip"
+    ver = str(m["latest"])
+    is_full = is_full_package(pkg)
+    # full 是 Inno Setup exe（非 zip）：必须以 .exe 落盘供安装器直接执行。
+    dst = DATA / "update" / (
+        f"full-{ver}.exe" if is_full else f"app-{ver}.zip")
     ok, err = download(str(pkg["url"]), dst, str(pkg.get("sha256", "")),
                        int(pkg.get("size", 0)))
     if not ok:
         print(f"[update] {err}；停在原版本")
         return 3
 
-    ver = str(m["latest"])
+    if is_full:
+        # Inno Setup 自行覆盖 bundle 根/版本层/runtime（data 保留），并通过
+        # RestartManager 关闭旧进程、装完拉起新版。客户端绝不能 wait()——
+        # 安装器会杀掉本进程，等待必然失败；跳过解压/junction/current.json。
+        if not launch_full_installer(dst):
+            print("[update] 全量安装启动失败；停在原版本")
+            return 8
+        # 只记在途：装没装上由新版本启动自检确认，不能在这里推进 sequence，
+        # 否则安装器被杀软拦停后客户端再也不会提示升级（1.3.2 事故）。
+        _save_pending(ver, int(m.get("sequence", 0)))
+        print("[update] 全量安装已启动，程序将自动重启。")
+        return 0
+
     target = APP_DIR / ver
     if target.exists():
         shutil.rmtree(target)

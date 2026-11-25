@@ -38,6 +38,16 @@ function isIgnored(c?: UpdateCheckOut): boolean {
   return c?.action === 'none' && c.ignored === true
 }
 
+/**
+ * 版本号只认后端 current_version（运行时读 version.txt）。
+ * __APP_VERSION__ 是前端编译期常量，用户漏跑 npm build 时它会落后于实际
+ * 安装版本——现场曾同屏出现 v1.3.0 / v1.3.1 / v1.3.2 三个版本号。
+ * 这里只在 check 尚未返回时用它兜底，绝不参与「已是最新版本」的展示。
+ */
+function currentVersion(c?: UpdateCheckOut): string {
+  return c?.current_version || __APP_VERSION__
+}
+
 function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
@@ -77,7 +87,7 @@ export function UpdateChip({ check, onClick }: {
   const ignored = isIgnored(check)
   const label = update
     ? `有新版本 ${check!.latest}`
-    : ignored ? `已忽略 ${check!.latest}` : `v${__APP_VERSION__}`
+    : ignored ? `已忽略 ${check!.latest}` : `v${currentVersion(check)}`
   return (
     <Chip
       size="small"
@@ -139,7 +149,7 @@ export function UpdateDialog({ open, onClose, check }: {
         .then((s) => {
           if (!alive) return
           setStatus(s)
-          if (s.state === 'done' || s.state === 'error' || s.state === 'applied') {
+          if (['done', 'error', 'applied', 'installing'].includes(s.state)) {
             setPolling(false)
           }
         })
@@ -231,7 +241,12 @@ export function UpdateDialog({ open, onClose, check }: {
       <DialogContent dividers>
         {!update && !ignored && !applied && (
           <Alert severity="info" sx={{ mb: 2 }}>
-            当前已经是最新版本（v{__APP_VERSION__}）
+            当前已经是最新版本（v{currentVersion(c)}）
+          </Alert>
+        )}
+        {c?.retry && !applied && (
+          <Alert severity="warning" sx={{ mb: 2 }}>
+            上次全量安装尚未生效，已保留更新入口，可重新下载安装。
           </Alert>
         )}
         {ignored && !applied && (
@@ -298,9 +313,16 @@ export function UpdateDialog({ open, onClose, check }: {
             更新失败：{status?.message || error}（已停在原版本，可关闭杀软后重试）
           </Alert>
         )}
+        {state === 'installing' && (
+          <Alert severity="info" sx={{ mt: 2 }}>
+            全量安装已启动，正在等待新版本启动确认…
+          </Alert>
+        )}
         {applied && (
           <Alert severity="success" sx={{ mt: 2 }}>
-            新版本已安装。请退出托盘程序后重新启动，即可使用新版本。
+            {status?.package_type === 'full'
+              ? '全量安装已启动，程序将自动重启；若长时间没有重启，请重新打开本窗口检查更新并重试。'
+              : '新版本已安装。请退出托盘程序后重新启动，即可使用新版本。'}
           </Alert>
         )}
         {error && !state.startsWith('error') && (
@@ -322,6 +344,11 @@ export function UpdateDialog({ open, onClose, check }: {
         {update && c?.action !== 'forced' && !applied && !downloading && state !== 'done' && (
           <Button onClick={() => void ignoreVersion()} color="inherit">
             忽略此版本
+          </Button>
+        )}
+        {state === 'installing' && (
+          <Button onClick={() => void qc.refetchQueries({ queryKey: QUERY_KEY })}>
+            重新检查
           </Button>
         )}
         {update && !downloading && !applied && state !== 'done' && (
@@ -353,7 +380,7 @@ export function UpdateSettingsTab() {
     <Box>
       <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 2 }}>
         <Typography variant="subtitle1" fontWeight={600}>系统更新</Typography>
-        <Chip size="small" label={`当前版本 v${__APP_VERSION__}`} />
+        <Chip size="small" label={`当前版本 v${currentVersion(c)}`} />
         <Box sx={{ flexGrow: 1 }} />
         <Button
           size="small"
@@ -386,7 +413,7 @@ export function UpdateSettingsTab() {
                 ? c.action === 'forced' ? '需要强制更新后才能继续使用' : '发现新版本，可点击「查看更新」安装'
                 : ignored
                   ? `已忽略此版本更新（v${c.latest}），可在「更新详情」中取消忽略`
-                  : `当前已经是最新版本（v${__APP_VERSION__}）`}
+                  : `当前已经是最新版本（v${currentVersion(c)}）`}
             </Typography>
             {c.notes && (
               <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>

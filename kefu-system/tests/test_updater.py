@@ -6,15 +6,19 @@ updater.py 作为独立脚本用 importlib 加载（它位于 packaging/，不�
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib.util
 import io
 import json
+import subprocess
 import zipfile
 from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from app import update_core
 
 UPDATER = Path(__file__).resolve().parents[2] / "packaging" / "updater.py"
 
@@ -134,6 +138,327 @@ def test_pick_package(updater):
     ]}
     assert updater.pick_package(m, "1.2.1")["type"] == "app"
     assert updater.pick_package(m, "1.0.0")["type"] == "full"
+
+
+# ---------------------------------------------------------------------------
+# full 全量安装包（Inno Setup exe）静默重装
+# ---------------------------------------------------------------------------
+def test_is_full_package():
+    assert update_core.is_full_package(None) is False
+    assert update_core.is_full_package({}) is False
+    assert update_core.is_full_package({"type": "app"}) is False
+    assert update_core.is_full_package({"type": "full"}) is True
+    assert update_core.is_full_package({"type": "FULL"}) is True
+    assert update_core.is_full_package({"type": " Full "}) is True
+
+
+def test_full_install_args():
+    assert update_core.full_install_args(Path("full-1.2.2.exe")) == [
+        "/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES",
+        "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS",
+    ]
+    short = update_core.full_install_args(Path("full-1.2.2.exe"),
+                                          close_apps=False)
+    assert short == ["/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES"]
+    assert "/CLOSEAPPLICATIONS" not in short
+    assert "/RESTARTAPPLICATIONS" not in short
+
+
+def test_launch_full_installer_rejects_missing_exe(monkeypatch, tmp_path):
+    calls = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            calls.append((cmd, kwargs))
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    assert update_core.launch_full_installer(tmp_path / "missing.exe") is False
+    assert calls == []
+
+
+def test_launch_full_installer_is_detached_and_never_waits(monkeypatch, tmp_path):
+    exe = tmp_path / "full-1.2.2.exe"
+    exe.write_bytes(b"MZ fake installer")
+    calls = []
+
+    class FakePopen:
+        """记录调用；故意不提供可正常返回的 wait/communicate。"""
+
+        def __init__(self, cmd, **kwargs):
+            calls.append({"cmd": list(cmd), "kwargs": dict(kwargs)})
+
+        def wait(self, *a, **k):
+            raise AssertionError("full 安装器绝不能 wait()")
+
+        def communicate(self, *a, **k):
+            raise AssertionError("full 安装器绝不能 communicate()")
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    assert update_core.launch_full_installer(exe) is True
+    assert len(calls) == 1
+
+    cmd = calls[0]["cmd"]
+    assert cmd == [
+        str(exe), "/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES",
+        "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS",
+    ]
+    kwargs = calls[0]["kwargs"]
+    assert kwargs["close_fds"] is True
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["stdout"] is subprocess.DEVNULL
+    assert kwargs["stderr"] is subprocess.DEVNULL
+    assert kwargs["creationflags"] != 0
+    assert "cwd" not in kwargs                      # 沿用安装包默认目录，不传 /DIR
+
+
+def test_launch_full_installer_swallows_popen_error(monkeypatch, tmp_path):
+    exe = tmp_path / "boom.exe"
+    exe.write_bytes(b"MZ")
+
+    def boom(*args, **kwargs):
+        raise OSError("CreateProcess failed")
+
+    monkeypatch.setattr(subprocess, "Popen", boom)
+    assert update_core.launch_full_installer(exe) is False
+
+
+def _full_manifest(version: str = "1.2.2", seq: int = 17,
+                   blob: bytes = b"MZ fake") -> dict:
+    return {
+        "channel": "stable", "sequence": seq, "latest": version,
+        "min_supported": "0.0.0", "notes": "full 安装测试",
+        "packages": [{"type": "full", "version": version, "url": "u",
+                      "sha256": hashlib.sha256(blob).hexdigest(),
+                      "size": len(blob)}],
+    }
+
+
+def _seed_bundle_for_full(tmp_path, version: str = "1.2.2") -> Path:
+    bundle = tmp_path / "bundle"
+    (bundle / "app" / "1.2.1" / "kefu-system" / "app").mkdir(parents=True)
+    (bundle / "current.json").write_text(
+        json.dumps({"version": "1.2.1", "active": "1.2.1"}), encoding="utf-8")
+    return bundle
+
+
+def test_updater_run_full_package_launches_installer(
+        updater, monkeypatch, tmp_path):
+    """托盘链路：full 包落盘 .exe、detached 拉起，不解压/不切 junction。
+
+    关键回归：拉起安装器后只记 pending，**绝不**写 last_sequence——否则
+    安装被杀软拦停时客户端再也不会提示升级（1.3.2 事故）。
+    """
+    bundle = _seed_bundle_for_full(tmp_path)
+    exe = bundle / "data" / "update" / "full-1.2.2.exe"
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    exe.write_bytes(b"MZ fake")
+
+    junction_calls = _run_env(updater, monkeypatch, bundle)
+    monkeypatch.setattr(updater, "_fetch_manifest",
+                        lambda: (_full_manifest(), None, ""))
+    saved, pending_saved = [], []
+    monkeypatch.setattr(updater, "_save_state",
+                        lambda *a, **k: saved.append((a, k)))
+    monkeypatch.setattr(updater, "_save_pending",
+                        lambda *a, **k: pending_saved.append((a, k)))
+    launched = []
+    monkeypatch.setattr(updater, "launch_full_installer",
+                        lambda p: launched.append(Path(p)) or True)
+
+    assert updater.run() == 0
+    assert launched == [exe]
+    assert saved == []
+    assert pending_saved == [(("1.2.2", 17), {})]
+    assert junction_calls == []
+    assert json.loads((bundle / "current.json").read_text(
+        encoding="utf-8"))["version"] == "1.2.1"
+    assert not (bundle / "app" / "1.2.2").exists()
+
+
+def test_updater_run_full_package_launch_failure_returns_8(
+        updater, monkeypatch, tmp_path, capsys):
+    """拉起失败返回新增码 8，且绝不推进状态/切 junction。"""
+    bundle = _seed_bundle_for_full(tmp_path)
+    exe = bundle / "data" / "update" / "full-1.2.2.exe"
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    exe.write_bytes(b"MZ fake")
+
+    junction_calls = _run_env(updater, monkeypatch, bundle)
+    monkeypatch.setattr(updater, "_fetch_manifest",
+                        lambda: (_full_manifest(), None, ""))
+    saved, pending_saved = [], []
+    monkeypatch.setattr(updater, "_save_state",
+                        lambda *a, **k: saved.append((a, k)))
+    monkeypatch.setattr(updater, "_save_pending",
+                        lambda *a, **k: pending_saved.append((a, k)))
+    monkeypatch.setattr(updater, "launch_full_installer", lambda p: False)
+
+    assert updater.run() == 8
+    assert "全量安装启动失败" in capsys.readouterr().out
+    assert saved == []
+    assert pending_saved == []
+    assert junction_calls == []
+    assert json.loads((bundle / "current.json").read_text(
+        encoding="utf-8"))["version"] == "1.2.1"
+
+
+class _FakeUpdateDB:
+    """UpdateService 所需的最小 settings DAO 替身。"""
+
+    def __init__(self) -> None:
+        self.data: dict[str, str] = {}
+
+    def get_setting(self, key: str, default: str = "") -> str:
+        return self.data.get(key, default)
+
+    def get_int(self, key: str, default: int = 0) -> int:
+        try:
+            return int(self.data.get(key, str(default)))
+        except ValueError:
+            return default
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.data[key] = str(value)
+
+
+def _svc_ready_for_full(tmp_path, *, blob: bytes = b"MZ fake",
+                        sha: str | None = None):
+    """构造「full 包已下载完成、等待 apply」的后端服务现场。"""
+    from app import update_service as us
+
+    bundle = _seed_bundle_for_full(tmp_path)
+    exe = bundle / "data" / "update" / "full-1.2.2.exe"
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    exe.write_bytes(blob)
+    manifest = _full_manifest(blob=blob)
+    if sha is not None:
+        manifest["packages"][0]["sha256"] = sha
+
+    svc = us.UpdateService(_FakeUpdateDB())
+    svc._manifest = lambda: (manifest, "")            # type: ignore[method-assign]
+    svc._last_manifest = manifest
+    svc._last_check_sequence = 17
+    with svc._lock:
+        svc._job = {"state": "done", "done": len(blob), "total": len(blob),
+                    "message": "下载完成", "version": "1.2.2",
+                    "action": "optional", "package_type": "full"}
+    return us, svc, bundle, exe
+
+
+def test_update_service_full_apply_launches_installer(monkeypatch, tmp_path):
+    """后端链路：full 包复核通过后拉起安装器，不动 current.json / junction。
+
+    关键点：sequence 只在启动自检确认新版本后推进；此刻只写 pending。
+    """
+    us, svc, bundle, exe = _svc_ready_for_full(tmp_path)
+    monkeypatch.setattr(us, "bundle_root", lambda: bundle)
+    launched = []
+    monkeypatch.setattr(us.core, "launch_full_installer",
+                        lambda p: launched.append(p) or True)
+
+    code, payload = svc.apply()
+    assert code == 200, payload
+    assert payload == {"ok": True, "need_restart": True, "version": "1.2.2",
+                       "full_install": True, "install_pending": True}
+    assert launched == [exe]
+    assert json.loads((bundle / "current.json").read_text(
+        encoding="utf-8"))["version"] == "1.2.1"
+    assert not (bundle / "app" / "1.2.2").exists()
+    assert update_core.KEY_LAST_SEQUENCE not in svc.db.data
+    assert svc.db.data[update_core.KEY_PENDING_VERSION] == "1.2.2"
+    assert svc.db.data[update_core.KEY_PENDING_SEQUENCE] == "17"
+    assert svc.db.data[update_core.KEY_IGNORED_VERSION] == ""
+    assert svc.status()["state"] == "installing"
+    assert svc.status()["message"] == "全量安装已启动，等待新版本启动确认"
+
+
+def test_reconcile_full_install_confirms_only_after_new_version_starts(
+        monkeypatch, tmp_path):
+    """启动自检：版本没变→保留 pending 不推进；版本已升→推进并清 pending。"""
+    from app import update_service as us
+
+    monkeypatch.setattr(us.core, "launch_full_installer", lambda p: True)
+    _us, svc, bundle, _exe = _svc_ready_for_full(tmp_path)
+    monkeypatch.setattr(us, "bundle_root", lambda: bundle)
+    svc.apply()                                  # 拉起安装器，只写 pending
+    db = svc.db
+    assert db.data[update_core.KEY_PENDING_VERSION] == "1.2.2"
+    assert update_core.KEY_LAST_SEQUENCE not in db.data
+
+    # 安装器被拦停：进程还停在 1.2.1 → 不能推进 sequence，继续提示。
+    assert us.reconcile_full_install(db, "1.2.1") == "pending"
+    assert update_core.KEY_LAST_SEQUENCE not in db.data
+    assert db.data[update_core.KEY_PENDING_VERSION] == "1.2.2"
+
+    # 新版本起来了 → 确认落地，推进 sequence 并清掉 pending。
+    assert us.reconcile_full_install(db, "1.2.2") == "confirmed"
+    assert db.data[update_core.KEY_LAST_SEQUENCE] == "17"
+    assert db.data[update_core.KEY_PENDING_VERSION] == ""
+    assert db.data[update_core.KEY_PENDING_SEQUENCE] == ""
+    assert us.reconcile_full_install(db, "1.2.2") == "none"
+
+
+def test_reconcile_never_regresses_sequence(monkeypatch, tmp_path):
+    """已推进过更高 sequence 时，旧 pending 不得把 last_sequence 往回写。"""
+    from app import update_service as us
+
+    db = _FakeUpdateDB()
+    db.data[update_core.KEY_LAST_SEQUENCE] = "20"
+    db.data[update_core.KEY_PENDING_VERSION] = "1.2.2"
+    db.data[update_core.KEY_PENDING_SEQUENCE] = "17"
+    assert us.reconcile_full_install(db, "1.2.2") == "confirmed"
+    assert db.data[update_core.KEY_LAST_SEQUENCE] == "20"
+
+
+def test_check_keeps_prompting_when_full_install_pending(monkeypatch, tmp_path):
+    """旧版客户端提前推进过 sequence 时，pending 仍要保留重试提示。"""
+    from app import update_service as us
+
+    monkeypatch.setattr(us.core, "launch_full_installer", lambda p: True)
+    _us, svc, bundle, _exe = _svc_ready_for_full(tmp_path)
+    monkeypatch.setattr(us, "bundle_root", lambda: bundle)
+    svc.apply()
+    svc.db.data[update_core.KEY_LAST_SEQUENCE] = "17"   # 模拟旧版提前推进
+    monkeypatch.setattr(us, "_manifest_url", "https://example.invalid/stable")
+    monkeypatch.setattr(us, "_channel", "stable")
+    monkeypatch.setattr(us, "APP_VERSION", "1.2.1")
+    monkeypatch.setattr(svc, "_manifest",
+                        lambda: (_full_manifest(), ""))  # type: ignore[method-assign]
+    result = svc.check()
+    assert result["action"] == "optional"
+    assert result["retry"] is True
+
+
+def test_update_service_full_apply_retryable_when_launch_failed(
+        monkeypatch, tmp_path):
+    """安装器没拉起来：保留已校验包与 done 状态，可直接重试安装。"""
+    us, svc, bundle, _exe = _svc_ready_for_full(tmp_path)
+    monkeypatch.setattr(us, "bundle_root", lambda: bundle)
+    monkeypatch.setattr(us.core, "launch_full_installer", lambda p: False)
+
+    code, payload = svc.apply()
+    assert code == 500 and "可重试安装" in payload["detail"]
+    assert svc.status()["state"] == "done"
+    assert update_core.KEY_LAST_SEQUENCE not in svc.db.data
+    assert update_core.KEY_PENDING_VERSION not in svc.db.data
+    assert (bundle / "data" / "update" / "full-1.2.2.exe").is_file()
+
+
+def test_update_service_full_apply_aborts_on_sha_mismatch(monkeypatch, tmp_path):
+    """二次验签后的 sha256 复核失败 → 停在原版本，绝不拉起安装器。"""
+    us, svc, bundle, _exe = _svc_ready_for_full(tmp_path, sha="0" * 64)
+    monkeypatch.setattr(us, "bundle_root", lambda: bundle)
+    launched = []
+    monkeypatch.setattr(us.core, "launch_full_installer",
+                        lambda p: launched.append(p) or True)
+
+    code, payload = svc.apply()
+    assert code == 500 and "SHA256" in payload["detail"]
+    assert launched == []
+    assert svc.status()["state"] == "error"
+    assert update_core.KEY_LAST_SEQUENCE not in svc.db.data
+    assert json.loads((bundle / "current.json").read_text(
+        encoding="utf-8"))["version"] == "1.2.1"
 
 
 # ---- 验签 ----
@@ -485,3 +810,14 @@ def test_updater_run_calls_repair_first(updater, monkeypatch, tmp_path):
     assert (bundle / "launcher.pyc").read_bytes() == b"LAUNCHER-NEW"
     assert (bundle / "start_kefu.bat").read_bytes() == b"START-BAT-NEW"
     assert junction_calls == []        # 无新版本 → 不切 junction
+
+
+def test_full_install_confirmed_uses_numeric_version_compare():
+    """版本确认必须用数字元组：1.10 > 1.9，且空/非法 pending 一律未确认。"""
+    from app.update_core import full_install_confirmed
+
+    assert full_install_confirmed("1.10.0", "1.9.0") is True
+    assert full_install_confirmed("1.9.0", "1.10.0") is False
+    assert full_install_confirmed("1.3.3", "1.3.3") is True
+    assert full_install_confirmed("1.3.3", "not-a-version") is False
+    assert full_install_confirmed("1.3.3", "") is False

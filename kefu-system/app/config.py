@@ -151,7 +151,7 @@ AI_DISABLE_THINKING_DEFAULT = True
 # 同步其余位置。这里运行时直接读文件，避免 APP_VERSION 变成第二份真源。
 # 打包后 version.txt 随包落在安装根 / app\<版本>\，也可用 KEFU_VERSION_FILE 指定。
 # 只有「version.txt 完全找不到」时才用兜底值；兜底值同样被 version_sync.py 校验。
-_FALLBACK_VERSION = "1.2.9"
+_FALLBACK_VERSION = "1.3.4"
 
 
 def _read_app_version() -> str:

@@ -3369,11 +3369,16 @@ class WeChatService:
             if not proc and not qt_shell:
                 samples.append("%s@unknown" % (title or cls))
                 return True
-            rect = _Rect()
-            user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            if rect.right - rect.left < 400 or rect.bottom - rect.top < 300:
-                samples.append("%s@%s(小窗/最小化)" % (title or cls, proc or "?"))
-                return True
+            # 真最小化（IsIconic=True）时 GetWindowRect 返回 Windows 的
+            # -32000 伪矩形（约 160x28），尺寸门槛会误杀可用主窗口；
+            # 发送链路用 SW_RESTORE 能唤起它，故此时跳过尺寸检查。
+            # 托盘态（IsWindowVisible=False）已在入口过滤，行为不变。
+            if not user32.IsIconic(hwnd):
+                rect = _Rect()
+                user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                if rect.right - rect.left < 400 or rect.bottom - rect.top < 300:
+                    samples.append("%s@%s(小窗/最小化)" % (title or cls, proc or "?"))
+                    return True
             found = True
             return False             # 命中即停止枚举
 

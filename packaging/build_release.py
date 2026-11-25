@@ -124,6 +124,32 @@ def build_manifest(version: str, sequence: int, channel: str, base_url: str,
     }
 
 
+def assert_frontend_version(root: Path, expected: str) -> None:
+    """打包前硬校验前端 dist 的版本号（机器可读的 version.json）。
+
+    现场事故：bump 版本后忘了 `npm run build`，打进安装包的 JS 里
+    __APP_VERSION__ 仍是上一个版本；同一界面同时显示 v1.3.0（前端编译期）、
+    v1.3.1（后端运行时）、v1.3.2（服务器最新）三个版本号。vite 现在会
+    往 dist 写 version.json，这里与版本唯一真源逐字节比对，不一致直接
+    中止打包，绝不产出「版本号打架」的安装包。
+    """
+    vfile = Path(root) / "kefu-system" / "frontend" / "dist" / "version.json"
+    if not vfile.is_file():
+        raise SystemExit(
+            f"[FATAL] 前端缺少 {vfile}（或构建于旧版 vite）。"
+            "请先执行：cd kefu-system/frontend && npm run build")
+    try:
+        actual = str(json.loads(vfile.read_text(encoding="utf-8")).get(
+            "version", "")).strip()
+    except Exception as exc:                      # noqa: BLE001
+        raise SystemExit(f"[FATAL] 前端 version.json 解析失败：{exc}") from exc
+    if actual != str(expected).strip():
+        raise SystemExit(
+            f"[FATAL] 前端版本不一致：dist/version.json={actual}，"
+            f"version.txt={expected}。请先重新构建前端："
+            "cd kefu-system/frontend && npm run build")
+
+
 def make_app_zip(version_dir: Path, dst: Path,
                  bundle: Path | None = None) -> None:
     """把 app/<版本>/ 下的版本层内容打成增量 zip（zip 根即 kefu-system/wechatauto）。
@@ -280,6 +306,8 @@ def release(args: argparse.Namespace) -> None:
     version_dir = bundle / "app" / version
     if not (version_dir / "kefu-system" / "app").is_dir():
         raise SystemExit(f"[FATAL] bundle 缺少版本层：{version_dir}")
+    # 前端构建期版本不一致是本次事故的直接成因，打包前 fail-closed。
+    assert_frontend_version(version_dir, version)
 
     out = args.out.resolve()
     pkg_dir = out / "packages"

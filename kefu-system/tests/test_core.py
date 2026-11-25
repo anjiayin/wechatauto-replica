@@ -1420,6 +1420,9 @@ def _fake_win32_ctypes(windows):
         def IsWindowVisible(self, hwnd):
             return windows[hwnd]["visible"]
 
+        def IsIconic(self, hwnd):
+            return windows[hwnd].get("iconic", False)
+
         def GetWindowTextW(self, hwnd, buf, size):
             buf.value = windows[hwnd]["title"]
             return len(buf.value)
@@ -1495,6 +1498,34 @@ class TestWeChatService:
         monkeypatch.setattr(wechat_service, "ctypes", _fake_win32_ctypes(windows))
         svc = WeChatService(Database(":memory:"), Aggregator(lambda u: None))
         assert svc.probe_wechat_window() is True
+
+    def test_probe_accepts_truly_minimized_wechat_rejects_editplus(self,
+                                                                   monkeypatch,
+                                                                   caplog):
+        """真最小化微信主窗（伪矩形 160x28）可用；EditPlus 同名窗仍拒绝。"""
+        import logging
+        from app import wechat_service
+
+        windows = {
+            # 真最小化：IsIconic=True，GetWindowRect 返回 -32000 伪矩形
+            1: dict(title="微信", cls="Qt51514QWindowIcon", pid=3152,
+                    proc="Weixin.exe", visible=True, iconic=True,
+                    rect=(-32000, -32000, -31840, -31972)),
+            # 干扰项：EditPlus 正编辑文件名含「微信」的记事本
+            2: dict(title="EditPlus - [微信客服开发-记事本.txt *]",
+                    cls="EditPlus", pid=16124, proc="editplus.exe",
+                    visible=True, iconic=True,
+                    rect=(-32000, -32000, -31840, -31972)),
+        }
+        monkeypatch.setattr(wechat_service, "ctypes", _fake_win32_ctypes(windows))
+        svc = WeChatService(Database(":memory:"), Aggregator(lambda u: None))
+        assert svc.probe_wechat_window() is True
+
+        # 移除真微信后，仅剩的同名 EditPlus 窗口不得被当作可用主窗
+        windows.pop(1)
+        with caplog.at_level(logging.INFO):
+            assert svc.probe_wechat_window() is False
+        assert "editplus.exe" in caplog.text.lower()
 
     def test_probe_rejects_hidden_minimized_and_logs_samples(self, monkeypatch,
                                                               caplog):

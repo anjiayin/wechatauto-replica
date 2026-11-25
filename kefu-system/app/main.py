@@ -42,7 +42,7 @@ from app.notifier import Notifier
 from app.pipeline import Pipeline
 from app.sender import Sender
 from app.summary import SummaryScheduler, SummaryService
-from app.update_service import repair_bundle_root_files
+from app.update_service import reconcile_full_install, repair_bundle_root_files
 from app.wechat_service import WeChatService
 
 logger = logging.getLogger("kefu")
@@ -194,6 +194,9 @@ def create_app() -> FastAPI:
         # 必须放在最前面，不依赖数据库与业务组件。
         repair_bundle_root_files()
         db = Database()
+        # 全量安装确认：只有新版本真的启动起来才推进 last_sequence；旧版
+        # 提前推进导致的「下次不再提示」由此自愈（1.3.2 事故）。fail-open。
+        reconcile_full_install(db)
         notifier = Notifier()
         notifier.set_loop(asyncio.get_running_loop())
         analysis_cfg = read_analysis_settings(db)
