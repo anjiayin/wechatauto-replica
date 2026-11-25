@@ -152,19 +152,28 @@ def test_is_full_package():
     assert update_core.is_full_package({"type": " Full "}) is True
 
 
-def test_full_install_args():
+def test_full_install_args(tmp_path):
+    # /FORCECLOSEAPPLICATIONS 是现场 1.3.6 拍出来的必需项：本程序无窗口消息循环，
+    # RestartManager 关不掉 → Abort/Retry 框被 /SUPPRESSMSGBOXES 自动答 Abort → 无声回滚。
     assert update_core.full_install_args(Path("full-1.2.2.exe")) == [
         "/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES",
-        "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS",
+        "/CLOSEAPPLICATIONS", "/FORCECLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS",
     ]
     short = update_core.full_install_args(Path("full-1.2.2.exe"),
                                           close_apps=False)
     assert short == ["/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES"]
     assert "/CLOSEAPPLICATIONS" not in short
+    assert "/FORCECLOSEAPPLICATIONS" not in short
     assert "/RESTARTAPPLICATIONS" not in short
+    # /LOG 由调用方决定是否带上：静默安装失败本来就无声，不留痕就无法取证
+    log = tmp_path / "i.log"
+    logged = update_core.full_install_args(Path("full-1.2.2.exe"), log_path=log)
+    assert logged[-1] == f"/LOG={log}"
+    exe = tmp_path / "data" / "update" / "full-1.2.2.exe"
+    assert update_core.full_install_log_path(exe) == exe.with_suffix(".log")
 
 
-def test_launch_full_installer_rejects_missing_exe(monkeypatch, tmp_path):
+def test_launch_full_installer_rejects_missing_exe(monkeypatch, tmp_path, caplog):
     calls = []
 
     class FakePopen:
@@ -172,17 +181,22 @@ def test_launch_full_installer_rejects_missing_exe(monkeypatch, tmp_path):
             calls.append((cmd, kwargs))
 
     monkeypatch.setattr(subprocess, "Popen", FakePopen)
-    assert update_core.launch_full_installer(tmp_path / "missing.exe") is False
+    with caplog.at_level("WARNING"):
+        assert update_core.launch_full_installer(tmp_path / "missing.exe") is False
     assert calls == []
+    assert "安装包不存在" in caplog.text
 
 
-def test_launch_full_installer_is_detached_and_never_waits(monkeypatch, tmp_path):
+def test_launch_full_installer_is_detached_and_never_waits(monkeypatch, tmp_path,
+                                                           caplog):
     exe = tmp_path / "full-1.2.2.exe"
     exe.write_bytes(b"MZ fake installer")
     calls = []
 
     class FakePopen:
         """记录调用；故意不提供可正常返回的 wait/communicate。"""
+
+        pid = 4242
 
         def __init__(self, cmd, **kwargs):
             calls.append({"cmd": list(cmd), "kwargs": dict(kwargs)})
@@ -194,13 +208,15 @@ def test_launch_full_installer_is_detached_and_never_waits(monkeypatch, tmp_path
             raise AssertionError("full 安装器绝不能 communicate()")
 
     monkeypatch.setattr(subprocess, "Popen", FakePopen)
-    assert update_core.launch_full_installer(exe) is True
+    with caplog.at_level("INFO"):
+        assert update_core.launch_full_installer(exe) is True
     assert len(calls) == 1
 
     cmd = calls[0]["cmd"]
     assert cmd == [
         str(exe), "/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES",
-        "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS",
+        "/CLOSEAPPLICATIONS", "/FORCECLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS",
+        f"/LOG={update_core.full_install_log_path(exe)}",
     ]
     kwargs = calls[0]["kwargs"]
     assert kwargs["close_fds"] is True
@@ -209,9 +225,13 @@ def test_launch_full_installer_is_detached_and_never_waits(monkeypatch, tmp_path
     assert kwargs["stderr"] is subprocess.DEVNULL
     assert kwargs["creationflags"] != 0
     assert "cwd" not in kwargs                      # 沿用安装包默认目录，不传 /DIR
+    # 拉起即留痕：exe / PID / 安装器日志路径（Popen 成功 ≠ 安装成功）
+    text = caplog.text
+    assert "4242" in text and str(exe) in text
+    assert str(update_core.full_install_log_path(exe)) in text
 
 
-def test_launch_full_installer_swallows_popen_error(monkeypatch, tmp_path):
+def test_launch_full_installer_swallows_popen_error(monkeypatch, tmp_path, caplog):
     exe = tmp_path / "boom.exe"
     exe.write_bytes(b"MZ")
 
@@ -219,7 +239,9 @@ def test_launch_full_installer_swallows_popen_error(monkeypatch, tmp_path):
         raise OSError("CreateProcess failed")
 
     monkeypatch.setattr(subprocess, "Popen", boom)
-    assert update_core.launch_full_installer(exe) is False
+    with caplog.at_level("WARNING"):
+        assert update_core.launch_full_installer(exe) is False
+    assert "CreateProcess failed" in caplog.text
 
 
 def _full_manifest(version: str = "1.2.2", seq: int = 17,
@@ -242,7 +264,7 @@ def _seed_bundle_for_full(tmp_path, version: str = "1.2.2") -> Path:
 
 
 def test_updater_run_full_package_launches_installer(
-        updater, monkeypatch, tmp_path):
+        updater, monkeypatch, tmp_path, capsys):
     """托盘链路：full 包落盘 .exe、detached 拉起，不解压/不切 junction。
 
     关键回归：拉起安装器后只记 pending，**绝不**写 last_sequence——否则
@@ -273,6 +295,8 @@ def test_updater_run_full_package_launches_installer(
     assert json.loads((bundle / "current.json").read_text(
         encoding="utf-8"))["version"] == "1.2.1"
     assert not (bundle / "app" / "1.2.2").exists()
+    # 托盘没有 kefu.log，安装器日志路径必须打在 stdout 上供现场取证
+    assert str(update_core.full_install_log_path(exe)) in capsys.readouterr().out
 
 
 def test_updater_run_full_package_launch_failure_returns_8(
@@ -345,7 +369,8 @@ def _svc_ready_for_full(tmp_path, *, blob: bytes = b"MZ fake",
     return us, svc, bundle, exe
 
 
-def test_update_service_full_apply_launches_installer(monkeypatch, tmp_path):
+def test_update_service_full_apply_launches_installer(monkeypatch, tmp_path,
+                                                       caplog):
     """后端链路：full 包复核通过后拉起安装器，不动 current.json / junction。
 
     关键点：sequence 只在启动自检确认新版本后推进；此刻只写 pending。
@@ -356,7 +381,8 @@ def test_update_service_full_apply_launches_installer(monkeypatch, tmp_path):
     monkeypatch.setattr(us.core, "launch_full_installer",
                         lambda p: launched.append(p) or True)
 
-    code, payload = svc.apply()
+    with caplog.at_level("INFO"):
+        code, payload = svc.apply()
     assert code == 200, payload
     assert payload == {"ok": True, "need_restart": True, "version": "1.2.2",
                        "full_install": True, "install_pending": True}
@@ -370,15 +396,18 @@ def test_update_service_full_apply_launches_installer(monkeypatch, tmp_path):
     assert svc.db.data[update_core.KEY_IGNORED_VERSION] == ""
     assert svc.status()["state"] == "installing"
     assert svc.status()["message"] == "全量安装已启动，等待新版本启动确认"
+    # 现场取证入口：复核结果与安装器日志路径都要落进 kefu.log
+    assert "安装包复核通过" in caplog.text
+    assert str(update_core.full_install_log_path(exe)) in caplog.text
 
 
 def test_reconcile_full_install_confirms_only_after_new_version_starts(
-        monkeypatch, tmp_path):
+        monkeypatch, tmp_path, caplog):
     """启动自检：版本没变→保留 pending 不推进；版本已升→推进并清 pending。"""
     from app import update_service as us
 
     monkeypatch.setattr(us.core, "launch_full_installer", lambda p: True)
-    _us, svc, bundle, _exe = _svc_ready_for_full(tmp_path)
+    _us, svc, bundle, exe = _svc_ready_for_full(tmp_path)
     monkeypatch.setattr(us, "bundle_root", lambda: bundle)
     svc.apply()                                  # 拉起安装器，只写 pending
     db = svc.db
@@ -386,7 +415,10 @@ def test_reconcile_full_install_confirms_only_after_new_version_starts(
     assert update_core.KEY_LAST_SEQUENCE not in db.data
 
     # 安装器被拦停：进程还停在 1.2.1 → 不能推进 sequence，继续提示。
-    assert us.reconcile_full_install(db, "1.2.1") == "pending"
+    # WARN 里要给出安装器日志路径，现场不用再猜去哪取证。
+    with caplog.at_level("WARNING"):
+        assert us.reconcile_full_install(db, "1.2.1") == "pending"
+    assert str(update_core.full_install_log_path(exe)) in caplog.text
     assert update_core.KEY_LAST_SEQUENCE not in db.data
     assert db.data[update_core.KEY_PENDING_VERSION] == "1.2.2"
 
@@ -459,6 +491,83 @@ def test_update_service_full_apply_aborts_on_sha_mismatch(monkeypatch, tmp_path)
     assert update_core.KEY_LAST_SEQUENCE not in svc.db.data
     assert json.loads((bundle / "current.json").read_text(
         encoding="utf-8"))["version"] == "1.2.1"
+
+
+# ---- 重启后本地全量包补位（免重新下载） ----
+def _restart_service(svc) -> None:
+    """模拟进程重启：内存状态机与缓存的 manifest 全部清零。"""
+    with svc._lock:
+        svc._job = {"state": "idle", "done": 0, "total": 0, "message": "",
+                    "version": "", "action": "none"}
+    svc._last_manifest = None
+
+
+def test_status_hydrates_unconfirmed_local_full_package(monkeypatch, tmp_path,
+                                                         caplog):
+    """全量安装被拦停 → 重启服务 → 本地包还在，状态直接补成「已下载」。
+
+    现场投诉：手工重启服务也触发不了全量升级，界面只剩「重新下载」，用户得再
+    下一遍几百 MB。补位后前端现成的 state==='done' 分支给出「安装并重启」。
+    """
+    us, svc, bundle, exe = _svc_ready_for_full(tmp_path)
+    monkeypatch.setattr(us, "bundle_root", lambda: bundle)
+    monkeypatch.setattr(us.core, "launch_full_installer", lambda p: True)
+    monkeypatch.setattr(us, "APP_VERSION", "1.2.1")
+    svc.apply()                                  # 只写 pending，安装器没落地
+
+    _restart_service(svc)
+    with caplog.at_level("INFO"):
+        st = svc.status()
+    assert st["state"] == "done"
+    assert st["version"] == "1.2.2"
+    assert st["package_type"] == "full"
+    assert st["done"] == st["total"] == exe.stat().st_size
+    assert "本地安装包" in caplog.text
+    # 补位只改显示状态：绝不推进 sequence、绝不提前清 pending
+    assert update_core.KEY_LAST_SEQUENCE not in svc.db.data
+    assert svc.db.data[update_core.KEY_PENDING_VERSION] == "1.2.2"
+
+
+def test_status_hydrate_skips_empty_missing_and_confirmed(monkeypatch, tmp_path):
+    """空文件 / 包不存在 / 版本已生效：一律不补位，别把用户误导成「可安装」。"""
+    us, svc, bundle, exe = _svc_ready_for_full(tmp_path)
+    monkeypatch.setattr(us, "bundle_root", lambda: bundle)
+    monkeypatch.setattr(us.core, "launch_full_installer", lambda p: True)
+    monkeypatch.setattr(us, "APP_VERSION", "1.2.1")
+    svc.apply()
+
+    exe.write_bytes(b"")                          # 0 字节 = 半途失败，不算有包
+    _restart_service(svc)
+    assert svc.status()["state"] == "idle"
+
+    exe.write_bytes(b"MZ fake")                   # 新版本已经起来了，等启动自检
+    monkeypatch.setattr(us, "APP_VERSION", "1.2.2")
+    _restart_service(svc)
+    assert svc.status()["state"] == "idle"
+
+    monkeypatch.setattr(us, "APP_VERSION", "1.2.1")
+    exe.unlink()                                  # data 被清理过 → 只能重新下载
+    _restart_service(svc)
+    assert svc.status()["state"] == "idle"
+
+
+def test_status_hydrate_respects_busy_state_and_dev_layout(monkeypatch, tmp_path):
+    """进行中的下载/安装不被覆盖；开发态（无安装根）不补位也不报错。"""
+    from app import update_service as us_mod
+
+    monkeypatch.setattr(us_mod, "bundle_root", lambda: None)
+    db = _FakeUpdateDB()
+    db.data[update_core.KEY_PENDING_VERSION] = "1.2.2"
+    svc = us_mod.UpdateService(db)
+
+    with svc._lock:
+        svc._job = {"state": "downloading", "done": 1, "total": 9, "message": "",
+                    "version": "1.2.2", "action": "optional",
+                    "package_type": "full"}
+    assert svc.status()["state"] == "downloading"
+
+    _restart_service(svc)
+    assert svc.status()["state"] == "idle"
 
 
 # ---- 验签 ----

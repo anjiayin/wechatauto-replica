@@ -141,9 +141,14 @@ def reconcile_full_install(db: Database, current_version: str = APP_VERSION) -> 
             return "none"
         seq = int(db.get_int(core.KEY_PENDING_SEQUENCE, 0) or 0)
         if not core.full_install_confirmed(current_version, pending):
+            bundle = bundle_root()
+            hint = ""
+            if bundle is not None and core.VERSION_RE.match(pending):
+                hint = "；安装器日志 " + str(core.full_install_log_path(
+                    bundle / "data" / "update" / f"full-{pending}.exe"))
             logger.warning(
                 "启动自检：上次全量安装 %s 尚未生效（当前版本 %s），"
-                "保留更新提示以便重试", pending, current_version)
+                "保留更新提示以便重试%s", pending, current_version, hint)
             return "pending"
         with _RECONCILE_LOCK:
             old_seq = int(db.get_int(core.KEY_LAST_SEQUENCE, 0) or 0)
@@ -255,6 +260,49 @@ class UpdateService:
         return core.fetch_manifest(_manifest_url, self._keys())
 
     # ------------------------------------------------------------------
+    # 状态补位（重启后免重新下载）
+    # ------------------------------------------------------------------
+    def _hydrate_full_retry(self) -> None:
+        """进程重启后把「本地已下载、上次没装成」的全量包补成可安装状态。
+
+        现场投诉：全量安装被拦停后手工重启服务也触发不了升级——重启把内存里的
+        ``_job`` 清零，界面只剩「重新下载」，用户得再下一遍几百 MB 才能重试。
+        安装包其实还在 ``data/update/full-<版本>.exe``（升级不清理 data），这里
+        只做状态补位，前端现成的 ``state === 'done'`` 分支就能直接给出
+        「安装并重启」，不需要新的接口字段。
+
+        只检查「文件存在且非零」，**不在这里算 sha256**：284MB 同步哈希挂在
+        GET /status 上会把界面卡死；完整性由 :meth:`apply` 对着刚验签的
+        manifest 复核（size + sha256），损坏照样 fail-closed 停在原版本。
+        仅在完全空闲时补位，绝不覆盖进行中的下载/安装状态。
+        """
+        with self._lock:
+            if self._job["state"] != "idle":
+                return
+            pending = str(self.db.get_setting(core.KEY_PENDING_VERSION, "")
+                          or "").strip()
+            if not pending or not core.VERSION_RE.match(pending):
+                return
+            if core.full_install_confirmed(APP_VERSION, pending):
+                return                      # 已落地，等启动自检推进即可
+            bundle = bundle_root()
+            if bundle is None:
+                return                      # 开发态 / 旧布局：没有 data/update 可言
+            exe = bundle / "data" / "update" / f"full-{pending}.exe"
+            try:
+                size = exe.stat().st_size
+            except OSError:
+                return
+            if size <= 0:
+                return
+            self._job = {"state": "done", "done": size, "total": size,
+                         "message": "检测到上次下载的全量安装包，可直接重试安装",
+                         "version": pending, "action": "optional",
+                         "package_type": "full"}
+            logger.info("全量安装重试：本地安装包仍在 %s（%d 字节），"
+                        "已按「下载完成」状态呈现，可直接重试安装", exe, size)
+
+    # ------------------------------------------------------------------
     # 检查
     # ------------------------------------------------------------------
     def check(self) -> dict[str, Any]:
@@ -320,6 +368,10 @@ class UpdateService:
     # 下载
     # ------------------------------------------------------------------
     def status(self) -> dict[str, Any]:
+        # 重启后 _job 归零：本地全量包还在就补成「已下载」，让界面直接给出
+        # 「安装并重启」，不必再下几百 MB（见 _hydrate_full_retry）。
+        # 放在取锁之前——本方法内部要自己拿锁，_lock 不是可重入锁。
+        self._hydrate_full_retry()
         with self._lock:
             return dict(self._job)
 
@@ -421,6 +473,8 @@ class UpdateService:
                 actual_sha = _sha256_file(exe) or ""
                 if sha and actual_sha.lower() != sha.lower():
                     raise RuntimeError("全量安装包 SHA256 校验失败，已中止")
+                logger.info("全量安装：安装包复核通过 size=%s sha256=%s exe=%s",
+                            size, actual_sha[:12], exe)
                 if not core.launch_full_installer(exe):
                     # 包已校验、只是进程没拉起来：保留 done 状态供直接重试安装，
                     # 绝不推进 sequence，也不写 pending（本次根本没有安装）。
@@ -464,6 +518,11 @@ class UpdateService:
                     self.db.set_setting(core.KEY_PENDING_VERSION, version)
                     self.db.set_setting(core.KEY_PENDING_SEQUENCE,
                                         str(int(fresh.get("sequence", 0) or 0)))
+                    logger.info(
+                        "全量安装已启动，等待新版本启动自检确认：pending=%s "
+                        "sequence=%s；未生效时看安装器日志 %s",
+                        version, int(fresh.get("sequence", 0) or 0),
+                        core.full_install_log_path(exe))
                     self._job.update({
                         "state": "installing",
                         "message": "全量安装已启动，等待新版本启动确认",

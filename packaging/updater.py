@@ -73,6 +73,12 @@ except ImportError:                              # pragma: no cover - 老版本�
         print("[update] 当前版本层不支持全量安装，已停在原版本")
         return False
 
+# 单独降级：只有新版 update_core 会给安装器传 /LOG，缺符号时不能谎报日志路径。
+try:
+    from app.update_core import full_install_log_path
+except ImportError:                              # pragma: no cover - 老版本层
+    full_install_log_path = None                 # type: ignore[assignment]
+
 BUNDLE_FILE = Path(__file__).resolve()
 
 
@@ -446,7 +452,10 @@ def run() -> int:
         # 只记在途：装没装上由新版本启动自检确认，不能在这里推进 sequence，
         # 否则安装器被杀软拦停后客户端再也不会提示升级（1.3.2 事故）。
         _save_pending(ver, int(m.get("sequence", 0)))
-        print("[update] 全量安装已启动，程序将自动重启。")
+        hint = ""
+        if full_install_log_path is not None:
+            hint = f"；安装器日志 {full_install_log_path(dst)}"
+        print("[update] 全量安装已启动，程序将自动重启。" + hint)
         return 0
 
     target = APP_DIR / ver

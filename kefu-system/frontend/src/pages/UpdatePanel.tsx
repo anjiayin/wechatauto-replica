@@ -246,7 +246,9 @@ export function UpdateDialog({ open, onClose, check }: {
         )}
         {c?.retry && !applied && (
           <Alert severity="warning" sx={{ mb: 2 }}>
-            上次全量安装尚未生效，已保留更新入口，可重新下载安装。
+            {state === 'done'
+              ? '上次全量安装尚未生效，安装包已在本机，直接点「安装并重启」即可重试，无需重新下载。'
+              : '上次全量安装尚未生效，已保留更新入口，可重新下载安装。'}
           </Alert>
         )}
         {ignored && !applied && (

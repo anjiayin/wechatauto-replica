@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -26,6 +27,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
 
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.\-]+)?$")
 
@@ -233,14 +236,32 @@ def full_install_confirmed(current: str, pending_version: str) -> bool:
         return False
 
 
-def full_install_args(exe: Path, *, close_apps: bool = True) -> list[str]:
+def full_install_log_path(exe: Path) -> Path:
+    """安装器日志落点：与安装包同目录同名换 .log（data/update/ 升级不清理）。"""
+    return Path(os.path.abspath(str(exe.with_suffix("")) + ".log"))
+
+
+def full_install_args(exe: Path, *, close_apps: bool = True,
+                      log_path: Path | None = None) -> list[str]:
     """构造 Inno Setup 静默重装命令行参数列表（不含 exe 自身）。
 
     返回形如：
     ["/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES",
-     "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"]
-    close_apps=False 时去掉后两项（测试/特殊场景用）。
+     "/CLOSEAPPLICATIONS", "/FORCECLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS",
+     "/LOG=<路径>"]
+    close_apps=False 时去掉 /CLOSEAPPLICATIONS /FORCECLOSEAPPLICATIONS
+    /RESTARTAPPLICATIONS 三项（测试/特殊场景用）；log_path=None 时不带 /LOG。
     参数顺序固定，便于测试断言。
+
+    ``/FORCECLOSEAPPLICATIONS`` 是现场 1.3.6 安装器日志拍出来的必需项：
+    本程序是 pythonw.exe + 后端 Python，**没有窗口消息循环**，RestartManager
+    发不出能生效的关闭请求 → 日志里 ``Some applications could not be shut
+    down.`` → Inno 弹「安装程序无法自动关闭所有应用程序」的 Abort/Retry/Ignore
+    框 → 该框被 ``/SUPPRESSMSGBOXES`` 按 Inno 默认规则自动答 **Abort** →
+    ``User canceled the installation process.`` + 回滚，284MB 包白下。
+    手工双击能装上的原因也在这里：非静默向导把那个框显示出来让人点「继续」。
+    代价是进程被硬杀：SQLite 走 WAL 不会损坏，但当时正在处理的消息会中断，
+    所以调用方（update_service / updater）拉起安装器前不该有正在发送的任务。
 
     ``exe`` 保留在签名里供调用方表达意图并兼容未来按包定制参数；当前
     Inno Setup 开关与具体文件路径无关，故函数体不使用它。
@@ -248,11 +269,15 @@ def full_install_args(exe: Path, *, close_apps: bool = True) -> list[str]:
     del exe  # 显式声明未使用，避免静态检查误报
     args = ["/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES"]
     if close_apps:
-        args.extend(["/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"])
+        args.extend(["/CLOSEAPPLICATIONS", "/FORCECLOSEAPPLICATIONS",
+                     "/RESTARTAPPLICATIONS"])
+    if log_path is not None:
+        args.append(f"/LOG={log_path}")
     return args
 
 
-def launch_full_installer(exe: Path, *, close_apps: bool = True) -> bool:
+def launch_full_installer(exe: Path, *, close_apps: bool = True,
+                          log_path: Path | None = None) -> bool:
     """以 detached 子进程启动全量安装包，返回是否成功拉起。
 
     - exe 必须是已下载且已校验 sha256 的本地文件；不存在返回 False。
@@ -264,25 +289,37 @@ def launch_full_installer(exe: Path, *, close_apps: bool = True) -> bool:
     - 捕获 OSError 等异常返回 False，不抛出。
     - 返回 True 仅表示进程已拉起，不代表安装成功。
 
+    可观测性（现场 1.3.2/1.3.3/1.3.4 三次「安装器无声消失」都查不到拦停点）：
+    拉起时默认带 ``/LOG=``，让 Inno 自己留痕；进程 PID、exe、日志路径与
+    拉起失败原因一律进日志。本进程被安装器杀掉之前写的这几行不会丢。
+
     Windows 上 ``CREATE_NEW_PROCESS_GROUP`` 与 ``DETACHED_PROCESS`` 均存在；
     非 Windows 测试环境用其真实的 Windows 数值兜底，保证 flags 恒非 0，
     便于 monkeypatch 的假 Popen 断言 detached 语义。
     """
+    target = str(exe)               # except 分支要用，Path() 自身失败也不能抛
     try:
         exe = Path(exe)
         if not exe.is_file():
+            logger.warning("全量安装未启动：安装包不存在 %s", exe)
             return False
-        cmd = [str(exe)] + full_install_args(exe, close_apps=close_apps)
+        if log_path is None:
+            log_path = full_install_log_path(exe)
+        cmd = [str(exe)] + full_install_args(exe, close_apps=close_apps,
+                                             log_path=log_path)
         flags = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
                  | getattr(subprocess, "DETACHED_PROCESS", 0x00000008))
-        subprocess.Popen(
+        proc = subprocess.Popen(
             cmd, close_fds=True,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=flags,
         )
-    except Exception:                            # noqa: BLE001 - fail-closed
+        logger.info("全量安装器已拉起（不代表安装成功）：pid=%s exe=%s log=%s",
+                    getattr(proc, "pid", "?"), exe, log_path)
+    except Exception as exc:                      # noqa: BLE001 - fail-closed
+        logger.warning("全量安装器拉起失败（停在原版本）：exe=%s err=%s", target, exc)
         return False
     return True
 
