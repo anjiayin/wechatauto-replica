@@ -3290,15 +3290,111 @@ class WeChatService:
         return result
 
     def probe_wechat_window(self) -> bool:
-        """探测微信主窗口是否存在（ctypes FindWindow，轻量、不创建 GUI 实例）。"""
+        """探测微信主窗口是否可操作（只读 Win32，不创建 GUI 实例、不碰 UIA）。
+
+        旧实现 ``FindWindowW(None, "微信")`` 是**标题精确匹配**，有两个实测
+        误判（2026-11-25）：
+        1. 微信 4.x 标题随未读消息数/当前会话变化（如「微信 (3)」），微信在跑
+           却报「微信窗口不可用」，标题恢复后前端 5 秒轮询才自己变绿；
+        2. 本机同时存在 WeChatAppEx 小程序全屏窗（Chrome_WidgetWin_0）也叫
+           「微信」，精确匹配可能拿到错误的句柄。
+
+        改为对齐 ``wechatauto.guia._looks_like_main_window`` 的判据：进程名
+        weixin* 一票否决 + 标题含微信关键词 + 顶层可见 + 尺寸达标。每 5 秒被
+        /api/status 调用，全程只读 Win32 调用（毫秒级）。失败时记下标题样本，
+        下次复现可直接看到是不是标题变体导致，不再靠猜。
+        """
         try:
-            for title in _WX_MAIN_TITLE_CANDIDATES:
-                hwnd = ctypes.windll.user32.FindWindowW(None, title)
-                if hwnd:
-                    return True
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+        except Exception:                # 非 Windows / ctypes 不可用
+            return False
+
+        keywords = tuple(_WX_MAIN_TITLE_CANDIDATES) + ("Weixin",)
+
+        def _proc_name(pid: int) -> str:
+            if not pid:
+                return ""
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFO
+            if not handle:
+                return ""    # 查询失败不否决，交给 Qt 类名兜底（同 guia 口径）
+            try:
+                buf = ctypes.create_unicode_buffer(1024)
+                size = ctypes.c_ulong(1024)
+                if kernel32.QueryFullProcessImageNameW(
+                        handle, 0, buf, ctypes.byref(size)):
+                    return buf.value.rsplit("\\", 1)[-1].lower()
+            except Exception:
+                return ""
+            finally:
+                try:
+                    kernel32.CloseHandle(handle)
+                except Exception:
+                    pass
+            return ""
+
+        class _Rect(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        found = False
+        samples: List[str] = []
+
+        def _cb(hwnd, _lparam) -> bool:
+            nonlocal found
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            title_buf = ctypes.create_unicode_buffer(256)
+            class_buf = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(hwnd, title_buf, 256)
+            user32.GetClassNameW(hwnd, class_buf, 256)
+            title, cls = title_buf.value.strip(), class_buf.value.strip()
+            if not (title or cls):
+                return True
+            pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            proc = _proc_name(int(pid.value))
+            qt_shell = cls.startswith("Qt") and "QWindowIcon" in cls
+            # 标题含微信关键词即可；标题读不到时（跨完整性级别 WM_GETTEXT
+            # 被拒）允许「Qt 外壳类名 + weixin 进程」兜底。
+            if not any(k in title for k in keywords) and not (
+                    qt_shell and proc.startswith("weixin")):
+                return True
+            # 进程身份一票否决：明确不是 weixin 进程的同名窗口一律不算
+            # （EditPlus 打开「微信客服开发.txt」、WeChatAppEx 小程序窗）。
+            if proc and not proc.startswith("weixin"):
+                samples.append("%s@%s" % (title or cls, proc))
+                return True
+            # 进程查不到时只认 Qt 微信外壳类名，避免误绑其它程序的窗口。
+            if not proc and not qt_shell:
+                samples.append("%s@unknown" % (title or cls))
+                return True
+            rect = _Rect()
+            user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            if rect.right - rect.left < 400 or rect.bottom - rect.top < 300:
+                samples.append("%s@%s(小窗/最小化)" % (title or cls, proc or "?"))
+                return True
+            found = True
+            return False             # 命中即停止枚举
+
+        try:
+            cb_type = ctypes.WINFUNCTYPE(ctypes.c_bool,
+                                         ctypes.c_void_p, ctypes.c_void_p)
+            cb = cb_type(_cb)
+            user32.EnumWindows(cb, 0)
         except Exception:
-            pass
-        return False
+            logger.debug("探测微信窗口失败（按不可用处理）", exc_info=True)
+            return False
+
+        if not found:
+            # 失败时留下标题样本，便于下次复现时直接定位标题变体；
+            # 微信退到托盘/最小化时每 5 秒都会失败，按分钟节流避免刷屏。
+            now = time.time()
+            if now - getattr(self, "_probe_miss_logged_at", 0) >= 60:
+                self._probe_miss_logged_at = now
+                logger.info("未探测到可操作的微信主窗口；顶层窗口样本=%s",
+                            samples[:12])
+        return found
 
 
 def wait_seconds(seconds: float) -> None:

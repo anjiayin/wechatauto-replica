@@ -1398,6 +1398,75 @@ class TestSenderPrewarm:
 # ---------------------------------------------------------------------------
 # wechat_service（不触碰真实微信的路径）
 # ---------------------------------------------------------------------------
+def _fake_win32_ctypes(windows):
+    """替身 ctypes：windows = {hwnd: {title, cls, pid, proc, visible, rect}}。
+
+    只实现 probe_wechat_window() 用到的 Win32 入口，不点击、不改真实窗口。
+    """
+    from types import SimpleNamespace
+
+    class _Buf:
+        def __init__(self, size):
+            self.value = ""
+
+    class _ULong:
+        def __init__(self, value=0):
+            self.value = value
+
+    class _Struct:
+        pass
+
+    class _User32:
+        def IsWindowVisible(self, hwnd):
+            return windows[hwnd]["visible"]
+
+        def GetWindowTextW(self, hwnd, buf, size):
+            buf.value = windows[hwnd]["title"]
+            return len(buf.value)
+
+        def GetClassNameW(self, hwnd, buf, size):
+            buf.value = windows[hwnd]["cls"]
+            return len(buf.value)
+
+        def GetWindowThreadProcessId(self, hwnd, pid):
+            pid.value = windows[hwnd]["pid"]
+
+        def GetWindowRect(self, hwnd, rect):
+            rect.left, rect.top, rect.right, rect.bottom = windows[hwnd]["rect"]
+
+        def EnumWindows(self, callback, _lparam):
+            for hwnd in windows:
+                if not callback(hwnd, 0):
+                    break
+            return True
+
+    class _Kernel32:
+        def OpenProcess(self, _flags, _inherit, pid):
+            for item in windows.values():
+                if item["pid"] == pid:
+                    return pid if item["proc"] else 0
+            return 0
+
+        def QueryFullProcessImageNameW(self, handle, _flags, buf, _size):
+            for item in windows.values():
+                if item["pid"] == handle:
+                    buf.value = "C:\\Program Files\\WeChat\\" + item["proc"]
+                    return True
+            return False
+
+        def CloseHandle(self, _handle):
+            return True
+
+    return SimpleNamespace(
+        windll=SimpleNamespace(user32=_User32(), kernel32=_Kernel32()),
+        WINFUNCTYPE=lambda *_args: (lambda fn: fn),
+        c_bool=bool, c_void_p=int, c_long=int, c_ulong=_ULong,
+        Structure=_Struct,
+        create_unicode_buffer=lambda size: _Buf(size),
+        byref=lambda value: value,
+    )
+
+
 class TestWeChatService:
     def test_degraded_state(self):
         db = Database(":memory:")
@@ -1406,6 +1475,78 @@ class TestWeChatService:
         # 未 start：默认降级态且不崩溃
         assert svc.listener_running is False
         assert svc.probe_wechat_window() in (True, False)
+
+    def test_probe_matches_dynamic_title_and_rejects_lookalikes(self, monkeypatch):
+        """标题带未读数仍能命中；同名小程序窗/记事本不得命中。"""
+        from app import wechat_service
+
+        windows = {
+            # 小程序宿主：标题精确等于「微信」，但进程不是 weixin
+            2: dict(title="微信", cls="Chrome_WidgetWin_0", pid=11828,
+                    proc="WeChatAppEx.exe", visible=True,
+                    rect=(0, 0, 1920, 1015)),
+            # 记事本打开带「微信」字样的文件，旧实现也可能误绑
+            3: dict(title="微信客服开发-记事本.txt", cls="Notepad", pid=99,
+                    proc="notepad.exe", visible=True, rect=(0, 0, 900, 700)),
+            # 真主窗：标题带未读数，旧实现精确匹配必失败
+            1: dict(title="微信 (3)", cls="Qt51514QWindowIcon", pid=3152,
+                    proc="Weixin.exe", visible=True, rect=(264, 135, 1230, 948)),
+        }
+        monkeypatch.setattr(wechat_service, "ctypes", _fake_win32_ctypes(windows))
+        svc = WeChatService(Database(":memory:"), Aggregator(lambda u: None))
+        assert svc.probe_wechat_window() is True
+
+    def test_probe_rejects_hidden_minimized_and_logs_samples(self, monkeypatch,
+                                                              caplog):
+        """托盘隐藏/最小化伪矩形不算可用，失败时记录标题样本。"""
+        import logging
+        from app import wechat_service
+
+        main = dict(title="微信", cls="Qt51514QWindowIcon", pid=3152,
+                    proc="Weixin.exe", visible=False,
+                    rect=(264, 135, 1230, 948))
+        lookalike = dict(title="微信", cls="Chrome_WidgetWin_0", pid=11828,
+                         proc="WeChatAppEx.exe", visible=True,
+                         rect=(0, 0, 1920, 1015))
+        monkeypatch.setattr(wechat_service, "ctypes",
+                            _fake_win32_ctypes({1: main, 2: lookalike}))
+        svc = WeChatService(Database(":memory:"), Aggregator(lambda u: None))
+
+        with caplog.at_level(logging.INFO):
+            assert svc.probe_wechat_window() is False
+        assert "未探测到可操作的微信主窗口" in caplog.text
+        assert "微信@wechatappex.exe" in caplog.text
+
+        main["visible"] = True
+        main["rect"] = (-32000, -32000, -31840, -31972)  # 最小化伪矩形 160x28
+        assert svc.probe_wechat_window() is False
+
+        main["rect"] = (264, 135, 1230, 948)
+        assert svc.probe_wechat_window() is True
+
+    def test_probe_process_query_failure_falls_back_to_qt_class(self, monkeypatch):
+        """权限不足查不到进程名时，Qt 外壳类名可兜底（同 guia 口径）。"""
+        from app import wechat_service
+
+        windows = {
+            1: dict(title="微信", cls="Qt51514QWindowIcon", pid=3152,
+                    proc="", visible=True, rect=(264, 135, 1230, 948)),
+        }
+        monkeypatch.setattr(wechat_service, "ctypes", _fake_win32_ctypes(windows))
+        svc = WeChatService(Database(":memory:"), Aggregator(lambda u: None))
+        assert svc.probe_wechat_window() is True
+
+    def test_probe_empty_title_falls_back_to_process_and_class(self, monkeypatch):
+        """跨完整性级别读不到标题时，Qt 类名 + weixin 进程仍判定可用。"""
+        from app import wechat_service
+
+        windows = {
+            1: dict(title="", cls="Qt51514QWindowIcon", pid=3152,
+                    proc="Weixin.exe", visible=True, rect=(264, 135, 1230, 948)),
+        }
+        monkeypatch.setattr(wechat_service, "ctypes", _fake_win32_ctypes(windows))
+        svc = WeChatService(Database(":memory:"), Aggregator(lambda u: None))
+        assert svc.probe_wechat_window() is True
 
     def test_display_name_fallback(self):
         db = Database(":memory:")
