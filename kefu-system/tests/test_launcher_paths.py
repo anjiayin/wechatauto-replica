@@ -134,6 +134,23 @@ def test_iss_packages_all_root_assets():
     assert "IconFilename:" in txt
 
 
+def test_iss_launch_entry_runs_in_silent_mode():
+    """[Run] 启动项不得带 skipifsilent：静默全量升级装完要自动把程序拉起来。
+
+    本机 ISCC 三组对照实测（同一脚本内 nowait postinstall / nowait /
+    nowait postinstall skipifsilent）：前两条在 /VERYSILENT 下都执行了，
+    日志 `-- Run entry -- / Run as: Original user`；带 skipifsilent 的那条
+    整条被跳过。现场「升级完程序不见了、要手动双击图标」就是这么来的。
+    """
+    iss = LAUNCHER.parent.parent / "installer" / "kefu.iss"
+    entries = [ln for ln in iss.read_text(encoding="utf-8").splitlines()
+               if ln.startswith('Filename: "{app}\\{#MyAppExeName}"')]
+    assert entries, "ISS 缺少 [Run] 启动条目"
+    for line in entries:
+        assert "skipifsilent" not in line, "静默安装不会启动程序"
+        assert "postinstall" in line and "nowait" in line
+
+
 # ---------------------------------------------------------------------------
 # 端口解析：必须与后端 run.py 的「环境变量 > 配置库 > 默认」优先级一致
 # ---------------------------------------------------------------------------

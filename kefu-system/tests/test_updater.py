@@ -442,6 +442,26 @@ def test_reconcile_never_regresses_sequence(monkeypatch, tmp_path):
     assert db.data[update_core.KEY_LAST_SEQUENCE] == "20"
 
 
+def test_reconcile_log_names_pending_not_only_current(monkeypatch, tmp_path,
+                                                       caplog):
+    """确认日志要写清「被满足的是哪个在途版本」，不能只报当前运行版本。
+
+    现场 1.3.7 那轮走的是 1.2MB app 增量，日志却打出「全量安装 1.3.7 已确认
+    生效」——那行只打印 current_version，而真正被清掉的是 1.3.6 遗留的
+    pending，复盘时把一次增量升级误读成成功的全量升级。
+    """
+    from app import update_service as us
+
+    db = _FakeUpdateDB()
+    db.data[update_core.KEY_PENDING_VERSION] = "1.2.2"
+    db.data[update_core.KEY_PENDING_SEQUENCE] = "17"
+    with caplog.at_level("INFO"):
+        assert us.reconcile_full_install(db, "1.2.3") == "confirmed"
+    assert "1.2.2" in caplog.text                 # 被满足的 pending
+    assert "1.2.3" in caplog.text                 # 当前运行版本
+    assert db.data[update_core.KEY_LAST_SEQUENCE] == "17"
+
+
 def test_check_keeps_prompting_when_full_install_pending(monkeypatch, tmp_path):
     """旧版客户端提前推进过 sequence 时，pending 仍要保留重试提示。"""
     from app import update_service as us

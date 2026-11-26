@@ -79,7 +79,13 @@ Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{a
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\app.ico"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Description: "立即启动{#MyAppName}"; Flags: nowait postinstall skipifsilent
+; 不带 skipifsilent —— 静默全量升级装完必须自动把程序拉起来。
+; 本机 ISCC 6.x 实测（三组对照）：`nowait postinstall` 在 /VERYSILENT 下会在
+; 安装成功后执行（日志 `-- Run entry -- / Run as: Original user`），加上
+; skipifsilent 才被整条跳过；此前带 skipifsilent 正是「升级完程序不见了、
+; 要用户自己双击图标」的原因。/RESTARTAPPLICATIONS 帮不上忙：它只能重启
+; 通过 Windows ARR 登记过的应用，pythonw 托盘与后端从未登记。
+Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Description: "立即启动{#MyAppName}"; Flags: nowait postinstall
 
 [UninstallRun]
 ; 先删 A/B junction（只删链接，不删目标），否则卸载器可能跟着链接删文件

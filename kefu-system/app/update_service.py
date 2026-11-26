@@ -156,8 +156,9 @@ def reconcile_full_install(db: Database, current_version: str = APP_VERSION) -> 
                 db.set_setting(core.KEY_LAST_SEQUENCE, str(seq))
             db.set_setting(core.KEY_PENDING_VERSION, "")
             db.set_setting(core.KEY_PENDING_SEQUENCE, "")
-        logger.info("启动自检：全量安装 %s 已确认生效，更新序号推进到 %d",
-                    current_version, max(old_seq, seq))
+        logger.info("启动自检：全量安装在途记录 %s 已由当前版本 %s 满足，"
+                    "更新序号推进到 %d", pending, current_version,
+                    max(old_seq, seq))
         return "confirmed"
     except Exception as exc:                      # noqa: BLE001 - fail-open
         logger.warning("启动自检确认全量安装失败（不阻断启动，下次继续）：%s", exc)
