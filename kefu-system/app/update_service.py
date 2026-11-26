@@ -120,6 +120,38 @@ def install_bundle_root_files(target: Path, bundle: Path) -> None:
 _RECONCILE_LOCK = threading.Lock()
 
 
+# ---------------------------------------------------------------------------
+# 增量升级落地后，请托盘启动器把后端重启一次
+# ---------------------------------------------------------------------------
+# 为什么用文件不用接口：托盘启动器（packaging/launcher.py）是独立进程、且刻意
+# 不 import 业务模块。它每 2 秒看一次 data/update_handoff.json，看到就把后端优雅
+# 重启（CTRL_BREAK 停 → 重新 spawn → 等就绪 → 重开页面）。写文件的正是本次升级前
+# 的那个后端，它随后就被重启掉，所以「谁写谁不重启」不会自杀。
+def _handoff_data_dir() -> Path | None:
+    """接力文件目录 = 安装根 data/（与启动器的 DATA 同一个）。
+
+    返回 None（源码运行、找不到安装根）时整条链路自动禁用：那种环境本来也没有
+    启动器进程可以请求重启。
+    """
+    bundle = bundle_root()
+    if bundle is None:
+        return None
+    return bundle / "data"
+
+
+def _clear_handoff_at_startup() -> None:
+    """清掉可能残留的接力文件，两条理由：
+
+    1) 本次重启已经消费过这个请求，重复消费会重启刚起来的自己；
+    2) 接力文件写在**旧**版本落地时，万一那次 apply 其实没成功（junction 没切、
+       current.json 没写），残留文件会把后来正在下载全量包的后端无辜杀掉。
+    """
+    try:
+        core.clear_handoff(_handoff_data_dir())
+    except Exception:                                  # 清不掉也不能挡住启动
+        pass
+
+
 def reconcile_full_install(db: Database, current_version: str = APP_VERSION) -> str:
     """启动自检：把「已确认落地」的全量安装从 pending 推进为 last_sequence。
 
@@ -135,6 +167,8 @@ def reconcile_full_install(db: Database, current_version: str = APP_VERSION) -> 
     返回 ``none``（没有在途安装）/ ``confirmed``（已确认）/ ``pending``
     （尚未落地，保留重试）。任何异常只记 WARN，绝不阻断后端启动。
     """
+    # 启动自检顺带消费掉上一版遗留的「请重启后端」请求（见 _clear_handoff_at_startup）。
+    _clear_handoff_at_startup()
     try:
         pending = str(db.get_setting(core.KEY_PENDING_VERSION, "") or "").strip()
         if not pending:
@@ -159,6 +193,10 @@ def reconcile_full_install(db: Database, current_version: str = APP_VERSION) -> 
         logger.info("启动自检：全量安装在途记录 %s 已由当前版本 %s 满足，"
                     "更新序号推进到 %d", pending, current_version,
                     max(old_seq, seq))
+        # 全量升级的安装器不会通知用户，托盘是唯一还活着的界面：留一条接力请求
+        # 让它冒个气泡，否则用户只能靠「设置页里版本号变了」才知道升级成功。
+        core.write_handoff(_handoff_data_dir(), current_version,
+                           kind=core.KIND_NOTIFY)
         return "confirmed"
     except Exception as exc:                      # noqa: BLE001 - fail-open
         logger.warning("启动自检确认全量安装失败（不阻断启动，下次继续）：%s", exc)
@@ -531,10 +569,15 @@ class UpdateService:
                 else:
                     self.db.set_setting(core.KEY_LAST_SEQUENCE,
                                         str(int(fresh.get("sequence", 0) or 0)))
-                    self._job.update({
-                        "state": "applied",
-                        "message": "安装完成，请重启",
-                    })
+                    # 版本层已切、current.json 已写 —— 剩下的只是让新代码跑起来。
+                    # 请求托盘启动器重启后端：它每 2 秒读一次接力文件，把本进程
+                    # 优雅停掉再重新拉起。写请求的一方正是被重启掉的本进程，所以
+                    # 后端自己绝不去 spawn 重启（那等于自杀）。
+                    if core.write_handoff(_handoff_data_dir(), version):
+                        message = "安装完成，正在自动重启后端…"
+                    else:
+                        message = "安装完成，请从托盘退出后重新打开"
+                    self._job.update({"state": "applied", "message": message})
         except Exception as exc:                  # noqa: BLE001
             logger.warning("更新应用失败：%s", exc)
             with self._lock:

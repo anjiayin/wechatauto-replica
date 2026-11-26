@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sqlite3
 import threading
 from pathlib import Path
@@ -20,6 +21,16 @@ def launcher():
     assert spec.loader is not None
     spec.loader.exec_module(mod)
     return mod
+
+
+@pytest.fixture(autouse=True)
+def isolate_data_dir(launcher, tmp_path: Path, monkeypatch):
+    """_log 会落 data/launcher.log：全模块把 DATA 指向临时目录。
+
+    否则每个用例都会往源码树 packaging/data/ 里写日志（污染工作区）。
+    """
+    monkeypatch.setattr(launcher, "DATA", tmp_path)
+    return tmp_path
 
 
 def _setup_bundle(launcher, monkeypatch, tmp_path: Path, version: str = "1.2.3"):
@@ -489,3 +500,248 @@ def test_start_backend_uses_binary_pipe(launcher):
     assert 'errors="replace"' in src
     # Edit 控件须显式放宽文本上限
     assert "EM_SETLIMITTEXT" in src
+
+
+# ---------------------------------------------------------------------------
+# C：日志落盘 data/launcher.log（pythonw 没有控制台，事后唯一取证）
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def log_data_dir(launcher, monkeypatch, tmp_path: Path) -> Path:
+    monkeypatch.delenv("KEFU_DATA_DIR", raising=False)
+    monkeypatch.setattr(launcher, "DATA", tmp_path)
+    return tmp_path
+
+
+def test_log_persists_to_file(launcher, log_data_dir):
+    launcher._state["log_lines"].clear()
+    launcher._log("后端启动中😀")
+    launcher._log("  带换行尾 ")
+    launcher._log("")                              # 空行不入内存也不落盘
+    text = (log_data_dir / "launcher.log").read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln]
+    assert len(lines) == 2
+    assert "后端启动中" in lines[0]
+    # 每行带完整日期时间：跨天排查升级时要能对齐 kefu.log
+    assert re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ", lines[0])
+    assert "带换行尾" in list(launcher._state["log_lines"])[-1]
+
+
+def test_log_file_rotates_over_limit(launcher, log_data_dir, monkeypatch):
+    """超上限轮转成 launcher.log.1，只留一份历史；轮转失败也不能丢当前写入。"""
+    monkeypatch.setattr(launcher, "LOG_MAX_BYTES", 10)
+    (log_data_dir / "launcher.log").write_text("x" * 40, encoding="utf-8")
+    launcher._log("new line")
+    assert (log_data_dir / "launcher.log.1").read_text(encoding="utf-8") == "x" * 40
+    assert "new line" in (log_data_dir / "launcher.log").read_text(encoding="utf-8")
+
+
+def test_unwritable_log_dir_keeps_gui_buffer(launcher, monkeypatch):
+    """落不了盘（无权限/磁盘满/盘符不存在）时日志窗口必须照常显示。
+
+    落盘排在缓冲之前，所以这一步炸了就等于整个日志功能消失——两侧都不能丢。
+    """
+    monkeypatch.setattr(launcher, "DATA", Path("Z:\\不存在-的-盘符"))
+    launcher._state["log_lines"].clear()
+    launcher._log("进内存但落不了盘")                 # 不抛异常
+    assert any("进内存但落不了盘" in ln for ln in launcher._state["log_lines"])
+
+
+# ---------------------------------------------------------------------------
+# B+D：升级接力（增量自动重启 + 升级完成气泡）
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def handoff_env(launcher, monkeypatch, tmp_path: Path):
+    """隔离 DATA、把「本次启动时刻」钉在 1000，便于构造陈旧/新鲜请求。"""
+    monkeypatch.setattr(launcher, "DATA", tmp_path)
+    monkeypatch.setitem(launcher._state, "started_at", 1000)
+    launcher._state["log_lines"].clear()
+
+    def write(version: str = "1.2.2", *, kind: str = "restart", at: int = 1000,
+              source: str = "backend") -> None:
+        (tmp_path / launcher.HANDOFF_FILE_NAME).write_text(
+            json.dumps({"version": version, "kind": kind, "at": at,
+                        "source": source}), encoding="utf-8")
+
+    return tmp_path, write
+
+
+def test_take_handoff_reads_and_deletes(launcher, handoff_env):
+    _, write = handoff_env
+    write(at=1001)
+    info = launcher._take_handoff(now_ts=1002)
+    assert info == {"version": "1.2.2", "kind": "restart", "at": 1001,
+                    "source": "backend"}
+    # 一次请求只执行一次
+    assert launcher._take_handoff(now_ts=1003) is None
+
+
+def test_take_handoff_ignores_stale_by_start_time(launcher, handoff_env):
+    """写入时刻早于本次启动：属于上一个启动器进程，照做会重启刚起来的后端。"""
+    data, write = handoff_env
+    write(at=999)
+    assert launcher._take_handoff(now_ts=1002) is None
+    assert not (data / launcher.HANDOFF_FILE_NAME).exists(), "忽略即删，不留悬案"
+
+
+def test_take_handoff_ignores_over_ttl(launcher, handoff_env):
+    """超 TTL 的请求来自半途失败的上一次 apply，照做会杀掉正在下载全量包的后端。"""
+    _, write = handoff_env
+    write(at=1001)
+    far = 1001 + launcher.HANDOFF_TTL_SEC + 1
+    assert launcher._take_handoff(now_ts=far) is None
+
+
+@pytest.mark.parametrize("doc", [
+    "{broken json", "[1,2]", '"text"',
+    json.dumps({"version": "1.2.2"}),                    # 缺 at
+    json.dumps({"version": "1.2.2", "at": "x"}),          # at 非 int
+    json.dumps({"version": "1.2.2", "at": True}),        # bool 是 int 子类，须拒
+    json.dumps({"version": "1.2.2", "at": 1.5}),          # 非 int
+])
+def test_take_handoff_fails_safe_on_bad_doc(launcher, handoff_env, doc):
+    data, _ = handoff_env
+    (data / launcher.HANDOFF_FILE_NAME).write_text(doc, encoding="utf-8")
+    assert launcher._take_handoff(now_ts=1002) is None
+
+
+def test_take_handoff_missing_file_is_quiet(launcher, handoff_env):
+    assert launcher._take_handoff(now_ts=1002) is None
+    assert len(launcher._state["log_lines"]) == 0
+
+
+def test_handle_handoff_notify_shows_balloon(launcher, monkeypatch):
+    got: list[tuple[str, str]] = []
+    monkeypatch.setattr(launcher, "_notify",
+                        lambda t, b: got.append((t, b)) or True)
+    restarts: list[str] = []
+    monkeypatch.setattr(launcher, "_restart_backend_for_update",
+                        lambda v="": restarts.append(v) or True)
+    assert launcher._handle_handoff({"kind": "notify", "version": "1.2.2"})
+    assert got and "1.2.2" in got[0][1]
+    assert restarts == []
+
+
+def test_handle_handoff_unknown_kind_is_ignored(launcher, monkeypatch):
+    """协议演进/写入方出 bug：记日志跳过，绝不做重启这种不可逆动作。"""
+    monkeypatch.setattr(launcher, "_notify",
+                        lambda *_a: (_ for _ in ()).throw(AssertionError))
+    assert launcher._handle_handoff({"kind": "who-knows", "version": "1.2.2"}) is False
+
+
+def test_notify_without_tray_hwnd_is_noop(launcher, monkeypatch):
+    monkeypatch.setitem(launcher._state, "hwnd", None)
+    assert launcher._notify("标题", "正文") is False
+
+
+def test_notify_or_log_falls_back_to_log(launcher, monkeypatch):
+    """气泡弹不出（远程桌面/无窗口站）时日志里必须留下同一句话。"""
+    monkeypatch.setattr(launcher, "_notify", lambda *_a: False)
+    launcher._state["log_lines"].clear()
+    launcher._notify_or_log("微信客服已更新", "已升级到 1.2.2")
+    assert any("已升级到 1.2.2" in ln for ln in launcher._state["log_lines"])
+
+
+def test_restart_backend_for_update_sequence(launcher, monkeypatch):
+    """重启顺序必须是 停→重新解析端口→重新起→等就绪→开页面→气泡。"""
+    calls: list[str] = []
+    monkeypatch.setitem(launcher._state, "exiting", False)
+    monkeypatch.setattr(launcher, "_stop_backend", lambda: calls.append("stop"))
+    monkeypatch.setattr(launcher, "_read_port",
+                        lambda: calls.append("port") or 8766)
+    monkeypatch.setattr(launcher, "_start_backend",
+                        lambda: calls.append("start") or object())
+    monkeypatch.setattr(
+        launcher, "_port_ready",
+        lambda port, timeout=30.0: calls.append(f"ready:{port}:{timeout}") or True)
+    monkeypatch.setattr(launcher, "_open_ui", lambda: calls.append("open"))
+    got: list[tuple[str, str]] = []
+    monkeypatch.setattr(launcher, "_notify",
+                        lambda t, b: got.append((t, b)) or True)
+
+    assert launcher._restart_backend_for_update("1.2.2") is True
+    assert calls == ["stop", "port", "start", "ready:8766:60.0", "open"]
+    assert got and got[0][0] == "微信客服已更新" and "1.2.2" in got[0][1]
+
+
+def test_restart_backend_gives_up_when_exiting(launcher, monkeypatch):
+    """用户在停止等待的 30 秒里点了托盘「退出」：绝不能再把后端拉起来，
+    否则进程退出后留下一个没有托盘托管的孤儿后端。"""
+    calls: list[str] = []
+
+    def stop():
+        calls.append("stop")
+        launcher._state["exiting"] = True      # 模拟等待期间用户退出
+
+    monkeypatch.setitem(launcher._state, "exiting", False)
+    monkeypatch.setattr(launcher, "_stop_backend", stop)
+    monkeypatch.setattr(launcher, "_start_backend",
+                        lambda: calls.append("start") or object())
+    assert launcher._restart_backend_for_update("1.2.2") is False
+    assert calls == ["stop"]
+
+
+def test_restart_backend_reports_start_failure(launcher, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(launcher, "_stop_backend", lambda: None)
+    monkeypatch.setattr(launcher, "_read_port", lambda: 8765)
+
+    def boom():
+        raise RuntimeError("内置 Python 缺失")
+
+    monkeypatch.setattr(launcher, "_start_backend", boom)
+    got: list[tuple[str, str]] = []
+    monkeypatch.setattr(launcher, "_notify",
+                        lambda t, b: got.append((t, b)) or True)
+    assert launcher._restart_backend_for_update("1.2.2") is False
+    assert got and "未完成" in got[0][0] and "内置 Python 缺失" in got[0][1]
+
+
+def test_restart_backend_reports_not_ready(launcher, monkeypatch):
+    monkeypatch.setattr(launcher, "_stop_backend", lambda: None)
+    monkeypatch.setattr(launcher, "_read_port", lambda: 8765)
+    monkeypatch.setattr(launcher, "_start_backend", lambda: object())
+    monkeypatch.setattr(launcher, "_port_ready", lambda port, timeout=30.0: False)
+    opened: list[str] = []
+    monkeypatch.setattr(launcher, "_open_ui", lambda: opened.append("open"))
+    got: list[tuple[str, str]] = []
+    monkeypatch.setattr(launcher, "_notify",
+                        lambda t, b: got.append((t, b)) or True)
+    assert launcher._restart_backend_for_update("1.2.2") is False
+    assert opened == []                             # 没就绪不能假装成功开页面
+    assert got and "未完成" in got[0][0]
+
+
+def test_handoff_watcher_survives_exceptions(launcher, monkeypatch):
+    """轮询线程任何异常都只记日志继续：线程一死，自动重启与升级提示双双失联。"""
+    ticks: list[int] = []
+
+    def fake_sleep(_s: float) -> None:
+        ticks.append(len(ticks))
+        if len(ticks) < 3:
+            raise RuntimeError("模拟轮询异常")
+
+    handled: list[dict] = []
+    monkeypatch.setattr(launcher.time, "sleep", fake_sleep)
+    monkeypatch.setattr(launcher, "_take_handoff",
+                        lambda: {"kind": "notify", "version": "1.2.2"})
+    monkeypatch.setattr(launcher, "_handle_handoff", handled.append)
+    t = launcher._start_handoff_watcher()
+    t.join(timeout=3.0)
+    assert handled, "异常后必须继续轮询并处理请求"
+    assert any("自动恢复" in ln for ln in launcher._state["log_lines"])
+
+
+def test_menu_exit_sets_exiting_flag_before_stopping(launcher):
+    """退出流程必须先立旗，接力线程才敢保证不再重启后端。"""
+    src = LAUNCHER.read_text(encoding="utf-8")
+    exit_block = src.split("elif cmd == MENU_EXIT:")[1].split("return 0")[0]
+    started = exit_block.index("_stop_backend()")
+    assert exit_block.index('_state["exiting"] = True') < started
+
+
+def test_main_starts_handoff_watcher(launcher):
+    src = LAUNCHER.read_text(encoding="utf-8")
+    assert "_start_handoff_watcher()" in src
+    body = src.split("def main(")[1]
+    assert body.index("_add_tray(hwnd)") < body.index("_start_handoff_watcher()"), \
+        "气泡要挂在已存在的托盘图标上，故必须在 _add_tray 之后启动"

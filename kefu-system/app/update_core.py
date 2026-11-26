@@ -236,6 +236,90 @@ def full_install_confirmed(current: str, pending_version: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# 升级后交给「托盘启动器」的接力文件
+# ---------------------------------------------------------------------------
+# 为什么用文件不用接口/HTTP：托盘启动器（packaging/launcher.py）是独立进程，且
+# 刻意不 import 本层任何模块（见其文件头），双方只约定这一个 JSON 文件；请求的
+# 执行结果恰恰是「本进程被重启」，任何同步调用都拿不到返回值。
+# launcher 侧有一份同 schema 的精简实现，字段改动必须同步改它 —— 改 HANDOFF_FILE
+# 或 version/at/kind 就等于改协议。
+HANDOFF_FILE = "update_handoff.json"
+HANDOFF_TTL_SEC = 15 * 60       # 过期请求不再执行：绝不能无故杀掉正在下载/安装的后端
+KIND_RESTART = "restart"        # 增量已落地：请把后端重启一次，加载新版本层
+KIND_NOTIFY = "notify"          # 全量升级已由新版本自检确认：请托盘提示用户升级完成
+_VERSION_SAFE_RE = re.compile(r"[^0-9A-Za-z._-]")
+
+
+def _handoff_path(data_dir: Any) -> Path | None:
+    """交接文件绝对路径；data_dir 为空（开发环境没有 bundle 根）返回 None。"""
+    if not data_dir:
+        return None
+    return Path(os.path.abspath(str(data_dir))) / HANDOFF_FILE
+
+
+def write_handoff(data_dir: Any, version: str, *, source: str = "backend",
+                  kind: str = KIND_RESTART, now_ts: int | None = None) -> Path | None:
+    """写升级接力文件，返回路径；目录不可用或写失败返回 None（调用方退回手动文案）。
+
+    原子写（先 .tmp 再 os.replace）：启动器 2 秒轮询一次，绝不能读到半截 JSON。
+    失败只影响「自动重启/自动提示」这一个便利，不影响已经装好的版本，故异常吞掉。
+    """
+    path = _handoff_path(data_dir)
+    if path is None:
+        return None
+    payload = {
+        "version": _VERSION_SAFE_RE.sub("", str(version or ""))[:64],
+        "source": _VERSION_SAFE_RE.sub("", str(source or ""))[:32],
+        "kind": kind if kind in (KIND_RESTART, KIND_NOTIFY) else KIND_NOTIFY,
+        "at": int(time.time() if now_ts is None else now_ts),
+    }
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)   # data/ 由后端先建，兜底自建
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return None
+    return path
+
+
+def read_handoff(data_dir: Any, *, max_age_sec: int = HANDOFF_TTL_SEC,
+                 now_ts: int | None = None) -> dict | None:
+    """读接力文件并校验时效；缺失/损坏/过期一律返回 None（fail-safe）。"""
+    path = _handoff_path(data_dir)
+    if path is None:
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    at = raw.get("at")
+    if not isinstance(at, int) or isinstance(at, bool):
+        return None
+    now = int(time.time() if now_ts is None else now_ts)
+    if now - at > int(max_age_sec):
+        return None
+    return raw
+
+
+def clear_handoff(data_dir: Any) -> None:
+    """删除接力文件：一次请求只被执行一次，也避免旧请求日后误触发重启。"""
+    path = _handoff_path(data_dir)
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
 def full_install_log_path(exe: Path) -> Path:
     """安装器日志落点：与安装包同目录同名换 .log（data/update/ 升级不清理）。"""
     return Path(os.path.abspath(str(exe.with_suffix("")) + ".log"))

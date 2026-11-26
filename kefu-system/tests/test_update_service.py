@@ -17,7 +17,8 @@ from app import update_service as us
 from app.api import license_guard
 from app.api.router_update import router as update_router
 from app.update_core import (
-    KEY_IGNORED_SEQUENCE, KEY_IGNORED_VERSION, KEY_LAST_SEQUENCE,
+    HANDOFF_FILE, KIND_RESTART, KEY_IGNORED_SEQUENCE, KEY_IGNORED_VERSION,
+    KEY_LAST_SEQUENCE, read_handoff,
 )
 
 
@@ -345,6 +346,13 @@ def test_apply_cross_version_switches_junction_and_current_json(
     assert svc.status()["state"] == "applied"
     assert svc.db.data[KEY_IGNORED_VERSION] == ""
     assert svc.db.data[KEY_IGNORED_SEQUENCE] == ""
+    # 增量落地的最后一步：把「重启后端」的请求交给托盘启动器。后端自己不能重启
+    # 自己（一死托盘只会看到进程退出），老版启动器不认识这文件、退回手动重启。
+    assert (bundle / "data" / HANDOFF_FILE).is_file()
+    handoff = read_handoff(bundle / "data")
+    assert handoff is not None
+    assert handoff["kind"] == KIND_RESTART and handoff["version"] == "1.2.2"
+    assert "自动重启" in svc.status()["message"]
 
 
 def test_update_routes_registered():
@@ -455,6 +463,8 @@ def test_apply_aborts_on_nonwhitelist_bundle_root_entry(
     assert (bundle / "launcher.pyc").read_bytes() == b"LAUNCHER-OLD"
     # target 已清理，不留半成品
     assert not (bundle / "app" / "1.2.2").exists()
+    # 失败绝不能留下重启请求：那会让启动器去重启一个根本没升级成功的后端
+    assert not (bundle / "data" / HANDOFF_FILE).exists()
 
 
 def test_apply_degrades_to_skip_when_root_file_locked(

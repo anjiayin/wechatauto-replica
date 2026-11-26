@@ -4,7 +4,7 @@
  * 后端已完成 manifest 验签与三级判定，前端只负责展示与「关杀软确认」交互；
  * 任何下载/切换都由后端接口执行，前端不直接访问 OSS（避免 CORS 与密钥问题）。
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Alert,
@@ -28,6 +28,15 @@ import { apiGet, apiPost } from '../api/client'
 import type { UpdateCheckOut, UpdateStatusOut } from '../api/types'
 
 const QUERY_KEY = ['update-check']
+
+/** 下载/安装的中间态之外都算本轮轮询可以停下来的状态。 */
+const SETTLED_STATES = ['done', 'error', 'applied', 'installing']
+
+/**
+ * 等自动重启的上限：全量安装实测约 2 分钟（8173 个文件），留足余量。
+ * 超时不代表升级失败，只代表「自动重启没观察到」——届时要给用户手动兜底入口。
+ */
+const RESTART_WAIT_MS = 5 * 60 * 1000
 
 function hasUpdate(c?: UpdateCheckOut): boolean {
   return c?.action === 'optional' || c?.action === 'forced'
@@ -64,6 +73,10 @@ export function useUpdateCheck(autoStart: boolean) {
     enabled: false,
     staleTime: 5 * 60 * 1000,
     retry: false,
+    // 覆盖 main.tsx 的全局 false：本页唯一「长时间挂着不动」的界面，切回标签页
+    // 就重查一次（受 staleTime 约束，最多 5 分钟一次），否则厂商重发同版本、
+    // 或升级后服务端版本已变，用户不点「检查更新」就永远看不到。
+    refetchOnWindowFocus: true,
   })
   const refetch = query.refetch
   useEffect(() => {
@@ -120,6 +133,13 @@ export function UpdateDialog({ open, onClose, check }: {
   const [polling, setPolling] = useState(false)
   const [applied, setApplied] = useState(false)
   const [unignoring, setUnignoring] = useState(false)
+  // 等自动重启：apply 成功后程序会被重启（增量由托盘重启后端、全量由安装器重启
+  // 整个程序），此刻后端进程会短暂连不上，必须继续轮询直到版本号真的变了。
+  const [awaitRestart, setAwaitRestart] = useState(false)
+  const [restarted, setRestarted] = useState(false)
+  const [restartTimeout, setRestartTimeout] = useState(false)
+  const [fromVersion, setFromVersion] = useState('')
+  const restartAt = useRef(0)
 
   const reset = useCallback(() => {
     setAgreed(false)
@@ -128,6 +148,11 @@ export function UpdateDialog({ open, onClose, check }: {
     setPolling(false)
     setApplied(false)
     setUnignoring(false)
+    setAwaitRestart(false)
+    setRestarted(false)
+    setRestartTimeout(false)
+    setFromVersion('')
+    restartAt.current = 0
   }, [])
   useEffect(() => {
     if (!open) {
@@ -140,32 +165,52 @@ export function UpdateDialog({ open, onClose, check }: {
       .catch(() => { /* 状态查询失败不打扰主流程 */ })
   }, [open, reset])
 
-  // 下载期间轮询本地状态接口；终态自动停止（error/done/applied）。
+  // 下载期间轮询本地状态接口；进入等重启阶段后改为轮询「服务端版本是否已变」。
   useEffect(() => {
-    if (!open || !polling || applied) return
+    if (!open || !polling) return
     let alive = true
     const tick = () => {
       apiGet<UpdateStatusOut>('/api/system/update/status')
         .then((s) => {
           if (!alive) return
           setStatus(s)
-          if (['done', 'error', 'applied', 'installing'].includes(s.state)) {
+          if (!awaitRestart) {
+            if (SETTLED_STATES.includes(s.state)) setPolling(false)
+            return
+          }
+          // 能问通就说明进程已经换过来了：让 App 的 update-check 重新取版本号
+          void qc.refetchQueries({ queryKey: QUERY_KEY })
+          if (Date.now() - restartAt.current > RESTART_WAIT_MS) {
             setPolling(false)
+            setRestartTimeout(true)
+            setAwaitRestart(false)
           }
         })
         .catch((e) => {
           if (!alive) return
-          setError(errText(e))
-          setPolling(false)
+          // 重启期间连接被拒是预期现象，不能报「更新失败」；只有下载阶段算错误
+          if (!awaitRestart) {
+            setError(errText(e))
+            setPolling(false)
+          }
         })
     }
     void tick()
-    const timer = window.setInterval(() => { void tick() }, 700)
+    const timer = window.setInterval(() => { void tick() }, awaitRestart ? 2000 : 700)
     return () => {
       alive = false
       window.clearInterval(timer)
     }
-  }, [open, polling, applied])
+  }, [open, polling, awaitRestart, qc])
+
+  // 自动重启完成的唯一判据：后端自报的运行版本变了（不是前端编译期常量）。
+  useEffect(() => {
+    const now = check?.current_version
+    if (!awaitRestart || !fromVersion || !now || now === fromVersion) return
+    setAwaitRestart(false)
+    setPolling(false)
+    setRestarted(true)
+  }, [awaitRestart, fromVersion, check?.current_version])
 
   const c = check
   const update = hasUpdate(c)
@@ -191,6 +236,16 @@ export function UpdateDialog({ open, onClose, check }: {
     }
   }
 
+  /** 进入「等程序自动重启」观察态：记下当前运行版本，轮询到版本变了即完成。 */
+  const startRestartWatch = () => {
+    setFromVersion(c?.current_version || '')
+    restartAt.current = Date.now()
+    setApplied(true)
+    setAwaitRestart(true)
+    setRestartTimeout(false)
+    setPolling(true)
+  }
+
   const applyUpdate = async () => {
     setError('')
     try {
@@ -198,7 +253,7 @@ export function UpdateDialog({ open, onClose, check }: {
         '/api/system/update/apply',
       )
       if (!r.ok) throw new Error('后端未能完成安装')
-      setApplied(true)
+      startRestartWatch()
       qc.setQueryData<UpdateCheckOut>(QUERY_KEY,
         (old) => (old ? { ...old, action: 'none', ignored: false } : old))
     } catch (e) {
@@ -315,16 +370,28 @@ export function UpdateDialog({ open, onClose, check }: {
             更新失败：{status?.message || error}（已停在原版本，可关闭杀软后重试）
           </Alert>
         )}
-        {state === 'installing' && (
+        {state === 'installing' && !applied && (
           <Alert severity="info" sx={{ mt: 2 }}>
-            全量安装已启动，正在等待新版本启动确认…
+            全量安装已在进行，安装程序会自动关闭并重新打开本程序…
           </Alert>
         )}
-        {applied && (
+        {restarted && (
           <Alert severity="success" sx={{ mt: 2 }}>
+            升级完成，当前版本 v{currentVersion(c)}。
+          </Alert>
+        )}
+        {applied && !restarted && (
+          <Alert severity="info" sx={{ mt: 2 }}>
             {status?.package_type === 'full'
-              ? '全量安装已启动，程序将自动重启；若长时间没有重启，请重新打开本窗口检查更新并重试。'
-              : '新版本已安装。请退出托盘程序后重新启动，即可使用新版本。'}
+              ? '全量安装已启动，安装完成后程序会自动重新打开（约 1-3 分钟），'
+                + '本窗口会自动显示新版本号，请勿关机。'
+              : '新版本已安装，正在自动重启后端服务，请稍候…'}
+          </Alert>
+        )}
+        {restartTimeout && (
+          <Alert severity="warning" sx={{ mt: 2 }}>
+            程序未能自动重启（版本已安装成功，只是没自动拉起来）。
+            请右键托盘图标「退出」，再双击桌面图标重新打开；重新打开后本页面会自动显示新版本。
           </Alert>
         )}
         {error && !state.startsWith('error') && (
@@ -348,9 +415,9 @@ export function UpdateDialog({ open, onClose, check }: {
             忽略此版本
           </Button>
         )}
-        {state === 'installing' && (
-          <Button onClick={() => void qc.refetchQueries({ queryKey: QUERY_KEY })}>
-            重新检查
+        {(state === 'installing' || awaitRestart) && !restarted && (
+          <Button onClick={startRestartWatch} disabled={awaitRestart}>
+            {awaitRestart ? '正在自动重启…' : '继续等待自动重启'}
           </Button>
         )}
         {update && !downloading && !applied && state !== 'done' && (

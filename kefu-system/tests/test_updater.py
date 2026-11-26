@@ -950,3 +950,128 @@ def test_full_install_confirmed_uses_numeric_version_compare():
     assert full_install_confirmed("1.3.3", "1.3.3") is True
     assert full_install_confirmed("1.3.3", "not-a-version") is False
     assert full_install_confirmed("1.3.3", "") is False
+
+
+# ---------------------------------------------------------------------------
+# 升级接力文件（写方：后端 apply / 启动自检 / 托盘 updater；读方：launcher.py）
+# ---------------------------------------------------------------------------
+def test_handoff_write_read_clear(tmp_path):
+    """协议本身：原子写、读到、清除，以及版本串清洗。"""
+    data = tmp_path / "data"
+    assert update_core.write_handoff(None, "1.2.2") is None     # 未启用不建目录
+    path = update_core.write_handoff(data, "1.2.2/../evil", source="backend")
+    assert path == data / update_core.HANDOFF_FILE
+    assert not list(data.glob("*.tmp"))                          # 不留半个临时文件
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    # 清洗只去路径分隔符（文件名固定，不存在穿越面），保留数字点号便于断言
+    assert "/" not in raw["version"] and "\\" not in raw["version"]
+    assert raw["kind"] == update_core.KIND_RESTART
+    info = update_core.read_handoff(data, now_ts=raw["at"])
+    assert info == raw
+    update_core.clear_handoff(data)
+    assert update_core.read_handoff(data, now_ts=raw["at"]) is None
+    update_core.clear_handoff(data)                              # 幂等不抛
+
+
+def test_handoff_read_fails_safe(tmp_path):
+    """缺失/损坏/非法 at/超 TTL 一律 None：启动器据此什么都不做，绝不报错。"""
+    data = tmp_path / "data"
+    data.mkdir()
+    assert update_core.read_handoff(data) is None
+    assert update_core.read_handoff(None) is None
+    path = data / update_core.HANDOFF_FILE
+    path.write_text("{broken", encoding="utf-8")
+    assert update_core.read_handoff(data) is None
+    path.write_text("[1,2]", encoding="utf-8")
+    assert update_core.read_handoff(data) is None
+    for bad_at in (None, "x", 1.5, True):
+        path.write_text(json.dumps({"version": "1.2.2", "at": bad_at}),
+                        encoding="utf-8")
+        assert update_core.read_handoff(data, now_ts=1_700_000_000) is None
+    path.write_text(json.dumps({"version": "1.2.2", "at": 100}), encoding="utf-8")
+    assert update_core.read_handoff(data, now_ts=100) is not None
+    assert update_core.read_handoff(
+        data, now_ts=100 + update_core.HANDOFF_TTL_SEC + 1) is None
+
+
+def test_reconcile_confirmed_leaves_notify_handoff(monkeypatch, tmp_path):
+    """全量升级确认落地时留一条 notify 请求，托盘据此弹「已升级到 x.y.z」。"""
+    from app import update_service as us
+
+    db = _FakeUpdateDB()
+    db.data[update_core.KEY_PENDING_VERSION] = "1.2.2"
+    db.data[update_core.KEY_PENDING_SEQUENCE] = "17"
+    bundle = tmp_path / "bundle"
+    (bundle / "data").mkdir(parents=True)
+    monkeypatch.setattr(us, "bundle_root", lambda: bundle)
+    assert us.reconcile_full_install(db, "1.2.2") == "confirmed"
+    info = update_core.read_handoff(bundle / "data", now_ts=None)
+    assert info is not None and info["kind"] == update_core.KIND_NOTIFY
+    assert info["version"] == "1.2.2"
+
+
+def test_reconcile_pending_and_none_leave_no_handoff(monkeypatch, tmp_path):
+    """未落地/无在途安装不得提示升级完成；陈旧 restart 请求必须由启动自检消费掉。"""
+    from app import update_service as us
+
+    bundle = tmp_path / "bundle"
+    data = bundle / "data"
+    data.mkdir(parents=True)
+    monkeypatch.setattr(us, "bundle_root", lambda: bundle)
+
+    db = _FakeUpdateDB()
+    db.data[update_core.KEY_PENDING_VERSION] = "1.2.2"       # 安装被拦停
+    stale = update_core.write_handoff(data, "1.2.1")
+    assert us.reconcile_full_install(db, "1.2.1") == "pending"
+    assert not stale.exists(), "残留请求会让启动器无故重启一次刚起来的后端"
+    assert update_core.read_handoff(data) is None
+
+    stale2 = update_core.write_handoff(data, "1.2.1")        # 再来一次，无 pending
+    assert us.reconcile_full_install(_FakeUpdateDB(), "1.2.1") == "none"
+    assert not stale2.exists()
+    assert update_core.read_handoff(data) is None
+
+
+def test_updater_run_writes_restart_handoff(updater, monkeypatch, tmp_path,
+                                            capsys):
+    """托盘链路增量成功后必须写重启请求，并把文案换成「正在自动重启」。"""
+    bundle = tmp_path / "bundle"
+    (bundle / "app" / "1.2.1" / "kefu-system" / "app").mkdir(parents=True)
+    (bundle / "current.json").write_text(
+        json.dumps({"version": "1.2.1", "active": "1.2.1"}), encoding="utf-8")
+    zip_path = bundle / "data" / "update" / "app-1.2.2.zip"
+    zip_path.parent.mkdir(parents=True)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("kefu-system/app/marker.pyc", b"new")
+    zip_path.write_bytes(buf.getvalue())
+    _run_env(updater, monkeypatch, bundle)
+
+    assert updater.run() == 0
+    info = update_core.read_handoff(bundle / "data")
+    assert info["version"] == "1.2.2"
+    assert info["kind"] == update_core.KIND_RESTART
+    assert info["source"] == "tray"
+    out = capsys.readouterr().out
+    assert "正在自动重启" in out and "请重启程序生效" not in out
+
+
+def test_updater_run_without_handoff_support_falls_back(updater, monkeypatch,
+                                                        tmp_path, capsys):
+    """老版本层没有 write_handoff 符号时退回手动重启文案，绝不报错中断升级。"""
+    bundle = tmp_path / "bundle"
+    (bundle / "app" / "1.2.1" / "kefu-system" / "app").mkdir(parents=True)
+    (bundle / "current.json").write_text(
+        json.dumps({"version": "1.2.1", "active": "1.2.1"}), encoding="utf-8")
+    zip_path = bundle / "data" / "update" / "app-1.2.2.zip"
+    zip_path.parent.mkdir(parents=True)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("kefu-system/app/marker.pyc", b"new")
+    zip_path.write_bytes(buf.getvalue())
+    _run_env(updater, monkeypatch, bundle)
+    monkeypatch.setattr(updater, "write_handoff", None)
+
+    assert updater.run() == 0
+    assert not (bundle / "data" / update_core.HANDOFF_FILE).exists()
+    assert "请重启程序生效" in capsys.readouterr().out

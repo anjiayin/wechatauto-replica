@@ -79,6 +79,12 @@ try:
 except ImportError:                              # pragma: no cover - 老版本层
     full_install_log_path = None                 # type: ignore[assignment]
 
+# 同样单独降级：「重启接力」缺失时只是不能自动重启，文案退回手动重启。
+try:
+    from app.update_core import write_handoff
+except ImportError:                              # pragma: no cover - 老版本层
+    write_handoff = None                         # type: ignore[assignment]
+
 BUNDLE_FILE = Path(__file__).resolve()
 
 
@@ -455,7 +461,7 @@ def run() -> int:
         hint = ""
         if full_install_log_path is not None:
             hint = f"；安装器日志 {full_install_log_path(dst)}"
-        print("[update] 全量安装已启动，程序将自动重启。" + hint)
+        print("[update] 全量安装已启动，装完会自动重新打开程序（约 1-2 分钟）。" + hint)
         return 0
 
     target = APP_DIR / ver
@@ -490,7 +496,13 @@ def run() -> int:
         {"version": ver, "active": ver, "previous": prev}, ensure_ascii=False, indent=2),
         encoding="utf-8")
     _save_state("", int(m.get("sequence", 0)))
-    print(f"[update] 已切换到 {ver}，请重启程序生效。")
+    # 请托盘启动器把后端重启一次，加载刚切好的新版本层（与后端 apply 同一套接力
+    # 文件）。本脚本绝不能自己重启：它是启动器 spawn 的子进程，且重启后必须仍
+    # 由托盘托管后端。老启动器不认识接力文件 → 文案退回手动重启。
+    if write_handoff is not None and write_handoff(DATA, ver, source="tray"):
+        print(f"[update] 已切换到 {ver}，正在自动重启后端…")
+    else:
+        print(f"[update] 已切换到 {ver}，请重启程序生效。")
     return 0
 
 

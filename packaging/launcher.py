@@ -11,6 +11,10 @@
     只隐藏不退进程；只有托盘「退出」才真正停后端并退出
   - 注入全部环境变量：PATH、QT_ACCESSIBILITY、KEFU_APP_ROOT/KEFU_BUNDLE_ROOT/
     KEFU_DATA_DIR/ASSETS_DIR/VERSION_FILE、KEFU_DELIVERY_SEED、DLL 搜索目录
+  - 升级接力：轮询 data/update_handoff.json，增量升级装完自动原地重启后端，
+    全量升级确认后弹托盘气泡「已升级到 x.y.z」（见 _start_handoff_watcher）
+  - 日志除 GUI 窗口外同步落 data/launcher.log（pythonw 没有控制台，这是事后
+    唯一取证入口）
 
 刻意不在本进程 import 业务代码（避免 UIA/COM 线程）；只做进程管理 + 托盘 + 日志。
 """
@@ -45,6 +49,13 @@ MUTEX_NAME = "Local\\WeChatKefuLauncher_SingleInstance"
 DEFAULT_PORT = 8765                                          # 与 run.py 的 DEFAULT_PORT 一致
 SETTING_KEY_PORT = "run.port"                                # 与 run.py/router_settings.py 一致
 DB_NAME = "kefu.sqlite3"                                     # 与 app.config.DB_PATH 一致
+# 升级接力文件（写入方 app/update_core.write_handoff，schema 改动必须两边同步）：
+# 本进程刻意不 import 业务模块，故这里独立实现读取，不复用 update_core。
+HANDOFF_FILE_NAME = "update_handoff.json"
+HANDOFF_TTL_SEC = 15 * 60          # 与 app/update_core.HANDOFF_TTL_SEC 一致
+HANDOFF_POLL_SEC = 2.0
+KIND_RESTART = "restart"
+KIND_NOTIFY = "notify"
 
 def _fatal(msg: str) -> None:
     """pythonw 无控制台：致命错误写文件，便于排查。"""
@@ -69,6 +80,9 @@ _state = {
     "hwnd": None, "proc": None, "port": DEFAULT_PORT, "opened": False, "nid": (1,),
     "log_hwnd": None, "log_edit": None, "log_lines": deque(maxlen=3000),
     "log_lock": threading.Lock(), "log_timer": None,
+    # 只执行本次启动之后写入的接力请求：更早的请求属于上一个启动器进程，
+    # 照它重启会杀掉刚起来的后端（还可能打断正在进行的下载/安装）。
+    "started_at": int(time.time()), "exiting": False,
 }
 
 
@@ -235,11 +249,38 @@ def _child_env() -> dict:
 # ---------------------------------------------------------------------------
 # 日志捕获 + GUI 日志窗口
 # ---------------------------------------------------------------------------
+# 落盘文件名与大小上限：启动器是 pythonw（没有控制台），日志窗口又是默认隐藏的，
+# 出问题（升级没起来、后端反复重启失败）时磁盘上这份是唯一的事后取证。
+LOG_FILE_NAME = "launcher.log"
+LOG_MAX_BYTES = 1024 * 1024          # 超限轮转，只留一份历史 launcher.log.1
+
+
+def _append_log_file(line: str) -> None:
+    """把一行日志追加到 data/launcher.log；任何 IO 异常都吞掉。
+
+    绝不允许影响 GUI 缓冲（日志窗口是排障第一入口），也不允许让 drain 线程因为
+    写盘失败而死——写盘失败的最坏后果只是「事后没日志可查」。
+    """
+    try:
+        DATA.mkdir(parents=True, exist_ok=True)
+        path = DATA / LOG_FILE_NAME
+        try:
+            if path.stat().st_size > LOG_MAX_BYTES:
+                os.replace(path, DATA / (LOG_FILE_NAME + ".1"))
+        except OSError:
+            pass                      # 新建/轮转失败继续按追加走
+        with open(path, "a", encoding="utf-8", errors="replace") as fh:
+            fh.write(time.strftime("%Y-%m-%d %H:%M:%S ") + line + "\n")
+    except Exception:                 # noqa: BLE001
+        pass
+
+
 def _log(line: str) -> None:
-    """把一行文本写入日志缓冲（供 GUI 日志窗口显示）。"""
+    """把一行文本写入日志缓冲（供 GUI 日志窗口显示）并落 data/launcher.log。"""
     line = line.rstrip("\r\n")
     if not line:
         return
+    _append_log_file(line)
     stamp = time.strftime("%H:%M:%S")
     with _state["log_lock"]:
         _state["log_lines"].append(f"[{stamp}] {line}")
@@ -585,6 +626,169 @@ def _do_update():
                          env=_child_env(), creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
 
 
+# ---------------------------------------------------------------------------
+# 升级接力：增量装完自动重启后端 + 升级完成托盘气泡提示
+# ---------------------------------------------------------------------------
+# 写入方是 app/update_core.write_handoff（后端 apply / 托盘 updater 调用）。
+# 为什么这件事只能由启动器做：「重启后端」= 停掉子进程再重新 spawn，而后端自己
+# 做不到（它一死，托盘只会看到进程退出，不会重新拉起——拉起是 main 的一次性逻辑）；
+# 用 kill + 外部计划任务更不行，1.3.6 现场已证明硬杀进程树的代价。
+# 老版启动器不认识这个文件（本能力随 launcher.pyc 一起发布），届时只是不自动
+# 重启，升级本身仍然成功 —— 请求文件会在 TTL 后被忽略并删除，不会累积。
+def _handoff_path() -> Path:
+    return DATA / HANDOFF_FILE_NAME
+
+
+def _take_handoff(now_ts: int | None = None) -> dict | None:
+    """读走一条升级接力请求（读到即删，一次请求只执行一次），不可执行返回 None。
+
+    两道守卫缺一不可：
+      - at < 本次启动时刻：属于上一个启动器进程的请求，照做会重启刚起来的后端；
+      - 超 TTL：apply 半途失败留下的陈旧请求，照做会杀掉此刻正在下载全量包的进程。
+    删除失败不影响正确性：at 守卫会让同一请求第二次被忽略。
+    """
+    path = _handoff_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None                              # 没有请求 / 读到半个 JSON
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    if not isinstance(raw, dict):
+        return None
+    at = raw.get("at")
+    if not isinstance(at, int) or isinstance(at, bool):
+        return None
+    now = int(time.time() if now_ts is None else now_ts)
+    if at < _state["started_at"] or now - at > HANDOFF_TTL_SEC:
+        _log(f"[launcher] 忽略陈旧升级接力请求（版本 {raw.get('version')}）")
+        return None
+    return raw
+
+
+def _notify(title: str, text: str) -> bool:
+    """托盘气泡提示（Vista 起的 Shell_NotifyIcon NIF_INFO）。
+
+    pywin32 的 Shell_NotifyIcon 只吃 6 元组（NIM_ADD 那套），带不了 szInfo/
+    szInfoTitle/dwInfoFlags，所以气泡必须用 ctypes 手搓 NOTIFYICONDATAW。
+    提示看不见不能影响服务本身：任何失败都返回 False，由调用方落日志。
+    """
+    hwnd = _state["hwnd"]
+    if not hwnd:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _NID(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND),
+                ("uID", wintypes.UINT), ("uFlags", wintypes.UINT),
+                ("uCallbackMessage", wintypes.UINT), ("hIcon", wintypes.HICON),
+                ("szTip", wintypes.WCHAR * 128),
+                ("dwState", wintypes.DWORD), ("dwStateMask", wintypes.DWORD),
+                ("szInfo", wintypes.WCHAR * 256),
+                ("uTimeout", wintypes.UINT),
+                ("szInfoTitle", wintypes.WCHAR * 64),
+                ("dwInfoFlags", wintypes.DWORD),
+                ("guidItem", ctypes.c_byte * 16),
+                ("hBalloonIcon", wintypes.HICON),
+            ]
+
+        nid = _NID()
+        nid.cbSize = ctypes.sizeof(_NID)         # 结构体大小决定 shell 版本判定
+        nid.hWnd = hwnd
+        nid.uID = _state["nid"][0]
+        nid.uFlags = 0x00000010                  # NIF_INFO：只改提示，不动图标
+        nid.szInfo = text[:254]
+        nid.szInfoTitle = title[:62]
+        nid.dwInfoFlags = 0x00000001             # NIIF_INFO（蓝色 i 图标）
+        return bool(ctypes.windll.shell32.Shell_NotifyIconW(0x00000001,
+                                                           ctypes.byref(nid)))
+    except Exception as exc:                     # noqa: BLE001
+        _log(f"[launcher] 托盘气泡提示失败：{exc}")
+        return False
+
+
+def _notify_or_log(title: str, text: str) -> None:
+    """气泡弹不出来（无窗口站/远程桌面/shell 拒绝）也要在日志里留一行。"""
+    if not _notify(title, text):
+        _log(f"[launcher] {title}：{text}")
+
+
+def _restart_backend_for_update(version: str = "") -> bool:
+    """原地重启后端，让刚切好的新版本层真正跑起来（不必人工退出再双击图标）。
+
+    只在守护线程里调用：_stop_backend 最坏等 25s+5s，放消息循环里托盘会假死。
+    """
+    _log(f"增量升级已落地（版本 {version or '未知'}），正在重启后端…")
+    _stop_backend()
+    _state["proc"] = None
+    if _state["exiting"]:                        # 用户在这 30 秒里点了「退出」
+        _log("收到退出请求，不再重启后端。")
+        return False
+    _state["port"] = _read_port()
+    try:
+        _state["proc"] = _start_backend()
+    except Exception as exc:                     # noqa: BLE001
+        _notify_or_log("微信客服更新未完成",
+                       f"新版本 {version} 已安装，但后端重启失败：{exc}\n"
+                       "请右键托盘图标「退出」后重新打开程序。")
+        return False
+    if not _port_ready(_state["port"], timeout=60.0):
+        _notify_or_log("微信客服更新未完成",
+                       f"新版本 {version} 已安装，但后端未能在 60s 内就绪。\n"
+                       "请右键托盘图标「查看/隐藏日志」排查，或退出后重新打开程序。")
+        return False
+    _open_ui()
+    _notify_or_log("微信客服已更新",
+                   f"已升级到 {version}，操作界面已重新打开。" if version
+                   else "后端已重启，操作界面已重新打开。")
+    return True
+
+
+def _handle_handoff(info: dict) -> bool:
+    kind = str(info.get("kind") or "")
+    version = str(info.get("version") or "").strip()
+    if kind == KIND_RESTART:
+        return _restart_backend_for_update(version)
+    if kind == KIND_NOTIFY:
+        # 全量升级由 Inno 自己重启程序，装完没有任何提示；这里补一条气泡。
+        _notify_or_log("微信客服已更新",
+                       f"已升级到 {version}，可正常使用。" if version else "升级完成。")
+        return True
+    _log(f"[launcher] 忽略未知类型的升级接力请求：{kind}")
+    return False
+
+
+def _start_handoff_watcher():
+    """守护线程轮询升级接力文件；任何异常都只记日志，线程绝不退出。
+
+    线程一死就再没人自动重启后端、再没人提示升级完成，而且用户完全看不出来
+    ——与 _drain_loop 同一套「宁可刷错误日志也不能死」的取舍。
+    """
+    def _loop():
+        while True:
+            try:
+                time.sleep(HANDOFF_POLL_SEC)
+                info = _take_handoff()
+                if info is not None:
+                    # 本线程是请求的唯一消费者，且重启是阻塞式的：不存在两个请求
+                    # 并行执行，因此无需加锁。
+                    _handle_handoff(info)
+            except Exception as exc:             # noqa: BLE001
+                try:
+                    _log(f"[launcher] 升级接力轮询异常（自动恢复）：{exc}")
+                except Exception:                # noqa: BLE001
+                    pass
+
+    t = threading.Thread(target=_loop, daemon=True, name="kefu-handoff-watch")
+    t.start()
+    return t
+
+
 def _wnd_proc(hwnd, msg, wparam, lparam):
     if msg == WM_APP_TRAY:
         event = lparam & 0xFFFF
@@ -602,6 +806,9 @@ def _wnd_proc(hwnd, msg, wparam, lparam):
         elif cmd == MENU_UPDATE:
             _do_update()
         elif cmd == MENU_EXIT:
+            # 先立旗：升级接力线程可能正卡在 _stop_backend 的 30s 等待里，
+            # 必须让它看见「用户要退出」，否则它会在我们退出后把后端又拉起来。
+            _state["exiting"] = True
             _stop_backend()
             log_hwnd = _state["log_hwnd"]
             if log_hwnd and win32gui.IsWindow(log_hwnd):
@@ -663,6 +870,8 @@ def main() -> None:
     hwnd = _create_window()
     _state["hwnd"] = hwnd
     _add_tray(hwnd)
+    # 托盘建好才能弹气泡（NIF_INFO 挂在已有图标上），故在 _add_tray 之后启动
+    _start_handoff_watcher()
 
     if _port_ready(_state["port"]):
         _log("后端就绪，正在打开操作界面。")
