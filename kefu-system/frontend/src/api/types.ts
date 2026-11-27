@@ -2,10 +2,55 @@
  * 与后端 app/schemas.py 字段一一对齐的 TS 类型（共享约定 8-1）。
  */
 
+/** 当前监控账号及其微信实例绑定（双开时确认"读/发的是哪个微信"） */
+export interface WechatAccountInfo {
+  /** 账号目录名（空 = 未识别） */
+  account: string
+  /** 去掉目录后缀的微信号 */
+  wxid: string
+  /** 微信昵称（读取失败为空） */
+  nick_name: string
+  /** 对应 Weixin.exe 的 PID（0 = 无法确认） */
+  pid: number
+  /** 当前运行的微信实例数（双开 = 2） */
+  instance_count: number
+  /** 是否已确认账号 ↔ PID */
+  mapped: boolean
+  /** 是否由用户在设置中指定（false = 自动选最近活跃账号） */
+  pinned: boolean
+  /** 监听是否已在该账号上运行 */
+  active: boolean
+  /** 无法确认/已暂停发送的用户可读原因 */
+  reason: string
+}
+
 /** /api/status */
 export interface WechatStatus {
   alive: boolean
   visible: boolean
+  account?: WechatAccountInfo
+}
+
+/** GET /api/wechat/accounts */
+export interface WechatAccountItem {
+  account: string
+  wxid: string
+  nick_name: string
+  last_activity: number
+  active: boolean
+  configured: boolean
+}
+
+export interface WechatAccountListOut {
+  accounts: WechatAccountItem[]
+  current: WechatAccountInfo
+}
+
+/** POST /api/wechat/account */
+export interface WechatAccountSwitchOut {
+  ok: boolean
+  current: WechatAccountInfo
+  accounts: WechatAccountItem[]
 }
 
 export interface QueueStatus {

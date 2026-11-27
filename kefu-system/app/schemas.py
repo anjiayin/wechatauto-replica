@@ -10,10 +10,49 @@ from pydantic import BaseModel, ConfigDict, Field
 # ---------------------------------------------------------------------------
 # 系统
 # ---------------------------------------------------------------------------
+class WechatAccountInfo(BaseModel):
+    """当前监控账号及其微信实例绑定（双开时用于确认「读/发的是哪个微信」）。"""
+    account: str = ""            # 账号目录名（空 = 未识别）
+    wxid: str = ""               # 去掉目录后缀的微信号
+    nick_name: str = ""          # 微信昵称（读取失败为空）
+    pid: int = 0                 # 对应 Weixin.exe 的 PID（0 = 无法确认）
+    instance_count: int = 0      # 当前运行的微信实例数（双开 = 2）
+    mapped: bool = False         # 是否已确认账号 ↔ PID
+    pinned: bool = False         # 是否由用户在设置中指定（False = 自动选）
+    active: bool = False         # 监听是否已在该账号上运行
+    reason: str = ""             # 无法确认/已暂停发送的用户可读原因
+
+
 class WechatStatus(BaseModel):
     """微信接入状态。"""
     alive: bool = False
     visible: bool = False
+    account: WechatAccountInfo = Field(default_factory=WechatAccountInfo)
+
+
+class WechatAccountItem(BaseModel):
+    """可选监控账号（GET /api/wechat/accounts）。"""
+    account: str
+    wxid: str = ""
+    nick_name: str = ""
+    last_activity: float = 0.0
+    active: bool = False
+    configured: bool = False
+
+
+class WechatAccountListOut(BaseModel):
+    accounts: List[WechatAccountItem] = Field(default_factory=list)
+    current: WechatAccountInfo = Field(default_factory=WechatAccountInfo)
+
+
+class WechatAccountSwitchIn(BaseModel):
+    account: str = ""            # 空 = 恢复自动选择
+
+
+class WechatAccountSwitchOut(BaseModel):
+    ok: bool = True
+    current: WechatAccountInfo = Field(default_factory=WechatAccountInfo)
+    accounts: List[WechatAccountItem] = Field(default_factory=list)
 
 
 class QueueStatus(BaseModel):

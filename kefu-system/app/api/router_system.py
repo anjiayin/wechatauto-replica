@@ -69,6 +69,11 @@ from app.schemas import (
     StatusOut,
     VoiceRetryIn,
     VoiceRetryOut,
+    WechatAccountInfo,
+    WechatAccountItem,
+    WechatAccountListOut,
+    WechatAccountSwitchIn,
+    WechatAccountSwitchOut,
     WechatJumpIn,
     WechatJumpOut,
     WechatStatus,
@@ -110,7 +115,8 @@ def get_status(db: Database = Depends(get_db),
         listener_running=svc.listener_running,
         monitored_count=svc.monitored_count,
         wechat=WechatStatus(alive=svc.available,
-                            visible=svc.probe_wechat_window()),
+                            visible=svc.probe_wechat_window(),
+                            account=_account_info(svc)),
         queue=QueueStatus(size=pipeline.queue_size, max=pipeline.queue_max,
                           dropped_total=pipeline.dropped_total,
                           # 图片识别队列积压（可选字段；服务替身/旧实现
@@ -145,6 +151,45 @@ def get_status(db: Database = Depends(get_db),
         image_key_ready=_image_key_ready(svc),
         cache=_cache_status(svc),
     )
+
+
+def _account_info(svc: WeChatService) -> WechatAccountInfo:
+    """读取当前监控账号绑定（测试替身/旧服务没有该能力时返回空信息）。"""
+    getter = getattr(svc, "account_binding", None)
+    if not callable(getter):
+        return WechatAccountInfo()
+    try:
+        data = getter() or {}
+    except Exception:
+        logger.debug("读取监控账号绑定失败（按未知处理）", exc_info=True)
+        return WechatAccountInfo()
+    return WechatAccountInfo(
+        account=str(data.get("account") or ""),
+        wxid=str(data.get("wxid") or ""),
+        nick_name=str(data.get("nick_name") or ""),
+        pid=int(data.get("pid") or 0),
+        instance_count=int(data.get("instance_count") or 0),
+        mapped=bool(data.get("mapped")),
+        pinned=bool(data.get("pinned")),
+        active=bool(data.get("active")),
+        reason=str(data.get("reason") or ""),
+    )
+
+
+def _account_items(items) -> List[WechatAccountItem]:
+    out: List[WechatAccountItem] = []
+    for item in items or []:
+        if not isinstance(item, dict) or not item.get("account"):
+            continue
+        out.append(WechatAccountItem(
+            account=str(item.get("account") or ""),
+            wxid=str(item.get("wxid") or ""),
+            nick_name=str(item.get("nick_name") or ""),
+            last_activity=float(item.get("last_activity") or 0.0),
+            active=bool(item.get("active")),
+            configured=bool(item.get("configured")),
+        ))
+    return out
 
 
 def _image_key_ready(svc: WeChatService) -> bool:
@@ -522,6 +567,47 @@ def update_cache_dir(body: CacheDirUpdate,
     db.set_setting(KEY_RUNTIME_CACHE_DIR, str(path) if raw else "")
     logger.info("缓存目录已更新为：%s（重启服务后生效）", path)
     return CacheDirOut(**wechat.cache_dir_info())
+
+
+# ---------------------------------------------------------------------------
+# 监控微信账号（双开时明确「看/回哪个微信」）
+# ---------------------------------------------------------------------------
+@router.get("/api/wechat/accounts", response_model=WechatAccountListOut)
+def get_wechat_accounts(
+        wechat: WeChatService = Depends(get_wechat_service),
+) -> WechatAccountListOut:
+    """列出本机检测到的微信账号与当前监控账号。"""
+    lister = getattr(wechat, "account_list", None)
+    items = lister() if callable(lister) else []
+    return WechatAccountListOut(accounts=_account_items(items),
+                                current=_account_info(wechat))
+
+
+@router.post("/api/wechat/account", response_model=WechatAccountSwitchOut)
+def switch_wechat_account(
+        body: WechatAccountSwitchIn,
+        wechat: WeChatService = Depends(get_wechat_service),
+) -> WechatAccountSwitchOut:
+    """切换监控账号（空字符串 = 恢复自动选择最近活跃账号）。
+
+    只重开监听，不重启分析/发送/识别 worker；切换后发送会按新账号的
+    Weixin.exe 实例定向操作。
+    """
+    switcher = getattr(wechat, "switch_account", None)
+    if not callable(switcher):
+        raise HTTPException(status_code=400, detail="当前服务不支持切换监控账号")
+    result = switcher(body.account or "")
+    if not isinstance(result, dict) or not result.get("ok"):
+        detail = (result.get("error") if isinstance(result, dict) else "")
+        raise HTTPException(status_code=400,
+                            detail=detail or "切换监控账号失败")
+    lister = getattr(wechat, "account_list", None)
+    items = lister() if callable(lister) else []
+    return WechatAccountSwitchOut(
+        ok=True,
+        current=_account_info(wechat),
+        accounts=_account_items(items),
+    )
 
 
 # ---------------------------------------------------------------------------

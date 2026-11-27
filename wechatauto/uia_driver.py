@@ -202,8 +202,13 @@ class WeChatUIA:
         uia.send_text('你好')
     """
 
-    def __init__(self, timeout: float = 15.0, search_timeout: float = 2.0):
+    def __init__(self, timeout: float = 15.0, search_timeout: float = 2.0,
+                 hwnd: int = None, pid: int = None):
         self.timeout = timeout
+        # 双开定向：只枚举/操作目标账号实例的窗口，绝不唤醒或新开实例
+        # （weixin:// 会拉起默认账号，回复就会落到另一个微信上）。
+        self._target_hwnd = int(hwnd or 0)
+        self._target_pid = int(pid or 0)
         self._win = None
         # 输入框控件缓存：open_chat 成功后 send_text / current_chat 直接复用，
         # 免去每次都在主窗口整棵 UIA 树里深扫。窗口句柄变化或控件失效时重建。
@@ -652,6 +657,8 @@ class WeChatUIA:
             try:
                 if win32gui.GetWindowText(h) not in MAIN_NAMES:
                     return True
+                if not self._is_target_hwnd(h):
+                    return True       # 双开：其它账号的窗口状态与我无关
                 visible = bool(win32gui.IsWindowVisible(h))
                 iconic = bool(win32gui.IsIconic(h))
                 if not visible:
@@ -743,6 +750,20 @@ class WeChatUIA:
         return ok
 
     # ------------------------------------------------------------------ 窗口定位
+    def _is_target_hwnd(self, hwnd, pid: Optional[int] = None) -> bool:
+        """窗口是否属于当前绑定的微信实例（未绑定时不做限制）。"""
+        target_hwnd = getattr(self, '_target_hwnd', 0)
+        target_pid = getattr(self, '_target_pid', 0)
+        if target_hwnd and hwnd == target_hwnd:
+            return True
+        if target_pid:
+            if pid is None:
+                pid = self._pid_from_hwnd(hwnd)
+            return bool(pid) and pid == target_pid
+        if target_hwnd:
+            return False
+        return True
+
     def _wechat_hwnds(self):
         if not _HAS_WIN32:
             return []
@@ -755,6 +776,8 @@ class WeChatUIA:
                     # 辅助进程窗口（其热激活必然失败，只会产生噪音警告）
                     pid = self._pid_from_hwnd(h)
                     if pid and self._weixin_dll_module(pid):
+                        if not self._is_target_hwnd(h, pid):
+                            return True   # 双开：忽略其它账号实例的窗口
                         l, t, r, b = win32gui.GetWindowRect(h)
                         res.append(((r - l) * (b - t), h))
             except Exception:
@@ -843,6 +866,10 @@ class WeChatUIA:
         deadline = time.time() + max(timeout, 15)
         last_wake = time.time()
         accessibility_woke = False
+        # 绑定目标实例时绝不能 wake()：weixin:// / Weixin.exe 只会拉起
+        # 默认账号，可能新开一个别的微信实例，后续点击全会落到它上面。
+        instance_bound = bool(getattr(self, '_target_pid', 0)
+                              or getattr(self, '_target_hwnd', 0))
         while time.time() < deadline:
             if allow_login:
                 self._auto_login()
@@ -858,7 +885,8 @@ class WeChatUIA:
                 accessibility_woke = True
                 last_wake = time.time()
                 continue
-            if self._login_window() is None and time.time() - last_wake > 6:
+            if (not instance_bound and self._login_window() is None
+                    and time.time() - last_wake > 6):
                 self.wake()
                 last_wake = time.time()
             time.sleep(0.8)
@@ -911,6 +939,12 @@ class WeChatUIA:
                 self._auto_login()
             elif self._wechat_hwnds():
                 self._wake_accessibility()
+            elif getattr(self, '_target_pid', 0) or getattr(self, '_target_hwnd', 0):
+                # 目标账号实例没有窗口：可能已退出/切号。禁止唤醒或新开
+                # 实例（会拉起默认账号，导致回复到另一个微信）。
+                wxlog.warning('当前监控账号的微信窗口不存在（可能已退出或'
+                              '切换了账号），不唤醒/不新开微信实例，本次操作失败')
+                return False
             else:
                 self._set_screen_reader_flag(True)
                 self.wake()

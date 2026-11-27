@@ -234,7 +234,7 @@ export default function App() {
           </Typography>
           <Typography variant="caption" sx={{ mr: 2, color: 'rgba(255,255,255,0.85)' }}>
             {status?.listener_running
-              ? `监听运行中 · 监控 ${status.monitored_count} 个会话`
+              ? `监听运行中 · 监控 ${status.monitored_count} 个会话${accountLabel(status)}`
               : '监听未运行'}
           </Typography>
           {/* 客户端版本 / 新版本提示（点击查看更新详情） */}
@@ -418,6 +418,19 @@ function NavItem(props: {
   )
 }
 
+/** 顶栏账号标识：昵称优先，其次微信号；双开时标注是否已确认实例。 */
+function accountLabel(status?: StatusOut): string {
+  const acct = status?.wechat.account
+  if (!acct) return ''
+  const name = acct.nick_name || acct.wxid || acct.account
+  if (!name) return ''
+  if (acct.instance_count > 1) {
+    return ` · 账号：${name}（${acct.mapped ? '已绑定实例' : '未确认实例'}，`
+      + `共 ${acct.instance_count} 个微信）`
+  }
+  return ` · 账号：${name}`
+}
+
 function buildBanner(status?: StatusOut) {
   if (!status) return null
   // AI 分析连续失败 ≥3 次：常驻横幅（恢复成功后 analysis_health 归零自动消失）
@@ -435,6 +448,23 @@ function buildBanner(status?: StatusOut) {
   if (!status.wechat.alive) {
     return { severity: 'warning' as const, text: '微信未登录或数据库不可读，商机监听未启动' }
   }
+  // 双开/指定账号但无法确认账号 ↔ 实例：回复已暂停，必须立刻让用户看到
+  const acct = status.wechat.account
+  const accountUnresolved = acct && !acct.mapped
+    && (acct.instance_count > 1
+      || (acct.pinned && acct.instance_count > 0))
+  if (acct && accountUnresolved) {
+    const name = acct.nick_name || acct.wxid || acct.account
+    // 只在这里拼一次完整提示：不要再拼后端 reason（它本就是整句说明，
+    // 会与前半句重复，用户实测横幅出现两遍同样的话）
+    const head = acct.instance_count > 1
+      ? `检测到 ${acct.instance_count} 个微信实例，无法确认哪个属于当前监控账号`
+      : `当前登录的微信不是所选监控账号${name ? `「${name}」` : ''}`
+    return {
+      severity: 'error' as const,
+      text: `${head}，自动回复已暂停以免发错账号；请到「设置 → 数据与账单 → 监控微信账号」重新选择，或登录该账号后重试。`,
+    }
+  }
   // 图片解密密钥缺失：图片消息会一直取图失败、不进入商机分析。此前该提醒只在
   // 设置页「数据与账单」tab 内，用户实际在商机列表/分析日志页看不到，误以为
   // 「图片没抓取」。提升到全局横幅，任何页面都能看到该补救动作。
@@ -442,7 +472,7 @@ function buildBanner(status?: StatusOut) {
   if (status.image_key_ready === false) {
     return {
       severity: 'warning' as const,
-      text: '图片解密密钥尚未获取：请在微信中打开任意一张图片查看大图，然后到「设置 → 数据与账单」点「重新检查」'
+      text: '图片解密密钥尚未获取：请在当前监控账号的微信中打开任意一张图片查看大图，然后到「设置 → 数据与账单」点「重新检查」'
         + '主动捕获（约 2~4 分钟）；捕获成功后未识别的图片会自动补识别。',
     }
   }

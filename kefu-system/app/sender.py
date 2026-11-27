@@ -109,6 +109,9 @@ class SendTask:
     # submit() 写入的入队时刻（monotonic）。发送线程据此执行 ACK_LEAD_SEC
     # 时序保护；手工构造的测试任务保持 0，不引入任何等待。
     enqueued_mono: float = 0.0
+    # submit() 盖章的监控账号（目录名）。发送前与当前监控账号比对：
+    # 切换账号后旧账号的排队回复会被取消，防止发到新账号的同名联系人。
+    account: str = ""
 
 
 class Sender:
@@ -128,6 +131,10 @@ class Sender:
         self._gui_lock = threading.Lock()
         self._message_lookup = None   # 注入：按 local_id 取消息
         self._latest_lookup = None    # 注入：取会话最新消息 local_id
+        # 注入：当前监控账号 ↔ 微信实例绑定（双开时只操作该 PID 的窗口）
+        self._binding_provider = None
+        self._gui_account = ""        # 缓存 GUI 所属账号（切换账号时重建）
+        self._last_gui_error = ""     # 最近一次建 GUI 失败的用户可读原因
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -248,6 +255,10 @@ class Sender:
         """任务入队（串行消费），同时打上入队时刻供时序保护使用。"""
         try:
             task.enqueued_mono = time.monotonic()
+            # 盖章当前监控账号：发送前据此拦截「切换账号前创建的回复」，
+            # 否则会用新账号的微信去打开同名会话，发给错误的人。
+            if not getattr(task, "account", ""):
+                task.account = self._binding_account()
             self._queue.put_nowait(task)
             return True
         except queue.Full:  # pragma: no cover - 无界队列实际不会满
@@ -344,6 +355,19 @@ class Sender:
 
     def _process_locked(self, task: SendTask, stage: _Stages) -> None:
         """发送主流程（调用方已持 ``_gui_lock``）。"""
+        # 账号一致性校验必须在碰微信窗口之前：切换账号后旧账号残留的
+        # 回复任务不能用新账号的微信去发（同名联系人会发错人）。
+        binding = self._wechat_binding()
+        current_account = (str(binding.get("account") or "")
+                           if binding else "")
+        task_account = str(getattr(task, "account", "") or "")
+        if task_account and current_account and task_account != current_account:
+            self._fail(
+                task,
+                f"该回复属于监控账号 {task_account}，当前已切换为 "
+                f"{current_account}，已取消发送以免发错账号；请确认监控"
+                "对象后重新回复", stage)
+            return
         gui = self._ensure_gui()
         stage.mark("init")
         if gui is None:
@@ -351,8 +375,10 @@ class Sender:
             # 前端等的是 send_result：不补这一条就会永远停在「发送中 /
             # 已加入发送队列」，看起来像系统没反应（与 0 秒失败被覆盖
             # 是同一类症状）。
-            self._fail(task, "未找到微信主窗口（微信可能未启动，或自动化组件"
-                             "不可用），请确认微信已登录后重试", stage)
+            reason = str(getattr(self, "_last_gui_error", "") or "")
+            self._fail(task, reason or (
+                "未找到微信主窗口（微信可能未启动，或自动化组件不可用），"
+                "请确认微信已登录后重试"), stage)
             return
         try:
             # 校验①：微信窗口可用性（登录态 + 可见性 + 窗口前置）
@@ -768,7 +794,8 @@ class Sender:
         try:
             gui = self._ensure_gui()
             if gui is None:
-                return False, "微信自动化组件不可用，无法跳转"
+                return False, (str(getattr(self, "_last_gui_error", "") or "")
+                               or "微信自动化组件不可用，无法跳转")
             # 与 _process_locked 同款三步：存活 → 前置可见 → 打开会话
             if not gui.is_alive():
                 return False, "微信未登录或窗口不存在，请检查后重试"
@@ -818,6 +845,45 @@ class Sender:
         之后所有发送/跳转都会 0 秒报「微信未登录或窗口不存在」（实测：
         is_alive 只查缓存句柄 IsWindow，旧句柄已死恒 False）。
         """
+        binding = self._wechat_binding()
+        want_pid = 0
+        want_account = ""
+        if binding is not None:
+            want_pid = int(binding.get("pid") or 0)
+            want_account = str(binding.get("account") or "")
+            instance_count = int(binding.get("instance_count") or 0)
+            # 双开且无法确认归属；或用户指定账号但当前微信不是它
+            unresolved = (not want_pid and (
+                instance_count > 1
+                or (bool(binding.get("pinned")) and instance_count > 0)))
+            if unresolved:
+                # 宁可不发，也不猜一个窗口
+                self._gui = None
+                self._gui_account = ""
+                reason = str(binding.get("reason") or (
+                    "检测到多个微信实例，无法确认当前监控账号对应的微信；"
+                    "已暂停自动回复以免发到其它账号"))
+                self._last_gui_error = reason
+                if quiet:
+                    logger.debug("账号实例未绑定（巡检静默）：%s", reason)
+                else:
+                    logger.warning("发送已阻止：%s", reason)
+                    self._notifier.broadcast("status_change", {
+                        "send_available": False, "message": reason})
+                return None
+        if self._gui is not None:
+            gui_pid = int(getattr(self._gui, "pid", 0) or 0)
+            gui_account = getattr(self, "_gui_account", "")
+            switched = (
+                (want_pid and gui_pid and gui_pid != want_pid)
+                or (want_account and gui_account
+                    and want_account != gui_account))
+            if switched:
+                logger.info("监控微信账号/实例已变化（%s/PID=%s → %s/PID=%s），"
+                            "重建 GUI 实例", gui_account or "未知", gui_pid,
+                            want_account or "自动", want_pid)
+                self._gui = None
+                self._gui_account = ""
         if self._gui is not None:
             if self._gui.is_alive():
                 return self._gui
@@ -835,6 +901,8 @@ class Sender:
         except Exception as exc:
             logger.error("微信自动化组件加载失败：%s", exc)
             self._gui = None
+            self._gui_account = ""
+            self._last_gui_error = f"微信自动化组件不可用（{exc}）"
             if not quiet:
                 # 无具体任务上下文，广播全局状态事件
                 self._notifier.broadcast("status_change", {
@@ -843,17 +911,36 @@ class Sender:
                 })
             return None
         try:
-            self._gui = WeChatGUI()
+            if want_pid:
+                try:
+                    # 双开：只绑定监控账号对应的 Weixin.exe 实例
+                    self._gui = WeChatGUI(pid=want_pid)
+                except TypeError:
+                    # 兼容不支持定向参数的替身实现
+                    self._gui = WeChatGUI()
+            else:
+                self._gui = WeChatGUI()
+            self._gui_account = want_account
+            self._last_gui_error = ""
         except Exception as exc:
+            self._gui = None
+            self._gui_account = ""
+            if want_pid:
+                reason = (f"未找到监控微信的窗口（账号 "
+                          f"{want_account or '未知'}，PID {want_pid}）；"
+                          "请确认该微信已登录且窗口未被关闭")
+            else:
+                reason = ("未找到微信主窗口（微信可能未启动），"
+                          "请确认微信已登录后重试")
+            self._last_gui_error = reason
             if quiet:
                 logger.debug("微信窗口定位失败（巡检静默）：%s", exc)
             else:
-                logger.error("微信窗口定位失败：%s", exc)
+                logger.error("微信窗口定位失败：%s（%s）", exc, reason)
                 self._notifier.broadcast("status_change", {
                     "send_available": False,
-                    "message": f"未找到微信主窗口（微信可能未启动），无法发送消息",
+                    "message": f"{reason}，无法发送消息",
                 })
-            self._gui = None
             return None
         return self._gui
 
@@ -886,3 +973,24 @@ class Sender:
     def set_latest_lookup(self, lookup) -> None:
         """注入「会话最新消息 local_id」查询函数（引用定位判定用）。"""
         self._latest_lookup = lookup
+
+    def set_wechat_binding_provider(self, provider) -> None:
+        """注入「监控账号 ↔ 微信实例」绑定查询（main.py 组装时调用）。"""
+        self._binding_provider = provider
+
+    def _wechat_binding(self) -> Optional[dict]:
+        """读取当前账号绑定；未注入/查询失败时返回 None（保持旧行为）。"""
+        provider = getattr(self, "_binding_provider", None)
+        if provider is None:
+            return None
+        try:
+            data = provider()
+        except Exception:
+            logger.debug("读取微信账号绑定失败（按未绑定处理）", exc_info=True)
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _binding_account(self) -> str:
+        """当前监控账号目录名（未知时为空串，不做拦截）。"""
+        binding = self._wechat_binding()
+        return str(binding.get("account") or "") if binding else ""

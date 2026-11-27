@@ -171,6 +171,49 @@ def _format_appmsg(content: str, type_name: str) -> str:
     return "\n".join(lines)
 
 
+def _format_sysmsg(body: str) -> Optional[str]:
+    """sysmsg 系统提示（撤回/拍一拍/入群等）XML → 友好文本；非 sysmsg 返回 None。
+
+    微信 4.x 把「撤回了一条消息」存成
+    ``<sysmsg type="revokemsg">…<replacemsg>…</replacemsg></sysmsg>``
+    （部分版本只有 ``<content>``；群消息可能带发送者前缀或被 ``<msg>``
+    包裹），直接展示是原始 XML。这里提取微信客户端自己渲染用的整句
+    提示（replacemsg 优先），去掉全部标签。
+    """
+    text = body.lstrip()
+    if text.startswith("<?xml"):
+        text = text.partition("?>")[2].lstrip()
+    if not text.startswith("<"):
+        return None
+    direct = text.startswith("<sysmsg")
+    root = _xml_parse(body)
+    if root is None:
+        return "[系统消息]" if direct else None
+    node = root
+    if not str(root.tag or "").lower().endswith("sysmsg"):
+        node = root.find(".//sysmsg")
+        if node is None:
+            return None
+    msg_type = str(node.get("type") or "").strip().lower()
+    friendly = ""
+    for tag in ("replacemsg", "content"):
+        for child in node.iter(tag):
+            val = (child.text or "").strip()
+            if val:
+                friendly = val
+                break
+        if friendly:
+            break
+    if not friendly:
+        friendly = _TAG_RE.sub("", body).strip()
+    friendly = " ".join(friendly.split())
+    if not friendly:
+        return "[系统消息]"
+    if msg_type == "revokemsg" and "撤回" not in friendly:
+        return f"[撤回消息] {friendly}"
+    return friendly
+
+
 def format_content(type_name: str, content: str) -> str:
     """按消息类型把原始内容转为对人友好的展示文本。
 
@@ -184,10 +227,16 @@ def format_content(type_name: str, content: str) -> str:
     content = str(content or "")
     tname = str(type_name or "")
     norm = _norm_type(tname)
-    if norm == "文本" or not content:
+    if not content:
         return content
     # 群消息正文可能带「发送者ID:\n」前缀（反馈 6/11）：展示前剥离
     body = _strip_sender_prefix(content)
+    # 系统提示消息（撤回等）是 XML 容器：转成微信客户端同款纯文本
+    sysmsg_text = _format_sysmsg(body)
+    if sysmsg_text is not None:
+        return sysmsg_text
+    if norm == "文本":
+        return content
     if norm == "图片":
         return "[图片]"
     if norm == "动画表情":
@@ -209,7 +258,11 @@ def format_content(type_name: str, content: str) -> str:
     if "小程序" in norm or norm in ("文件链接卡片", "链接", "文件", "卡片"):
         return _format_appmsg(body, "小程序" if "小程序" in norm else "链接")
     if norm == "系统消息":
-        # 系统消息本身是纯文本提示（如"xxx 加入群聊"），原样返回
+        # 纯文本系统提示（如"xxx 加入群聊"）原样返回；XML 形态（撤回等）
+        # 已在上方 sysmsg 分支处理，剩下的未知 XML 一律去标签，绝不透传
+        if body.lstrip().startswith("<"):
+            plain = " ".join(_TAG_RE.sub("", body).split()).strip()
+            return plain[:200] if plain else "[系统消息]"
         return content
     # 内容本身是 XML 而类型未知：尽力解析，失败回退去标签纯文本
     if body.lstrip().startswith("<"):

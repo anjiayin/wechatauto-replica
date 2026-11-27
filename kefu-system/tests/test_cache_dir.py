@@ -28,6 +28,7 @@ from app.db import Database
 from app.notifier import Notifier
 from app import wechat_service as ws_mod
 from app.wechat_service import WeChatService
+from wechatauto import db as wxdb_mod
 
 
 # ---------------------------------------------------------------------------
@@ -128,10 +129,12 @@ class TestDirUsage:
     def test_counts_files_and_bytes(self, tmp_path: Path):
         (tmp_path / "a.db").write_bytes(b"x" * 100)
         (tmp_path / "b.stamp").write_bytes(b"y" * 23)
-        (tmp_path / "sub").mkdir()      # 子目录不计入（缓存目录是平铺文件）
+        # 解密缓存现在按账号隔离在子目录，统计必须递归
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "c.db").write_bytes(b"z" * 7)
         size, count = config_mod.dir_usage(tmp_path)
-        assert size == 123
-        assert count == 2
+        assert size == 130
+        assert count == 3
 
     def test_missing_dir_returns_zero(self, tmp_path: Path):
         assert config_mod.dir_usage(tmp_path / "nope") == (0, 0)
@@ -238,6 +241,199 @@ class TestServiceCacheDir:
             target = tmp_path / "new_cache"
             svc._adopt_legacy_keys(target)
             assert (target / "keys.json").read_text(encoding="utf-8") == '{"v": "new"}'
+        finally:
+            db.close()
+
+    def test_adopt_prefers_shared_base_over_temp(self, monkeypatch, tmp_path):
+        """升级到按账号隔离时，共享缓存根（升级前的 workdir）优先于 %TEMP%。"""
+        base = tmp_path / "shared_cache"
+        base.mkdir()
+        (base / "keys.json").write_text('{"v": "base"}', encoding="utf-8")
+        os.utime(base / "keys.json", (1_600_000_000, 1_600_000_000))
+        legacy_root = tmp_path / "legacy"
+        temp_acc = legacy_root / "wxid_self_abcd"
+        temp_acc.mkdir(parents=True)
+        (temp_acc / "keys.json").write_text('{"v": "temp"}', encoding="utf-8")
+        os.utime(temp_acc / "keys.json", (1_800_000_000, 1_800_000_000))
+        monkeypatch.setattr(ws_mod, "LEGACY_CACHE_ROOT", legacy_root)
+
+        svc, db = _make_service(tmp_path)
+        try:
+            target = base / "wxid_self_abcd"
+            svc._adopt_legacy_keys(target, base)
+            assert (target / "keys.json").read_text(
+                encoding="utf-8") == '{"v": "base"}'
+        finally:
+            db.close()
+
+    def test_adopt_prefers_same_name_legacy_account(self, monkeypatch,
+                                                    tmp_path: Path):
+        """%TEMP% 下同名账号目录优先于其它账号（即使其它账号更新）。"""
+        legacy_root = tmp_path / "legacy"
+        same = legacy_root / "wxid_self_abcd"
+        other = legacy_root / "wxid_other_efgh"
+        same.mkdir(parents=True)
+        other.mkdir(parents=True)
+        (same / "keys.json").write_text('{"v": "same"}', encoding="utf-8")
+        (other / "keys.json").write_text('{"v": "other"}', encoding="utf-8")
+        os.utime(same / "keys.json", (1_600_000_000, 1_600_000_000))
+        os.utime(other / "keys.json", (1_800_000_000, 1_800_000_000))
+        monkeypatch.setattr(ws_mod, "LEGACY_CACHE_ROOT", legacy_root)
+
+        svc, db = _make_service(tmp_path)
+        try:
+            target = tmp_path / "cache" / "wxid_self_abcd"
+            svc._adopt_legacy_keys(target, tmp_path / "cache")
+            assert (target / "keys.json").read_text(
+                encoding="utf-8") == '{"v": "same"}'
+        finally:
+            db.close()
+
+
+# ---------------------------------------------------------------------------
+# 解密缓存/密钥按账号隔离：换号后不得复用上一个账号的解密结果
+# ---------------------------------------------------------------------------
+class TestAccountScopedCache:
+    """``_open_listener_locked`` 必须用 <缓存根>/<账号> 作为 workdir。
+
+    背景（真机）：keys.json/.pages/.stamp 只按库相对路径命名，共用目录时
+    切到未登录的账号仍会返回原账号的联系人/群列表。
+    """
+
+    def _patch_wx(self, monkeypatch, db_root: Path):
+        created = []
+
+        class _FakeWxdb:
+            def __init__(self, workdir="", account=None):
+                self.workdir = str(workdir)
+                self.account = account or ""
+                self.pid = 0
+                created.append(self)
+
+            def get_messages(self, username, limit=1):
+                return []
+
+        class _FakeListener:
+            def __init__(self, wxdb, interval=1.0, watermark=None):
+                self.wxdb = wxdb
+                self.watermark = dict(watermark or {})
+
+            def add_listener(self, username, cb):
+                pass
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+        monkeypatch.setattr(wxdb_mod, "WeChatDB", _FakeWxdb)
+        monkeypatch.setattr(wxdb_mod, "Listener", _FakeListener)
+        monkeypatch.setattr(wxdb_mod, "auto_detect_db_dir",
+                            lambda: str(db_root))
+        return created
+
+    def test_explicit_account_isolated_subdir(self, monkeypatch,
+                                              tmp_path: Path):
+        db_root = tmp_path / "wx_files"
+        (db_root / "wxid_self_abcd" / "db_storage").mkdir(parents=True)
+        cache = tmp_path / "cache"
+        svc, db = _make_service(tmp_path)
+        db.set_setting(config_mod.KEY_RUNTIME_CACHE_DIR, str(cache))
+        created = self._patch_wx(monkeypatch, db_root)
+        adopted = []
+        monkeypatch.setattr(
+            svc, "_adopt_legacy_keys",
+            lambda target, base=None: adopted.append((target, base)))
+        monkeypatch.setattr(wxdb_mod, "enumerate_weixin_pids", lambda: [])
+        try:
+            with svc._listener_lock:
+                ok = svc._open_listener_locked("wxid_self_abcd")
+            assert ok is True
+            assert created[0].workdir == str(cache / "wxid_self_abcd")
+            assert created[0].account == "wxid_self_abcd"
+            assert adopted == [(cache / "wxid_self_abcd", cache)]
+        finally:
+            svc.stop()
+            db.close()
+
+    def test_auto_account_uses_resolved_subdir(self, monkeypatch,
+                                               tmp_path: Path):
+        db_root = tmp_path / "wx_files"
+        db_root.mkdir()
+        cache = tmp_path / "cache"
+        svc, db = _make_service(tmp_path)
+        db.set_setting(config_mod.KEY_RUNTIME_CACHE_DIR, str(cache))
+        created = self._patch_wx(monkeypatch, db_root)
+        monkeypatch.setattr(wxdb_mod, "list_accounts", lambda: [
+            {"account": "wxid_self_abcd", "wxid": "wxid_self"}])
+        monkeypatch.setattr(svc, "_adopt_legacy_keys", lambda *a, **k: None)
+        try:
+            with svc._listener_lock:
+                ok = svc._open_listener_locked("")
+            assert ok is True
+            assert created[0].workdir == str(cache / "wxid_self_abcd")
+            assert created[0].account == ""
+        finally:
+            svc.stop()
+            db.close()
+
+    def test_not_running_account_fails_fast(self, monkeypatch,
+                                            tmp_path: Path):
+        """句柄明确显示运行中的微信都属于别的账号 → 立即降级，不构造库。"""
+        db_root = tmp_path / "wx_files"
+        (db_root / "wxid_self_abcd" / "db_storage").mkdir(parents=True)
+        svc, db = _make_service(tmp_path)
+        constructed = []
+        monkeypatch.setattr(wxdb_mod, "WeChatDB",
+                            lambda **kw: constructed.append(kw))
+        monkeypatch.setattr(wxdb_mod, "auto_detect_db_dir",
+                            lambda: str(db_root))
+        monkeypatch.setattr(wxdb_mod, "enumerate_weixin_pids", lambda: [11800])
+        monkeypatch.setattr(wxdb_mod, "pid_account_match",
+                            lambda *a: False)
+        try:
+            with svc._listener_lock:
+                ok = svc._open_listener_locked("wxid_self_abcd")
+            assert ok is False
+            assert constructed == []
+            assert svc._wxdb is None
+            assert "当前未登录" in svc._reason
+        finally:
+            db.close()
+
+    def test_unknown_instance_evidence_still_opens(self, monkeypatch,
+                                                   tmp_path: Path):
+        """句柄读不到（权限受限）时不能拦，按原流程继续。"""
+        db_root = tmp_path / "wx_files"
+        (db_root / "wxid_self_abcd" / "db_storage").mkdir(parents=True)
+        svc, db = _make_service(tmp_path)
+        created = self._patch_wx(monkeypatch, db_root)
+        monkeypatch.setattr(wxdb_mod, "enumerate_weixin_pids", lambda: [11800])
+        monkeypatch.setattr(wxdb_mod, "pid_account_match", lambda *a: None)
+        monkeypatch.setattr(svc, "_adopt_legacy_keys", lambda *a, **k: None)
+        try:
+            with svc._listener_lock:
+                ok = svc._open_listener_locked("wxid_self_abcd")
+            assert ok is True
+            assert len(created) == 1
+        finally:
+            svc.stop()
+            db.close()
+
+    def test_missing_account_dir_never_falls_back(self, monkeypatch,
+                                                  tmp_path: Path):
+        """指定账号目录不存在 → 明确降级，绝不悄悄用别的账号。"""
+        db_root = tmp_path / "wx_files"
+        db_root.mkdir()
+        svc, db = _make_service(tmp_path)
+        created = self._patch_wx(monkeypatch, db_root)
+        try:
+            with svc._listener_lock:
+                ok = svc._open_listener_locked("wxid_gone_abcd")
+            assert ok is False
+            assert created == []
+            assert "不存在或未登录" in svc._reason
         finally:
             db.close()
 

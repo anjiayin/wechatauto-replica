@@ -584,6 +584,135 @@ def _find_account_dirs(db_dir: str) -> List[str]:
     return sorted(out)
 
 
+def _weixin_processes() -> Optional[List[Tuple[int, int]]]:
+    """psutil 口径的 Weixin.exe (pid, ppid) 列表；psutil 不可用返回 None。"""
+    try:
+        import psutil
+        out: List[Tuple[int, int]] = []
+        for p in psutil.process_iter(["pid", "name", "ppid"]):
+            name = p.info.get("name") or ""
+            if name.lower() != "weixin.exe":
+                continue
+            out.append((int(p.info["pid"]), int(p.info.get("ppid") or 0)))
+        return out
+    except Exception:
+        return None
+
+
+def _tasklist_weixin_pids() -> List[int]:
+    """tasklist 兜底（不带 /FI，避免 WMI "Invalid class" 错误）。"""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError:
+        return []
+    pids = []
+    for line in r.stdout.strip().splitlines():
+        parts = line.strip('"').split('","')
+        if len(parts) >= 2 and parts[0].lower() == "weixin.exe" \
+                and parts[1].isdigit():
+            pids.append(int(parts[1]))
+    return pids
+
+
+def enumerate_weixin_pids() -> List[int]:
+    """当前 Weixin.exe **主实例** PID 列表（双开时多个；子进程不计数）。
+
+    微信 4.x 是多进程架构：一个登录实例（主进程，父进程通常是
+    explorer/启动器）会派生多个同名 Weixin.exe 子进程（渲染/工具等）。
+    把子进程也算进来会误报「检测到 5 个微信」（1 主 + 4 子），并让
+    「账号 ↔ 实例」绑定误以为存在多个候选而 fail-closed。这里只保留
+    父进程不是 Weixin.exe 的顶层进程；psutil 不可用时退回 tasklist
+    全量口径（无法区分父子，只能多报）。
+
+    注意：内存密钥扫描不要用本函数（会漏子进程内存里的密钥），
+    请用 :func:`enumerate_all_weixin_pids`。
+    """
+    procs = _weixin_processes()
+    if procs is None:
+        return _tasklist_weixin_pids()
+    if not procs:
+        return []
+    import psutil
+    mains: List[int] = []
+    for pid, ppid in procs:
+        parent_name = ""
+        if ppid:
+            try:
+                parent_name = (psutil.Process(ppid).name() or "").lower()
+            except Exception:
+                parent_name = ""
+        if parent_name != "weixin.exe":
+            mains.append(pid)
+    # 极端情况（全部被判成子进程）：不猜父子关系，回退全量，宁可多报
+    return mains or [pid for pid, _ in procs]
+
+
+def enumerate_all_weixin_pids() -> List[int]:
+    """全部 Weixin.exe 进程（含渲染/工具子进程），仅供内存密钥扫描。
+
+    图片 AES 密钥实测分布在多个 Weixin 进程内存里（现场 5 进程 ~1.3GB，
+    全量扫描约 110s）；扫描范围缩到主进程会漏密钥。账号 ↔ 实例归属
+    请用 :func:`enumerate_weixin_pids`（只含主实例）。
+    """
+    procs = _weixin_processes()
+    if procs is None:
+        return _tasklist_weixin_pids()
+    return [pid for pid, _ in procs]
+
+
+def pid_account_match(pid: int, db_dir: str, account: str = "",
+                      account_dir: str = "") -> Optional[bool]:
+    """进程句柄证据：pid 是否正开着 account 的库文件（True/False/None）。
+
+    微信 4.x 实例会持续持有当前登录账号
+    ``<数据目录>/<account>/db_storage`` 下的文件句柄。该信号与微信版本
+    无关，也不依赖先构造 :class:`WeChatDB`（构造可能触发耗时的内存密钥
+    扫描），供服务层在建库前快速判断「所选账号是否真的在运行」。
+
+    Returns:
+        True  = 打开了该账号的库文件（确属该账号）；
+        False = 只打开了其它账号的库文件（明确不是该账号）；
+        None  = 没有可判断的文件句柄或读取失败（无法否定）。
+    """
+    db_dir = str(db_dir or "")
+    account = str(account or "")
+    account_dir = str(account_dir or "")
+    if not db_dir or not (account_dir or account):
+        return None
+    if not account_dir:
+        account_dir = os.path.join(db_dir, account)
+    try:
+        import psutil
+        files = psutil.Process(pid).open_files()
+    except Exception:
+        return None
+    if not files:
+        return None
+    base = os.path.normcase(os.path.abspath(db_dir))
+    mine = os.path.normcase(os.path.abspath(account_dir))
+    if not base.endswith(os.sep):
+        base += os.sep
+    if not mine.endswith(os.sep):
+        mine += os.sep
+    storage_sep = f"{os.sep}db_storage{os.sep}"
+    saw_other = False
+    for f in files:
+        raw = str(getattr(f, "path", "") or "")
+        if not raw:
+            continue
+        path = os.path.normcase(os.path.abspath(raw))
+        if path.startswith(mine):
+            return True
+        if path.startswith(base) and storage_sep in path:
+            saw_other = True
+    return False if saw_other else None
+
+
 class WeChatDB:
     """微信 4.x 本地数据库读取器"""
 
@@ -756,6 +885,30 @@ class WeChatDB:
         still = [
             rel for rel, _, _ in self._db_files if not self._key_works(rel)
         ]
+        # 校验不过的密钥必须从内存里移除：否则 _open() 会继续拿上一个账号
+        # （或旧版本）的密钥解密本账号的库——大分片全量解密慢、且若命中
+        # 旧解密缓存会把别的账号的数据当成当前账号数据返回。
+        # 只在「源库可读且页 1 HMAC 明确失败」时移除：源库暂时读不到
+        # 不能判定密钥失效，误删会让本可用的密钥被丢掉（重启后要重新扫描）。
+        stale = []
+        for rel in still:
+            key = self._keys.get(rel)
+            if not key:
+                continue
+            try:
+                with open(self._db_path(rel), "rb") as f:
+                    page1 = f.read(PAGE_SZ)
+            except OSError:
+                continue
+            if len(page1) >= PAGE_SZ and not _verify_enc_key(key, page1):
+                stale.append(rel)
+        if stale:
+            for rel in stale:
+                self._keys.pop(rel, None)
+            try:
+                self._save_keys()
+            except Exception:
+                pass
         if still:
             import sys as _sys
             print(
@@ -841,37 +994,137 @@ class WeChatDB:
                 break
         return keys
 
-    def _find_weixin_pids(self) -> List[int]:
-        """查找 Weixin.exe 进程 PID。
+    def list_weixin_pids(self) -> List[int]:
+        """当前 Weixin.exe 主实例 PID 列表（双开时返回多个；子进程不计数）。"""
+        return enumerate_weixin_pids()
 
-        优先使用 psutil（基于原生 Windows API，不依赖 WMI），
-        若 psutil 不可用则回退到 tasklist（不带 /FI 过滤以避免 WMI 依赖）。
+    def find_account_pid(self, pids: Optional[List[int]] = None,
+                         strict: bool = False) -> Optional[int]:
+        """定位当前监控账号所属的 Weixin.exe 进程（双开区分实例）。
+
+        三级信号，依次尝试、命中即返回：
+        1. 进程打开的文件里是否含当前账号目录（open_files，最稳，不依赖
+           微信版本内存布局——cfg/主密钥解析在部分新版本上会失效）；
+        2. cfg 读出的登录 wxId 与当前账号匹配；
+        3. 主密钥派生当前账号库密钥做页 1 HMAC 强校验。
+
+        账号目录名不一定是登录 wxid（自定义微信号也常见），因此 2/3 兜底。
+        单实例且未指定账号（自动模式）直接返回该 PID（归属无歧义，不必
+        读进程）；``strict=True``（用户指定了监控账号）时仍做校验，
+        **确认运行的不是该账号**则返回 None。多实例且无法确认时返回
+        None——调用方必须 fail-closed，绝不能猜一个窗口发消息。
+
+        进程信息读取失败（权限/版本）无法校验时按「无法否定」处理，
+        不因此阻断单实例场景；只有拿到明确不匹配的证据才返回 None。
+        """
+        pids = [int(p) for p in
+                (pids if pids is not None
+                 else enumerate_weixin_pids()) if p]
+        if not pids:
+            return None
+        if len(pids) == 1 and not strict:
+            return pids[0]
+        # 信号 1：打开文件句柄（True = 确属本账号，直接命中）
+        handles: Dict[int, Optional[bool]] = {}
+        for pid in pids:
+            try:
+                handles[pid] = self._pid_account_match(pid)
+            except Exception:
+                handles[pid] = None
+            if handles[pid] is True:
+                return pid
+        self_wxid = re.sub(r"_\w{4}$", "", str(self.wxid or "")).casefold()
+        # 信号 2/3 只在「未被句柄明确否定」的候选里找：正开着别的账号库
+        # 的进程不可能是当前账号，跳过它避免误判。
+        candidates = [pid for pid in pids if handles.get(pid) is not False]
+        if len(pids) == 1:
+            pid = pids[0]
+            if not candidates:
+                return None       # 句柄明确显示登录的是其它账号
+            try:
+                got = extract_master_key_from_cfg(pid)
+            except Exception:
+                got = None
+            if got:
+                master_hex, _cfg_dword, wxid = got
+                got_wxid = re.sub(r"_\w{4}$", "", str(wxid or "")).casefold()
+                if self_wxid and got_wxid and got_wxid == self_wxid:
+                    return pid
+                try:
+                    matched = self._master_matches_account(master_hex)
+                except Exception:
+                    return pid    # 校验过程异常：无法否定，不阻断
+                if matched is None:
+                    return pid
+                return pid if matched else None  # False = 明确不是该账号
+            return pid            # 读不到进程信息：无法否定，保持可用
+        pending: List[Tuple[int, str]] = []
+        for pid in candidates:
+            try:
+                got = extract_master_key_from_cfg(pid)
+            except Exception:
+                got = None
+            if not got:
+                continue
+            master_hex, _cfg_dword, wxid = got
+            got_wxid = re.sub(r"_\w{4}$", "", str(wxid or "")).casefold()
+            if self_wxid and got_wxid and got_wxid == self_wxid:
+                return pid
+            pending.append((pid, master_hex))
+        for pid, master_hex in pending:
+            try:
+                if self._master_matches_account(master_hex):
+                    return pid
+            except Exception:
+                continue
+        return None
+
+    def _pid_account_match(self, pid: int) -> Optional[bool]:
+        """指定进程是否正开着当前监控账号的库文件（True/False/None）。"""
+        return pid_account_match(
+            pid,
+            str(getattr(self, "db_dir", "") or ""),
+            account=str(getattr(self, "account", "") or ""),
+            account_dir=str(getattr(self, "account_dir", "") or ""))
+
+    def _master_matches_account(self, master_hex: str) -> Optional[bool]:
+        """主密钥能否解密当前账号的库（页 1 HMAC 强校验，防误匹配）。
+
+        Returns:
+            True/False = 已校验；None = 没有任何库可读（无法校验）。
         """
         try:
-            import psutil
-            return [
-                p.info["pid"]
-                for p in psutil.process_iter(["pid", "name"])
-                if p.info["name"] and p.info["name"].lower() == "weixin.exe"
-            ]
-        except Exception:
-            pass
-        # psutil 不可用时的兜底：tasklist 不带 /FI（避免 WMI "Invalid class" 错误）
-        import subprocess
-        try:
-            r = subprocess.run(
-                ["tasklist", "/FO", "CSV", "/NH"],
-                capture_output=True, text=True,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except OSError:
-            return []
-        pids = []
-        for line in r.stdout.strip().splitlines():
-            parts = line.strip('"').split('","')
-            if len(parts) >= 2 and parts[0].lower() == "weixin.exe" and parts[1].isdigit():
-                pids.append(int(parts[1]))
-        return pids
+            master = bytes.fromhex(master_hex)
+        except ValueError:
+            return False
+        if len(master) != 32:
+            return False
+        # 只验证少量代表库：contact.db 优先；账号主密钥正确时任一库必然通过。
+        ordered = sorted(
+            self._db_files,
+            key=lambda t: 0 if os.path.basename(t[1]) == "contact.db" else 1)
+        checked = False
+        for _rel, path, _ in ordered[:3]:
+            try:
+                with open(path, "rb") as f:
+                    page1 = f.read(PAGE_SZ)
+            except OSError:
+                continue
+            if len(page1) < PAGE_SZ:
+                continue
+            checked = True
+            derived = _pbkdf2(master, page1[:16], self.KDF_ITER)
+            if _verify_enc_key(derived, page1):
+                return True
+        return False if checked else None
+
+    def _find_weixin_pids(self) -> List[int]:
+        """全部 Weixin.exe 进程 PID（含子进程），用于内存密钥扫描。
+
+        密钥可能分布在渲染/工具子进程内存中（图片 AES 密钥现场实测），
+        扫描必须覆盖全部进程；账号 ↔ 实例归属请用 ``enumerate_weixin_pids``。
+        """
+        return enumerate_all_weixin_pids()
 
     def _extract_keys_pid(self, pid: int, tested: set) -> Dict[str, bytes]:
         h = _k32.OpenProcess(0x0010 | 0x0400, False, pid)

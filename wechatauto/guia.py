@@ -424,13 +424,21 @@ class WeChatGUI:
     """
 
     def __init__(self, title: str = WX_MAIN_WIN_TITLE, hwnd: int = None,
-                 calibrate: bool = False):
+                 calibrate: bool = False, pid: int = None):
         self._input = WinInput()
         self._sidebar_ratio = SIDEBAR_RATIO
         self._send_button_ratio = SEND_BUTTON_RATIO
+        # 目标账号的 Weixin.exe PID：双开时必须只操作这个实例的窗口，
+        # 绝不能按「最大/最高分窗口」随便挑一个（会回复到另一个账号）。
+        self._target_pid = int(pid or 0)
         self.main_hwnd = hwnd or self._locate_main_window(title)
         if not self.main_hwnd:
             raise RuntimeError('未找到微信主窗口，请确认微信已登录并运行')
+        self.pid = self._get_pid(self.main_hwnd)
+        if self._target_pid and self.pid != self._target_pid:
+            raise RuntimeError(
+                f'微信主窗口归属进程不符（期望 PID={self._target_pid}，'
+                f'实际 PID={self.pid}），已阻止操作以防回复到其它账号')
         # 真主窗口锚点：use_window() 会把 main_hwnd 临时切到搜索打开的独立
         # 聊天窗；重绑时优先回到这个锚点，别把独立窗或同名候选当主窗口。
         self._primary_hwnd = self.main_hwnd
@@ -440,7 +448,6 @@ class WeChatGUI:
             wxlog.warning('未找到微信渲染子窗口，回退用主窗口矩形定位坐标')
             self.render_hwnd = self.main_hwnd
         self._update_render_rect()
-        self.pid = self._get_pid(self.main_hwnd)
         self._current_chat = None  # 最近打开的会话名，用于连续发送时复用
         self._last_input_box = None  # 最近一次成功发送的输入框位置，连续发送复用
         self._uia = None  # UIA 引擎（惰性创建，仅当可用时启用）
@@ -516,6 +523,9 @@ class WeChatGUI:
         u = self._input._user32
         if not u.IsWindow(hwnd) or not u.IsWindowVisible(hwnd):
             return False
+        target_pid = getattr(self, '_target_pid', 0)
+        if target_pid and self._get_pid(hwnd) != target_pid:
+            return False       # 双开：只认目标账号实例的窗口
         # 最小化窗口 IsWindowVisible 仍为 True，但它不可操作；其矩形是
         # (-32000,-32000,...) 伪值，拿它算布局会让后续所有定位全错。
         try:
@@ -560,6 +570,7 @@ class WeChatGUI:
         u = self._input._user32
         scored = []
         cb_ref = []
+        target_pid = getattr(self, '_target_pid', 0)
 
         def _cb(h, lp):
             if not u.IsWindowVisible(h):
@@ -569,6 +580,8 @@ class WeChatGUI:
                     return True      # 最小化窗口不参与主窗口评分
             except Exception:
                 pass
+            if target_pid and self._get_pid(h) != target_pid:
+                return True          # 双开：非目标账号实例一律不参与评分
             we = self._is_wechat_process(h)
             if we is False:
                 return True          # 非微信进程：一票否决，不参与评分
@@ -628,6 +641,7 @@ class WeChatGUI:
             return 0
         found = []
         cb_ref = []
+        target_pid = getattr(self, '_target_pid', 0)
 
         def _cb(h, lp):
             try:
@@ -637,6 +651,8 @@ class WeChatGUI:
                 return True
             if visible and not iconic:
                 return True          # 正常可见窗口不归这里管
+            if target_pid and self._get_pid(h) != target_pid:
+                return True
             if self._is_wechat_process(h) is False:
                 return True
             buf = ctypes.create_unicode_buffer(256)
@@ -984,6 +1000,12 @@ class WeChatGUI:
         """
         hwnd = self._locate_main_window(WX_MAIN_WIN_TITLE)
         if not hwnd:
+            return False
+        target_pid = getattr(self, '_target_pid', 0)
+        if target_pid and self._get_pid(hwnd) != target_pid:
+            wxlog.warning('重绑时定位到的窗口不属于当前监控账号（PID=%s，'
+                          '期望 PID=%s），拒绝绑定', self._get_pid(hwnd),
+                          target_pid)
             return False
         primary = getattr(self, '_primary_hwnd', 0)
         if (primary and primary != hwnd
@@ -1515,6 +1537,22 @@ class WeChatGUI:
         except Exception:
             return False
 
+    def _new_uia_engine(self):
+        """创建 UIA 引擎；绑定目标账号时强制限定到该实例的窗口。"""
+        from wechatauto.uia_driver import WeChatUIA
+        target_pid = getattr(self, '_target_pid', 0)
+        if not target_pid:
+            return WeChatUIA()
+        kwargs = {'pid': target_pid}
+        hwnd = getattr(self, 'main_hwnd', 0)
+        if hwnd:
+            kwargs['hwnd'] = hwnd
+        try:
+            return WeChatUIA(**kwargs)
+        except TypeError:
+            # 兼容不支持定向参数的替身/旧实现
+            return WeChatUIA()
+
     def _get_uia(self, refresh: bool = False):
         """惰性创建并复用 UIA 引擎；不可用时返回 None（调用方 fail-closed）。
 
@@ -1539,8 +1577,7 @@ class WeChatGUI:
             return None
         self._uia_tried = True
         try:
-            from wechatauto.uia_driver import WeChatUIA
-            eng = WeChatUIA()
+            eng = self._new_uia_engine()
             if eng.ensure_window():
                 self._uia = eng
                 self._uia_retry_after = 0
@@ -1657,11 +1694,11 @@ class WeChatGUI:
             wxlog.debug('微信关闭到系统托盘，预热跳过（不打补丁、不唤醒）')
             return False
         try:
-            from wechatauto.uia_driver import WeChatUIA
+            import wechatauto.uia_driver  # noqa: F401  依赖未装时提前退出
         except Exception as e:                  # 依赖未装（如 linux CI）
             wxlog.debug('预热跳过（UIA 依赖不可用）：%s', e)
             return False
-        eng = WeChatUIA()
+        eng = self._new_uia_engine()
         if not eng.warm_tree(timeout=timeout):
             return False                        # _uia_tried 保持 False
         self._uia = eng

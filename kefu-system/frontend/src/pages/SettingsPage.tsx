@@ -66,6 +66,9 @@ import type {
   SessionItem,
   StatusOut,
   SummarySettings,
+  WechatAccountInfo,
+  WechatAccountListOut,
+  WechatAccountSwitchOut,
 } from '../api/types'
 import {
   PRESCREEN_PRESETS,
@@ -239,8 +242,11 @@ function TargetsTab() {
 
   // 群聊/私聊两个列表并行请求（Promise.all）：一次请求双端缓存，
   // 子页签切换零等待；后端另有 60s 联系人缓存，重复搜索毫秒级返回。
+  // queryKey 带当前监控账号：切换账号后旧账号的候选列表立即作废，
+  // 不会在新账号下短暂显示上一个微信的联系人（后端解密缓存已按账号隔离）。
+  const accountKey = statusData?.wechat.account?.account ?? ''
   const { data: candidateLists, isFetching: searching } = useQuery({
-    queryKey: ['session-candidates', keyword],
+    queryKey: ['session-candidates', accountKey, keyword],
     queryFn: async () => {
       const [groups, friends] = await Promise.all([
         apiGet<SessionItem[]>(
@@ -378,6 +384,8 @@ function TargetsTab() {
 
   return (
     <Box>
+      {/* 双开时先明确「这些联系人属于哪个微信」，避免加错账号的联系人 */}
+      <WxAccountAlert account={statusData?.wechat.account} />
       {/* 配额提示：接近上限（≥90%）用警告色；右侧为监控上限配置项 */}
       <Stack
         direction="row"
@@ -1762,6 +1770,39 @@ function fmtBytes(n: number): string {
   return `${value.toFixed(idx === 0 ? 0 : 1)} ${units[idx]}`
 }
 
+/** 监控账号的人类可读名称（昵称优先，其次微信号）。 */
+function wxAccountName(account?: WechatAccountInfo | null): string {
+  if (!account) return ''
+  return account.nick_name || account.wxid || account.account || ''
+}
+
+/** 监控对象页顶部提示：当前联系人来自哪个微信账号（双开防混淆）。 */
+function WxAccountAlert({ account }: { account?: WechatAccountInfo }) {
+  if (!account || (!account.account && !account.instance_count)) return null
+  const name = wxAccountName(account) || '未识别'
+  const unresolved = !account.mapped
+    && (account.instance_count > 1
+      || (account.pinned && account.instance_count > 0))
+  if (unresolved) {
+    return (
+      <Alert severity="error" variant="outlined" sx={{ mb: 1.5 }}>
+        {account.instance_count > 1
+          ? `检测到 ${account.instance_count} 个微信实例，无法确认哪个属于当前监控账号`
+          : `当前登录的微信不是所选监控账号${name !== '未识别' ? `「${name}」` : ''}`}
+        ，自动回复已暂停以免发错账号；请到「数据与账单 → 监控微信账号」重新选择，
+        或登录该账号后重试。
+      </Alert>
+    )
+  }
+  return (
+    <Alert severity="info" variant="outlined" sx={{ mb: 1.5 }}>
+      当前监控微信账号：<strong>{name}</strong>
+      {account.instance_count > 1 && `（已绑定实例 PID ${account.pid}）`}
+      。以下联系人/群聊均来自该账号；自动回复只会操作该账号的微信实例。
+    </Alert>
+  )
+}
+
 /** 清理预览结果 + 本次请求的保留天数（确认对话框真删时复用）。 */
 interface PurgeConfirm extends PurgeResult {
   keep_days: number
@@ -1838,6 +1879,57 @@ function DataBillingTab() {
     queryKey: ['purge-last'],
     queryFn: () => apiGet<LastPurge>('/api/system/purge/last'),
   })
+
+  // 监控微信账号（双开时一次只监控一个；切换只重开监听，不重启服务）
+  const {
+    data: wxAccounts,
+    isFetching: wxAccountsLoading,
+    refetch: refetchWxAccounts,
+  } = useQuery({
+    queryKey: ['wechat-accounts'],
+    queryFn: () => apiGet<WechatAccountListOut>('/api/wechat/accounts'),
+    // 双开时后台切换/重启微信后，列表需要重新扫描；低频轮询即可
+    refetchInterval: 60000,
+  })
+  const [accountSel, setAccountSel] = useState('')
+  const [accountLoaded, setAccountLoaded] = useState(false)
+  useEffect(() => {
+    if (wxAccounts && !accountLoaded) {
+      setAccountSel(wxAccounts.current.pinned
+        ? wxAccounts.current.account : '')
+      setAccountLoaded(true)
+    }
+  }, [wxAccounts, accountLoaded])
+  const switchAccountMutation = useMutation({
+    mutationFn: (account: string) =>
+      apiPost<WechatAccountSwitchOut>('/api/wechat/account', { account }),
+    onSuccess: (r) => {
+      setAccountSel(r.current.pinned ? r.current.account : '')
+      setSnack(`已切换监控账号：${wxAccountName(r.current) || '自动选择'}`)
+    },
+    onError: (e: Error) => setSnack(`切换失败：${e.message}`),
+    // 无论成败都重取：切换失败（如所选账号未登录）时后端也已保存新的
+    // 监控账号，继续显示旧账号的联系人/监控对象会误导用户
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ['wechat-accounts'] })
+      void queryClient.invalidateQueries({ queryKey: ['status'] })
+      // 换账号后联系人/群聊/监控对象来源都变了，全部重新拉取；
+      // 图片密钥按账号隔离，也必须重新查询（旧账号的就绪状态不再适用）
+      void queryClient.invalidateQueries({ queryKey: ['monitor-targets'] })
+      void queryClient.invalidateQueries({ queryKey: ['session-candidates'] })
+      void queryClient.invalidateQueries({ queryKey: ['sessions'] })
+      // 群总结的候选群/成员统计同样来自当前微信库，换账号后必须重取
+      void queryClient.invalidateQueries({ queryKey: ['summary-config-groups'] })
+      void queryClient.invalidateQueries({ queryKey: ['summary-sessions'] })
+      void queryClient.invalidateQueries({ queryKey: ['summary-members'] })
+      void queryClient.invalidateQueries({ queryKey: ['summary-context'] })
+      void queryClient.invalidateQueries({ queryKey: ['image-key-status'] })
+    },
+  })
+  const currentWx = wxAccounts?.current
+  // 「自动选择」= 设置值为空；保存的账号与之不同才允许点切换
+  const currentPinnedAccount = currentWx?.pinned ? currentWx.account : ''
+  const accountDirty = accountSel !== currentPinnedAccount
 
   // 微信数据库解密缓存目录（默认客服系统 data/wechat_cache，不占 %TEMP%）
   const { data: cacheInfo } = useQuery({
@@ -2003,6 +2095,75 @@ function DataBillingTab() {
 
   return (
     <Box>
+      <Typography variant="subtitle2" sx={{ mb: 1 }}>监控微信账号</Typography>
+      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
+        电脑上同时登录多个微信时，系统<strong>一次只监控一个账号</strong>：
+        「监控对象」里的联系人和自动回复都只针对这个账号，回复时会定位到该账号的
+        Weixin.exe 实例。切换账号只重开监听（约 1~2 秒），不会重启整个服务；
+        切换后请重新检查监控对象是否属于新账号。
+      </Typography>
+      <Stack spacing={1.5} sx={{ mb: 2 }}>
+        <Stack direction="row" spacing={1} alignItems="center" useFlexGap>
+          <TextField
+            select
+            size="small"
+            sx={{ minWidth: 360 }}
+            label="监控账号"
+            value={accountSel}
+            onChange={(e) => setAccountSel(e.target.value)}
+            disabled={wxAccountsLoading}
+          >
+            <MenuItem value="">自动选择（最近活跃账号）</MenuItem>
+            {(wxAccounts?.accounts ?? []).map((a) => (
+              <MenuItem key={a.account} value={a.account}>
+                {a.nick_name || a.wxid || a.account}
+                {a.wxid && a.nick_name ? `（${a.wxid}）` : ''}
+                {a.active ? ' · 当前' : ''}
+              </MenuItem>
+            ))}
+          </TextField>
+          <Button
+            variant="contained"
+            disabled={switchAccountMutation.isPending || !accountDirty}
+            onClick={() => switchAccountMutation.mutate(accountSel)}
+          >
+            切换监控账号
+          </Button>
+          <Button
+            disabled={wxAccountsLoading}
+            onClick={() => void refetchWxAccounts()}
+          >
+            刷新列表
+          </Button>
+        </Stack>
+        {currentWx && (
+          <Box>
+            <Typography variant="caption" color="text.secondary" component="div">
+              当前实际监控：{wxAccountName(currentWx) || '未识别'}
+              （{currentWx.account || '—'}）
+              · 微信实例：{currentWx.pid ? `PID ${currentWx.pid}` : '未确认'}
+              · 检测到 {currentWx.instance_count} 个微信
+            </Typography>
+            {!currentWx.mapped && (currentWx.instance_count > 1
+              || (currentWx.pinned && currentWx.instance_count > 0)) && (
+              <Alert severity="error" sx={{ py: 0.5, mt: 1 }}>
+                {currentWx.instance_count > 1
+                  ? `检测到 ${currentWx.instance_count} 个微信实例，无法确认哪个属于当前监控账号`
+                  : `当前登录的微信不是所选监控账号${wxAccountName(currentWx) ? `「${wxAccountName(currentWx)}」` : ''}`}
+                ，自动回复已暂停以免发错账号；请重新选择账号，或登录该账号后重启微信重试。
+              </Alert>
+            )}
+            {currentWx.instance_count > 1 && currentWx.mapped && (
+              <Alert severity="success" sx={{ py: 0.5, mt: 1 }}>
+                已确认该账号对应的微信实例（PID {currentWx.pid}），
+                自动回复只会操作这个微信。
+              </Alert>
+            )}
+          </Box>
+        )}
+      </Stack>
+
+      <Divider sx={{ my: 2 }} />
       <Typography variant="subtitle2" sx={{ mb: 1 }}>历史数据管理</Typography>
       <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
         分别配置分析日志与商机的保留天数，含义为「保留最近 N 天（含今天）」：填 1 只保留今天，
@@ -2199,8 +2360,8 @@ function DataBillingTab() {
             }
           >
             {recheckRunning
-              ? '正在后台扫描微信进程内存捕获密钥（约 2~4 分钟），请在微信中打开任意一张图片查看大图以提高命中率…'
-              : '图片解密密钥尚未获取：请在微信中打开任意一张图片查看大图，然后点「重新检查」主动捕获并缓存'
+              ? '正在后台扫描微信进程内存捕获密钥（约 2~4 分钟），请在当前监控账号的微信中打开任意一张图片查看大图以提高命中率…'
+              : '图片解密密钥尚未获取：请在当前监控账号的微信中打开任意一张图片查看大图，然后点「重新检查」主动捕获并缓存'
                 + '（除非更换微信账号、清除缓存或微信升级导致密钥变化）。'}
           </Alert>
           {imageKey.recheck_last_ok === false && !recheckRunning && (

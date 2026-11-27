@@ -223,6 +223,8 @@ def create_app() -> FastAPI:
         # 注入引用消息查询（避免 sender ↔ wechat_service 循环导入）
         sender.set_message_lookup(wechat.get_message_by_local_id)
         sender.set_latest_lookup(wechat.get_latest_local_id)
+        # 双开防发错账号：发送前按当前监控账号定位到对应 Weixin.exe 实例
+        sender.set_wechat_binding_provider(wechat.account_binding)
         # 注入语音补转写（分析线程兜住历史上未转写的 [语音] 消息）
         pipeline.set_voice_lookup(wechat.transcribe_voice)
         # 注入 @人 ID 还原（群聊 AI 判定上下文线索，批次 5 需求 ④）

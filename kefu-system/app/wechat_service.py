@@ -14,7 +14,9 @@ wechatauto 只 import 调用，不做任何修改（硬约束）。
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
+import os
 import queue
 import re
 import shutil
@@ -49,6 +51,8 @@ from app.config import (
     KEY_ASR_MAX_SECONDS,
     KEY_ANALYSIS_FILTER_SELF,
     KEY_RUNTIME_CACHE_DIR,
+    KEY_RUNTIME_WECHAT_ACCOUNT,
+    KEY_RUNTIME_WECHAT_ACCOUNT_NICKS,
     KEY_RUNTIME_WM_SAVED_AT,
     CACHE_DIR_DEFAULT,
     dir_usage,
@@ -64,6 +68,9 @@ logger = logging.getLogger(__name__)
 # 企业简称几乎不变（只有新增企业微信联系人才会变），10 分钟足够新；
 # 读失败时另按 30 秒短缓存重试，见 WeChatService.openim_corp_map。
 CORP_MAP_CACHE_TTL_SEC = 600.0
+# 当前监控账号 ↔ Weixin.exe PID 绑定的缓存时长（秒）。双开时确认归属要读
+# 进程内存里的主密钥，开销较大；状态接口每 5 秒轮询，必须缓存。
+ACCOUNT_BINDING_TTL_SEC = 15.0
 
 # 微信库读取失败的用户可读提示（前端展示 + 重新加载按钮）
 MSG_DB_BUSY_ERROR = "微信数据库正忙（微信客户端正在写入），请稍后点击重新加载"
@@ -169,6 +176,9 @@ class WeChatService:
         self._session_times_ts: float = 0.0
         # 当前登录账号 wxid（过滤自己发送的消息用，懒加载缓存）
         self._self_wxid: str = ""
+        # 当前监控账号 ↔ 微信实例 PID 绑定（双开防发错账号）
+        self._binding_lock = threading.Lock()
+        self._binding_cache: Optional[tuple[float, dict]] = None
         # 媒体下载器懒加载单例（MediaDownloader 首次使用会解密媒体库，约 13s，
         # 不能每条消息/每张图片都新建一个）。图片与语音共用同一实例。
         self._media_downloader = None
@@ -238,6 +248,16 @@ class WeChatService:
         size, count = dir_usage(path)
         wxdb = self._wxdb
         active_dir = str(getattr(wxdb, "workdir", "") or "") if wxdb else ""
+        # 解密缓存/密钥按账号隔离在 <缓存根>/<账号> 子目录，属于配置目录
+        # 即视为已在用，避免设置页误报「已保存但未生效」。
+        active = False
+        if active_dir:
+            try:
+                child = os.path.normcase(os.path.abspath(active_dir))
+                root = os.path.normcase(os.path.abspath(str(path)))
+                active = child == root or child.startswith(root + os.sep)
+            except (OSError, ValueError):
+                active = False
         return {
             "dir": str(path),
             "default_dir": str(CACHE_DIR_DEFAULT),
@@ -246,7 +266,7 @@ class WeChatService:
             "size_bytes": size,
             "file_count": count,
             "active_dir": active_dir,
-            "active": bool(active_dir) and active_dir == str(path),
+            "active": active,
             "legacy_dirs": [str(d) for d in self._legacy_cache_dirs()],
         }
 
@@ -263,12 +283,20 @@ class WeChatService:
         size, _ = dir_usage(path)
         return size / 1048576.0
 
-    def _adopt_legacy_keys(self, target: Path) -> None:
-        """把旧 TEMP 目录里的密钥缓存搬到新目录（仅当目标缺失）。
+    def _adopt_legacy_keys(self, target: Path,
+                           base: Optional[Path] = None) -> None:
+        """把旧的密钥缓存搬到目标目录（仅当目标缺失）。
 
-        不搬的话首次启动要重新从微信进程内存提取密钥，微信升级后可能提取
-        失败（表现为"数据库不可用"）。keys.json 很小，且 WeChatDB 会对每个
-        库做页 1 HMAC 校验、不匹配就重新提取，所以即使账号不同也不会用错。
+        目标目录现在是**按账号隔离**的子目录（``<缓存根>/<账号>``）：
+        keys.json 与解密缓存都只按库相对路径命名，共用一个目录会让换号
+        后的查询直接命中上一个账号的解密缓存。首次升级到隔离布局时，
+        依次尝试两个来源，避免无谓地重新扫描微信进程内存：
+
+        1. 旧共享缓存根目录（升级前 workdir 就是它）；
+        2. 旧 %TEMP% 目录（历史版本），优先同名账号子目录，其次最新修改。
+
+        keys.json 里的每条密钥都会被 WeChatDB 按目标账号的库做页 1 HMAC
+        校验，不匹配即丢弃并重新提取，所以复制来源不同也不会用错密钥。
         """
         try:
             target.mkdir(parents=True, exist_ok=True)
@@ -280,14 +308,28 @@ class WeChatService:
             if dst.exists():
                 continue
             best: Optional[Path] = None
-            best_mtime = 0.0
+            best_key: Optional[tuple] = None
+            if base is not None and target.resolve() != base.resolve():
+                src = base / name
+                try:
+                    if src.is_file():
+                        # 优先级最高：共享缓存根就是升级前的 workdir，
+                        # 其中的密钥属于最近在用的账号
+                        best, best_key = src, (3, src.stat().st_mtime)
+                except OSError:
+                    best, best_key = None, None
             for d in self._legacy_cache_dirs():
                 src = d / name
                 try:
-                    if src.is_file() and src.stat().st_mtime >= best_mtime:
-                        best, best_mtime = src, src.stat().st_mtime
+                    if not src.is_file():
+                        continue
+                    # 同名账号目录优先（旧 TEMP 布局本身就按账号分目录）
+                    key = (2 if d.name == target.name else 1,
+                           src.stat().st_mtime)
                 except OSError:
                     continue
+                if best_key is None or key > best_key:
+                    best, best_key = src, key
             if best is None:
                 continue
             try:
@@ -295,6 +337,241 @@ class WeChatService:
                 logger.info("已迁移密钥缓存：%s → %s", best, dst)
             except OSError as exc:
                 logger.warning("密钥缓存迁移失败（%s）：%s", best, exc)
+
+    # ------------------------------------------------------------------
+    # 监控微信账号（双开时必须明确「读哪个账号、点哪个实例」）
+    # ------------------------------------------------------------------
+    def configured_account(self) -> str:
+        """用户指定的监控账号目录名（空 = 自动选最近活跃账号）。"""
+        return str(self._db.get_setting(KEY_RUNTIME_WECHAT_ACCOUNT, "") or "").strip()
+
+    def effective_account(self) -> str:
+        """当前真正在监控的账号目录名。"""
+        wxdb = self._wxdb
+        active = (str(getattr(wxdb, "account", "") or "").strip()
+                  if wxdb is not None else "")
+        return active or self.configured_account()
+
+    def account_list(self) -> list[dict]:
+        """本机检测到的微信账号目录（供设置页选择监控账号）。"""
+        try:
+            from wechatauto.db import list_accounts
+            items = list(list_accounts() or [])
+        except Exception as exc:
+            logger.warning("扫描微信账号目录失败：%s", exc)
+            return []
+        active = self.effective_account()
+        configured = self.configured_account()
+        nicks = self._load_account_nicks()
+        # 当前账号昵称以最近一次绑定计算为准（可能刚登录/刚改昵称）
+        with self._binding_lock:
+            cached = self._binding_cache
+        if cached is not None:
+            cached_info = cached[1]
+            cached_account = str(cached_info.get("account") or "")
+            cached_nick = str(cached_info.get("nick_name") or "")
+            if cached_account and cached_nick:
+                nicks.setdefault(cached_account, cached_nick)
+        out: list[dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            account = str(item.get("account") or "")
+            item["account"] = account
+            item["active"] = account == active
+            item["configured"] = account == configured
+            item["nick_name"] = nicks.get(account, "")
+            out.append(item)
+        return out
+
+    def _load_account_nicks(self) -> dict:
+        """已知账号昵称表（账号目录名 → 昵称）；损坏/为空返回空表。"""
+        raw = ""
+        try:
+            raw = self._db.get_setting(KEY_RUNTIME_WECHAT_ACCOUNT_NICKS, "")
+        except Exception:
+            return {}
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items() if k and v}
+
+    def _remember_account_nick(self, account: str, nick_name: str) -> None:
+        """记住「账号目录名 → 昵称」：昵称需解密 contact.db 才能读到，
+        未登录的账号无法实时获取，持久化后设置页可显示名称而非 wxid。"""
+        account = str(account or "").strip()
+        nick_name = str(nick_name or "").strip()
+        if not account or not nick_name:
+            return
+        known = self._load_account_nicks()
+        if known.get(account) == nick_name:
+            return
+        known[account] = nick_name
+        try:
+            self._db.set_setting(
+                KEY_RUNTIME_WECHAT_ACCOUNT_NICKS,
+                json.dumps(known, ensure_ascii=False, sort_keys=True))
+        except Exception:
+            logger.debug("记录微信账号昵称失败（忽略）", exc_info=True)
+
+    def account_binding(self, force: bool = False) -> dict:
+        """当前监控账号 ↔ Weixin.exe 实例绑定（双开防发错账号）。
+
+        返回字段：account/wxid/nick_name/pid/instance_count/mapped/pinned/
+        active/reason。``pid=0`` 且 ``instance_count>1`` 时调用方必须
+        fail-closed（绝不猜一个窗口发送）。
+        """
+        now = time.time()
+        with self._binding_lock:
+            cached = self._binding_cache
+            if (not force and cached is not None
+                    and now - cached[0] < ACCOUNT_BINDING_TTL_SEC):
+                return dict(cached[1])
+        info = self._compute_account_binding()
+        with self._binding_lock:
+            self._binding_cache = (time.time(), dict(info))
+        return info
+
+    def _compute_account_binding(self) -> dict:
+        """实际计算账号身份与实例 PID（可能读进程内存，结果应缓存）。"""
+        configured = self.configured_account()
+        wxdb = self._wxdb
+        active = (str(getattr(wxdb, "account", "") or "").strip()
+                  if wxdb is not None else "")
+        account = active or configured
+        wxid = ""
+        if wxdb is not None and active:
+            try:
+                wxid = str(getattr(wxdb, "wxid", "") or "")
+            except Exception:
+                wxid = ""
+        if not wxid and account:
+            wxid = re.sub(r"_\w{4}$", "", account)
+        nick_name = ""
+        if wxdb is not None and active:
+            try:
+                self_info = wxdb.get_self_info() or {}
+                nick_name = str(self_info.get("nick_name") or "")
+            except Exception:
+                logger.debug("读取监控账号昵称失败（忽略）", exc_info=True)
+        if not nick_name and account:
+            # 降级（未打开库）时从已保存昵称表回退，顶栏仍显示「昵称」而非 wxid
+            try:
+                nick_name = str(self._load_account_nicks().get(account, "") or "")
+            except Exception:
+                nick_name = ""
+        if account and nick_name:
+            self._remember_account_nick(account, nick_name)
+        try:
+            from wechatauto.db import enumerate_weixin_pids
+            pids = enumerate_weixin_pids()
+        except Exception:
+            pids = []
+        pid = 0
+        if wxdb is not None:
+            try:
+                # 指定了账号（pinned）时即使单实例也校验，防「所选账号未登录、
+                # 实际开着另一个微信」时把新账号的消息回给旧账号联系人。
+                pid = int(wxdb.find_account_pid(
+                    pids, strict=bool(configured)) or 0)
+            except Exception:
+                logger.debug("定位监控账号微信实例失败", exc_info=True)
+                pid = 0
+        reason = ""
+        if not pids:
+            reason = "未检测到正在运行的微信（请先登录监控账号）"
+        elif len(pids) > 1 and not pid:
+            reason = ("检测到多个微信实例，但无法确认哪个属于当前监控账号；"
+                      "已暂停自动回复以免发到其它账号，请重启微信或在"
+                      "「设置 → 数据与账单 → 监控微信账号」重新选择")
+        elif wxdb is None:
+            reason = "微信数据库未就绪，无法确认监控账号实例"
+        elif configured and not pid:
+            reason = (f"当前登录的微信不是所选监控账号（{configured}）；"
+                      "已暂停自动回复以免发错账号，请在设置中重新选择或登录"
+                      "该账号后重试")
+        return {
+            "account": account,
+            "wxid": wxid,
+            "nick_name": nick_name,
+            "pid": pid,
+            "instance_count": len(pids),
+            "mapped": bool(pid),
+            "pinned": bool(configured),
+            "active": bool(wxdb is not None and self._available),
+            "reason": reason,
+        }
+
+    def switch_account(self, account: str) -> dict:
+        """切换监控账号：只重开 Listener，不重启发送/识别 worker。
+
+        Args:
+            account: 账号目录名；空串 = 恢复自动选择。
+
+        Returns:
+            {"ok": bool, "error": str, "binding": dict}
+        """
+        account = str(account or "").strip()
+        if account:
+            known = {str(a.get("account") or "") for a in self.account_list()}
+            if account not in known:
+                return {"ok": False,
+                        "error": f"未找到微信账号目录：{account}",
+                        "binding": self.account_binding(force=True)}
+        with self._listener_lock:
+            old = self._listener
+            self._listener = None
+        if old is not None:
+            try:
+                old.stop()
+            except Exception:
+                logger.exception("切换监控账号时停止旧监听异常")
+            try:
+                marks = old.watermark
+                if marks:
+                    self._db.save_watermarks(marks)
+                    self._db.set_setting(KEY_RUNTIME_WM_SAVED_AT,
+                                         dbmod.now_iso())
+            except Exception:
+                logger.exception("切换监控账号时刷回 watermark 失败")
+        self._db.set_setting(KEY_RUNTIME_WECHAT_ACCOUNT, account)
+        self._reset_account_caches()
+        with self._listener_lock:
+            ok = self._open_listener_locked(account)
+        if ok:
+            self._ensure_flush_thread()
+        binding = self.account_binding(force=True)
+        logger.info("监控微信账号已切换为：%s（监听%s）",
+                    account or "自动", "已启动" if ok else "启动失败")
+        return {"ok": ok,
+                "error": "" if ok else (self._reason or "切换监控账号失败"),
+                "binding": binding}
+
+    def _reset_account_caches(self) -> None:
+        """账号切换/换库后清空所有与账号绑定的缓存。"""
+        with self._name_cache_lock:
+            self._name_cache.clear()
+        with self._alias_cache_lock:
+            self._alias_cache.clear()
+        with self._corp_map_lock:
+            self._corp_map_cache = (0.0, None, False)
+        with self._contact_cache_lock:
+            self._contact_cache = []
+            self._contact_cache_ts = 0.0
+            self._session_times = {}
+            self._session_times_ts = 0.0
+        with self._group_members_lock:
+            self._group_members_cache.clear()
+        self._self_wxid = ""
+        with self._media_lock:
+            self._media_downloader = None
+        with self._binding_lock:
+            self._binding_cache = None
 
     # ------------------------------------------------------------------
     # 启停
@@ -313,57 +590,155 @@ class WeChatService:
         with self._listener_lock:
             if self._listener is not None:
                 return
+            self._open_listener_locked(self.configured_account())
+        if self._listener is not None:
+            self._ensure_flush_thread()
+
+    def _open_listener_locked(self, account: str = "") -> bool:
+        """（重）建 WeChatDB + Listener；调用方必须持 ``_listener_lock``。
+
+        Args:
+            account: 要监控的账号目录名；空 = 自动选最近活跃账号。
+                指定账号时必须真实存在（含 db_storage），否则给出可操作
+                的降级原因，绝不悄悄回退到另一个账号。
+
+        Returns:
+            True = 监听已启动；False = 已降级（原因见 ``degraded_reason``）。
+        """
+        account = str(account or "").strip()
+        try:
+            from wechatauto.db import (Listener, WeChatDB, auto_detect_db_dir,
+                                       list_accounts)
+        except Exception as exc:
+            self._degrade(f"微信组件加载失败：{exc}")
+            return False
+        try:
+            # 缓存目录可配置（默认 kefu-system/data/wechat_cache）：
+            # 不再落在 %TEMP% 下，避免被系统清理后全量重新解密。
+            cache_dir = self.configured_cache_dir()
+            if account:
+                db_dir = auto_detect_db_dir()
+                target = os.path.join(db_dir or "", account, "db_storage")
+                if not db_dir or not os.path.isdir(target):
+                    self._wxdb = None
+                    self._reset_account_caches()
+                    self._degrade(
+                        f"配置的监控微信账号不存在或未登录：{account}。"
+                        "请在「设置 → 数据与账单 → 监控微信账号」重新选择")
+                    return False
+                # 所选账号未登录时快速失败：否则 WeChatDB 构造会扫描全部
+                # 微信进程内存找该账号的密钥（约 110 秒）且注定失败。
+                # 只在句柄给出「明确不是该账号」的证据时拦截。
+                if self._account_instance_absent(account, db_dir):
+                    self._wxdb = None
+                    self._reset_account_caches()
+                    self._degrade(
+                        f"所选监控账号「{self._account_display(account)}」当前未登录："
+                        "正在运行的微信不是该账号，无法读取该账号的数据。"
+                        "请登录该账号后重试，或在「设置 → 数据与账单 → "
+                        "监控微信账号」切换到正在运行的账号")
+                    return False
+            # 解密缓存与密钥必须按账号隔离到 <缓存根>/<账号>：
+            # keys.json 与 .pages/.stamp 只按库相对路径命名，共用一个
+            # 目录会让换号后的查询直接命中上一个账号的解密缓存
+            # （实测：切到未登录账号仍显示原账号的联系人/群列表）。
+            workdir = cache_dir
+            resolved = account
+            if not resolved:
+                try:
+                    accounts = list_accounts()
+                    resolved = (str(accounts[0].get("account") or "")
+                                if accounts else "")
+                except Exception:
+                    resolved = ""
+            if resolved:
+                workdir = cache_dir / resolved
+            self._adopt_legacy_keys(workdir, cache_dir)
+            self._wxdb = WeChatDB(workdir=str(workdir),
+                                  account=account or None)
+            # 换了 wxdb 实例：账号相关的所有缓存都必须丢弃
+            self._reset_account_caches()
+            logger.info("微信数据库缓存目录：%s（%.1f MB，账号 %s）",
+                        workdir, self._dir_size_mb(workdir),
+                        getattr(self._wxdb, "account", "") or "自动")
+        except Exception as exc:
+            self._wxdb = None
+            self._reset_account_caches()
+            self._degrade(f"微信数据库不可用（微信可能未登录）：{exc}")
+            return False
+        try:
+            # 记录本次启动时刻（epoch 秒）作为时间闸门下界。必须早于
+            # watermark 推进：推进与 listener.start() 之间到达的真新消息
+            # create_time >= 本水位，不会被误杀。
+            self._session_start_ts = time.time()
+            marks = self._db.load_watermarks()
+            # 治本：把已启用会话的 watermark 推进到当前最新 sort_seq，
+            # 让 Listener 从「最新」开始轮询，根本不回放停机积压。
+            # 推进发生在构造 Listener 之前（而非 add_listener 之后），
+            # 因为 add_listener 只在 user 不在 watermark 时赋值，绝不会
+            # 覆盖这里写入的值（见 wechatauto/db.py:3299）。
+            advanced_marks = self._advance_start_watermarks(marks)
+            listener = Listener(self._wxdb, interval=1.0,
+                                watermark=advanced_marks or None)
+            for username in self._db.list_enabled_target_usernames():
+                listener.add_listener(username, self._on_message)
+            listener.start()
+            self._listener = listener
+            self._available = True
+            self._reason = ""
+            logger.info("微信监听已启动（账号 %s，监控会话 %d 个，加载 watermark "
+                        "%d 条，推进后水位共 %d 条；启动水位=%.0f）",
+                        getattr(self._wxdb, "account", "") or "自动",
+                        len(self._db.list_enabled_target_usernames()),
+                        len(marks), len(advanced_marks),
+                        self._session_start_ts)
+            return True
+        except Exception as exc:
+            self._listener = None
+            self._degrade(f"微信监听启动失败：{exc}")
+            return False
+
+    @staticmethod
+    def _account_instance_absent(account: str, db_dir: str) -> bool:
+        """运行中的微信实例都明确不属于 account 时返回 True。
+
+        只用进程打开文件句柄这一强证据（:func:`pid_account_match`）：
+        任一实例确认属于该账号、或句柄无法读取（权限受限/微信未运行）
+        都返回 False——宁可不拦，避免误伤正常场景。
+        """
+        try:
+            from wechatauto.db import enumerate_weixin_pids, pid_account_match
+            pids = enumerate_weixin_pids()
+        except Exception:
+            return False
+        if not pids:
+            return False
+        account_dir = os.path.join(db_dir, account)
+        evidence: List[Optional[bool]] = []
+        for pid in pids:
             try:
-                from wechatauto.db import Listener, WeChatDB  # 延迟导入
-            except Exception as exc:
-                self._degrade(f"微信组件加载失败：{exc}")
-                return
-            try:
-                # 缓存目录可配置（默认 kefu-system/data/wechat_cache）：
-                # 不再落在 %TEMP% 下，避免被系统清理后全量重新解密。
-                cache_dir = self.configured_cache_dir()
-                self._adopt_legacy_keys(cache_dir)
-                self._wxdb = WeChatDB(workdir=str(cache_dir))
-                # 换了 wxdb 实例：旧的媒体下载器绑在旧实例上，必须丢弃
-                self._media_downloader = None
-                logger.info("微信数据库缓存目录：%s（%.1f MB）",
-                            cache_dir, self._dir_size_mb(cache_dir))
-            except Exception as exc:
-                self._degrade(f"微信数据库不可用（微信可能未登录）：{exc}")
-                return
-            try:
-                # 记录本次启动时刻（epoch 秒）作为时间闸门下界。必须早于
-                # watermark 推进：推进与 listener.start() 之间到达的真新消息
-                # create_time >= 本水位，不会被误杀。
-                self._session_start_ts = time.time()
-                marks = self._db.load_watermarks()
-                # 治本：把已启用会话的 watermark 推进到当前最新 sort_seq，
-                # 让 Listener 从「最新」开始轮询，根本不回放停机积压。
-                # 推进发生在构造 Listener 之前（而非 add_listener 之后），
-                # 因为 add_listener 只在 user 不在 watermark 时赋值，绝不会
-                # 覆盖这里写入的值（见 wechatauto/db.py:3299）。
-                advanced_marks = self._advance_start_watermarks(marks)
-                self._listener = Listener(self._wxdb, interval=1.0,
-                                          watermark=advanced_marks or None)
-                for username in self._db.list_enabled_target_usernames():
-                    self._listener.add_listener(username, self._on_message)
-                self._listener.start()
-                self._available = True
-                self._reason = ""
-                logger.info("微信监听已启动（监控会话 %d 个，加载 watermark %d 条，"
-                            "推进后水位共 %d 条；启动水位=%.0f）",
-                            len(self._db.list_enabled_target_usernames()),
-                            len(marks), len(advanced_marks),
-                            self._session_start_ts)
-            except Exception as exc:
-                self._listener = None
-                self._degrade(f"微信监听启动失败：{exc}")
-                return
-            # watermark 定期刷回线程
-            self._stop.clear()
-            self._flush_thread = threading.Thread(
-                target=self._flush_loop, name="kefu-wm-flush", daemon=True)
-            self._flush_thread.start()
+                evidence.append(pid_account_match(pid, db_dir, account,
+                                                  account_dir))
+            except Exception:
+                evidence.append(None)
+        return bool(evidence) and all(v is False for v in evidence)
+
+    def _account_display(self, account: str) -> str:
+        """账号目录名 → 用户可读名称（已知昵称优先，否则去后缀 wxid）。"""
+        account = str(account or "").strip()
+        nick = str(self._load_account_nicks().get(account, "") or "").strip()
+        if nick:
+            return nick
+        return re.sub(r"_\w{4}$", "", account)
+
+    def _ensure_flush_thread(self) -> None:
+        """确保 watermark 定期刷回线程在跑（账号切换时不重复启动）。"""
+        if self._flush_thread is not None and self._flush_thread.is_alive():
+            return
+        self._stop.clear()
+        self._flush_thread = threading.Thread(
+            target=self._flush_loop, name="kefu-wm-flush", daemon=True)
+        self._flush_thread.start()
 
     def _advance_start_watermarks(self,
                                   marks: Optional[dict]) -> dict[str, int]:
@@ -2819,6 +3194,10 @@ class WeChatService:
         首次调用会解密媒体库（本机约 13s），因此**不能**每条消息都新建；
         失败返回 None（由调用方转成用户可读原因）。
         """
+        # 降级/选错账号时没有微信库：绝不能构造 MediaDownloader，否则状态
+        # 轮询会反复抛 AttributeError（db.workdir）刷满日志。
+        if self._wxdb is None:
+            return None
         if self._media_downloader is not None:
             return self._media_downloader
         with self._media_lock:

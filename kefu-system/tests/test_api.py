@@ -266,7 +266,10 @@ class TestSystemContract:
                     "worker", "ai_configured", "watermark_saved_at",
                     "analysis_health"):
             assert key in body, f"缺少字段 {key}"
-        assert set(body["wechat"]) == {"alive", "visible"}
+        # 双开定向：新增 account（当前监控账号 ↔ 微信实例绑定），替身无该能力
+        # 时返回默认值，不影响旧字段约定
+        assert set(body["wechat"]) == {"alive", "visible", "account"}
+        assert body["wechat"]["account"]["pid"] == 0
         # 批次 6 需求 5：queue 新增可选字段 vision_pending（图片识别队列积压）
         # 批次 7 需求 2：queue 再新增 vision_retry_pending（原图未下载完、
         # 正在退避补识别的图片数）

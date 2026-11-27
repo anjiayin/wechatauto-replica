@@ -32,6 +32,7 @@ import {
 import { apiDelete, apiGet, apiPost, apiPut, qs } from '../api/client'
 import type {
   SessionItem,
+  StatusOut,
   SummaryContent,
   SummaryContextOut,
   SummaryGenerateIn,
@@ -224,8 +225,14 @@ export default function GroupSummary() {
     [settings],
   )
 
+  const { data: statusData } = useQuery({
+    queryKey: ['status'],
+    queryFn: () => apiGet<StatusOut>('/api/status'),
+  })
+  // 候选群来自当前监控微信库；切换账号后旧账号的群列表立即作废
+  const accountKey = statusData?.wechat.account?.account ?? ''
   const { data: sessions = [] } = useQuery({
-    queryKey: ['summary-sessions', sessionKeyword],
+    queryKey: ['summary-sessions', accountKey, sessionKeyword],
     queryFn: () => apiGet<SessionItem[]>(
       `/api/sessions/search${qs({ kind: 'group', keyword: sessionKeyword, limit: 100 })}`),
   })

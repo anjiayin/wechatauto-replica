@@ -221,6 +221,9 @@ class _FakeDb:
     def list_enabled_target_usernames(self) -> list[str]:
         return list(self.usernames)
 
+    def get_setting(self, key, default=""):
+        return default
+
 
 class TestStartWatermarkAdvance:
     """start() 把 watermark 推进到每个会话当前最新 sort_seq。"""
@@ -303,7 +306,7 @@ class TestStartWatermarkAdvance:
 
         svc = WeChatService(db, None)  # type: ignore[arg-type]
         svc.configured_cache_dir = lambda: tmp_path  # type: ignore[method-assign]
-        svc._adopt_legacy_keys = lambda path: None  # type: ignore[method-assign]
+        svc._adopt_legacy_keys = lambda *a, **k: None  # type: ignore[method-assign]
         svc._voice_retry.start = lambda: None  # type: ignore[method-assign]
         svc._start_vision_workers = lambda: None  # type: ignore[method-assign]
         svc._image_retry.start = lambda: None  # type: ignore[method-assign]

@@ -96,18 +96,22 @@ def check_cache_dir(raw: str | None = None) -> tuple[bool, str, Path]:
 
 
 def dir_usage(path: Path | str) -> tuple[int, int]:
-    """统计目录占用 (字节数, 文件数)。缓存目录是平铺文件，只统计一层。"""
+    """统计目录占用 (字节数, 文件数)，含子目录。
+
+    解密缓存现在按账号隔离在 ``<缓存根>/<账号>/`` 子目录，统计必须递归，
+    否则设置页会显示 0 字节。
+    """
     total = 0
     count = 0
     try:
-        with os.scandir(path) as it:
-            for entry in it:
+        for root, _dirs, files in os.walk(path):
+            for name in files:
                 try:
-                    if entry.is_file(follow_symlinks=False):
-                        total += entry.stat(follow_symlinks=False).st_size
-                        count += 1
+                    st = os.stat(os.path.join(root, name), follow_symlinks=False)
                 except OSError:
                     continue
+                total += st.st_size
+                count += 1
     except OSError:
         return 0, 0
     return total, count
@@ -230,6 +234,13 @@ KEY_RUNTIME_LOCALTIME_MIGRATED = "runtime.created_at_localtime"
 KEY_RUNTIME_AI_USAGE_BACKFILLED = "runtime.ai_usage_backfilled"
 # 微信数据库解密缓存目录（空 = 默认 DATA_DIR/wechat_cache；相对路径按 kefu-system/ 解析）
 KEY_RUNTIME_CACHE_DIR = "runtime.cache_dir"
+# 当前监控的微信账号目录名（空 = 自动选最近活跃账号）。双开时用于明确
+# 「监控哪个微信」，并把回复限定到该账号对应的 Weixin.exe 实例。
+KEY_RUNTIME_WECHAT_ACCOUNT = "runtime.wechat_account"
+# 已知微信账号昵称缓存（JSON：账号目录名 → 微信昵称）。昵称只有解密
+# 对应账号的 contact.db 才能读到，未登录/已切换的账号先记住上次读到的，
+# 供设置页选择账号时认人（否则只能显示 wxid）。
+KEY_RUNTIME_WECHAT_ACCOUNT_NICKS = "runtime.wechat_account_nicks"
 # 内部键：最近一次手动清理记录（JSON：table/deleted/keep_days/cutoff/at）。
 # 落库留痕，不依赖日志文件——日志轮转失败时仍能查出「数据是被谁清理掉的」。
 KEY_RUNTIME_LAST_PURGE = "runtime.last_purge"
@@ -296,6 +307,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     KEY_MONITOR_MAX_TARGETS: str(MAX_MONITOR_TARGETS),
     KEY_COMPLIANCE_CONFIRMED: "0",
     KEY_RUNTIME_CACHE_DIR: "",     # 空 = 使用 CACHE_DIR_DEFAULT
+    KEY_RUNTIME_WECHAT_ACCOUNT: "",  # 空 = 自动选择最近活跃账号
     KEY_RUNTIME_LAST_PURGE: "",    # 空 = 尚未执行过手动清理（JSON 字符串）
     # 授权：默认值只对新建数据库（settings 表）生效；已有库用 --license /
     # 环境变量 KEFU_LICENSE_ENABLED=1 覆盖，或改 settings 表里的 license.enabled。
