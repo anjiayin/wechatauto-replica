@@ -54,6 +54,10 @@ export interface WechatAccountSwitchOut {
   /** 切换完成后的监听状态（前端立即回写顶栏/降级横幅，无需等轮询） */
   listener_running: boolean
   degraded_reason: string
+  /** 切换后的监控会话数（顶栏「监控 N 个会话」立即更新） */
+  monitored_count: number
+  /** 切换后的监控对象配额（设置页「已监控 X/190」立即更新） */
+  monitor_quota: MonitorQuota
 }
 
 export interface QueueStatus {

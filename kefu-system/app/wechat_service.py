@@ -703,9 +703,10 @@ class WeChatService:
                     if any(int(v or 0) for v in filled.values()):
                         logger.info(
                             "存量数据已归属到账号 %s（监控对象 %d / 商机 %d / "
-                            "定时总结 %d）", active_account,
+                            "分析日志 %d / 定时总结 %d）", active_account,
                             filled.get("targets", 0),
                             filled.get("opportunities", 0),
+                            filled.get("logs", 0),
                             filled.get("schedules", 0))
                 except Exception:
                     logger.exception("存量数据账号归属回填失败（忽略）")
@@ -1014,6 +1015,7 @@ class WeChatService:
                         mtype, content)[:200],
                     status="skipped",
                     error="自己发送的消息已过滤（设置 → 分析判定）",
+                    account=self._account_for_queries(),
                 )
                 return
             # 群消息到达即学习「微信端实际显示的发送者名称」（群名片，
@@ -1067,6 +1069,7 @@ class WeChatService:
                             mtype, str(msg.get("content") or ""))[:200],
                         status="skipped",
                         error=f"非文本消息（{mtype or '未知类型'}），不分析",
+                        account=self._account_for_queries(),
                     )
                     return
             # 企业微信联系人按微信 UI 习惯显示「昵称@企业简称」：只存昵称
@@ -1128,6 +1131,7 @@ class WeChatService:
                 # 带 local_id 落库：前端「重新识别」要按 (会话, local_id)
                 # 精确定位这张图（日志正文里没有可用标识）
                 image_local_id=local_id or None,
+                account=self._account_for_queries(),
             )
         except Exception:
             logger.exception("写入图片跳过日志失败（已忽略）")
@@ -1792,6 +1796,7 @@ class WeChatService:
                 status="skipped",
                 error=f"语音转写失败：{error}{note}",
                 voice_local_id=local_id or None,
+                account=self._account_for_queries(),
             )
         except Exception:
             logger.exception("写入语音失败日志异常（已忽略）")

@@ -210,6 +210,9 @@ function TargetsTab() {
   const quotaRatio = quota && quota.max > 0 ? quota.used / quota.max : 0
   const quotaWarning = quotaRatio >= 0.9
   const quotaFull = quota ? quota.used >= quota.max : false
+  // 配额按「当前监控账号」统计；在提示里带上账号名，避免与旁边
+  // 「显示全部账号」的列表条数看起来对不上（切号后尤其明显）
+  const quotaAccountName = wxAccountName(statusData?.wechat.account)
 
   // 监控上限配置（monitor.max_targets，10~2000；保存后配额提示即时更新）
   const { data: monitorSettings } = useQuery({
@@ -417,7 +420,9 @@ function TargetsTab() {
             variant="outlined"
             sx={{ flex: 1, minWidth: 260 }}
           >
-            已监控 {quota.used}/{quota.max}，还可添加 {quota.max - quota.used} 个
+            {quotaAccountName ? `账号「${quotaAccountName}」` : '当前账号'}已监控{' '}
+            {quota.used}/{quota.max}，还可添加 {quota.max - quota.used} 个
+            {showAllAccounts && `（下方列表为全部账号，共 ${targets?.length ?? 0} 个）`}
             {quotaWarning && '（已接近上限，建议清理不再需要的监控对象）'}
           </Alert>
         )}
@@ -1982,6 +1987,10 @@ function DataBillingTab() {
               ...old,
               listener_running: r.listener_running,
               degraded_reason: r.degraded_reason,
+              // 监控数/配额随切换结果一起回写：否则设置页的
+              // 「已监控 X/Y」要等下一轮轮询才变（旧账号数字残留）
+              monitored_count: r.monitored_count,
+              monitor_quota: r.monitor_quota,
               wechat: { ...old.wechat, account: r.current },
             }
           : old,
@@ -1998,6 +2007,8 @@ function DataBillingTab() {
       void queryClient.invalidateQueries({ queryKey: ['monitor-targets'] })
       void queryClient.invalidateQueries({ queryKey: ['session-candidates'] })
       void queryClient.invalidateQueries({ queryKey: ['sessions'] })
+      // 分析日志已在后端按账号过滤，换账号后内容必须跟着切换
+      void queryClient.invalidateQueries({ queryKey: ['analysis-logs'] })
       // 群总结的候选群/成员统计同样来自当前微信库，换账号后必须重取
       void queryClient.invalidateQueries({ queryKey: ['summary-config-groups'] })
       void queryClient.invalidateQueries({ queryKey: ['summary-sessions'] })

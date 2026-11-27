@@ -45,6 +45,12 @@ class WechatAccountListOut(BaseModel):
     current: WechatAccountInfo = Field(default_factory=WechatAccountInfo)
 
 
+class MonitorQuota(BaseModel):
+    """监控对象配额（used/max，设置页双栏顶部提示用）。"""
+    used: int = 0
+    max: int = 0
+
+
 class WechatAccountSwitchIn(BaseModel):
     account: str = ""            # 空 = 恢复自动选择
 
@@ -57,6 +63,10 @@ class WechatAccountSwitchOut(BaseModel):
     # 下一次 5 秒轮询（用户实测切换成功后横幅长时间不消失）。
     listener_running: bool = False
     degraded_reason: str = ""
+    # 切换后的监控会话数与配额：前端立即回写「监控 N 个会话」与
+    # 「已监控 X/190」，避免计数短暂停留在上一个账号。
+    monitored_count: int = 0
+    monitor_quota: MonitorQuota = Field(default_factory=MonitorQuota)
 
 
 class QueueStatus(BaseModel):
@@ -71,12 +81,6 @@ class QueueStatus(BaseModel):
 
 class WorkerStatus(BaseModel):
     busy: int = 0
-    max: int = 0
-
-
-class MonitorQuota(BaseModel):
-    """监控对象配额（used/max，设置页双栏顶部提示用）。"""
-    used: int = 0
     max: int = 0
 
 

@@ -590,6 +590,7 @@ def get_wechat_accounts(
 @router.post("/api/wechat/account", response_model=WechatAccountSwitchOut)
 def switch_wechat_account(
         body: WechatAccountSwitchIn,
+        db: Database = Depends(get_db),
         wechat: WeChatService = Depends(get_wechat_service),
 ) -> WechatAccountSwitchOut:
     """切换监控账号（空字符串 = 恢复自动选择最近活跃账号）。
@@ -609,12 +610,23 @@ def switch_wechat_account(
     items = lister() if callable(lister) else []
     running = getattr(wechat, "listener_running", False)
     reason = getattr(wechat, "degraded_reason", "")
+    # 配额与监控会话数按切换后的账号重新计算：前端据此立即刷新计数，
+    # 不必等状态轮询（用户实测切号后「已监控 X/190」停留在上一个账号）。
+    account = current_account(wechat)
+    try:
+        monitored = int(wechat.monitored_count)
+    except Exception:
+        monitored = 0
     return WechatAccountSwitchOut(
         ok=True,
         current=_account_info(wechat),
         accounts=_account_items(items),
         listener_running=bool(running),
         degraded_reason=str(reason or ""),
+        monitored_count=monitored,
+        monitor_quota=MonitorQuota(
+            used=db.count_targets(account=account),
+            max=read_monitor_max_targets(db)),
     )
 
 

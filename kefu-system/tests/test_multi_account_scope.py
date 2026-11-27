@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from app.aggregator import Aggregator
 from app.api import deps
+from app.api.router_analysis import router as analysis_router
 from app.api.router_opportunities import router as opportunities_router
 from app.api.router_targets import router as targets_router
 from app.config import KEY_SUMMARY_SCHEDULE_CONFIGS
@@ -105,17 +106,21 @@ def test_backfill_scope_assigns_legacy_rows_once(tmp_path):
             ensure_ascii=False))
         db.insert_target("g@chatroom", "群", "group")
         _insert_opp(db, session="g@chatroom", account="")
+        db.insert_analysis_log(session_username="g@chatroom", status="ok",
+                               input_text="[10:00] 测试原文")
 
         result = db.backfill_account_scope("acc_a")
-        assert result == {"targets": 1, "opportunities": 1, "schedules": 1}
+        assert result == {"targets": 1, "opportunities": 1, "logs": 1,
+                          "schedules": 1}
         assert db.list_targets(account="acc_a")[0]["username"] == "g@chatroom"
         assert db.list_opportunities(account="acc_a")[0] == 1
+        assert db.list_analysis_logs(account="acc_a")[0] == 1
         configs = json.loads(db.get_setting(KEY_SUMMARY_SCHEDULE_CONFIGS))
         assert configs[0]["account"] == "acc_a"
 
         # 幂等：再次打开同一账号不会重复归属，也不会错归其它账号
         assert db.backfill_account_scope("acc_a") == {
-            "targets": 0, "opportunities": 0, "schedules": 0}
+            "targets": 0, "opportunities": 0, "logs": 0, "schedules": 0}
         assert db.list_targets(account="acc_b") == []
     finally:
         db.close()
@@ -139,6 +144,9 @@ class _FakeWechat:
     def get_display_name(self, username: str) -> str:
         return username
 
+    def build_log_displays(self, session_username: str, input_text: str):
+        return session_username, input_text
+
     def session_exists(self, username: str) -> bool:
         return True
 
@@ -158,6 +166,7 @@ def scope_api(tmp_path):
     app = FastAPI()
     app.include_router(targets_router)
     app.include_router(opportunities_router)
+    app.include_router(analysis_router)
     client = TestClient(app)
     yield SimpleNamespace(db=db, svc=svc, client=client)
     deps.reset_for_tests()
@@ -213,6 +222,27 @@ def test_opportunities_api_filters_and_all_accounts(scope_api):
 
     all_body = env.client.get("/api/opportunities?all_accounts=1").json()
     assert all_body["total"] == 2
+
+
+def test_analysis_logs_api_filters_and_all_accounts(scope_api):
+    """分析日志默认只返回当前账号的，切换账号后内容随之切换。"""
+    env = scope_api
+    env.db.insert_analysis_log(session_username="a@chatroom", status="ok",
+                               input_text="[10:00] 账号A的消息", account="acc_a")
+    env.db.insert_analysis_log(session_username="b@chatroom", status="ok",
+                               input_text="[10:00] 账号B的消息", account="acc_b")
+
+    default_body = env.client.get("/api/analysis-logs").json()
+    assert default_body["total"] == 1
+    assert default_body["items"][0]["session_username"] == "a@chatroom"
+
+    all_body = env.client.get("/api/analysis-logs?all_accounts=1").json()
+    assert all_body["total"] == 2
+
+    env.svc._account = "acc_b"
+    switched_body = env.client.get("/api/analysis-logs").json()
+    assert switched_body["total"] == 1
+    assert switched_body["items"][0]["session_username"] == "b@chatroom"
 
 
 # ---------------------------------------------------------------------------

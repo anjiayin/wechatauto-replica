@@ -40,6 +40,7 @@ import type {
   AnalysisLogListOut,
   AnalysisSettings,
   ImageRetryResult,
+  StatusOut,
   VoiceRetryResult,
 } from '../api/types'
 
@@ -157,8 +158,22 @@ export default function AnalysisLogs() {
     [page, pageSize, status, session, sender, keyword],
   )
 
+  // 分析日志由后端按「当前监控账号」过滤；订阅全局状态让 queryKey 携带
+  // 账号，切号后立即按新账号重取（否则继续展示旧账号的分析记录）
+  const { data: statusData } = useQuery({
+    queryKey: ['status'],
+    queryFn: () => apiGet<StatusOut>('/api/status'),
+  })
+  const accountKey = statusData?.wechat.account?.account ?? ''
+  const accountLabel = statusData?.wechat.account?.nick_name || accountKey
+
+  // 换账号后旧页码/筛选可能在新账号下无结果，回到第一页
+  useEffect(() => {
+    setPage(0)
+  }, [accountKey])
+
   const { data, isLoading, refetch } = useQuery({
-    queryKey: ['analysis-logs', query],
+    queryKey: ['analysis-logs', query, accountKey],
     queryFn: () => apiGet<AnalysisLogListOut>(query),
   })
 
@@ -215,6 +230,13 @@ export default function AnalysisLogs() {
         <Typography variant="body2" color="text.secondary" sx={{ flex: 1, minWidth: 260 }}>
           漏判修正：把被预筛跳过或 AI 未命中的真实商机消息，加入关键词或示例，后续类似消息将能被识别。
         </Typography>
+        {/* 分析日志只显示当前监控账号的记录，标注账号避免看成全部 */}
+        <Chip
+          size="small"
+          variant="outlined"
+          color="secondary"
+          label={accountLabel ? `当前账号：${accountLabel}` : '当前账号未识别'}
+        />
         <Chip
           size="small"
           color="primary"

@@ -172,7 +172,8 @@ DDL_STATEMENTS: tuple[str, ...] = (
       queue_wait_ms    INTEGER,
       e2e_ms           INTEGER,
       voice_local_id   INTEGER,
-      image_local_id   INTEGER
+      image_local_id   INTEGER,
+      account          TEXT NOT NULL DEFAULT ''
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_logs_created ON analysis_logs (created_at DESC)",
@@ -442,6 +443,8 @@ class Database:
             # 由 backfill_account_scope 把存量行回填到该账号。
             ("monitor_targets", "account", "TEXT NOT NULL DEFAULT ''"),
             ("opportunities", "account", "TEXT NOT NULL DEFAULT ''"),
+            # 分析日志同样按账号隔离：日志页默认只显示当前监控账号的记录
+            ("analysis_logs", "account", "TEXT NOT NULL DEFAULT ''"),
         )
         with self._lock:
             for table, column, col_type in plans:
@@ -456,6 +459,9 @@ class Database:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_opp_account "
                 "ON opportunities (account, created_at DESC)")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_logs_account "
+                "ON analysis_logs (account, id DESC)")
             self._conn.commit()
 
     def _migrate_target_account_unique(self) -> None:
@@ -865,19 +871,23 @@ class Database:
     def backfill_account_scope(self, account: str) -> dict[str, int]:
         """把升级前存量的空账号归属回填到当前真正打开的账号。
 
-        只在服务成功打开某账号后调用：监控对象、商机、定时总结群配置
-        三类存量数据统一归属到该账号，之后各账号各看各的。重复调用只
-        影响仍为空串的行（幂等）。
+        只在服务成功打开某账号后调用：监控对象、商机、分析日志、定时总结
+        群配置四类存量数据统一归属到该账号，之后各账号各看各的。重复调用
+        只影响仍为空串的行（幂等）。
         """
         account = str(account or "").strip()
         if not account:
-            return {"targets": 0, "opportunities": 0, "schedules": 0}
+            return {"targets": 0, "opportunities": 0, "logs": 0,
+                    "schedules": 0}
         with self._lock:
             targets = self._conn.execute(
                 "UPDATE monitor_targets SET account=? WHERE account=''",
                 (account,)).rowcount
             opps = self._conn.execute(
                 "UPDATE opportunities SET account=? WHERE account=''",
+                (account,)).rowcount
+            logs = self._conn.execute(
+                "UPDATE analysis_logs SET account=? WHERE account=''",
                 (account,)).rowcount
             self._conn.commit()
         schedules = 0
@@ -900,6 +910,7 @@ class Database:
             logger.exception("定时总结群配置账号归属回填失败（已跳过）")
         return {"targets": int(targets or 0),
                 "opportunities": int(opps or 0),
+                "logs": int(logs or 0),
                 "schedules": schedules}
 
     # ------------------------------------------------------------------
@@ -1239,7 +1250,8 @@ class Database:
                             queue_wait_ms: Optional[int] = None,
                             e2e_ms: Optional[int] = None,
                             voice_local_id: Optional[int] = None,
-                            image_local_id: Optional[int] = None) -> int:
+                            image_local_id: Optional[int] = None,
+                            account: str = "") -> int:
         """写入一条分析日志（ok/error/skipped/below_threshold）。
 
         prompt_tokens/completion_tokens：AI 调用 token 用量（反馈 13
@@ -1257,6 +1269,8 @@ class Database:
         ``image_local_id``：图片消息在微信会话内的 local_id（非图片为
         None）。原图/缩略图没下载完时靠它在补识别队列与「重新识别」按钮里
         精确定位那张图。
+
+        ``account``：消息来源的监控账号目录名（多开隔离）；空串 = 未归属。
         """
         with self._lock:
             cur = self._conn.execute(
@@ -1264,15 +1278,16 @@ class Database:
                 "msg_count, input_text, result, status, error, model, "
                 "latency_ms, opportunity_id, prompt_tokens, completion_tokens, "
                 "agg_wait_ms, queue_wait_ms, e2e_ms, voice_local_id, "
-                "image_local_id, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "image_local_id, account, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
                 "datetime('now','localtime'))",
                 (session_username, sender_wxid, msg_count, input_text, result,
                  status, error, model, latency_ms, opportunity_id,
                  prompt_tokens, completion_tokens,
                  agg_wait_ms, queue_wait_ms, e2e_ms,
                  int(voice_local_id) if voice_local_id else None,
-                 int(image_local_id) if image_local_id else None),
+                 int(image_local_id) if image_local_id else None,
+                 str(account or "")),
             )
             # 同一事务里镜像到 ai_usage：账单只认这张表，即使之后分析日志
             # 被「历史清理」删掉，用量与费用统计也不会出现空洞。
@@ -1317,7 +1332,8 @@ class Database:
             self._conn.commit()
             return bool(cur.rowcount)
 
-    def distinct_log_sessions(self, limit: int = 500) -> list[str]:
+    def distinct_log_sessions(self, limit: int = 500,
+                              account: str = "") -> list[str]:
         """分析日志中出现过的会话 username（去重，按最近出现倒序）。
 
         批次 6 需求 2：日志页「来源会话」列展示的是解析后的显示名（备注/
@@ -1327,19 +1343,25 @@ class Database:
 
         Args:
             limit: 最多返回多少条候选（上限保护，避免大表全表扫描）。
+            account: 非空时只取该账号的日志（多开隔离，与列表口径一致）。
 
         Returns:
             非空 ``session_username`` 列表（去重，最近出现优先）。
         """
         cap = max(1, min(int(limit or 500), 2000))
+        where = "session_username IS NOT NULL AND session_username != ''"
+        params: list[Any] = []
+        if account:
+            where += " AND account=?"
+            params.append(account)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT session_username, MAX(id) AS last_id "
                 "FROM analysis_logs "
-                "WHERE session_username IS NOT NULL AND session_username != '' "
+                f"WHERE {where} "
                 "GROUP BY session_username "
                 "ORDER BY last_id DESC LIMIT ?",
-                (cap,),
+                [*params, cap],
             ).fetchall()
         out: list[str] = []
         for row in rows:
@@ -1348,7 +1370,8 @@ class Database:
                 out.append(name)
         return out
 
-    def distinct_log_sender_pairs(self, limit: int = 500
+    def distinct_log_sender_pairs(self, limit: int = 500,
+                                  account: str = ""
                                   ) -> list[tuple[str, str]]:
         """分析日志中出现过的 (发送人 wxid, 所属会话 username) 组合。
 
@@ -1358,19 +1381,25 @@ class Database:
 
         Args:
             limit: 最多返回多少条候选（上限保护，避免大表全表扫描）。
+            account: 非空时只取该账号的日志（多开隔离，与列表口径一致）。
 
         Returns:
             ``[(sender_wxid, session_username), ...]``，去重、最近出现优先。
         """
         cap = max(1, min(int(limit or 500), 2000))
+        where = "sender_wxid IS NOT NULL AND sender_wxid != ''"
+        params: list[Any] = []
+        if account:
+            where += " AND account=?"
+            params.append(account)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT sender_wxid, session_username, MAX(id) AS last_id "
                 "FROM analysis_logs "
-                "WHERE sender_wxid IS NOT NULL AND sender_wxid != '' "
+                f"WHERE {where} "
                 "GROUP BY sender_wxid, session_username "
                 "ORDER BY last_id DESC LIMIT ?",
-                (cap,),
+                [*params, cap],
             ).fetchall()
         out: list[tuple[str, str]] = []
         for row in rows:
@@ -1380,7 +1409,8 @@ class Database:
             out.append((wxid, str(row[1] or "")))
         return out
 
-    def distinct_log_senders(self, limit: int = 500) -> list[str]:
+    def distinct_log_senders(self, limit: int = 500,
+                             account: str = "") -> list[str]:
         """分析日志中出现过的发送人 wxid（去重，按最近出现倒序）。
 
         与 :meth:`distinct_log_sessions` 同构；路由层用它把用户输入的
@@ -1393,7 +1423,8 @@ class Database:
             非空 ``sender_wxid`` 列表（去重，最近出现优先）。
         """
         seen: list[str] = []
-        for wxid, _session in self.distinct_log_sender_pairs(limit=limit):
+        for wxid, _session in self.distinct_log_sender_pairs(
+                limit=limit, account=account):
             if wxid not in seen:
                 seen.append(wxid)
         return seen
@@ -1403,7 +1434,8 @@ class Database:
                            keyword: str = "",
                            session_in: Optional[list[str]] = None,
                            sender: str = "",
-                           sender_in: Optional[list[str]] = None
+                           sender_in: Optional[list[str]] = None,
+                           account: str = ""
                            ) -> tuple[int, list[dict]]:
         """分析日志分页列表（id 倒序 = 时间倒序）。
 
@@ -1417,12 +1449,16 @@ class Database:
             sender: 发送人筛选（sender_wxid 模糊匹配；批次 11 需求 2）。
             sender_in: 精确命中的发送人 wxid 列表（用户输入的是昵称，路由层
                 先解析成 wxid 候选）。为空/None 时只走 LIKE。
+            account: 非空时只返回该账号的日志（多开隔离）；空串 = 全部。
 
         Returns:
             (total, items)
         """
         where: list[str] = []
         params: list[Any] = []
+        if account:
+            where.append("account=?")
+            params.append(account)
         if status in ("ok", "error", "skipped", "below_threshold"):
             where.append("status=?")
             params.append(status)

@@ -15,7 +15,7 @@ import logging
 
 from fastapi import APIRouter, Depends, Query
 
-from app.api.deps import get_db, get_wechat_service
+from app.api.deps import current_account, get_db, get_wechat_service
 from app.db import Database
 from app.schemas import AnalysisLogListOut, AnalysisLogOut
 from app.sender_display import (resolve_sender_display,
@@ -39,7 +39,7 @@ def _name_resolver(svc: WeChatService):
 
 
 def _match_log_sessions(db: Database, svc: WeChatService,
-                        keyword: str) -> list[str]:
+                        keyword: str, account: str = "") -> list[str]:
     """把用户输入的会话名/备注/群名解析成 ``session_username`` 候选列表。
 
     匹配规则（大小写不敏感）：用户输入是显示名或 username 的子串即命中。
@@ -49,6 +49,7 @@ def _match_log_sessions(db: Database, svc: WeChatService,
         db: 数据库实例（提供 ``distinct_log_sessions``）。
         svc: 微信服务实例（提供 ``get_display_name``）。
         keyword: 用户输入的会话名或微信 ID 片段。
+        account: 非空时只在当前账号出现过的会话里匹配（与列表口径一致）。
 
     Returns:
         命中的 ``session_username`` 列表（未命中返回空列表）。
@@ -57,7 +58,8 @@ def _match_log_sessions(db: Database, svc: WeChatService,
     if not key:
         return []
     try:
-        candidates = db.distinct_log_sessions(limit=SESSION_CANDIDATE_LIMIT)
+        candidates = db.distinct_log_sessions(
+            limit=SESSION_CANDIDATE_LIMIT, account=account)
     except Exception:
         logger.exception("查询日志会话候选失败（退化为 username 模糊匹配）")
         return []
@@ -79,7 +81,7 @@ def _match_log_sessions(db: Database, svc: WeChatService,
 
 
 def _match_log_senders(db: Database, svc: WeChatService,
-                       keyword: str) -> list[str]:
+                       keyword: str, account: str = "") -> list[str]:
     """把用户输入的发送人「昵称 / wxid 片段」解析成 ``sender_wxid`` 候选列表。
 
     日志表只存 ``sender_wxid``，页面上展示的是解析后的显示名（群昵称最准，
@@ -93,6 +95,7 @@ def _match_log_senders(db: Database, svc: WeChatService,
         db: 数据库实例（提供 ``distinct_log_sender_pairs``）。
         svc: 微信服务实例（提供 ``get_display_name``）。
         keyword: 用户输入的发送人昵称或微信 ID 片段。
+        account: 非空时只在当前账号出现过的发送人里匹配（与列表口径一致）。
 
     Returns:
         命中的 ``sender_wxid`` 列表（去重、未命中返回空列表）。
@@ -101,7 +104,8 @@ def _match_log_senders(db: Database, svc: WeChatService,
     if not key:
         return []
     try:
-        pairs = db.distinct_log_sender_pairs(limit=SENDER_CANDIDATE_LIMIT)
+        pairs = db.distinct_log_sender_pairs(
+            limit=SENDER_CANDIDATE_LIMIT, account=account)
     except Exception:
         logger.exception("查询日志发送人候选失败（退化为 wxid 模糊匹配）")
         return []
@@ -150,11 +154,13 @@ def list_analysis_logs(
     session: str = "",
     sender: str = "",
     keyword: str = "",
+    all_accounts: bool = Query(default=False),
     db: Database = Depends(get_db),
     svc: WeChatService = Depends(get_wechat_service),
 ) -> AnalysisLogListOut:
     """分析日志分页列表（id 倒序；status 空为全部）。
 
+    - 默认只返回当前监控账号的日志（多开隔离）；all_accounts=1 看全部账号；
     - session：来源会话筛选，**支持会话名/备注/群名**（批次 6 需求 2）：
       页面上「来源会话」列展示的是解析后的显示名，而库里存的是
       ``session_username``，因此先用候选集把「显示名 → username」解析出来，
@@ -164,18 +170,20 @@ def list_analysis_logs(
       解析方式与会话一致（显示名 → wxid 候选 + 原 LIKE 路径兜底）；
     - keyword：消息内容筛选（input_text 模糊匹配）。
     """
+    account = "" if all_accounts else current_account(svc)
     session_q = session.strip()
     session_in: list[str] = []
     if session_q:
-        session_in = _match_log_sessions(db, svc, session_q)
+        session_in = _match_log_sessions(db, svc, session_q, account=account)
     sender_q = sender.strip()
     sender_in: list[str] = []
     if sender_q:
-        sender_in = _match_log_senders(db, svc, sender_q)
+        sender_in = _match_log_senders(db, svc, sender_q, account=account)
     total, rows = db.list_analysis_logs(
         page=page, page_size=page_size, status=status,
         session=session_q, keyword=keyword.strip(),
-        session_in=session_in, sender=sender_q, sender_in=sender_in)
+        session_in=session_in, sender=sender_q, sender_in=sender_in,
+        account=account)
     displays: list[str] = _sender_displays(db, svc, rows)
     items: list[AnalysisLogOut] = []
     for row, sender_display in zip(rows, displays):

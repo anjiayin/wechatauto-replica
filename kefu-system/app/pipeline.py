@@ -455,6 +455,8 @@ class Pipeline:
             input_text=unit.merged_text()[:2000],
             agg_wait_ms=agg_wait_ms,
             queue_wait_ms=queue_wait_ms,
+            # 日志归属账号：日志页默认按当前监控账号过滤（多开隔离）
+            account=str(getattr(unit, "account", "") or ""),
         )
         # 不使用 AI 接口（设置里可关闭）：直接用「轻量筛选」关键词/正则判定商机。
         # 该模式不向外部发送消息内容，因此不要求合规知情确认。
@@ -879,6 +881,7 @@ class Pipeline:
             "sender_wxid": unit.sender_wxid,
             "msg_count": unit.merged_count,
             "input_text": unit.merged_text()[:2000],
+            "account": str(getattr(unit, "account", "") or ""),
         }
         log.update(base_log or {})
         return log
