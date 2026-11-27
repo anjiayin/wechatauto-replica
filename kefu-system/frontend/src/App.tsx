@@ -93,11 +93,16 @@ export default function App() {
     if (location.pathname === '/summary') setSummaryBadge(0)
   }, [location.pathname])
 
-  // 状态轮询：WS 断开时的兜底刷新通道
+  // 状态轮询：WS 断开时的兜底刷新通道。
+  // 后台标签页/切回窗口也要及时刷新：降级横幅与顶栏监听状态都取自这里，
+  // 之前依赖 5 秒轮询且全局关闭了 refetchOnWindowFocus，切号后横幅
+  // 可能长时间停留在旧状态（用户实测）。
   const { data: status } = useQuery({
     queryKey: ['status'],
     queryFn: () => apiGet<StatusOut>('/api/status'),
     refetchInterval: 5000,
+    refetchIntervalInBackground: true,
+    refetchOnWindowFocus: true,
   })
 
   // 客户端更新：启动 5s 后检查一次、之后每 12h；发现新版本自动提示一次。

@@ -698,11 +698,31 @@ class SummaryScheduler:
     # ------------------------------------------------------------------
     # 命中判断与生成
     # ------------------------------------------------------------------
+    def _active_account(self) -> str:
+        """当前监控账号目录名（调度只跑本账号的定时群）。
+
+        服务替身/单测没有 ``effective_account`` 时返回空串 = 兼容旧行为
+        （只跑未标注账号的存量配置）。
+        """
+        wechat = getattr(self._service, "_wechat", None)
+        getter = getattr(wechat, "effective_account", None)
+        if not callable(getter):
+            return ""
+        try:
+            return str(getter() or "").strip()
+        except Exception:
+            logger.debug("读取当前监控账号失败（定时总结按旧口径执行）",
+                         exc_info=True)
+            return ""
+
     def tick(self) -> list[dict]:
         """检查当前 HH:MM 命中的启用配置并逐一生成；返回本次产出列表。
 
         每次调用独立完成「读配置 → 过滤命中 → 当日去重 → 生成 → 广播」，
         无内部状态依赖（测试可直接调用 tick() 驱动，不必起线程）。
+
+        多开隔离：只跑当前监控账号自己的群配置；属于其它账号的配置一律
+        跳过（切号不会拿旧账号的群产出空摘要）。
         """
         db = self._service._db
         if db.get_setting(KEY_SUMMARY_SCHEDULE_ENABLED, "0") != "1":
@@ -713,6 +733,7 @@ class SummaryScheduler:
             return []
         if not isinstance(configs, list):
             return []
+        account = self._active_account()
         now = self._now_fn()
         now_hm = now.strftime("%H:%M")
         produced: list[dict] = []
@@ -721,6 +742,14 @@ class SummaryScheduler:
                 continue
             if str(cfg.get("time") or SUMMARY_SCHEDULE_TIME_DEFAULT) != now_hm:
                 continue
+            cfg_account = str(cfg.get("account") or "").strip()
+            if cfg_account != account:
+                if account:
+                    # 当前账号已知：未归属（待回填）与其它账号的配置都跳过
+                    continue
+                if cfg_account:
+                    # 当前账号未知（未打开/降级）：不跑其它账号的群配置
+                    continue
             session = str(cfg.get("session") or "").strip()
             if not session:
                 continue

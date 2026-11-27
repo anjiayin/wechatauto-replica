@@ -352,6 +352,40 @@ class WeChatService:
                   if wxdb is not None else "")
         return active or self.configured_account()
 
+    def _account_for_queries(self) -> str:
+        """业务库查询用的当前账号（读取失败按空处理 = 不按账号过滤）。"""
+        try:
+            return str(self.effective_account() or "").strip()
+        except Exception:
+            return ""
+
+    def _enabled_target_usernames(self) -> list[str]:
+        """当前账号下启用中的监控会话（兼容无 account 参数的测试替身）。"""
+        lister = getattr(self._db, "list_enabled_target_usernames", None)
+        if not callable(lister):
+            return []
+        account = self._account_for_queries()
+        try:
+            rows = lister(account=account) if account else lister()
+        except TypeError:      # 老替身/旧实现只接受无参调用
+            rows = lister()
+        return [str(u) for u in (rows or [])]
+
+    def _target_for_username(self, username: str) -> Optional[dict]:
+        """按当前账号查监控对象（兼容无 account 参数的测试替身）。"""
+        getter = getattr(self._db, "get_target_by_username", None)
+        if not callable(getter):
+            return None
+        account = self._account_for_queries()
+        try:
+            return getter(username, account=account) if account else getter(username)
+        except TypeError:
+            return getter(username)
+
+    def account_display(self, account: str) -> str:
+        """账号目录名 → 用户可读名称（列表按账号展示时用）。"""
+        return self._account_display(account)
+
     def account_list(self) -> list[dict]:
         """本机检测到的微信账号目录（供设置页选择监控账号）。"""
         try:
@@ -658,6 +692,23 @@ class WeChatService:
                                   account=account or None)
             # 换了 wxdb 实例：账号相关的所有缓存都必须丢弃
             self._reset_account_caches()
+            # 升级前存量的监控对象/商机/定时总结配置没有账号字段：
+            # 在服务真正打开某账号后统一归属到该账号（幂等，只补空串）。
+            active_account = str(
+                getattr(self._wxdb, "account", "") or resolved or "").strip()
+            backfill = getattr(self._db, "backfill_account_scope", None)
+            if active_account and callable(backfill):
+                try:
+                    filled = backfill(active_account)
+                    if any(int(v or 0) for v in filled.values()):
+                        logger.info(
+                            "存量数据已归属到账号 %s（监控对象 %d / 商机 %d / "
+                            "定时总结 %d）", active_account,
+                            filled.get("targets", 0),
+                            filled.get("opportunities", 0),
+                            filled.get("schedules", 0))
+                except Exception:
+                    logger.exception("存量数据账号归属回填失败（忽略）")
             logger.info("微信数据库缓存目录：%s（%.1f MB，账号 %s）",
                         workdir, self._dir_size_mb(workdir),
                         getattr(self._wxdb, "account", "") or "自动")
@@ -680,7 +731,8 @@ class WeChatService:
             advanced_marks = self._advance_start_watermarks(marks)
             listener = Listener(self._wxdb, interval=1.0,
                                 watermark=advanced_marks or None)
-            for username in self._db.list_enabled_target_usernames():
+            enabled_usernames = self._enabled_target_usernames()
+            for username in enabled_usernames:
                 listener.add_listener(username, self._on_message)
             listener.start()
             self._listener = listener
@@ -689,7 +741,7 @@ class WeChatService:
             logger.info("微信监听已启动（账号 %s，监控会话 %d 个，加载 watermark "
                         "%d 条，推进后水位共 %d 条；启动水位=%.0f）",
                         getattr(self._wxdb, "account", "") or "自动",
-                        len(self._db.list_enabled_target_usernames()),
+                        len(enabled_usernames),
                         len(marks), len(advanced_marks),
                         self._session_start_ts)
             return True
@@ -763,7 +815,7 @@ class WeChatService:
         if self._wxdb is None or self._db is None:
             return advanced
         try:
-            usernames = self._db.list_enabled_target_usernames()
+            usernames = self._enabled_target_usernames()
         except Exception:
             logger.debug("读取已启用监控会话失败（跳过 watermark 推进）：",
                          exc_info=True)
@@ -877,7 +929,7 @@ class WeChatService:
         since = 0.0
         if self._db is not None:
             try:
-                target = self._db.get_target_by_username(username)
+                target = self._target_for_username(username)
             except Exception:
                 # 测试替身/降级场景可能没有该 DAO 或读取失败；不限制。
                 logger.debug("读取监控水位失败（按不过滤处理）：%s", username,
@@ -1024,6 +1076,8 @@ class WeChatService:
             # 覆盖 msg 中不可靠的 sender_username 供 Aggregator/管线透传
             msg["sender_username"] = sender_wxid
             msg["sender_display_name"] = sender_name
+            # 来源账号随消息进入聚合缓冲：管线落库时写进 opportunities.account
+            msg["_account"] = self._account_for_queries()
             self._aggregator.add(msg, session_name, kind)
         except Exception:
             logger.exception("处理新消息回调异常（已忽略）")
@@ -1677,6 +1731,7 @@ class WeChatService:
             "create_time": task.get("create_time"),
             "image_sell": True,
         }
+        msg["_account"] = self._account_for_queries()
         self._aggregator.add(msg, str(task.get("session_name") or ""),
                              str(task.get("kind") or "friend"))
         logger.info("[图片识别] %s 的图片判定为车辆/配件（%s%s），已按卖货送入分析",
@@ -1774,6 +1829,7 @@ class WeChatService:
         msg["content"] = shown
         msg["sender_username"] = payload.get("sender_wxid") or ""
         msg["sender_display_name"] = payload.get("sender_name") or ""
+        msg["_account"] = self._account_for_queries()
         # 语音消息的原始 local_id 已在 msg 中（快照保留），聚合器按需对齐
         self._aggregator.add(msg, self.display_name_with_corp(username),
                              payload.get("kind") or "friend")
@@ -1825,6 +1881,7 @@ class WeChatService:
                     username, kind, msg)
                 msg["sender_username"] = sender_wxid
                 msg["sender_display_name"] = sender_name
+                msg["_account"] = self._account_for_queries()
                 self._aggregator.add(msg, self.display_name_with_corp(username),
                                      kind)
             except Exception:
@@ -3589,8 +3646,8 @@ class WeChatService:
 
     @property
     def monitored_count(self) -> int:
-        """启用中的监控会话数。"""
-        return len(self._db.list_enabled_target_usernames())
+        """启用中的监控会话数（只计当前监控账号）。"""
+        return len(self._enabled_target_usernames())
 
     @property
     def watermark_saved_at(self) -> str:

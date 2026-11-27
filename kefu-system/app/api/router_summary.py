@@ -266,6 +266,12 @@ def update_summary_settings(body: SummarySettingsUpdate,
             for item in configs:
                 if not isinstance(item, dict) or not str(item.get("session") or ""):
                     raise HTTPException(status_code=422, detail="定时配置缺少群聊")
+                # account（可选）：该定时群归属的监控账号，调度器只跑
+                # 当前账号的配置；旧配置缺该字段时待服务打开账号后回填。
+                item_account = item.get("account")
+                if item_account is not None and not isinstance(item_account, str):
+                    raise HTTPException(
+                        status_code=422, detail="定时配置的账号字段必须是字符串")
                 if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d",
                                     str(item.get("time") or "18:00")):
                     raise HTTPException(status_code=422, detail="触发时间格式应为 HH:MM")

@@ -42,6 +42,7 @@ from app.config import (
     KEY_RUNTIME_MW_MIGRATED,
     KEY_RUNTIME_LOCALTIME_MIGRATED,
     KEY_RUNTIME_AI_USAGE_BACKFILLED,
+    KEY_SUMMARY_SCHEDULE_CONFIGS,
     DELIVERY_SEED_FILE,
 )
 
@@ -75,6 +76,9 @@ def epoch_to_iso(epoch: Optional[int | float]) -> str:
 # 对旧库做一次表重建迁移（见 _migrate_opportunity_status_handled）。
 _OPPORTUNITIES_COLUMNS = """
       id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      -- 产生该商机的监控微信账号目录名（空 = 升级前存量/未归属）。
+      -- 切换监控账号后商机列表默认只显示当前账号的数据。
+      account          TEXT NOT NULL DEFAULT '',
       session_username TEXT NOT NULL,
       session_name     TEXT NOT NULL,
       sender_wxid      TEXT NOT NULL DEFAULT '',
@@ -116,7 +120,7 @@ DDL_STATEMENTS: tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS monitor_targets (
       id           INTEGER PRIMARY KEY AUTOINCREMENT,
-      username     TEXT NOT NULL UNIQUE,
+      username     TEXT NOT NULL,
       display_name TEXT NOT NULL,
       kind         TEXT NOT NULL CHECK (kind IN ('group','friend')),
       enabled      INTEGER NOT NULL DEFAULT 1,
@@ -126,7 +130,11 @@ DDL_STATEMENTS: tuple[str, ...] = (
       -- 一旦过期/重置会回放该会话多年历史消息；配置时写入当前 epoch，
       -- 由 _on_message 按此值兜底过滤（群/私聊统一生效）。
       -- 0 = 存量兼容（不限制），老库升级前的 target 保持原行为。
-      monitor_since INTEGER NOT NULL DEFAULT 0
+      monitor_since INTEGER NOT NULL DEFAULT 0,
+      -- 所属监控微信账号目录名（空 = 升级前存量/未归属）。
+      -- 同一 username 可同时属于不同账号（切号后各看各的）。
+      account      TEXT NOT NULL DEFAULT '',
+      UNIQUE(account, username)
     )
     """,
     """
@@ -294,6 +302,7 @@ class Database:
         self._migrate_merge_window_default()
         self._migrate_opportunity_status_handled()
         self._migrate_add_columns()
+        self._migrate_target_account_unique()
         self._migrate_created_at_localtime()
         self._migrate_ai_usage_backfill()
         self._migrate_ai_usage_kind()
@@ -429,6 +438,10 @@ class Database:
             # 老库 ALTER 时默认 0 = 不限制，避免升级瞬间误伤正在监控的会话。
             ("monitor_targets", "monitor_since",
              "INTEGER NOT NULL DEFAULT 0"),
+            # 账号归属（方案 A）：老库先补空串列，服务首次成功打开某账号时
+            # 由 backfill_account_scope 把存量行回填到该账号。
+            ("monitor_targets", "account", "TEXT NOT NULL DEFAULT ''"),
+            ("opportunities", "account", "TEXT NOT NULL DEFAULT ''"),
         )
         with self._lock:
             for table, column, col_type in plans:
@@ -439,7 +452,55 @@ class Database:
                 self._conn.execute(
                     f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
                 logger.info("已迁移：%s 增加 %s 列", table, column)
+            # 账号索引必须在加列之后建（老库 DDL 阶段还没有该列）
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_opp_account "
+                "ON opportunities (account, created_at DESC)")
             self._conn.commit()
+
+    def _migrate_target_account_unique(self) -> None:
+        """把 monitor_targets 的唯一约束从 username 重建为 (account, username)。
+
+        SQLite 不支持修改约束，只能建新表→复制→删旧表→改名。新库 DDL
+        已带 (account, username)，此处按 sqlite_master 里的表结构判断，
+        已迁移则跳过（可重复执行）。
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='monitor_targets'").fetchone()
+            sql = str((row["sql"] if row else "") or "")
+            compact = "".join(sql.lower().split())
+            if not compact or "unique(account,username)" in compact:
+                return
+            cols = {r["name"] for r in self._conn.execute(
+                "PRAGMA table_info(monitor_targets)").fetchall()}
+            if "account" not in cols:
+                return
+            self._conn.execute("DROP TABLE IF EXISTS monitor_targets_new")
+            self._conn.execute("""
+                CREATE TABLE monitor_targets_new (
+                  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                  username     TEXT NOT NULL,
+                  display_name TEXT NOT NULL,
+                  kind         TEXT NOT NULL CHECK (kind IN ('group','friend')),
+                  enabled      INTEGER NOT NULL DEFAULT 1,
+                  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                  monitor_since INTEGER NOT NULL DEFAULT 0,
+                  account      TEXT NOT NULL DEFAULT '',
+                  UNIQUE(account, username)
+                )
+            """)
+            self._conn.execute(
+                "INSERT INTO monitor_targets_new (id, username, display_name, "
+                "kind, enabled, created_at, monitor_since, account) "
+                "SELECT id, username, display_name, kind, enabled, created_at, "
+                "monitor_since, account FROM monitor_targets")
+            self._conn.execute("DROP TABLE monitor_targets")
+            self._conn.execute(
+                "ALTER TABLE monitor_targets_new RENAME TO monitor_targets")
+            self._conn.commit()
+            logger.info("已迁移：monitor_targets 唯一约束改为 (account, username)")
 
     # ------------------------------------------------------------------
     # 基础
@@ -644,25 +705,30 @@ class Database:
     # ------------------------------------------------------------------
     # monitor_targets DAO
     # ------------------------------------------------------------------
-    def list_targets(self) -> list[dict]:
-        """全部监控对象（按创建时间正序）。"""
+    def list_targets(self, account: str = "") -> list[dict]:
+        """监控对象（按创建时间正序）；account 非空时只返回该账号的。"""
+        sql = ("SELECT id, username, display_name, kind, enabled, created_at, "
+               "monitor_since, account FROM monitor_targets")
+        params: list[Any] = []
+        if account:
+            sql += " WHERE account=?"
+            params.append(account)
+        sql += " ORDER BY id"
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT id, username, display_name, kind, enabled, created_at, "
-                "monitor_since "
-                "FROM monitor_targets ORDER BY id"
-            ).fetchall()
+            rows = self._conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
-    def get_target_by_username(self, username: str) -> Optional[dict]:
-        """按会话 username 查监控对象。"""
+    def get_target_by_username(self, username: str,
+                               account: str = "") -> Optional[dict]:
+        """按会话 username 查监控对象；account 非空时限定账号。"""
+        sql = ("SELECT id, username, display_name, kind, enabled, created_at, "
+               "monitor_since, account FROM monitor_targets WHERE username=?")
+        params: list[Any] = [username]
+        if account:
+            sql += " AND account=?"
+            params.append(account)
         with self._lock:
-            row = self._conn.execute(
-                "SELECT id, username, display_name, kind, enabled, created_at, "
-                "monitor_since "
-                "FROM monitor_targets WHERE username=?",
-                (username,),
-            ).fetchone()
+            row = self._conn.execute(sql, params).fetchone()
         return dict(row) if row else None
 
     def get_target(self, target_id: int) -> Optional[dict]:
@@ -670,24 +736,26 @@ class Database:
         with self._lock:
             row = self._conn.execute(
                 "SELECT id, username, display_name, kind, enabled, created_at, "
-                "monitor_since "
-                "FROM monitor_targets WHERE id=?",
+                "monitor_since, account FROM monitor_targets WHERE id=?",
                 (target_id,),
             ).fetchone()
         return dict(row) if row else None
 
     def insert_target(self, username: str, display_name: str, kind: str,
-                      enabled: int = 1, monitor_since: int = 0) -> dict:
-        """新增监控对象（username 重复抛 sqlite3.IntegrityError）。
+                      enabled: int = 1, monitor_since: int = 0,
+                      account: str = "") -> dict:
+        """新增监控对象（同账号 username 重复抛 sqlite3.IntegrityError）。
 
         Args:
             monitor_since: 配置完成时刻（epoch 秒）；0 = 存量/测试默认不限制。
+            account: 所属监控账号目录名；空串 = 未归属（升级前/测试）。
         """
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO monitor_targets (username, display_name, kind, "
-                "enabled, monitor_since) VALUES (?, ?, ?, ?, ?)",
-                (username, display_name, kind, enabled, int(monitor_since)),
+                "enabled, monitor_since, account) VALUES (?, ?, ?, ?, ?, ?)",
+                (username, display_name, kind, enabled, int(monitor_since),
+                 str(account or "")),
             )
             self._conn.commit()
             return self.get_target(cur.lastrowid)  # type: ignore[return-value]
@@ -695,25 +763,33 @@ class Database:
     def insert_target_within_limit(self, username: str, display_name: str,
                                    kind: str, max_targets: int,
                                    enabled: int = 1,
-                                   monitor_since: int = 0) -> Optional[dict]:
+                                   monitor_since: int = 0,
+                                   account: str = "") -> Optional[dict]:
         """原子「配额校验 + 插入」（修复 BUG-3 并发越界）。
 
-        计数与 INSERT 在同一把写锁内完成，并发添加最后 1 个名额时
-        恰好达到上限、不会越过。
+        计数与 INSERT 在同一把写锁内完成；account 非空时按账号分别计数
+        （每个账号各自拥有 max_targets 个名额）。
 
         Returns:
             新建对象；达到/超过上限时返回 None（调用方转 400）。
             username 重复抛 sqlite3.IntegrityError。
         """
+        account = str(account or "")
         with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*) FROM monitor_targets").fetchone()
+            if account:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM monitor_targets WHERE account=?",
+                    (account,)).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM monitor_targets").fetchone()
             if int(row[0]) >= max_targets:
                 return None
             cur = self._conn.execute(
                 "INSERT INTO monitor_targets (username, display_name, kind, "
-                "enabled, monitor_since) VALUES (?, ?, ?, ?, ?)",
-                (username, display_name, kind, enabled, int(monitor_since)),
+                "enabled, monitor_since, account) VALUES (?, ?, ?, ?, ?, ?)",
+                (username, display_name, kind, enabled, int(monitor_since),
+                 account),
             )
             self._conn.commit()
             return self.get_target(cur.lastrowid)  # type: ignore[return-value]
@@ -759,20 +835,72 @@ class Database:
             self._conn.commit()
             return cur.rowcount
 
-    def count_targets(self) -> int:
-        """监控对象总数（配额展示用）。"""
+    def count_targets(self, account: str = "") -> int:
+        """监控对象数量（配额展示用）；account 非空时只计该账号。"""
         with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*) FROM monitor_targets").fetchone()
+            if account:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM monitor_targets WHERE account=?",
+                    (account,)).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM monitor_targets").fetchone()
         return int(row[0])
 
-    def list_enabled_target_usernames(self) -> list[str]:
-        """全部启用中的监控会话 username（Listener 启动注册用）。"""
+    def list_enabled_target_usernames(self, account: str = "") -> list[str]:
+        """启用中的监控会话 username（Listener 启动注册用）。
+
+        account 非空时只返回该账号下的对象：切换账号后绝不能把上一个
+        账号的群/好友注册到新账号的监听上。
+        """
+        sql = "SELECT username FROM monitor_targets WHERE enabled=1"
+        params: list[Any] = []
+        if account:
+            sql += " AND account=?"
+            params.append(account)
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT username FROM monitor_targets WHERE enabled=1"
-            ).fetchall()
+            rows = self._conn.execute(sql, params).fetchall()
         return [r["username"] for r in rows]
+
+    def backfill_account_scope(self, account: str) -> dict[str, int]:
+        """把升级前存量的空账号归属回填到当前真正打开的账号。
+
+        只在服务成功打开某账号后调用：监控对象、商机、定时总结群配置
+        三类存量数据统一归属到该账号，之后各账号各看各的。重复调用只
+        影响仍为空串的行（幂等）。
+        """
+        account = str(account or "").strip()
+        if not account:
+            return {"targets": 0, "opportunities": 0, "schedules": 0}
+        with self._lock:
+            targets = self._conn.execute(
+                "UPDATE monitor_targets SET account=? WHERE account=''",
+                (account,)).rowcount
+            opps = self._conn.execute(
+                "UPDATE opportunities SET account=? WHERE account=''",
+                (account,)).rowcount
+            self._conn.commit()
+        schedules = 0
+        try:
+            raw = self.get_setting(KEY_SUMMARY_SCHEDULE_CONFIGS, "[]")
+            configs = json.loads(raw) if raw else []
+            if isinstance(configs, list):
+                changed = False
+                for cfg in configs:
+                    if (isinstance(cfg, dict)
+                            and not str(cfg.get("account") or "").strip()):
+                        cfg["account"] = account
+                        changed = True
+                        schedules += 1
+                if changed:
+                    self.set_setting(
+                        KEY_SUMMARY_SCHEDULE_CONFIGS,
+                        json.dumps(configs, ensure_ascii=False))
+        except Exception:      # 配置损坏/写失败不影响主流程
+            logger.exception("定时总结群配置账号归属回填失败（已跳过）")
+        return {"targets": int(targets or 0),
+                "opportunities": int(opps or 0),
+                "schedules": schedules}
 
     # ------------------------------------------------------------------
     # opportunity_types DAO
@@ -851,22 +979,26 @@ class Database:
                            summary: str, key_quote: str,
                            confidence: int,
                            direction: str = "",
-                           raw_refs: str = "[]") -> dict:
+                           raw_refs: str = "[]",
+                           account: str = "") -> dict:
         """插入一条商机并返回完整记录。
 
         Args:
             raw_refs: 原文行里的图片引用 JSON 数组字符串（批次 11 需求 1，
                 由 pipeline 用 ``json.dumps(..., ensure_ascii=False)`` 生成）。
+            account: 产生该商机的监控账号目录名（空 = 未归属/测试）。
         """
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO opportunities (session_username, session_name, "
+                "INSERT INTO opportunities (account, session_username, "
+                "session_name, "
                 "sender_wxid, sender_name, window_start, window_end, merged_count, "
                 "raw_text, raw_refs, type_id, type_name, summary, key_quote, "
                 "confidence, direction, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
                 "datetime('now','localtime'))",
-                (session_username, session_name, sender_wxid, sender_name,
+                (str(account or ""), session_username, session_name,
+                 sender_wxid, sender_name,
                  window_start, window_end, merged_count, raw_text,
                  str(raw_refs or "[]"), type_id,
                  type_name, summary, key_quote, confidence,
@@ -882,19 +1014,24 @@ class Database:
     def list_opportunities(self, *, page: int = 1, page_size: int = 20,
                            session: str = "", type_id: Optional[int] = None,
                            status: str = "", keyword: str = "",
-                           direction: str = "") -> tuple[int, list[dict]]:
+                           direction: str = "",
+                           account: str = "") -> tuple[int, list[dict]]:
         """商机列表（时间倒序）。
 
         Args:
             status: pending/replied/ignored/handled；空串 = 排除 ignored
                 （handled 与 pending/replied 一样默认展示在列表中）。
             direction: buy/sell；空串 = 全部方向（反馈 4）。
+            account: 监控账号目录名；非空时只返回该账号产生的商机。
 
         Returns:
             (total, items)
         """
         where: list[str] = []
         params: list[Any] = []
+        if account:
+            where.append("account=?")
+            params.append(account)
         if status in ("pending", "replied", "ignored", "handled"):
             where.append("status=?")
             params.append(status)
@@ -946,24 +1083,28 @@ class Database:
 
     def find_mergeable_opportunity(self, *, session_username: str,
                                    sender_wxid: str, sender_name: str,
-                                   min_window_end_iso: str) -> Optional[dict]:
+                                   min_window_end_iso: str,
+                                   account: str = "") -> Optional[dict]:
         """查找可合并商机（商机合并窗口内，pipeline 用）。
 
         条件：同会话 + 同发送人（wxid 为空时退化为昵称匹配）+ status='pending'
         + window_end 距今不超过商机合并窗口（ISO 字符串同格式可直接比较）。
+        account 非空时还要求同账号，避免切号后把新消息合并进另一个账号的商机。
 
         Args:
             min_window_end_iso: 窗口下限（now - opp_merge_window_sec 的 ISO 串）。
         """
         sender_cond = "sender_wxid=?" if sender_wxid else "sender_name=?"
         sender_val = sender_wxid or sender_name
+        sql = ("SELECT * FROM opportunities WHERE session_username=? AND "
+               f"{sender_cond} AND status='pending' AND window_end>=?")
+        params: list[Any] = [session_username, sender_val, min_window_end_iso]
+        if account:
+            sql += " AND account=?"
+            params.append(account)
+        sql += " ORDER BY window_end DESC, id DESC LIMIT 1"
         with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM opportunities WHERE session_username=? AND "
-                f"{sender_cond} AND status='pending' AND window_end>=? "
-                "ORDER BY window_end DESC, id DESC LIMIT 1",
-                (session_username, sender_val, min_window_end_iso),
-            ).fetchone()
+            row = self._conn.execute(sql, params).fetchone()
         return self._opp_row_to_dict(row) if row else None
 
     def merge_opportunity(self, opp_id: int, *, raw_text_append: str,
@@ -1767,6 +1908,27 @@ class Database:
             row = self._conn.execute(
                 "SELECT COUNT(*) FROM opportunities WHERE status='pending'"
             ).fetchone()
+        return int(row[0])
+
+    def count_unread_opportunities(self, ids: Iterable[int],
+                                   account: str = "") -> int:
+        """未读商机数（account 非空时只计当前账号的，切号后角标同步）。
+
+        Notifier 的未读集合是进程内全局的；按账号过滤时还必须回到库里
+        核对归属，否则切到新账号后顶栏仍显示旧账号的未读数。
+        """
+        values = [int(i) for i in ids]
+        if not values:
+            return 0
+        placeholders = ",".join("?" * len(values))
+        sql = ("SELECT COUNT(*) FROM opportunities WHERE id IN ("
+               f"{placeholders})")
+        params: list[Any] = values
+        if account:
+            sql += " AND account=?"
+            params.append(account)
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
         return int(row[0])
 
 

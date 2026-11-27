@@ -31,6 +31,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, WebSocke
 from app import voice_asr
 from app.billing import estimate_cost, get_billing_settings
 from app.api.deps import (
+    current_account,
     get_db,
     get_notifier,
     get_pipeline,
@@ -111,6 +112,8 @@ def get_status(db: Database = Depends(get_db),
     except Exception:  # 防御：健康度读取失败不阻塞状态接口
         logger.exception("读取分析健康度失败（按空值处理）")
         health = {}
+    # 配额与未读按当前监控账号统计（多开隔离；账号未知时退回全局口径）
+    account = current_account(svc)
     return StatusOut(
         listener_running=svc.listener_running,
         monitored_count=svc.monitored_count,
@@ -128,7 +131,7 @@ def get_status(db: Database = Depends(get_db),
                           vision_retry_pending=int(
                               getattr(svc, "image_retry_pending", 0) or 0)),
         worker=WorkerStatus(busy=pipeline.busy, max=2),
-        monitor_quota=MonitorQuota(used=db.count_targets(),
+        monitor_quota=MonitorQuota(used=db.count_targets(account=account),
                                    max=read_monitor_max_targets(db)),
         analysis_health=AnalysisHealth(
             last_error=str(health.get("last_error") or ""),
@@ -138,7 +141,8 @@ def get_status(db: Database = Depends(get_db),
         ai_enabled=db.get_setting("ai.enabled", "1") != "0",
         watermark_saved_at=svc.watermark_saved_at,
         degraded_reason=svc.degraded_reason,
-        unread_count=notifier.unread_count,
+        unread_count=db.count_unread_opportunities(
+            notifier.unread_ids(), account=account),
         today_cost=round(estimate_cost(
             int(today_usage.get("prompt_tokens") or 0),
             int(today_usage.get("completion_tokens") or 0),
@@ -603,10 +607,14 @@ def switch_wechat_account(
                             detail=detail or "切换监控账号失败")
     lister = getattr(wechat, "account_list", None)
     items = lister() if callable(lister) else []
+    running = getattr(wechat, "listener_running", False)
+    reason = getattr(wechat, "degraded_reason", "")
     return WechatAccountSwitchOut(
         ok=True,
         current=_account_info(wechat),
         accounts=_account_items(items),
+        listener_running=bool(running),
+        degraded_reason=str(reason or ""),
     )
 
 

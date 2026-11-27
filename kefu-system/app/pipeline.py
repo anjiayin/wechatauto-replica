@@ -760,6 +760,7 @@ class Pipeline:
             key_quote=result.get("quote", ""),
             confidence=result["confidence"],
             direction=str(result.get("direction") or ""),
+            account=str(getattr(unit, "account", "") or ""),
         )
         self._db.insert_analysis_log(
             status="ok", result=result_json, model=model,
@@ -794,6 +795,7 @@ class Pipeline:
                 sender_wxid=unit.sender_wxid,
                 sender_name=unit.sender_name,
                 min_window_end_iso=cutoff,
+                account=str(getattr(unit, "account", "") or ""),
             )
         except Exception:
             logger.exception("查找可合并商机失败（按新建处理）")
@@ -902,6 +904,7 @@ class Pipeline:
             key_quote=result.get("quote", ""),
             confidence=result["confidence"],
             direction=str(result.get("direction") or ""),
+            account=str(getattr(unit, "account", "") or ""),
         )
         self._db.insert_analysis_log(
             status="ok", result=json.dumps(result, ensure_ascii=False),

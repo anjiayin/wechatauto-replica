@@ -128,12 +128,15 @@ type SnackState = { msg: string; severity: 'success' | 'warning' | 'error' }
 function TargetRow({
   target,
   checked,
+  accountLabel,
   onToggleCheck,
   onToggleEnabled,
   onRemove,
 }: {
   target: MonitorTarget
   checked: boolean
+  /** 「显示全部账号」时的归属账号名（当前账号视图下不传） */
+  accountLabel?: string
   onToggleCheck: () => void
   onToggleEnabled: () => void
   onRemove: () => void
@@ -170,7 +173,7 @@ function TargetRow({
             : target.username.endsWith('@openim') || target.username.includes('@kefu')
               ? '企业微信'
               : '私聊'
-        } · ${target.alias || target.username}${target.enabled === 1 ? '' : '（已停用）'}`}
+        } · ${target.alias || target.username}${accountLabel ? ` · 归属：${accountLabel}` : ''}${target.enabled === 1 ? '' : '（已停用）'}`}
       />
     </ListItem>
   )
@@ -190,6 +193,8 @@ function TargetsTab() {
     () => new Set(),
   )
   const [snack, setSnack] = useState<SnackState | null>(null)
+  // 默认只看当前监控账号的监控对象；打开后显示所有账号（排查旧账号遗留）
+  const [showAllAccounts, setShowAllAccounts] = useState(false)
 
   // 搜索关键词 300ms 防抖（输入即过滤，不打爆接口）
   useEffect(() => {
@@ -235,16 +240,18 @@ function TargetsTab() {
     onError: (err: Error) => setSnack({ msg: err.message, severity: 'error' }),
   })
 
+  // 当前监控账号（多开隔离）：监控对象/候选列表都随账号切换
+  const accountKey = statusData?.wechat.account?.account ?? ''
   const { data: targets } = useQuery({
-    queryKey: ['monitor-targets'],
-    queryFn: () => apiGet<MonitorTarget[]>('/api/monitor-targets'),
+    queryKey: ['monitor-targets', accountKey, showAllAccounts],
+    queryFn: () => apiGet<MonitorTarget[]>(
+      `/api/monitor-targets${qs({ all_accounts: showAllAccounts ? 1 : undefined })}`),
   })
 
   // 群聊/私聊两个列表并行请求（Promise.all）：一次请求双端缓存，
   // 子页签切换零等待；后端另有 60s 联系人缓存，重复搜索毫秒级返回。
   // queryKey 带当前监控账号：切换账号后旧账号的候选列表立即作废，
   // 不会在新账号下短暂显示上一个微信的联系人（后端解密缓存已按账号隔离）。
-  const accountKey = statusData?.wechat.account?.account ?? ''
   const { data: candidateLists, isFetching: searching } = useQuery({
     queryKey: ['session-candidates', accountKey, keyword],
     queryFn: async () => {
@@ -262,7 +269,14 @@ function TargetsTab() {
   const candidates =
     candidateKind === 'group' ? (candidateLists?.group ?? []) : (candidateLists?.friend ?? [])
 
-  const targetUsernames = new Set((targets ?? []).map((t) => t.username))
+  // 候选列表的「已监控」只认当前账号：同一群在别的账号下监控过，
+  // 不代表在「本账号」也加过（显示全部账号时仍要能继续添加）。
+  const targetUsernames = new Set(
+    (targets ?? [])
+      .filter((t) => !showAllAccounts || !accountKey
+        || (t.account || '') === accountKey)
+      .map((t) => t.username),
+  )
 
   const toggleCandidate = (username: string) => {
     setCheckedCandidates((prev) => {
@@ -369,6 +383,9 @@ function TargetsTab() {
           key={t.id}
           target={t}
           checked={checkedTargets.has(t.id)}
+          accountLabel={showAllAccounts
+            ? (t.account_name || t.account || '未归属')
+            : undefined}
           onToggleCheck={() => toggleTarget(t.id)}
           onToggleEnabled={() => toggleEnabledMutation.mutate(t)}
           onRemove={() => removeMutation.mutate([t.id])}
@@ -607,9 +624,25 @@ function TargetsTab() {
             minWidth: 0,
           }}
         >
-          <Typography variant="subtitle2" sx={{ mb: 1 }}>
-            已选监控（{targets?.length ?? 0}）
-          </Typography>
+          <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
+            <Typography variant="subtitle2">
+              已选监控（{targets?.length ?? 0}）
+            </Typography>
+            <FormControlLabel
+              sx={{ ml: 'auto', mr: 0 }}
+              control={(
+                <Switch
+                  size="small"
+                  checked={showAllAccounts}
+                  onChange={(e) => {
+                    setShowAllAccounts(e.target.checked)
+                    setCheckedTargets(new Set())
+                  }}
+                />
+              )}
+              label={<Typography variant="caption">显示全部账号</Typography>}
+            />
+          </Stack>
           <List dense sx={{ flex: 1, minHeight: 220, maxHeight: 340, overflow: 'auto' }}>
             {renderTargetGroup('群聊', groupTargets)}
             {renderTargetGroup('私聊', friendTargets)}
@@ -1507,6 +1540,8 @@ interface ScheduleConfig {
   time: string
   /** 定时生成的总结风格（P1 风格可选；老配置无该字段时后端回退 detailed） */
   style?: 'detailed' | 'concise' | 'bullets'
+  /** 归属的监控微信账号目录名（空/缺省 = 旧配置，待后端回填） */
+  account?: string
 }
 
 const NO_PRICE_HINT = '请先在设置页配置模型单价，否则金额预算不生效'
@@ -1522,8 +1557,14 @@ function SummarySettingsTab() {
     queryKey: ['billing'],
     queryFn: () => apiGet<BillingOut>('/api/system/billing'),
   })
+  // 定时群配置跟随当前监控账号：只显示/保存本账号的群（多开隔离）
+  const { data: statusData } = useQuery({
+    queryKey: ['status'],
+    queryFn: () => apiGet<StatusOut>('/api/status'),
+  })
+  const accountKey = statusData?.wechat.account?.account ?? ''
   const { data: groups = [] } = useQuery({
-    queryKey: ['summary-config-groups'],
+    queryKey: ['summary-config-groups', accountKey],
     queryFn: () => apiGet<SessionItem[]>(
       `/api/sessions/search${qs({ kind: 'group', limit: 100 })}`),
   })
@@ -1536,9 +1577,12 @@ function SummarySettingsTab() {
   const [scheduleEnabled, setScheduleEnabled] = useState(false)
   const [schedules, setSchedules] = useState<ScheduleConfig[]>([])
   const [loaded, setLoaded] = useState(false)
+  const [loadedAccount, setLoadedAccount] = useState('')
 
   useEffect(() => {
-    if (!saved || loaded) return
+    if (!saved) return
+    // 账号切换后重新加载（只取本账号的定时群，旧配置不串号）
+    if (loaded && loadedAccount === accountKey) return
     setBudgetMode(saved['summary.budget_mode'] || 'money')
     setBudgetMoney(saved['summary.budget_money'] || '1.0')
     setBudgetTokens(saved['summary.budget_tokens'] || '60000')
@@ -1547,23 +1591,39 @@ function SummarySettingsTab() {
     setScheduleEnabled(saved['summary.schedule_enabled'] === '1')
     try {
       const parsed = JSON.parse(saved['summary.schedule_configs'] || '[]')
-      setSchedules(Array.isArray(parsed) ? parsed as ScheduleConfig[] : [])
+      const items = Array.isArray(parsed) ? parsed as ScheduleConfig[] : []
+      setSchedules(items.filter((item) => (item.account || '') === accountKey))
     } catch {
       setSchedules([])
     }
     setLoaded(true)
-  }, [saved, loaded])
+    setLoadedAccount(accountKey)
+  }, [saved, loaded, loadedAccount, accountKey])
 
   const saveMutation = useMutation({
-    mutationFn: () => apiPut<SummarySettings>('/api/summary/settings', {
-      'summary.budget_mode': budgetMode,
-      'summary.budget_money': budgetMoney,
-      'summary.budget_tokens': budgetTokens,
-      'summary.over_limit_action': action,
-      'summary.truncate_recent_n': truncateN,
-      'summary.schedule_enabled': scheduleEnabled ? '1' : '0',
-      'summary.schedule_configs': JSON.stringify(schedules),
-    }),
+    // 只替换当前账号的定时群，合并保留其它账号的配置（切号不丢配置）
+    mutationFn: () => {
+      let others: ScheduleConfig[] = []
+      try {
+        const parsed = JSON.parse(saved?.['summary.schedule_configs'] || '[]')
+        if (Array.isArray(parsed)) {
+          others = (parsed as ScheduleConfig[]).filter(
+            (item) => (item.account || '') !== accountKey)
+        }
+      } catch {
+        others = []
+      }
+      const mine = schedules.map((item) => ({ ...item, account: accountKey }))
+      return apiPut<SummarySettings>('/api/summary/settings', {
+        'summary.budget_mode': budgetMode,
+        'summary.budget_money': budgetMoney,
+        'summary.budget_tokens': budgetTokens,
+        'summary.over_limit_action': action,
+        'summary.truncate_recent_n': truncateN,
+        'summary.schedule_enabled': scheduleEnabled ? '1' : '0',
+        'summary.schedule_configs': JSON.stringify([...others, ...mine]),
+      })
+    },
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['summary-settings'] })
       setSnack('群消息总结配置已保存')
@@ -1663,6 +1723,8 @@ function SummarySettingsTab() {
       <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
         默认每日 18:00 触发一次，时间与风格均可调整；生成后左侧「群消息总结」
         出现红点角标，历史列表自动刷新。当天已生成过的群不会重复生成。
+        定时群配置跟随当前监控账号：切到哪个微信，就只显示并执行该账号的群，
+        切换账号后请为对应微信重新添加群聊。
       </Typography>
       <Stack spacing={1} sx={{ maxWidth: 720 }}>
         {schedules.map((item, index) => (
@@ -1726,6 +1788,7 @@ function SummarySettingsTab() {
             session: groups[0]?.username || '',
             display_name: groups[0]?.display_name || '',
             enabled: true, time: '18:00', style: 'detailed',
+            account: accountKey,
           }])}>
           添加群聊
         </Button>
@@ -1906,6 +1969,23 @@ function DataBillingTab() {
     onSuccess: (r) => {
       setAccountSel(r.current.pinned ? r.current.account : '')
       setSnack(`已切换监控账号：${wxAccountName(r.current) || '自动选择'}`)
+      // 切换接口已返回监听结果，立即回写账号列表与全局状态：后台标签页
+      // 的 5 秒轮询可能暂停，只靠 invalidate 会出现「切换成功但横幅/
+      // 顶栏长时间不消失」（用户实测）。
+      queryClient.setQueryData<WechatAccountListOut>(['wechat-accounts'], {
+        accounts: r.accounts,
+        current: r.current,
+      })
+      queryClient.setQueryData<StatusOut>(['status'], (old) =>
+        old
+          ? {
+              ...old,
+              listener_running: r.listener_running,
+              degraded_reason: r.degraded_reason,
+              wechat: { ...old.wechat, account: r.current },
+            }
+          : old,
+      )
     },
     onError: (e: Error) => setSnack(`切换失败：${e.message}`),
     // 无论成败都重取：切换失败（如所选账号未登录）时后端也已保存新的

@@ -17,7 +17,7 @@ from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from app.api.deps import (get_db, get_notifier, get_sender,
+from app.api.deps import (current_account, get_db, get_notifier, get_sender,
                           get_wechat_service, get_wechat_service_optional)
 from app.config import CONTEXT_COUNT
 from app.db import Database
@@ -152,19 +152,25 @@ def list_opportunities(
                         pattern="^(|pending|replied|ignored|handled)$"),
     keyword: str = "",
     direction: str = Query(default="", pattern="^(|buy|sell)$"),
+    all_accounts: bool = Query(default=False),
     db: Database = Depends(get_db),
 ) -> OpportunityListOut:
     """商机列表（时间倒序；status 为空时排除已忽略项；direction 买卖货筛选）。
+
+    默认只列当前监控账号产生的商机；``all_accounts=1`` 显示全部账号
+    （换号后想找旧商机时用）。
 
     每行附加 ``unread`` 未读标识（内存态，供列表页行内展示 + 点击消除），
     以及 ``session_display`` / ``sender_display``（企业微信显示「昵称@企业名」，
     见 :func:`_display_with_corp`）。
     """
+    svc = get_wechat_service_optional()
+    account = "" if all_accounts else current_account(svc)
     total, rows = db.list_opportunities(
         page=page, page_size=page_size, session=session,
-        type_id=type_id, status=status, keyword=keyword, direction=direction)
+        type_id=type_id, status=status, keyword=keyword, direction=direction,
+        account=account)
     unread_ids = get_notifier().unread_ids()
-    svc = get_wechat_service_optional()
     items = [OpportunityListItem(**r, unread=r["id"] in unread_ids)
              for r in _with_displays(rows, svc)]
     return OpportunityListOut(total=total, items=items)
@@ -460,8 +466,9 @@ def reply_opportunity(opp_id: int, body: ReplyRequest,
         at_names = [a.strip() for a in body.at if a.strip()]
         quote_local_id = body.quote.local_id if body.quote else None
         quote_latest = bool(body.quote and body.quote.latest)
-    # 目标校验①：监控对象或联系人存在性
-    if not db.get_target_by_username(session_username) \
+    # 目标校验①：监控对象（限当前账号）或联系人存在性
+    if not db.get_target_by_username(session_username,
+                                     account=current_account(svc)) \
             and not svc.session_exists(session_username):
         raise HTTPException(
             status_code=400,

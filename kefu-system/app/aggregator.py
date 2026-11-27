@@ -57,6 +57,9 @@ class AnalysisUnit:
     first_seen_epoch: float = 0.0     # 缓冲创建墙钟（与 enqueued_epoch 同源）
     enqueued_epoch: float = 0.0       # 入队墙钟（算合并等待）
     enqueued_mono: float = 0.0        # 入队单调时钟（算排队等待）
+    # 消息所属监控账号目录名（来源账号）：落库商机时带上，切号后各账号
+    # 只看自己的商机。空串 = 未归属（测试/降级）。
+    account: str = ""
 
     def merged_text(self) -> str:
         """合并后全文：每行 "[HH:MM] 内容"。"""
@@ -81,6 +84,8 @@ class _Buffer:
     first_seen_epoch: float = 0.0      # 缓冲创建墙钟时间（端到端计时起点）
     # 缓冲里出现过「识别为车辆/配件」的图片（flush 时带给 AnalysisUnit）
     has_image_sell: bool = False
+    # 该缓冲内消息所属监控账号（切号时同会话/同发送人也要分开缓冲）
+    account: str = ""
 
     def count(self) -> int:
         return len(self.lines)
@@ -98,7 +103,7 @@ class Aggregator:
                  window_sec_provider: Optional[Callable[[], int]] = None) -> None:
         self._flush_callback = flush_callback
         self._window_sec_provider = window_sec_provider or (lambda: 60)
-        self._buffers: Dict[Tuple[str, str], _Buffer] = {}
+        self._buffers: Dict[Tuple[str, str, str], _Buffer] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -125,9 +130,12 @@ class Aggregator:
         epoch = float(msg.get("create_time") or 0) or datetime.now().timestamp()
         sender_wxid = str(msg.get("sender_username") or "")
         sender_name = str(msg.get("sender_display_name") or sender_wxid or "未知用户")
-        # 发送人 wxid 缺失时合并键退化为昵称（共享约定 9.2）
+        # 发送人 wxid 缺失时合并键退化为昵称（共享约定 9.2）。
+        # 账号也进合并键：切换监控账号后，同一群/好友在新账号下的消息
+        # 不能与上一个账号的缓冲合并，否则商机会挂错账号。
         sender_key = sender_wxid or sender_name
-        key = (str(msg.get("username") or ""), sender_key)
+        account = str(msg.get("_account") or "")
+        key = (str(msg.get("username") or ""), sender_key, account)
         hm = datetime.fromtimestamp(epoch).strftime("%H:%M")
         with self._lock:
             buf = self._buffers.get(key)
@@ -138,6 +146,7 @@ class Aggregator:
                     sender_wxid=sender_wxid,
                     sender_name=sender_name,
                     first_seen_epoch=time.time(),
+                    account=account,
                 )
                 self._buffers[key] = buf
             # local_id 必须在任何 append 之前完成整数转换（批次 11 L1）：
@@ -211,7 +220,7 @@ class Aggregator:
         window = max(5, int(self._window_sec_provider() or 60))
         force_flush_age = window * AGGREGATOR_FORCE_FLUSH_FACTOR
         now = datetime.now().timestamp()
-        ready: List[Tuple[Tuple[str, str], _Buffer]] = []
+        ready: List[Tuple[Tuple[str, str, str], _Buffer]] = []
         with self._lock:
             for key, buf in list(self._buffers.items()):
                 if force or (now - buf.last_epoch) >= window or (
@@ -236,6 +245,7 @@ class Aggregator:
                 line_kinds=list(buf.line_kinds),
                 has_image_sell=buf.has_image_sell,
                 first_seen_epoch=buf.first_seen_epoch,
+                account=buf.account,
             )
             try:
                 self._flush_callback(unit)

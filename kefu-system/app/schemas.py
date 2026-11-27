@@ -53,6 +53,10 @@ class WechatAccountSwitchOut(BaseModel):
     ok: bool = True
     current: WechatAccountInfo = Field(default_factory=WechatAccountInfo)
     accounts: List[WechatAccountItem] = Field(default_factory=list)
+    # 切换完成后的监听状态：前端据此立即回写顶栏/降级横幅，不必等
+    # 下一次 5 秒轮询（用户实测切换成功后横幅长时间不消失）。
+    listener_running: bool = False
+    degraded_reason: str = ""
 
 
 class QueueStatus(BaseModel):
@@ -158,6 +162,9 @@ class MonitorTargetOut(BaseModel):
     alias: str = ""
     kind: str
     enabled: int
+    # 归属的监控微信账号（目录名）与昵称；空 = 升级前存量/未归属
+    account: str = ""
+    account_name: str = ""
 
 
 class MonitorTargetCreate(BaseModel):

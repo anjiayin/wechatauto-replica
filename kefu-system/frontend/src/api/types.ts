@@ -51,6 +51,9 @@ export interface WechatAccountSwitchOut {
   ok: boolean
   current: WechatAccountInfo
   accounts: WechatAccountItem[]
+  /** 切换完成后的监听状态（前端立即回写顶栏/降级横幅，无需等轮询） */
+  listener_running: boolean
+  degraded_reason: string
 }
 
 export interface QueueStatus {
@@ -152,6 +155,10 @@ export interface MonitorTarget {
   alias: string
   kind: 'group' | 'friend'
   enabled: number
+  /** 归属的监控微信账号目录名（空 = 升级前存量/未归属） */
+  account?: string
+  /** 归属账号的微信昵称（后端解析，展示用） */
+  account_name?: string
 }
 
 /** /api/opportunity-types */
@@ -727,6 +734,8 @@ export interface SummaryScheduleConfig {
   time: string
   /** 定时生成的总结风格（P1 用户要求风格可选，默认 detailed） */
   style?: SummaryStyle
+  /** 归属的监控微信账号目录名（空/缺省 = 旧配置，待服务打开账号后回填） */
+  account?: string
 }
 
 /** 群总结提示词模板（prompt_templates JSON 元素） */

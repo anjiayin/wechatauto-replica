@@ -4,11 +4,13 @@ import {
   Box,
   Button,
   Chip,
+  FormControlLabel,
   IconButton,
   MenuItem,
   Paper,
   Snackbar,
   Stack,
+  Switch,
   Table,
   TableBody,
   TableCell,
@@ -220,6 +222,8 @@ function SourceCell(props: { opp: OpportunityListItem }) {
   const [page, setPage] = useState(0)
   const [pageSize, setPageSize] = useState(20)
   const [detailId, setDetailId] = useState<number | null>(null)
+  // 默认只看当前监控账号的商机；打开后显示所有账号（换号后找旧商机）
+  const [showAllAccounts, setShowAllAccounts] = useState(false)
 
   // 全局「新商机 toast 点击跳转」：App 派发 kefu-open-opportunity → 打开详情抽屉。
   // 列表页未挂载时事件丢失的竞态由 pending 机制兜底：挂载时消费待打开 id。
@@ -237,6 +241,14 @@ function SourceCell(props: { opp: OpportunityListItem }) {
     return () => window.removeEventListener('kefu-open-opportunity', handler)
   }, [])
 
+  const { data: statusInfo } = useQuery({
+    queryKey: ['status'],
+    queryFn: () => apiGet<StatusOut>('/api/status'),
+    refetchInterval: 5000,
+  })
+  // 当前监控账号进 queryKey：设置页切号后列表立即按新账号重取
+  const accountKey = statusInfo?.wechat.account?.account ?? ''
+
   const query = useMemo(
     () =>
       `/api/opportunities${qs({
@@ -246,24 +258,19 @@ function SourceCell(props: { opp: OpportunityListItem }) {
         type_id: typeId,
         direction,
         keyword,
+        all_accounts: showAllAccounts ? 1 : undefined,
       })}`,
-    [page, pageSize, status, typeId, direction, keyword],
+    [page, pageSize, status, typeId, direction, keyword, showAllAccounts],
   )
 
   const { data, isLoading } = useQuery({
-    queryKey: ['opportunities', query],
+    queryKey: ['opportunities', accountKey, query],
     queryFn: () => apiGet<OpportunityListOut>(query),
   })
 
   const { data: types } = useQuery({
     queryKey: ['opportunity-types'],
     queryFn: () => apiGet<OpportunityType[]>('/api/opportunity-types'),
-  })
-
-  const { data: statusInfo } = useQuery({
-    queryKey: ['status'],
-    queryFn: () => apiGet<StatusOut>('/api/status'),
-    refetchInterval: 5000,
   })
 
   const ignoreMutation = useMutation({
@@ -391,6 +398,20 @@ function SourceCell(props: { opp: OpportunityListItem }) {
             setPage(0)
             setKeyword(e.target.value)
           }}
+        />
+        <FormControlLabel
+          control={(
+            <Switch
+              size="small"
+              checked={showAllAccounts}
+              onChange={(e) => {
+                setPage(0)
+                setShowAllAccounts(e.target.checked)
+              }}
+            />
+          )}
+          label={<Typography variant="body2">显示全部账号</Typography>}
+          title="默认只显示当前监控微信产生的商机；换号后想找旧商机时打开"
         />
         {statusInfo && statusInfo.unread_count > 0 && (
           <>

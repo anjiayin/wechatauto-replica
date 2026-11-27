@@ -19,9 +19,10 @@ import sqlite3
 import threading
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
-from app.api.deps import get_db, get_wechat_service
+from app.api.deps import (account_display_name, current_account, get_db,
+                          get_wechat_service)
 from app.db import Database, read_monitor_max_targets
 from app.schemas import MonitorTargetCreate, MonitorTargetOut, MonitorTargetUpdate
 from app.sender_display import resolve_wechat_id
@@ -59,12 +60,23 @@ def _register_async(svc: WeChatService, username: str) -> None:
                      daemon=True).start()
 
 
+def _with_account_name(item: dict, svc: WeChatService) -> dict:
+    """补账号昵称（多开时区分「这个群属于哪个微信」）。"""
+    item["account_name"] = account_display_name(svc, str(item.get("account") or ""))
+    return item
+
+
 @router.get("", response_model=list[MonitorTargetOut])
-def list_targets(db: Database = Depends(get_db),
+def list_targets(all_accounts: bool = Query(default=False),
+                 db: Database = Depends(get_db),
                  svc: WeChatService = Depends(get_wechat_service)
                  ) -> list[MonitorTargetOut]:
-    """已配置监控对象列表（补齐陈旧显示名快照：右侧列表优先显示群名/昵称）。"""
-    targets = db.list_targets()
+    """已配置监控对象列表（默认只看当前监控账号；all_accounts=1 看全部）。
+
+    ``account``/``account_name`` 标出归属账号，前端可开「显示全部账号」排查。
+    """
+    account = "" if all_accounts else current_account(svc)
+    targets = db.list_targets(account=account)
     for t in targets:
         if t["display_name"] != t["username"]:
             continue
@@ -75,7 +87,8 @@ def list_targets(db: Database = Depends(get_db),
         if fresh and fresh != t["username"]:
             db.update_target_display_name(t["id"], fresh)
             t["display_name"] = fresh
-    return [MonitorTargetOut(**_with_alias(t, svc)) for t in targets]
+    return [MonitorTargetOut(**_with_account_name(_with_alias(t, svc), svc))
+            for t in targets]
 
 
 @router.post("", response_model=MonitorTargetOut, status_code=201)
@@ -91,7 +104,9 @@ def create_target(body: MonitorTargetCreate,
     username = body.username.strip()
     if not username:
         raise HTTPException(status_code=422, detail="会话 username 不能为空")
-    if db.get_target_by_username(username):
+    # 监控对象归属当前生效账号：同一群可被不同微信账号分别加入监控。
+    account = current_account(svc)
+    if db.get_target_by_username(username, account=account):
         raise HTTPException(status_code=400, detail="该会话已在监控列表中")
     kind = "group" if username.endswith("@chatroom") else "friend"
     display_name = (body.display_name.strip()
@@ -115,7 +130,8 @@ def create_target(body: MonitorTargetCreate,
     try:
         target = db.insert_target_within_limit(username, display_name, kind,
                                                max_targets,
-                                               monitor_since=monitor_since)
+                                               monitor_since=monitor_since,
+                                               account=account)
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=400, detail="该会话已在监控列表中")
     if target is None:
@@ -124,8 +140,9 @@ def create_target(body: MonitorTargetCreate,
             detail=f"监控对象已达上限 {max_targets} 个，请先移除部分再添加")
     if target["enabled"]:
         _register_async(svc, username)
-    logger.info("新增监控对象：%s（%s）", display_name, username)
-    return MonitorTargetOut(**_with_alias(target, svc))
+    logger.info("新增监控对象：%s（%s，账号 %s）", display_name, username,
+                account or "未归属")
+    return MonitorTargetOut(**_with_account_name(_with_alias(target, svc), svc))
 
 
 @router.patch("/{target_id}", response_model=MonitorTargetOut)
@@ -139,19 +156,27 @@ def update_target(target_id: int, body: MonitorTargetUpdate,
         raise HTTPException(status_code=404, detail="监控对象不存在")
     was_enabled = bool(target.get("enabled"))
     db.update_target_enabled(target_id, body.enabled)
+    # 「显示全部账号」时可能操作到别的账号的对象：只改库，不注册到当前
+    # 监听（否则会把那个账号的群拉到本账号的监听里）；切到该账号时自然生效。
+    account = current_account(svc)
+    owns_current = not account or (target.get("account") or "") in ("", account)
     if body.enabled:
         # 「停用 → 重新启用」等价于重新配置：水位推进到当前时刻，
         # 停用期间的历史消息不因 Listener 回放而涌入商机分析。
         # 已是启用态时重复 PATCH 不刷新，避免把刚到达的消息误判为历史。
         if not was_enabled:
             db.reset_target_monitor_since(target_id, int(time.time()))
-        _register_async(svc, target["username"])
-    else:
+        if owns_current:
+            _register_async(svc, target["username"])
+        else:
+            logger.info("监控对象 %s 属于其它账号，未注册到当前监听",
+                        target["username"])
+    elif owns_current:
         svc.unregister_target(target["username"])
     logger.info("监控对象 %s 已%s", target["username"],
                 "启用" if body.enabled else "停用")
-    return MonitorTargetOut(
-        **_with_alias(db.get_target(target_id) or {}, svc))
+    return MonitorTargetOut(**_with_account_name(
+        _with_alias(db.get_target(target_id) or {}, svc), svc))
 
 
 @router.delete("/{target_id}", status_code=204)
@@ -163,7 +188,10 @@ def delete_target(target_id: int,
     target = db.get_target(target_id)
     if not target:
         raise HTTPException(status_code=404, detail="监控对象不存在")
+    account = current_account(svc)
+    owns_current = not account or (target.get("account") or "") in ("", account)
     db.delete_target(target_id)
-    svc.unregister_target(target["username"])
+    if owns_current:
+        svc.unregister_target(target["username"])
     logger.info("删除监控对象：%s", target["username"])
     return Response(status_code=204)

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from fastapi import HTTPException
 
@@ -156,3 +157,40 @@ def get_license_client() -> license_mod.LicenseClient:
         if _license is not None:
             return _license
     return license_mod.get_client()
+
+
+def current_account(svc: Any) -> str:
+    """当前生效的监控账号目录名（多开隔离的过滤键）。
+
+    微信服务未注入/测试替身没有 ``effective_account`` 时返回空串，
+    调用方按「不过滤」处理，保持单账号与测试场景的旧行为。
+    """
+    getter = getattr(svc, "effective_account", None)
+    if not callable(getter):
+        return ""
+    try:
+        return str(getter() or "").strip()
+    except Exception:
+        logger.debug("读取当前监控账号失败（按全部账号处理）", exc_info=True)
+        return ""
+
+
+def account_display_name(svc: Any, account: str) -> str:
+    """账号目录名 → 微信昵称（读不到时退回目录名去掉随机后缀）。
+
+    wxid 类目录形如 ``wxid_xxx_ab12``，末尾 4 位是客户端生成的后缀，
+    兜底展示时剥掉更像昵称；真实昵称由微信服务提供。
+    """
+    value = str(account or "").strip()
+    if not value:
+        return ""
+    getter = getattr(svc, "account_display", None)
+    if callable(getter):
+        try:
+            name = str(getter(value) or "").strip()
+        except Exception:
+            logger.debug("读取账号显示名失败：%s", value, exc_info=True)
+            name = ""
+        if name:
+            return name
+    return re.sub(r"_[0-9a-z]{4}$", "", value, flags=re.IGNORECASE)
