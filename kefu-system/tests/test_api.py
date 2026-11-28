@@ -736,6 +736,22 @@ class TestSettingsContract:
                               json={"sound_enabled": False})
         assert env.db.get_bool("notify.sound_enabled") is False
 
+    def test_notify_system_switch_defaults_on_and_partial_update(self, env):
+        """系统通知默认开启；只提交一个字段时另一个保持不变。"""
+        data = env.client.get("/api/settings/notify").json()
+        assert data["system_enabled"] is True
+        assert data["sound_enabled"] is False
+
+        assert env.client.put("/api/settings/notify",
+                              json={"system_enabled": False}).status_code == 200
+        assert env.db.get_bool("notify.system_enabled") is False
+        assert env.db.get_bool("notify.sound_enabled") is False
+
+        assert env.client.put("/api/settings/notify",
+                              json={"sound_enabled": True}).status_code == 200
+        assert env.db.get_bool("notify.system_enabled") is False
+        assert env.db.get_bool("notify.sound_enabled") is True
+
 
 # ---------------------------------------------------------------------------
 # 商机生命周期：筛选 → 详情 → 状态

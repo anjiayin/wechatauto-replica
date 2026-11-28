@@ -218,6 +218,24 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // 托盘系统通知深链：?opportunity=<id>（浏览器未打开时点击通知）
+  // 读取后立即从地址栏移除，避免刷新/收藏重复打开同一条商机。
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const raw = params.get('opportunity')
+    if (raw === null) return
+    params.delete('opportunity')
+    const rest = params.toString()
+    window.history.replaceState(
+      {},
+      '',
+      `${window.location.pathname}${rest ? `?${rest}` : ''}${window.location.hash}`,
+    )
+    const id = Number(raw)
+    if (Number.isInteger(id) && id > 0) openOpportunity(id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   const banner = buildBanner(status)
 
   return (

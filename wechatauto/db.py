@@ -65,15 +65,137 @@ CACHE_STALE_WARN_INTERVAL_SEC = 60.0
 SOURCE_CHURN_ACTIVE_SEC = 600.0
 # last_error 会进 cache_status() → /api/status，必须限长（traceback 可达数 KB）
 MAX_CACHE_ERROR_LEN = 800
-# 临时缓存晋升为正式缓存的重试：Windows 上只要本进程还有只读连接持有
-# 目标文件，os.replace 就会 PermissionError。轮询每轮都会短暂打开缓存，
-# 因此把窗口放细（60×0.2s=12s），比原来的 20×0.5s 更容易挑到空档。
-PROMOTE_ATTEMPTS = 60
+# 临时缓存晋升为正式缓存的重试：Windows 上只要还有未 share-delete 的句柄
+# 持有目标文件，os.replace 就会 PermissionError。轮询每轮都会短暂打开缓存，
+# 因此把窗口放细（0.2s 一次），比原来的 0.5s 更容易挑到空档。
 PROMOTE_RETRY_INTERVAL_SEC = 0.2
+# 阶段一（被动）：只等别人自己关连接，不打扰任何在跑的查询。
+# 纯被动在轮询高峰期会整段撞满（1.4.2 真机实测：contact 缓存的
+# .db/-wal/-shm 被本进程连续握住 7s 以上，60 次重试全失败）。
+PROMOTE_PASSIVE_ATTEMPTS = 3
+# 阶段二（主动）：挡住新读连接 + 释放本进程登记的读连接，自己制造空档。
+# 主动阶段刻意做短：这样还换不上，说明占用者不在本进程名册里（另一个后端
+# 实例、杀软/索引器），继续等只会白占重建配额并拖住轮询线程。
+PROMOTE_ACTIVE_ATTEMPTS = 10
+# 晋升期间读连接最多让路多久。正常情况下关连接+替换只需毫秒，这个上限
+# 只用于兜底：宁可本次晋升失败，也绝不长期拖住轮询线程。
+PROMOTE_READERS_WAIT_SEC = 1.0
+# 每个缓存路径登记的只读连接上限。sqlite3.Connection 不支持弱引用，
+# 忘 close 的调用方会让名册只增不减，超限即回收最旧的（本就是泄漏）。
+MAX_RO_LEASES_PER_PATH = 32
+# 晋升彻底失败后该分片暂停重建的时长。不退避时 stamp 不更新 → 每轮轮询
+# 都白烧一次「全量重建 + 晋升重试」，反而把 I/O 抢得更凶。
+PROMOTE_FAIL_BACKOFF_SEC = 180.0
 # 全局重建配额（进程内共享，跨分片生效）
 _REBUILD_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_REBUILDS)
 # 惰性状态初始化锁（兼容 __new__ 构造的实例）
 _CACHE_STATE_LOCK = threading.Lock()
+
+# 本进程当前打开的解密缓存只读连接（归一化路径 -> 连接列表）。
+# SQLite 在 Windows 上打开库文件时不带 FILE_SHARE_DELETE，只要这里还剩
+# 一个连接，os.replace 就无法替换该缓存 —— 晋升失败的根因即在此。
+_RO_LEASES: Dict[str, List["sqlite3.Connection"]] = {}
+# 正在晋升的缓存路径：新的只读连接见此标记先让路，免得刚关完又被打开
+_PROMOTING_PATHS: set = set()
+# 条件变量兼作上面两个容器的锁（wait 期间必须能释放锁，否则晋升卡死）
+_RO_LOCK = threading.Condition()
+
+
+def _lease_key(dst: str) -> str:
+    """把缓存路径归一化，保证登记方与晋升方用的是同一个键。"""
+    return os.path.normcase(os.path.abspath(dst))
+
+
+def _register_ro(dst: str, conn: "sqlite3.Connection") -> None:
+    """登记一个只读缓存连接，供晋升前统一释放。"""
+    key = _lease_key(dst)
+    conn._ro_key = key          # type: ignore[attr-defined]
+    with _RO_LOCK:
+        conns = _RO_LEASES.setdefault(key, [])
+        conns.append(conn)
+        overflow = len(conns) - MAX_RO_LEASES_PER_PATH
+        stale = conns[:overflow] if overflow > 0 else []
+        if stale:
+            del conns[:overflow]
+    for old in stale:           # 关闭必须在锁外：close 会回调摘除登记
+        _close_quietly(old)
+
+
+def _unregister_ro(conn: "sqlite3.Connection") -> None:
+    """连接自行关闭时摘除登记（幂等，重复 close 不再处理）。"""
+    key = getattr(conn, "_ro_key", None)
+    if not key:
+        return
+    conn._ro_key = None         # type: ignore[attr-defined]
+    with _RO_LOCK:
+        conns = _RO_LEASES.get(key)
+        if conns and any(c is conn for c in conns):
+            conns = [c for c in conns if c is not conn]
+            if conns:
+                _RO_LEASES[key] = conns
+            else:
+                _RO_LEASES.pop(key, None)
+
+
+def _close_quietly(conn: "sqlite3.Connection") -> bool:
+    try:
+        conn.close()
+        return True
+    except Exception:           # noqa: BLE001 - 已关闭/正在使用都不该炸调度线程
+        return False
+
+
+def _release_ro_leases(dst: str) -> int:
+    """关掉本进程对该缓存路径的全部只读连接，返回实际关闭个数。
+
+    这些都是各查询函数里的临时只读连接，数据在磁盘上，关掉后下一次查询
+    自然重开，不会丢消息。若某线程正 fetch 到一半，那条查询会抛
+    ProgrammingError 由上层按本轮失败重试（见 _is_released_mid_query）——
+    代价远小于缓存永久锁死。
+    关不掉的（极少数）留在名册里等下一轮，悄悄摘除只会让句柄变成无人看管。
+    """
+    key = _lease_key(dst)
+    with _RO_LOCK:
+        conns = _RO_LEASES.pop(key, [])
+    kept = [conn for conn in conns if not _close_quietly(conn)]
+    if kept:
+        with _RO_LOCK:
+            _RO_LEASES.setdefault(key, []).extend(kept)
+    return len(conns) - len(kept)
+
+
+def _promote_pause(dst: str) -> None:
+    """标记该缓存正在晋升：新的读连接先让路。"""
+    with _RO_LOCK:
+        _PROMOTING_PATHS.add(_lease_key(dst))
+
+
+def _promote_resume(dst: str) -> None:
+    with _RO_LOCK:
+        _PROMOTING_PATHS.discard(_lease_key(dst))
+        _RO_LOCK.notify_all()
+
+
+def _wait_promote_slot(dst: str) -> None:
+    """有晋升在进行时短暂等待，让「释放→替换」能拿到确定的空档。"""
+    key = _lease_key(dst)
+    deadline = time.monotonic() + PROMOTE_READERS_WAIT_SEC
+    with _RO_LOCK:
+        while key in _PROMOTING_PATHS:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return          # 超时照常打开：本次晋升失败会有退避兜底
+            _RO_LOCK.wait(left)
+
+
+class _RoCacheConn(sqlite3.Connection):
+    """登记在案的只读缓存连接，唯一区别是 close() 时自行摘除登记。"""
+
+    def close(self) -> None:
+        _unregister_ro(self)
+        super().close()
+
+
 CONFIG_CIPHER_NAME = b"com.Tencent.WCDB.Config.Cipher"
 CONFIG_XOR_MASK = bytes.fromhex(
     "d2c7442458020000004889442450488b"
@@ -205,6 +327,17 @@ _SYSTEM_USERNAMES = frozenset({
 def _is_malformed(exc) -> bool:
     """是否 SQLite "database disk image is malformed" 类库损坏（数据页损坏）。"""
     return isinstance(exc, sqlite3.DatabaseError) and "malformed" in str(exc).lower()
+
+
+def _is_released_mid_query(exc) -> bool:
+    """是否「查询跑到一半，连接被晋升流程关掉」。
+
+    缓存晋升前会释放本进程的只读连接以腾出文件句柄（见 _promote_cache），
+    正在 fetch 的那条查询因此报错。它与缓存好坏无关，重开连接再查即可，
+    绝不能走「库损坏 → 失效重建」那条重路径。
+    """
+    return (isinstance(exc, sqlite3.ProgrammingError)
+            and "closed database" in str(exc).lower())
 
 
 # 企业微信联系人的 extra_buffer 里，"企业" 分组的 desc 就是企业标识
@@ -744,16 +877,12 @@ class WeChatDB:
         self._rebuild_guard = threading.Lock()
         self._rebuild_locks: Dict[str, threading.Lock] = {}
         self._rebuild_done_at: Dict[str, float] = {}  # rel -> 上次重建完成时刻
-        # 缓存健康度（供 cache_status()/陈旧告警使用，全部为墙钟时间）
-        self._cache_ok_at: Dict[str, float] = {}        # rel -> 上次成功 promote
-        self._cache_first_seen: Dict[str, float] = {}   # rel -> 首次尝试重建
-        self._cache_last_error: Dict[str, str] = {}     # rel -> 最近一次失败原因
-        self._cache_fail_streak: Dict[str, int] = {}    # rel -> 连续失败次数
-        self._stale_warned_at: Dict[str, float] = {}    # rel -> 上次陈旧告警时刻
-        self._cache_churn_at: Dict[str, float] = {}     # rel -> 最近一次源库持续写入
-        self._rebuild_skipped_at: Dict[str, float] = {}  # rel -> 上次因配额跳过
-        self._rebuild_sem = _REBUILD_SEMAPHORE
-        self._cache_state_ready = True
+        # 缓存健康度字段（供 cache_status()/陈旧告警使用，全部为墙钟时间）：
+        # 唯一出处是 _ensure_cache_state()，这里只负责触发它。1.4.3 现场教训：
+        # __init__ 曾自己铺一遍这些字典并直接置 _cache_state_ready=True，
+        # 于是新增字段只加进 _ensure_cache_state() 的话，真实实例永远缺它，
+        # 而用 object.__new__ 构造的单测照样全绿。
+        self._ensure_cache_state()
         self._load_or_extract_keys(master_key=master_key)
 
     # ------------------------------------------------------------------
@@ -804,10 +933,15 @@ class WeChatDB:
             if os.path.basename(path) != "contact.db":
                 continue
             conn = self._open(rel)
-            row = conn.execute(
-                "SELECT username, nick_name, remark FROM contact WHERE username=? LIMIT 1",
-                (self.wxid,),
-            ).fetchone()
+            try:
+                row = conn.execute(
+                    "SELECT username, nick_name, remark FROM contact WHERE username=? LIMIT 1",
+                    (self.wxid,),
+                ).fetchone()
+            finally:
+                # 必须显式关闭：这条连接握着 contact 缓存的 .db/-wal/-shm，
+                # 早退不关会让后台晋升一直 PermissionError
+                conn.close()
             if row:
                 return {"username": row[0], "nick_name": row[1], "remark": row[2]}
         return {"username": self.wxid, "nick_name": "", "remark": ""}
@@ -1360,9 +1494,18 @@ class WeChatDB:
 
     @staticmethod
     def _connect_ro(dst: str) -> sqlite3.Connection:
-        conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
+        # 登记 + 让路：本函数返回的连接在 close 前会一直占着 .db/-wal/-shm，
+        # 而正式缓存晋升时必须先让出这些句柄（见 _promote_cache）。
+        # check_same_thread=False 不是放宽跨线程使用（连接仍在各自线程里用），
+        # 只是让「重建线程晋升前关闭轮询线程的连接」成为可能 —— 默认 True 时
+        # 跨线程 close 直接抛 ProgrammingError，释放等于什么都没做（实测）。
+        _wait_promote_slot(dst)
+        conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True,
+                               factory=_RoCacheConn,
+                               check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.text_factory = _sqlite_text_factory
+        _register_ro(dst, conn)
         return conn
 
     @staticmethod
@@ -1380,30 +1523,58 @@ class WeChatDB:
 
     @staticmethod
     def _promote_cache(tmp: str, dst: str) -> bool:
-        """把重建结果原子替换为正式缓存；目标被占用时短暂重试。
+        """把重建结果原子替换为正式缓存；目标被占用时先等、等不到就主动腾。
 
+        两段式：被动重试 `PROMOTE_PASSIVE_ATTEMPTS` 次（不打扰任何在跑的查询），
+        仍失败则暂停新的读连接并释放本进程已登记的连接，再试
+        `PROMOTE_ACTIVE_ATTEMPTS` 次。
         成功返回 True；彻底失败删除临时文件并返回 False（保留旧缓存，
-        stamp 不更新 → 下次打开自然再次触发重建）。
+        stamp 不更新 → 下次打开自然再次触发重建，并由调用方记退避）。
         源页哈希边车（.pages）随缓存一并替换，供下次增量重建使用。
         """
         last_err = ""
-        for _ in range(PROMOTE_ATTEMPTS):
-            try:
-                os.replace(tmp, dst)
-                if os.path.exists(tmp + ".pages"):
-                    try:
-                        os.replace(tmp + ".pages", dst + ".pages")
-                    except OSError:
-                        pass  # 边车替换失败：下次重建回退全量，不影响正确性
-                return True
-            except OSError as exc:
-                last_err = "%s: %s" % (type(exc).__name__, exc)
-                time.sleep(PROMOTE_RETRY_INTERVAL_SEC)
+        released = 0
+        paused = False
+        total = PROMOTE_PASSIVE_ATTEMPTS + PROMOTE_ACTIVE_ATTEMPTS
+        try:
+            for attempt in range(1, total + 1):
+                if not paused and attempt > PROMOTE_PASSIVE_ATTEMPTS:
+                    # 被动等不到空档 → 主动制造：先让新读连接排队，再释放本进程
+                    # 已登记的连接（1.4.2 真机：被动等满 12s 也挑不到一次空档）
+                    _promote_pause(dst)
+                    paused = True
+                if paused:
+                    released += _release_ro_leases(dst)
+                try:
+                    os.replace(tmp, dst)
+                    if os.path.exists(tmp + ".pages"):
+                        try:
+                            os.replace(tmp + ".pages", dst + ".pages")
+                        except OSError:
+                            pass  # 边车替换失败：下次重建回退全量，不影响正确性
+                    if released:
+                        # 说明本次是靠「主动释放」才成功的，留痕便于判断
+                        # 占用是否仍在（若仍需释放很多轮才成功，得看调用方）
+                        sys.stderr.write(
+                            "[wechatauto] %s 释放本进程 %d 个只读连接后晋升成功"
+                            "（第 %d 次尝试）\n"
+                            % (os.path.basename(dst), released, attempt))
+                    return True
+                except OSError as exc:
+                    last_err = "%s: %s" % (type(exc).__name__, exc)
+                    time.sleep(PROMOTE_RETRY_INTERVAL_SEC)
+        finally:
+            if paused:
+                _promote_resume(dst)
         # 失败时留下真实原因（如 PermissionError 表示缓存文件仍被只读连接
         # 占用），否则日志只能写“被占用？”，无法定位是谁占着。
+        # 主动释放后仍失败 = 占用者不在本进程名册里（另一个后端实例、
+        # 杀毒/索引程序，或未经 _connect_ro 打开的裸连接）。
         sys.stderr.write(
-            "[wechatauto] %s 晋升失败原因：%s（重试 %d 次仍未释放）\n"
-            % (os.path.basename(dst), last_err or "未知", PROMOTE_ATTEMPTS))
+            "[wechatauto] %s 晋升失败原因：%s（被动等 %d 次、主动释放 %d 个本进程"
+            "只读连接后共试 %d 次仍未成功，占用者可能在本进程之外）\n"
+            % (os.path.basename(dst), last_err or "未知",
+               PROMOTE_PASSIVE_ATTEMPTS, released, total))
         for p in (tmp, tmp + ".pages"):
             try:
                 os.remove(p)
@@ -1448,6 +1619,8 @@ class WeChatDB:
                 self._cache_churn_at = {}
             if not hasattr(self, "_rebuild_skipped_at"):
                 self._rebuild_skipped_at = {}
+            if not hasattr(self, "_promote_fail_at"):
+                self._promote_fail_at = {}
             if not hasattr(self, "_rebuild_sem") or self._rebuild_sem is None:
                 self._rebuild_sem = _REBUILD_SEMAPHORE
             self._cache_state_ready = True
@@ -1459,6 +1632,25 @@ class WeChatDB:
         self._cache_ok_at[rel] = now
         self._cache_fail_streak[rel] = 0
         self._cache_last_error.pop(rel, None)
+        self._promote_fail_at.pop(rel, None)
+
+    def _record_promote_fail(self, rel: str) -> None:
+        """记一次「重建结果无法晋升」，并按 PROMOTE_FAIL_BACKOFF_SEC 退避。
+
+        stamp 未更新会让下一轮 `_open` 立刻再触发整轮重建，等于拿「重建 +
+        晋升重试」去抢同一把还被占用的锁；退避期间直接用旧缓存应答，
+        几轮之后占用者通常早已释放。
+        """
+        self._ensure_cache_state()
+        self._promote_fail_at[rel] = time.monotonic()
+
+    def _promote_backoff_left(self, rel: str) -> float:
+        """该分片距下次允许重建还有多少秒（0 = 不在退避中）。"""
+        self._ensure_cache_state()
+        fail_at = self._promote_fail_at.get(rel)
+        if not fail_at:
+            return 0.0
+        return max(0.0, PROMOTE_FAIL_BACKOFF_SEC - (time.monotonic() - fail_at))
 
     def _record_cache_error(self, rel: str, reason: str) -> None:
         """记录一次缓存重建失败：连续失败次数 +1，保存最后一次原因。
@@ -1542,14 +1734,17 @@ class WeChatDB:
         - ``last_ok_at``     最近一次成功 promote 的时刻（ISO8601，空 = 从未）；
         - ``last_error``     最近一次失败原因（空 = 无失败）；
         - ``fail_streak``    连续失败次数；
-        - ``rebuilding``     当前是否正在后台重建。
+        - ``rebuilding``     当前是否正在后台重建；
+        - ``promote_backoff`` 因「晋升失败」暂停重建的剩余秒数（0 = 未退避）。
+          没有这个字段时，退避期看起来像「一切正常只是没变化」，反而更难查。
         """
         self._ensure_cache_state()
         now = time.time()
         with self._rebuild_guard:
             rebuilding = set(self._rebuilding)
         rels = set(self._cache_ok_at) | set(self._cache_last_error) \
-            | set(self._cache_first_seen) | rebuilding
+            | set(self._cache_first_seen) | set(self._promote_fail_at) \
+            | rebuilding
         items: List[dict] = []
         for rel in sorted(rels):
             ok_at = self._cache_ok_at.get(rel)
@@ -1563,6 +1758,7 @@ class WeChatDB:
                 "last_error": self._cache_last_error.get(rel, ""),
                 "fail_streak": int(self._cache_fail_streak.get(rel, 0)),
                 "rebuilding": rel in rebuilding,
+                "promote_backoff": round(self._promote_backoff_left(rel), 1),
             })
         return items
 
@@ -1745,7 +1941,10 @@ class WeChatDB:
                 if check_ok:
                     build = False
                     if full and not self._promote_cache(tmp, dst):
-                        old = None  # 替换失败（缓存被占用等）：重试
+                        # 替换失败（正式缓存被占用）：build 已置假，本次直接
+                        # 沿用旧缓存返回，stamp 不更新 → 下轮自然再次重建追平。
+                        # 同时记退避，避免同步路径之外每轮再烧一次整库重建。
+                        self._record_promote_fail(rel)
                         continue
                     self._write_stamp(stamp, src_mtime, src_size,
                                       wal_mtime, wal_size, applied)
@@ -1760,11 +1959,17 @@ class WeChatDB:
                     self._decrypt_file(src, tmp, key)
                     if self._check_merged(tmp):
                         # 校验通过才晋升；本次不含 WAL 增量，部分最新消息可能缺失
-                        self._promote_cache(tmp, dst)
-                        applied = 0
-                        build = False
-                        self._write_stamp(stamp, src_mtime, src_size, 0, 0, 0)
-                        self._record_cache_ok(rel)
+                        if self._promote_cache(tmp, dst):
+                            applied = 0
+                            build = False
+                            self._write_stamp(stamp, src_mtime, src_size, 0, 0, 0)
+                            self._record_cache_ok(rel)
+                        else:
+                            # 晋升失败绝不能落 stamp：旧实现无条件盖戳，正式
+                            # 缓存还停在旧数据却被记为"已追平"，下一轮不再
+                            # 重建 → 静默陈旧（表现为读不到新消息且无报错）
+                            build = False
+                            self._record_promote_fail(rel)
                     else:
                         # 源库正被微信写库、快照始终撕裂：不晋升未校验文件
                         # （旧实现会降级晋升坏缓存并盖上有效戳，导致后续反复
@@ -1794,7 +1999,18 @@ class WeChatDB:
         微信活跃期源库几乎每秒都在变，若不加节流会无限重建。
         距上次重建完成不足 REBUILD_MIN_INTERVAL_SEC 时仅返回旧缓存，
         新消息最迟在下一次重建后即可读到（秒级延迟，不再阻塞）。
+        刚发生「重建完成但无法晋升」时分片额外退避 PROMOTE_FAIL_BACKOFF_SEC：
+        占用者还在，重建一样白烧。
         """
+        left = self._promote_backoff_left(rel)
+        if left > 0:
+            if left >= PROMOTE_FAIL_BACKOFF_SEC - 1.0:
+                # 只在退避刚开始时打一条，避免轮询每 30s 刷屏
+                sys.stderr.write(
+                    "[wechatauto] %s 缓存晋升失败，退避 %.0fs 后重试重建"
+                    "（期间沿用旧缓存）\n" % (rel, left)
+                )
+            return
         with self._rebuild_guard:
             if rel in self._rebuilding:
                 return
@@ -1970,9 +2186,12 @@ class WeChatDB:
                     return
                 if not self._promote_cache(tmp, dst):
                     self._record_cache_error(rel, "临时文件晋升正式缓存失败")
+                    self._record_promote_fail(rel)
                     sys.stderr.write(
                         "[wechatauto] %s 缓存重建完成但晋升失败（正式缓存被占用？），"
-                        "耗时 %.1fs，下轮重试\n" % (rel, time.monotonic() - started)
+                        "耗时 %.1fs，退避 %.0fs 后重试（期间沿用旧缓存）\n"
+                        % (rel, time.monotonic() - started,
+                           PROMOTE_FAIL_BACKOFF_SEC)
                     )
                     return
                 # 无论源库是否在构建期间变化，都必须写 stamp：
@@ -2560,6 +2779,14 @@ class WeChatDB:
             try:
                 return build(found)
             except sqlite3.DatabaseError as exc:
+                if _is_released_mid_query(exc):
+                    if attempt:
+                        raise
+                    sys.stderr.write(
+                        "[wechatauto] %s 查询被缓存晋升打断（连接已释放），"
+                        "重开连接重试本轮\n" % user
+                    )
+                    continue     # finally 会关掉剩余连接（重复 close 是安全的）
                 if attempt or not _is_malformed(exc):
                     raise
                 sys.stderr.write(

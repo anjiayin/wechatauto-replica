@@ -1044,13 +1044,40 @@ function AiTab() {
   const [notifPermission, setNotifPermission] = useState<string>(() =>
     typeof Notification === 'undefined' ? 'unsupported' : Notification.permission,
   )
-  // 应用级系统通知开关（默认关；localStorage 与提示音开关同级）
+  // 应用级系统通知开关：后端配置为准（页面未打开时由托盘弹 Windows 通知），
+  // localStorage 仅作浏览器通知的镜像（页面后台时使用）。
   const [systemNotifyEnabled, setSystemNotifyEnabled] = useState(() => {
     try {
       return window.localStorage.getItem('kefu.system_notify_enabled') === '1'
     } catch {
       return false
     }
+  })
+  const { data: notifySettings } = useQuery({
+    queryKey: ['notify-settings'],
+    queryFn: () =>
+      apiGet<{ sound_enabled: boolean; system_enabled: boolean }>(
+        '/api/settings/notify',
+      ),
+  })
+  useEffect(() => {
+    if (!notifySettings) return
+    setSystemNotifyEnabled(notifySettings.system_enabled)
+    try {
+      window.localStorage.setItem(
+        'kefu.system_notify_enabled',
+        notifySettings.system_enabled ? '1' : '0',
+      )
+    } catch {
+      // localStorage 不可用：仅后端开关生效
+    }
+  }, [notifySettings])
+  const saveSystemNotifyMutation = useMutation({
+    mutationFn: (enabled: boolean) =>
+      apiPut<{ ok: boolean }>('/api/settings/notify', {
+        system_enabled: enabled,
+      }),
+    onError: (err: Error) => setError(err.message),
   })
   const toggleSystemNotify = (enabled: boolean) => {
     setSystemNotifyEnabled(enabled)
@@ -1062,7 +1089,8 @@ function AiTab() {
     } catch {
       // localStorage 不可用（隐私模式等）：仅内存态生效
     }
-    // 打开开关且尚未授权时，引导用户完成浏览器授权
+    saveSystemNotifyMutation.mutate(enabled)
+    // 打开开关且尚未授权时，引导用户完成浏览器授权（页面后台通知用）
     if (enabled && notifPermission === 'default') {
       void requestNotification()
     }
@@ -1456,7 +1484,7 @@ function AiTab() {
                 onChange={(e) => toggleSystemNotify(e.target.checked)}
               />
             }
-            label="系统通知（页面不在前台时收到新的商机/投诉提醒，系统弹窗提醒）"
+            label="系统通知（未打开操作界面时收到新的商机/投诉，由托盘弹 Windows 通知，点击打开对应商机）"
           />
           {showAuthButton && (
             <Button
@@ -1468,7 +1496,8 @@ function AiTab() {
             </Button>
           )}
           <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
-            {notifPermissionLabel}；系统通知在页面切换到后台时才会发出，可在浏览器设置中撤销授权
+            {notifPermissionLabel}；操作界面未打开时由托盘弹 Windows 通知（无需授权）；
+            界面已打开但切到后台时使用浏览器通知，可在浏览器设置中撤销授权
           </Typography>
         </Box>
       </Stack>

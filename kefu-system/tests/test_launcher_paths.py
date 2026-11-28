@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -745,3 +746,89 @@ def test_main_starts_handoff_watcher(launcher):
     body = src.split("def main(")[1]
     assert body.index("_add_tray(hwnd)") < body.index("_start_handoff_watcher()"), \
         "气泡要挂在已存在的托盘图标上，故必须在 _add_tray 之后启动"
+
+
+# ---------------------------------------------------------------------------
+# 新商机系统通知（native_alert.json → 托盘气泡 → 点击深链）
+# ---------------------------------------------------------------------------
+def _write_alert(launcher, tmp_path: Path, payload: dict) -> Path:
+    path = tmp_path / launcher.ALERT_FILE_NAME
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def test_take_alert_pops_once(launcher, tmp_path):
+    launcher._state["last_alert_key"] = None
+    payload = {"id": 12, "title": "收到新商机", "body": "客户群：求购",
+               "at": int(time.time())}
+    path = _write_alert(launcher, tmp_path, payload)
+    info = launcher._take_alert()
+    assert info is not None and info["id"] == 12
+    assert not path.exists(), "读到即删，避免下一秒重复弹"
+    assert launcher._take_alert() is None
+
+
+def test_take_alert_ignores_stale_and_invalid(launcher, tmp_path):
+    launcher._state["last_alert_key"] = None
+    stale = {"id": 1, "at": int(time.time()) - launcher.ALERT_TTL_SEC - 5}
+    assert launcher._take_alert() is None
+    _write_alert(launcher, tmp_path, stale)
+    assert launcher._take_alert() is None
+
+    _write_alert(launcher, tmp_path, {"id": "abc", "at": int(time.time())})
+    assert launcher._take_alert() is None
+
+    _write_alert(launcher, tmp_path, {"id": 2})
+    assert launcher._take_alert() is None
+
+
+def test_take_alert_survives_unlink_failure(launcher, tmp_path, monkeypatch):
+    """文件删不掉（占用/权限）时同一请求不能每秒重复弹。"""
+    launcher._state["last_alert_key"] = None
+    _write_alert(launcher, tmp_path,
+                 {"id": 21, "at": int(time.time())})
+
+    def fail_unlink(self, *a, **k):
+        raise OSError("locked")
+
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    assert launcher._take_alert()["id"] == 21
+    assert launcher._take_alert() is None
+
+
+def test_show_alert_sets_opportunity_deep_link(launcher, monkeypatch):
+    monkeypatch.setitem(launcher._state, "port", 9123)
+    calls: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        launcher, "_notify",
+        lambda title, text, url="": calls.append((title, text, url)) or True)
+    launcher._show_alert({"id": 5, "title": "收到新的客户投诉",
+                          "body": "售后群：要退款", "at": int(time.time())})
+    assert calls == [(
+        "收到新的客户投诉", "售后群：要退款",
+        "http://127.0.0.1:9123/?opportunity=5")]
+
+
+def test_open_alert_target_opens_deep_link_then_clears(launcher, monkeypatch):
+    opened: list[str] = []
+    monkeypatch.setattr(launcher.webbrowser, "open", opened.append)
+    monkeypatch.setitem(launcher._state, "alert_url",
+                        "http://127.0.0.1:9123/?opportunity=5")
+    launcher._open_alert_target()
+    assert opened == ["http://127.0.0.1:9123/?opportunity=5"]
+    assert launcher._state["alert_url"] == ""
+
+
+def test_open_alert_target_falls_back_to_home(launcher, monkeypatch):
+    called: list[str] = []
+    monkeypatch.setitem(launcher._state, "alert_url", "")
+    monkeypatch.setattr(launcher, "_open_ui", lambda: called.append("open"))
+    launcher._open_alert_target()
+    assert called == ["open"]
+
+
+def test_main_starts_alert_watcher_after_tray(launcher):
+    src = LAUNCHER.read_text(encoding="utf-8")
+    body = src.split("def main(")[1]
+    assert body.index("_add_tray(hwnd)") < body.index("_start_alert_watcher()"), \
+        "系统通知气泡同样要挂在已存在的托盘图标上"
