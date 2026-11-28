@@ -712,15 +712,18 @@ class Sender:
         """引用回复：定位被引用消息。
 
         - ``quote_latest``（用户点了「引用最新一条消息」）→ 恒返回 None，
-          执行时直接右键当时的最新一条；不受页面加载后新消息影响；
-        - 目标就是该会话最新一条 → 返回 None，直接引用最新消息（不依赖
-          文本匹配，图片/小程序/链接消息也能引用）；
+          执行时直接右键当时最新的**对方**消息（微信不支持引用自己的
+          消息；私聊里自己刚回复过时，字面最新一条正是自己发的）；
+        - 目标就是该会话最新一条且不是自己发的 → 返回 None，直接引用
+          最新消息（不依赖文本匹配，图片/小程序/链接消息也能引用）；
         - 更早的消息 → 返回清洗后的文本片段供 UIA 在消息列表里定位；
         - 更早且无可识别文字 → 抛 QuoteTargetUnavailable，提示用户改用
-          「引用最新一条」，绝不默默引用错消息。
+          「引用最新一条」，绝不默默引用错消息；
+        - 明确选中了自己发送的消息 → 抛 QuoteTargetUnavailable（微信
+          不支持引用自己的消息），绝不悄悄改引别条。
         """
         if task.quote_latest:
-            logger.debug("引用回复：latest 意图 → 执行时直接右键最新一条")
+            logger.debug("引用回复：latest 意图 → 执行时右键最新一条对方消息")
             return None
         if not task.quote_local_id:
             return None
@@ -730,6 +733,10 @@ class Sender:
                                        task.quote_local_id)
         except Exception:
             msg = None
+        if msg and msg.get("is_self"):
+            raise QuoteTargetUnavailable(
+                "微信不支持引用自己发送的消息；请直接回复文字，"
+                "或选择对方的消息引用")
         latest = self._lookup_latest(task.session_username)
         if latest and latest == task.quote_local_id:
             return None

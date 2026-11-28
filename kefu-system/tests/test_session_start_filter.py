@@ -9,7 +9,9 @@
 1. 时间闸门：``_is_before_monitor_since`` 叠加「本次启动时刻」，早于启动的
    消息一律静默丢弃（配置水位仍独立严格生效，两者都要满足）；
 2. 源头治本：``start()`` 把每个已启用会话的 watermark 推进到当前最新
-   sort_seq，Listener 从最新位置开始，不再回放停机积压。
+   sort_seq，Listener 从最新位置开始，不再回放停机积压；
+3. 下限兜底：推进读到的可能是后台重建前的旧解密缓存，``start()`` 再把水位
+   抬到「启动时刻」（sort_seq 即毫秒时间戳），切号/冷缓存同样不回放。
 
 边界/存量：未调用 start()（_session_start_ts=0）时闸门不生效，老行为不变；
 启动水位按秒级口径比较（同一秒视为启动后），配置水位严格比较（沿用既有语义）。
@@ -273,7 +275,11 @@ class TestStartWatermarkAdvance:
 
     def test_start_records_session_ts_and_passes_advanced_watermark(
             self, monkeypatch, tmp_path):
-        """start() 集成：启动水位已记录，Listener 拿到推进后的 watermark。"""
+        """start() 集成：启动水位已记录，Listener 拿到推进后的 watermark。
+
+        缓存新鲜（最新 sort_seq 晚于启动时刻，毫秒口径）时水位按下限逻辑
+        原样保留，不会被误抬。
+        """
         created: list[object] = []
 
         class _FakeListener:
@@ -297,9 +303,10 @@ class TestStartWatermarkAdvance:
                 return dict(self.wm)
 
         db = _FakeDb()
+        fresh = int(time.time()) * 1000 + 60_000  # 缓存里比启动时刻还新的消息
         wx = _FakeWxdb({
-            "old@chatroom": [{"sort_seq": 5000}],
-            "new@chatroom": [{"sort_seq": 8000}],
+            "old@chatroom": [{"sort_seq": fresh}],
+            "new@chatroom": [{"sort_seq": fresh + 1000}],
         })
         monkeypatch.setattr(wxdbmod, "Listener", _FakeListener)
         monkeypatch.setattr(wxdbmod, "WeChatDB", lambda **kwargs: wx)
@@ -318,10 +325,116 @@ class TestStartWatermarkAdvance:
         assert before <= svc._session_start_ts <= after
         assert len(created) == 1
         listener = created[0]
-        assert listener.wm["old@chatroom"] == 5000  # type: ignore[attr-defined]
-        assert listener.wm["new@chatroom"] == 8000  # type: ignore[attr-defined]
+        assert listener.wm["old@chatroom"] == fresh  # type: ignore[attr-defined]
+        assert listener.wm["new@chatroom"] == fresh + 1000  # type: ignore[attr-defined]
         assert listener.wm["gone@chatroom"] == 5     # type: ignore[attr-defined]
         assert listener.registered == ["old@chatroom", "new@chatroom"]  # type: ignore[attr-defined]
         assert listener.started is True  # type: ignore[attr-defined]
         # 清理刷回线程（daemon，设 stop 让其自行退出）
         svc._stop.set()
+
+    def test_start_floors_stale_cache_watermark(self, monkeypatch, tmp_path):
+        """start() 集成：缓存停在昨天时水位被抬到启动时刻，不回放积压。"""
+        created: list[object] = []
+
+        class _FakeListener:
+            def __init__(self, db, interval, watermark):
+                self.wm = dict(watermark or {})
+                self.registered: list[str] = []
+                created.append(self)
+
+            def add_listener(self, user, callback):
+                self.registered.append(user)
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            @property
+            def watermark(self):
+                return dict(self.wm)
+
+        db = _FakeDb()
+        stale = int(time.time() - 86_400) * 1000  # 昨天的缓存
+        wx = _FakeWxdb({
+            "old@chatroom": [{"sort_seq": stale}],
+            "new@chatroom": [{"sort_seq": stale - 3_600_000}],
+        })
+        monkeypatch.setattr(wxdbmod, "Listener", _FakeListener)
+        monkeypatch.setattr(wxdbmod, "WeChatDB", lambda **kwargs: wx)
+
+        svc = WeChatService(db, None)  # type: ignore[arg-type]
+        svc.configured_cache_dir = lambda: tmp_path  # type: ignore[method-assign]
+        svc._adopt_legacy_keys = lambda *a, **k: None  # type: ignore[method-assign]
+        svc._voice_retry.start = lambda: None  # type: ignore[method-assign]
+        svc._start_vision_workers = lambda: None  # type: ignore[method-assign]
+        svc._image_retry.start = lambda: None  # type: ignore[method-assign]
+        svc.start()
+
+        listener = created[0]
+        floor = int(svc._session_start_ts) * 1000 - 1
+        assert listener.wm["old@chatroom"] == floor  # type: ignore[attr-defined]
+        assert listener.wm["new@chatroom"] == floor  # type: ignore[attr-defined]
+        assert listener.wm["gone@chatroom"] == 5     # type: ignore[attr-defined]
+        svc._stop.set()
+
+
+class TestStartWatermarkFloor:
+    """启动水位下限：旧缓存/冷缓存也不回放启动前的历史。"""
+
+    def _svc(self, start_ts) -> WeChatService:
+        svc = WeChatService(_FakeDb(), None)  # type: ignore[arg-type]
+        svc._session_start_ts = start_ts
+        return svc
+
+    def test_stale_watermarks_lifted_to_start(self):
+        svc = self._svc(1_760_000_000.6)
+        marks = {"old@chatroom": 1_700_000_000_000}
+        lifted = svc._floor_start_watermarks(
+            marks, ["old@chatroom", "new@chatroom"])
+        floor = 1_760_000_000_000 - 1
+        assert lifted == 2
+        assert marks["old@chatroom"] == floor
+        # 没有持久化水位的会话（0/缺失）同样被抬升，不从头发送
+        assert marks["new@chatroom"] == floor
+
+    def test_fresh_watermark_kept(self):
+        svc = self._svc(1_760_000_000.6)
+        newer = 1_760_000_500_000
+        marks = {"old@chatroom": newer}
+        lifted = svc._floor_start_watermarks(marks, ["old@chatroom"])
+        assert lifted == 0
+        assert marks["old@chatroom"] == newer
+
+    def test_start_second_messages_not_killed(self):
+        """下限比启动秒的毫秒值小 1：启动秒内到达的消息仍在上限之上。"""
+        svc = self._svc(1_760_000_000.9)
+        marks: dict[str, int] = {}
+        svc._floor_start_watermarks(marks, ["111@chatroom"])
+        floor = marks["111@chatroom"]
+        # 启动秒内（create_time 向下取整 == 启动秒）的消息 seq = 秒*1000
+        assert 1_760_000_000_000 > floor
+        # 上一秒的消息 seq 必须被挡在水位之下
+        assert 1_759_999_999_000 < floor
+
+    def test_non_enabled_sessions_untouched(self):
+        svc = self._svc(1_760_000_000.0)
+        marks = {"gone@chatroom": 5, "old@chatroom": 0}
+        svc._floor_start_watermarks(marks, ["old@chatroom"])
+        assert marks["gone@chatroom"] == 5
+        assert marks["old@chatroom"] > 0
+
+    def test_no_session_start_no_floor(self):
+        """未 start()（水位=0）时不做任何修改，老行为/测试直调不误伤。"""
+        svc = self._svc(0.0)
+        marks = {"old@chatroom": 5}
+        assert svc._floor_start_watermarks(marks, ["old@chatroom"]) == 0
+        assert marks == {"old@chatroom": 5}
+
+    def test_bad_session_start_value_degrades_safely(self):
+        svc = self._svc("bad")  # type: ignore[arg-type]
+        marks = {"old@chatroom": 5}
+        assert svc._floor_start_watermarks(marks, ["old@chatroom"]) == 0
+        assert marks == {"old@chatroom": 5}

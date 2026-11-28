@@ -205,6 +205,17 @@ class TestQuoteTarget:
             sender.sender._quote_target_text(make_task(quote_local_id=5))
         assert "引用最新一条消息" in str(exc.value)
 
+    def test_self_message_quote_rejected(self, sender):
+        """明确选中自己发的消息 → 直接失败：微信不支持引用自己的消息，
+        硬发会右键到没有「引用」项的气泡上（2026-11-28 实测）。"""
+        sender.sender._message_lookup = lambda u, i: {
+            "content": "3", "is_self": True}
+        sender.sender._latest_lookup = lambda u: 5
+
+        with pytest.raises(QuoteTargetUnavailable) as exc:
+            sender.sender._quote_target_text(make_task(quote_local_id=5))
+        assert "自己发送" in str(exc.value)
+
     def test_process_reports_quote_failure_as_send_failure(self, sender):
         gui = FakeGui()
         sender.sender._gui = gui

@@ -724,15 +724,19 @@ class WeChatService:
             # create_time >= 本水位，不会被误杀。
             self._session_start_ts = time.time()
             marks = self._db.load_watermarks()
+            enabled_usernames = self._enabled_target_usernames()
             # 治本：把已启用会话的 watermark 推进到当前最新 sort_seq，
             # 让 Listener 从「最新」开始轮询，根本不回放停机积压。
             # 推进发生在构造 Listener 之前（而非 add_listener 之后），
             # 因为 add_listener 只在 user 不在 watermark 时赋值，绝不会
             # 覆盖这里写入的值（见 wechatauto/db.py:3299）。
             advanced_marks = self._advance_start_watermarks(marks)
+            # 兜底：推进读到的可能是后台重建完成前的旧解密缓存，
+            # 再抬一层到「启动时刻」，切号/冷缓存也不回放历史。
+            lifted = self._floor_start_watermarks(advanced_marks,
+                                                  enabled_usernames)
             listener = Listener(self._wxdb, interval=1.0,
                                 watermark=advanced_marks or None)
-            enabled_usernames = self._enabled_target_usernames()
             for username in enabled_usernames:
                 listener.add_listener(username, self._on_message)
             listener.start()
@@ -740,10 +744,11 @@ class WeChatService:
             self._available = True
             self._reason = ""
             logger.info("微信监听已启动（账号 %s，监控会话 %d 个，加载 watermark "
-                        "%d 条，推进后水位共 %d 条；启动水位=%.0f）",
+                        "%d 条，推进后水位共 %d 条（其中 %d 条抬升到启动水位）；"
+                        "启动水位=%.0f）",
                         getattr(self._wxdb, "account", "") or "自动",
                         len(enabled_usernames),
-                        len(marks), len(advanced_marks),
+                        len(marks), len(advanced_marks), lifted,
                         self._session_start_ts)
             return True
         except Exception as exc:
@@ -836,6 +841,48 @@ class WeChatService:
             if isinstance(seq, (int, float)) and not isinstance(seq, bool):
                 advanced[username] = int(seq)
         return advanced
+
+    def _floor_start_watermarks(self, marks: dict[str, int],
+                                usernames: list[str]) -> int:
+        """把本次启动水位抬到「启动时刻」，兜住旧缓存导致的积压回放。
+
+        ``sort_seq`` 就是消息时间的毫秒值（实测 ``create_time * 1000``，
+        一一对应），所以切号/重启后即使 ``_advance_start_watermarks`` 读到
+        的是后台重建完成前的旧解密缓存（``_open`` 先用旧缓存响应、稍后原子
+        重建），Listener 也不会把「缓存最后更新时刻 → 本次启动时刻」之间的
+        历史消息当新消息回放：这些消息下游 ``_is_before_monitor_since``
+        本来就会全部静默丢弃，抬水位只是不再每秒空读 200 条历史
+        （现场表现为「收到 200 条新消息」刷屏而无商机）。
+
+        下限取 ``int(start) * 1000 - 1``：闸门语义是「同一秒视为启动后」，
+        减 1 保证启动秒内到达的消息仍满足 ``sort_seq > 水位`` 不被误杀；
+        get_new_messages 是严格大于比较，不能直接用 ``int(start) * 1000``。
+
+        Args:
+            marks: 即将交给 Listener 的水位字典（原地修改）。
+            usernames: 本次启用监控的会话列表；其余会话的水位不动。
+
+        Returns:
+            被抬升的会话数（供启动日志观测）。
+        """
+        try:
+            start = float(getattr(self, "_session_start_ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0
+        if start <= 0:
+            return 0
+        floor = int(start) * 1000 - 1
+        lifted = 0
+        for username in usernames or ():
+            current = marks.get(username)
+            try:
+                current = int(current)
+            except (TypeError, ValueError):
+                current = 0
+            if current < floor:
+                marks[username] = floor
+                lifted += 1
+        return lifted
 
     def stop(self) -> None:
         """停止监听并把 watermark 刷回数据库。"""
@@ -3148,6 +3195,9 @@ class WeChatService:
         return {
             "local_id": int(row.get("local_id") or 0),
             "content": content,
+            # 微信不支持引用自己发送的消息（右键菜单无「引用」项）：
+            # real_sender_id=2 是微信库里的「自己」，供发送层提前拦截。
+            "is_self": row.get("sender_id") in (2, "2"),
             "sender_name": self.get_display_name(
                 str(row.get("sender_username") or "")) or "未知",
         }

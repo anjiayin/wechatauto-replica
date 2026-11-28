@@ -1667,6 +1667,16 @@ class WeChatGUI:
             f'{what}，已取消发送；请点开微信窗口、确认会话后重试',
             data={'content': text, 'chat_verified': False})
 
+    @staticmethod
+    def _quote_failure_reason(uia, default: str = '引用操作未完成') -> str:
+        """拼接组件层记录的引用失败细节（没有则用默认文案）。"""
+        try:
+            getter = getattr(uia, 'last_quote_error', None)
+            detail = str(getter() if callable(getter) else '') or ''
+        except Exception:
+            detail = ''
+        return f'{default}：{detail}' if detail else default
+
     def warm_up(self, timeout: float = 30.0) -> bool:
         """启动预热：把 UIA 引擎建好、控件树物化，**不激活窗口、不动前后台**。
 
@@ -2788,11 +2798,15 @@ class WeChatGUI:
                   who_username: Optional[str] = None) -> WxResponse:
         """引用指定/最近一条消息（右键 → 菜单「引用」→ 输入 → 发送）。
 
-        **只走 UIA**：菜单项是真实控件，图片/小程序/长文本消息也能引用。
-        旧的 OCR 兜底（截图找消息 → 右键 → OCR 找「引用」菜单）已删除：
-        窗口从托盘恢复时坐标全错，实测白等 28.6s 后报「未找到「引用」菜单项」，
-        还可能在会话未校验时把消息发到别处（2026-11-15 用户要求 fail-closed）。
-        target_text 用于定位要引用的消息（可选，省略=最新一条）。
+        **UIA 为主**：菜单优先按 UIA 控件点击（微信 4.x 的右键菜单是独立
+        浮层窗口，见 ``WeChatUIA._wechat_popup_windows``）；浮层打开但 UIA
+        没暴露菜单项时，仅在浮层窗口矩形内做一次有界 OCR 找「引用」，绝不
+        降级为全屏 OCR/坐标猜测。旧的整链路 OCR 兜底（截图找消息 → 右键 →
+        全屏 OCR 找菜单）已删除：窗口从托盘恢复时坐标全错，实测白等 28.6s
+        后报「未找到「引用」菜单项」，还可能在会话未校验时把消息发到别处
+        （2026-11-15 用户要求 fail-closed）。
+        target_text 用于定位要引用的消息（可选，省略=最新一条**对方**消息；
+        微信不支持引用自己发送的消息）。
         who_username：目标会话 wxid，verify=True 时数据库回读直查用。
         """
         uia, err = self._require_uia('引用回复')
@@ -2809,7 +2823,8 @@ class WeChatGUI:
                 uia.dismiss_quote_menu()
             except Exception as exc:
                 wxlog.debug('引用失败后清理异常（忽略）：%s', exc)
-            return self._send_unverified_failure(text, '引用操作未完成')
+            return self._send_unverified_failure(
+                text, self._quote_failure_reason(uia))
         self._current_chat = who or getattr(self, '_current_chat', None)
         data = {'content': text, 'chat_verified': True}
         if not verify:
@@ -2864,7 +2879,8 @@ class WeChatGUI:
         if not uia.at_members(names, text, who=who, quote=quote,
                               quote_target_text=quote_target_text):
             return self._send_unverified_failure(
-                text, '@ 成员/引用操作未完成' if quote else '@ 成员操作未完成')
+                text, (self._quote_failure_reason(uia, '@ 成员/引用操作未完成')
+                       if quote else '@ 成员操作未完成'))
         self._current_chat = who or getattr(self, '_current_chat', None)
         data = {'members': names, 'content': text, 'chat_verified': True}
         if not verify:

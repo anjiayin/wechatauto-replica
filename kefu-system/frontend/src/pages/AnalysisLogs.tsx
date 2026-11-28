@@ -366,6 +366,7 @@ export default function AnalysisLogs() {
                 <LogRow
                   key={log.id}
                   log={log}
+                  accountLabel={accountLabel}
                   onSaveKeyword={(kw) =>
                     saveSettingsMutation.mutate({
                       prescreen_keywords: appendKeyword(
@@ -418,6 +419,7 @@ function appendKeyword(existing: string, kw: string): string {
 /** 日志行 + 漏判修正操作对话框（每行独立状态，避免互串） */
 function LogRow(props: {
   log: AnalysisLogItem
+  accountLabel: string
   onSaveKeyword: (kw: string) => void
   onSaveExample: (text: string) => void
   examplesFull: boolean
@@ -482,9 +484,18 @@ function LogRow(props: {
   // 前端这里按同顺序取值，保证界面上不再出现 wxid_xxx 这类内部 ID。
   const sessionId = log.session_alias || log.session_display || log.session_username
   const senderId = log.sender_alias || ''
+  // 「自己发送已过滤」的行发送人字段为空（发送人就是当前监控账号），
+  // 补一行小字说明，避免把上方的「来源会话」误读成发送人。
+  const selfFiltered = log.status === 'skipped'
+    && (log.error || '').includes('自己发送的消息已过滤')
+  const senderText = log.sender_display
+    || (selfFiltered
+      ? (props.accountLabel ? `自己（${props.accountLabel}）` : '自己')
+      : '')
   const sourceTip = [
     `会话：${sessionId}`,
     senderId ? `发送人微信号：${senderId}` : '',
+    !log.sender_display && senderText ? `发送人：${senderText}` : '',
   ].filter(Boolean).join('\n')
 
   return (
@@ -506,9 +517,9 @@ function LogRow(props: {
               {sessionId}
             </Typography>
             {/* 发送人（批次 11 需求 2）：群聊私聊都显示，让「谁说的」一眼可见 */}
-            {log.sender_display && (
+            {senderText && (
               <Typography variant="caption" color="text.secondary" noWrap display="block">
-                发送人：{log.sender_display}
+                发送人：{senderText}
               </Typography>
             )}
           </Box>

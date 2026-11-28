@@ -238,16 +238,246 @@ class TestScrollRestore:
 
 
 class TestDismissQuoteMenu:
-    def test_esc_then_scroll_to_latest(self, uia, monkeypatch):
+    def test_no_esc_when_menu_already_closed(self, uia, monkeypatch):
+        """菜单已关时绝不盲发 Esc：微信主窗口收到 Esc 会隐藏到托盘
+        （2026-11-28 实测：私聊引用失败后窗口被藏、界面报不可用）。"""
         calls = []
         monkeypatch.setattr(uia, "_key_esc", lambda: calls.append("esc"))
+        monkeypatch.setattr(uia, "_wechat_popup_windows", lambda: [])
+        monkeypatch.setattr(uia, "_uia_find_menu_item",
+                            lambda *a, **k: None)
         monkeypatch.setattr(uia, "_message_list", lambda: Lst([]))
         monkeypatch.setattr(uia, "_set_cursor", lambda x, y: None)
         monkeypatch.setattr(uia, "_mouse_wheel", lambda d: calls.append(d))
         uia.dismiss_quote_menu()
-        assert calls[0] == "esc"
-        assert all(d == -120 for d in calls[1:])
-        assert len(calls) == 17
+        assert "esc" not in calls
+        assert calls and all(d == -120 for d in calls)
+        assert len(calls) == 16
+
+    def test_menu_closed_by_clicking_input_not_esc(self, uia, monkeypatch):
+        """菜单还开着时点输入框关菜单：点菜单外任意位置即可关闭，
+        且输入框本来就要用；Esc 一律不发（无菜单时 Esc 会藏窗口）。"""
+        calls = []
+        monkeypatch.setattr(uia, "_context_menu_open", lambda: True)
+        monkeypatch.setattr(uia, "_key_esc", lambda: calls.append("esc"))
+        monkeypatch.setattr(
+            uia, "_chat_input",
+            lambda: Row("输入框", R(100, 800, 700, 860)))
+        monkeypatch.setattr(uia, "_set_cursor", lambda x, y: None)
+        monkeypatch.setattr(uia, "_left_click", lambda: calls.append("click"))
+        uia._close_context_menu()
+        assert calls == ["click"]
+
+    def test_esc_only_when_input_missing_and_menu_popup(self, uia, monkeypatch):
+        """输入框不可用且确认是菜单浮层时才退回 Esc（此时菜单开着，Esc 安全）。"""
+        calls = []
+        monkeypatch.setattr(uia, "_context_menu_open", lambda: True)
+        monkeypatch.setattr(uia, "_key_esc", lambda: calls.append("esc"))
+        monkeypatch.setattr(uia, "_chat_input", lambda: None)
+        monkeypatch.setattr(
+            uia, "_wechat_popup_windows",
+            lambda: [MenuPopup([MenuItem("引用")])])
+        uia._close_context_menu()
+        assert calls == ["esc"]
+
+
+class TestLatestIncomingRow:
+    """引用最新一条必须跳过自己发的消息：微信不支持引用自己的消息，
+    私聊里自己刚回复过时，字面最新一条没有「引用」菜单（2026-11-28 实测）。"""
+
+    def _rows(self):
+        friend = Row("我要机油", R(100, 200, 700, 260))
+        mine = Row("3", R(100, 300, 700, 360))
+        return friend, mine
+
+    def test_incoming_only_skips_self_bubble(self, uia, monkeypatch):
+        friend, mine = self._rows()
+        monkeypatch.setattr(uia, "_message_list", lambda: Lst([friend, mine]))
+        monkeypatch.setattr(
+            uia, "_row_content_center_x",
+            lambda r: r.left + 30 if r.top == 200 else r.right - 30)
+        ctrl, rect = uia._latest_message_row(incoming_only=True)
+        assert ctrl is friend
+        assert rect.top == 200
+
+    def test_incoming_only_returns_none_when_all_self(self, uia, monkeypatch):
+        friend, mine = self._rows()
+        monkeypatch.setattr(uia, "_message_list", lambda: Lst([friend, mine]))
+        monkeypatch.setattr(uia, "_row_content_center_x",
+                            lambda r: r.right - 30)
+        assert uia._latest_message_row(incoming_only=True) is None
+
+    def test_default_still_returns_literal_latest(self, uia, monkeypatch):
+        """撤回自己的消息依赖字面最新一条，默认行为不能改。"""
+        friend, mine = self._rows()
+        monkeypatch.setattr(uia, "_message_list", lambda: Lst([friend, mine]))
+
+        def _boom(r):
+            raise AssertionError("默认路径不应做方向判定")
+
+        monkeypatch.setattr(uia, "_row_content_center_x", _boom)
+        ctrl, rect = uia._latest_message_row()
+        assert ctrl is mine and rect.top == 300
+
+    def test_right_click_lands_on_friend_bubble(self, uia, monkeypatch):
+        friend, mine = self._rows()
+        monkeypatch.setattr(uia, "ensure_window", lambda: True)
+        monkeypatch.setattr(uia, "_message_list", lambda: Lst([friend, mine]))
+        monkeypatch.setattr(
+            uia, "_row_content_center_x",
+            lambda r: r.left + 40 if r.top == 200 else r.right - 40)
+        monkeypatch.setattr(uia, "_set_cursor", lambda x, y: None)
+        monkeypatch.setattr(uia, "_right_click", lambda: None)
+        assert uia._right_click_latest_row(
+            None, incoming_only=True) == (140, 230)
+
+
+class TestPrepareQuoteIncoming:
+    def _prep(self, uia, monkeypatch):
+        monkeypatch.setattr(uia, "_clear_input", lambda e: None)
+        monkeypatch.setattr(uia, "_chat_input", lambda: object())
+        monkeypatch.setattr(uia, "_focus_input_end", lambda e: None)
+
+    def test_latest_intent_requests_incoming_row(self, uia, monkeypatch):
+        self._prep(uia, monkeypatch)
+        seen = []
+        monkeypatch.setattr(
+            uia, "_right_click_latest_row",
+            lambda who=None, incoming_only=False:
+                seen.append(incoming_only) or (10, 20))
+        monkeypatch.setattr(uia, "_menu_click", lambda kws: True)
+        assert uia._prepare_quote() is not None
+        assert seen == [True]
+
+    def test_no_incoming_message_reports_reason(self, uia, monkeypatch):
+        self._prep(uia, monkeypatch)
+        monkeypatch.setattr(uia, "_right_click_latest_row",
+                            lambda who=None, incoming_only=False: None)
+        assert uia._prepare_quote() is None
+        assert "对方" in uia.last_quote_error()
+
+    def test_missing_menu_cleanup_is_guarded(self, uia, monkeypatch):
+        """菜单没找到时只走带存在性判断的清理，不再盲发 Esc。"""
+        self._prep(uia, monkeypatch)
+        cleaned = []
+        monkeypatch.setattr(uia, "_right_click_latest_row",
+                            lambda who=None, incoming_only=False: (10, 20))
+        monkeypatch.setattr(uia, "_menu_click", lambda kws: False)
+        monkeypatch.setattr(uia, "_wechat_popup_windows", lambda: [])
+        monkeypatch.setattr(uia, "_ocr_click_menu_item", lambda kws: False)
+        monkeypatch.setattr(uia, "_set_cursor", lambda x, y: None)
+        monkeypatch.setattr(uia, "_right_click", lambda: None)
+        monkeypatch.setattr(uia, "_key_esc", lambda: None)
+        monkeypatch.setattr(uia, "_close_context_menu",
+                            lambda: cleaned.append("close"))
+        assert uia._prepare_quote() is None
+        assert cleaned == ["close"]
+        assert "引用" in uia.last_quote_error()
+
+
+# ---------------------------------------------------------------------------
+# 3b. 右键菜单是独立浮层窗口（2026-11-28 实测：主窗口树里没有菜单节点）
+#     微信 4.x 的消息右键菜单弹在 mmui::XMenu 顶层窗口里，
+#     _uia_find_menu_item 只扫主窗口子树 → 永远找不到「引用」。
+# ---------------------------------------------------------------------------
+class MenuItem:
+    def __init__(self, name, cls="mmui::XMenuView",
+                 ctype="MenuItemControl", offscreen=False):
+        self.Name = name
+        self.ClassName = cls
+        self.ControlTypeName = ctype
+        self.IsOffscreen = offscreen
+
+
+class MenuPopup:
+    def __init__(self, items):
+        self.ClassName = "mmui::XMenu"
+        self._items = list(items)
+
+    def GetChildren(self):
+        return list(self._items)
+
+
+class TestMenuPopupLookup:
+    def _uia(self):
+        u = object.__new__(WeChatUIA)
+        u._win = None
+        u._target_hwnd = 0
+        u._target_pid = 0
+        return u
+
+    def test_item_found_in_popup_window(self, monkeypatch):
+        u = self._uia()
+        popup = MenuPopup([MenuItem("复制"), MenuItem("引用")])
+        monkeypatch.setattr(u, "_wechat_popup_windows", lambda: [popup])
+        item = u._uia_find_menu_item("引用")
+        assert item is not None and item.Name == "引用"
+
+    def test_offscreen_item_skipped(self, monkeypatch):
+        """关闭后残留的不可见菜单节点不能命中（否则会点歪）。"""
+        u = self._uia()
+        popup = MenuPopup([MenuItem("引用", offscreen=True)])
+        monkeypatch.setattr(u, "_wechat_popup_windows", lambda: [popup])
+        assert u._uia_find_menu_item("引用") is None
+
+    def test_prepare_quote_clicks_popup_menu(self, monkeypatch):
+        """UIA 菜单项在浮层窗口里也能点中（真机引用失败的根因回归）。"""
+        u = self._uia()
+        clicks = []
+        monkeypatch.setattr(u, "_chat_input", lambda: object())
+        monkeypatch.setattr(u, "_clear_input", lambda e: None)
+        monkeypatch.setattr(u, "_focus_input_end", lambda e: None)
+        monkeypatch.setattr(u, "_right_click_latest_row",
+                            lambda who=None, incoming_only=False: (10, 20))
+        monkeypatch.setattr(
+            u, "_wechat_popup_windows",
+            lambda: [MenuPopup([MenuItem("复制"), MenuItem("引用")])])
+        monkeypatch.setattr(u, "_uia_click_menu_item",
+                            lambda item: clicks.append(item.Name) or True)
+        assert u._prepare_quote() is not None
+        assert clicks == ["引用"]
+        assert u.last_quote_error() == ""
+
+    def test_menu_open_without_quote_never_reclicks(self, monkeypatch):
+        """菜单已弹出但没有「引用」项：补右键会点到菜单项（转发/删除），
+        必须只做清理后失败。"""
+        u = self._uia()
+        monkeypatch.setattr(u, "_chat_input", lambda: object())
+        monkeypatch.setattr(u, "_clear_input", lambda e: None)
+        monkeypatch.setattr(u, "_right_click_latest_row",
+                            lambda who=None, incoming_only=False: (10, 20))
+        monkeypatch.setattr(
+            u, "_wechat_popup_windows",
+            lambda: [MenuPopup([MenuItem("复制")])])
+        right_clicks = []
+        monkeypatch.setattr(u, "_right_click",
+                            lambda: right_clicks.append(1))
+        monkeypatch.setattr(u, "_ocr_click_menu_item", lambda kws: False)
+        cleaned = []
+        monkeypatch.setattr(u, "_close_context_menu",
+                            lambda: cleaned.append(1))
+        assert u._prepare_quote() is None
+        assert right_clicks == []
+        assert cleaned == [1]
+        assert "引用" in u.last_quote_error()
+
+    def test_no_menu_retries_right_click_once(self, monkeypatch):
+        """菜单完全没弹出（首击落空）：补一次右键；仍没有则失败且不发 Esc。"""
+        u = self._uia()
+        monkeypatch.setattr(u, "_chat_input", lambda: object())
+        monkeypatch.setattr(u, "_clear_input", lambda e: None)
+        monkeypatch.setattr(u, "_right_click_latest_row",
+                            lambda who=None, incoming_only=False: (10, 20))
+        monkeypatch.setattr(u, "_wechat_popup_windows", lambda: [])
+        right_clicks = []
+        monkeypatch.setattr(u, "_right_click",
+                            lambda: right_clicks.append(1))
+        monkeypatch.setattr(u, "_set_cursor", lambda x, y: None)
+        esc = []
+        monkeypatch.setattr(u, "_key_esc", lambda: esc.append(1))
+        assert u._prepare_quote() is None
+        assert right_clicks == [1]
+        assert esc == []
 
 
 # ---------------------------------------------------------------------------

@@ -71,6 +71,8 @@ CHAT_INPUT_AID = "chat_input_field"                # 输入框；其 .Name == �
 # 仍读不到照旧返回 None——不降级成「不引用直接发」。
 _LATEST_ROW_ATTEMPTS = 4
 _LATEST_ROW_WAIT = 0.4
+# Qt 内部消息泵窗口：枚举顶层窗口时跳过，其 UIA 服务可能阻塞调用
+QT_INTERNAL_WIN_CLASS_PREFIX = "QEventDispatcherWin32_Internal_"
 # 聊天标题栏里的「企业名」标签：**只有企业微信/客服会话才有**这个控件。
 # 打开会话后靠它判断「当前这个会话是不是企业微信身份的那一个」——同名
 # 好友与企业微信联系人（如「安佳胤」与「安佳胤@我的车车」）在搜索框里
@@ -1733,6 +1735,176 @@ class WeChatUIA:
                 return True
         return False
 
+    def _wechat_popup_windows(self) -> list:
+        """微信当前可见的浮层窗口（右键菜单等独立顶层窗口，不含主窗口）。
+
+        2026-11-28 实测根因：微信 4.x 的消息右键菜单不在主窗口 UIA 子树里，
+        而是独立顶层弹窗（旧版 ``ui/component.py`` 的 ``Menu`` 就是按
+        ``mmui::XMenu`` 顶层窗口查找的）。主窗口树里永远没有「引用」节点，
+        1.4.4/1.4.5 所有引用发送都卡在「没找到「引用」菜单项」——撤回的
+        UIA 路径同样从未命中，一直被 OCR 兜底掩盖。
+
+        只枚举微信 PID 自己的可见顶层窗口，不遍历桌面 UIA 根树（避免
+        UIA 根遍历的系统挂起 bug）。
+        """
+        main_hwnd = 0
+        pid = 0
+        try:
+            main_hwnd = int(self._win.NativeWindowHandle or 0)
+            pid = int(self._win.ProcessId or 0)
+        except Exception:
+            main_hwnd = int(getattr(self, "_target_hwnd", 0) or 0)
+            pid = int(getattr(self, "_target_pid", 0) or 0)
+        popups = []
+        if _HAS_WIN32 and pid:
+            hwnds = []
+
+            def _collect(hwnd, _extra):
+                try:
+                    if hwnd == main_hwnd:
+                        return True
+                    if not win32gui.IsWindowVisible(hwnd):
+                        return True
+                    if win32process.GetWindowThreadProcessId(hwnd)[1] != pid:
+                        return True
+                    cls = win32gui.GetClassName(hwnd)
+                    if cls.startswith(QT_INTERNAL_WIN_CLASS_PREFIX):
+                        return True
+                    hwnds.append(hwnd)
+                except Exception:
+                    pass
+                return True
+
+            try:
+                win32gui.EnumWindows(_collect, None)
+            except Exception:
+                hwnds = []
+            for hwnd in hwnds:
+                try:
+                    ctrl = auto.ControlFromHandle(hwnd)
+                    if ctrl is not None:
+                        popups.append(ctrl)
+                except Exception:
+                    continue
+            return popups
+        # 无 win32 环境（极端兜底）：桌面直连子窗口里按 PID 过滤
+        try:
+            for w in auto.GetRootControl().GetChildren():
+                try:
+                    if pid and w.ProcessId != pid:
+                        continue
+                    if main_hwnd and w.NativeWindowHandle == main_hwnd:
+                        continue
+                    if not w.IsOffscreen:
+                        popups.append(w)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return popups
+
+    @staticmethod
+    def _menu_item_nodes(popup, max_depth: int = 5) -> list:
+        """浮层窗口里的菜单项控件（``MenuItemControl`` / ``mmui::XMenuView``）。"""
+        items = []
+
+        def walk(c, d=0):
+            if d > max_depth:
+                return
+            try:
+                children = c.GetChildren()
+            except Exception:
+                return
+            for ch in children:
+                try:
+                    cn = ch.ClassName or ""
+                    ctype = ch.ControlTypeName or ""
+                    if cn == "mmui::XMenuView" or ctype == "MenuItemControl":
+                        items.append(ch)
+                except Exception:
+                    pass
+                walk(ch, d + 1)
+
+        walk(popup)
+        return items
+
+    def _ocr_click_menu_item(self, keywords: Tuple[str, ...]) -> bool:
+        """浮层菜单里按 OCR 文字点击菜单项（UIA 未暴露菜单项时的兜底）。
+
+        只在**确认微信浮层窗口已打开**后调用：截图限定在各浮层窗口矩形
+        内，只点击 OCR 命中关键词的那一项；找不到直接失败，绝不盲点。
+        """
+        popups = self._wechat_popup_windows()
+        if not popups:
+            return False
+        left = top = None
+        right = bottom = None
+        for p in popups:
+            try:
+                r = p.BoundingRectangle
+            except Exception:
+                continue
+            if r.right - r.left < 8 or r.bottom - r.top < 8:
+                continue
+            left = r.left if left is None else min(left, r.left)
+            top = r.top if top is None else min(top, r.top)
+            right = r.right if right is None else max(right, r.right)
+            bottom = r.bottom if bottom is None else max(bottom, r.bottom)
+        if left is None:
+            return False
+        try:
+            from wechatauto.guia import ScreenOCR
+            import PIL.ImageGrab as IG
+        except Exception:
+            return False
+        pad = 4
+        bbox = (left - pad, top - pad, right + pad, bottom + pad)
+        try:
+            img = IG.grab(bbox=bbox)
+        except Exception:
+            return False
+        try:
+            res = ScreenOCR.recognize(img)
+        except Exception:
+            return False
+        wanted = tuple(k.lower() for k in keywords)
+        for text, x, y, w, h in res:
+            t = (text or "").replace(" ", "").lower()
+            if not t:
+                continue
+            if any(k in t for k in wanted):
+                cx = bbox[0] + x + w // 2
+                cy = bbox[1] + y + h // 2
+                self._set_cursor(cx, cy)
+                time.sleep(0.2)
+                self._left_click()
+                time.sleep(0.3)
+                return True
+        return False
+
+    def _click_menu_item(self, keywords: Tuple[str, ...],
+                         retry_pos: Optional[Tuple[int, int]] = None) -> bool:
+        """点击右键菜单项（主窗口树 → 浮层窗口 → 有界 OCR）。
+
+        ``retry_pos``：菜单完全没弹出时补一次右键的坐标。菜单已经打开时
+        **绝不补右键**——菜单就弹在右键坐标处，再右键会点到菜单项里。
+        """
+        if self._menu_click(keywords):
+            return True
+        if self._context_menu_open():
+            return self._ocr_click_menu_item(keywords)
+        if retry_pos is None:
+            return False
+        self._set_cursor(*retry_pos)
+        time.sleep(0.2)
+        self._right_click()
+        time.sleep(0.8)
+        if self._menu_click(keywords):
+            return True
+        if self._context_menu_open():
+            return self._ocr_click_menu_item(keywords)
+        return False
+
     @staticmethod
     def _key_esc() -> None:
         """按一次 Esc（关右键菜单）；单独抽出便于测试打桩，不发真实按键。"""
@@ -1742,17 +1914,69 @@ class WeChatUIA:
         except Exception:
             pass
 
+    def _menu_popup_windows(self) -> list:
+        """确认是右键菜单的浮层窗口（UIA 类名含 Menu 或含菜单项节点）。"""
+        menus = []
+        for popup in self._wechat_popup_windows():
+            try:
+                cn = popup.ClassName or ""
+            except Exception:
+                cn = ""
+            if "Menu" in cn:
+                menus.append(popup)
+            elif self._menu_item_nodes(popup):
+                menus.append(popup)
+        return menus
+
+    def _context_menu_open(self) -> bool:
+        """右键菜单是否处于打开状态（浮层窗口或主窗口树内的菜单节点）。
+
+        微信 4.x 的消息右键菜单是**独立顶层浮层窗口**（``mmui::XMenu``），
+        不在主窗口子树里；单看 ``_uia_find_menu_item("")`` 会漏判。
+        """
+        if self._wechat_popup_windows():
+            return True
+        return self._uia_find_menu_item("") is not None
+
+    def _close_context_menu(self) -> None:
+        """关闭右键菜单（不发 Esc，避免误隐藏微信主窗口）。
+
+        微信主窗口在「没有菜单」时收到 Esc 会隐藏到系统托盘（2026-11-28
+        实测：私聊引用失败后窗口被藏、界面持续报「微信窗口不可用」）。
+        这里改为点一下聊天输入框——点击菜单外的任意位置即可关闭菜单，
+        而输入框本来就是下一步要操作的控件，最坏情况也无副作用。只有
+        确认是菜单浮层（``mmui::XMenu``）且输入框不可用时才退回 Esc。
+        """
+        if not self._context_menu_open():
+            return
+        try:
+            e = self._chat_input()
+        except Exception:
+            e = None
+        if e is not None:
+            try:
+                r = e.BoundingRectangle
+                self._set_cursor((r.left + r.right) // 2, r.bottom - 12)
+                time.sleep(0.12)
+                self._left_click()
+                time.sleep(0.2)
+            except Exception:
+                pass
+            return
+        if self._menu_popup_windows():
+            self._key_esc()
+            time.sleep(0.2)
+
     def dismiss_quote_menu(self) -> None:
         """UIA 引用失败后的现场清理（**不再降级 OCR**）。
 
         旧流程在「菜单没弹出 / 菜单项没识别到」时直接降级 OCR，此时右键
         菜单可能仍开着、消息列表可能停在历史消息处，实测会连续「未检测到
         输入框」、右键点到历史消息、找不到「引用」菜单项，白等 20~30 秒。
-        现在发送链路 fail-closed 直接判失败，这里按 Esc 关菜单并滚回最新，
-        只是给**下一次**操作留一个干净的起点。
+        现在发送链路 fail-closed 直接判失败，这里只关掉**确实还开着**的
+        菜单并滚回最新，给下一次操作留一个干净的起点。
         """
-        self._key_esc()
-        time.sleep(0.2)
+        self._close_context_menu()
         try:
             lst = self._message_list()
             if lst is None:
@@ -1801,7 +2025,13 @@ class WeChatUIA:
         顺序是硬约束：清草稿必须在右键引用**之前**（此时还没有引用卡片），
         引用之后绝不能再 Ctrl+A/Delete，否则引用块会被一起删掉，发出去的
         就变成普通消息。抽出这一步是为了让「引用 + @」组合复用同一条路径。
+
+        ``target_text=None`` 表示引用「最新一条**对方**消息」：微信不支持
+        引用自己发送的消息（右键菜单没有「引用」项），私聊里自己刚回复过
+        时，右键字面最新一条必然失败（2026-11-28 实测：私聊引用失败后
+        窗口还被 Esc 清理误隐藏）。
         """
+        self._last_quote_error = ""
         e0 = self._chat_input()
         if e0 is not None:
             self._clear_input(e0)
@@ -1811,33 +2041,36 @@ class WeChatUIA:
             if pos is None:
                 wxlog.debug("引用目标未在消息列表中定位到：%s",
                             (target_text or "")[:30])
+                self._last_quote_error = "未在消息列表中定位到要引用的消息"
                 return None
         else:
-            pos = self._right_click_latest_row(None)
+            pos = self._right_click_latest_row(None, incoming_only=True)
         if not pos:
+            self._last_quote_error = (
+                "没有可引用的对方消息（最新一条可能是您自己发送的，"
+                "微信不支持引用自己的消息）")
             return None
-        if not self._menu_click(("引用", "Quote")):
-            # 菜单没弹出来时再右键一次，避免首击落在消息空白处
-            self._set_cursor(*pos)
-            time.sleep(0.2)
-            self._right_click()
-            time.sleep(0.8)
-            if not self._menu_click(("引用", "Quote")):
-                wxlog.debug("引用失败：已右键消息行但两次都没找到「引用」菜单项"
-                            "（菜单未弹出或控件树未物化）")
-                try:
-                    from wechatauto.ui.component import Menu
-                    Menu(self).close()
-                except Exception:
-                    pass
-                return None
+        if not self._click_menu_item(("引用", "Quote"), retry_pos=pos):
+            wxlog.debug("引用失败：右键消息行后没有找到「引用」菜单项"
+                        "（浮层窗口 %d 个）",
+                        len(self._wechat_popup_windows()))
+            self._close_context_menu()
+            self._last_quote_error = (
+                "右键菜单里没有「引用」项（该消息可能不支持引用，"
+                "或最新一条不是对方发送的）")
+            return None
         time.sleep(0.5)
         e = self._chat_input()
         if e is None:
+            self._last_quote_error = "引用卡片已建立，但未找到输入框"
             return None
         # 点击菜单后焦点可能落在消息区：先把光标放回输入框末尾
         self._focus_input_end(e)
         return e
+
+    def last_quote_error(self) -> str:
+        """最近一次引用准备/发送的失败原因（空串 = 没有错误）。"""
+        return getattr(self, "_last_quote_error", "")
 
     def quote_message(self, text: str, who: Optional[str] = None,
                       target_text: Optional[str] = None) -> bool:
@@ -1851,11 +2084,15 @@ class WeChatUIA:
             text: 要发送的正文
             who: 目标会话（None = 当前已打开会话）
             target_text: 要引用的消息文本片段；None = 引用最新一条
+                **对方发送**的消息（微信不支持引用自己的消息）
         """
+        self._last_quote_error = ""
         if not self.ensure_window():
+            self._last_quote_error = "微信窗口不可用"
             return False
         if who and not self.same_chat(self.current_chat(), who):
             if not self.open_chat(who):
+                self._last_quote_error = f"无法打开会话「{who}」"
                 return False
             time.sleep(0.5)
         e = self._prepare_quote(target_text)
@@ -1863,11 +2100,13 @@ class WeChatUIA:
             return False
         # 草稿里已经有「引用卡片」，这里绝不能再 Ctrl+A/Delete
         if not self._paste_append(e, text):
+            self._last_quote_error = "引用卡片已建立，但正文写入输入框失败"
             return False
         time.sleep(0.2)
         try:
             e.SendKeys("{Enter}", waitTime=0.05)
         except Exception:
+            self._last_quote_error = "引用消息已填充，但发送按键失败"
             return False
         return True
 
@@ -2062,7 +2301,8 @@ class WeChatUIA:
         ``quote=True`` 时先建立引用卡片，再在同一个草稿里 @ ——微信允许
         引用与 @ 共存。引用准备由 :meth:`_prepare_quote` 完成，它内部会
         在**引用之前**清草稿；引用之后不能清空，否则引用卡片会被删掉。
-        ``quote_target_text=None`` 表示引用最新一条，字符串表示按文本定位。
+        ``quote_target_text=None`` 表示引用最新一条**对方**消息（微信不
+        支持引用自己的消息）。
         """
         names = [m.strip() for m in (members or []) if m and m.strip()]
         if not names:
@@ -2265,11 +2505,36 @@ class WeChatUIA:
                     return True
         return False
 
-    def _latest_message_row(self):
+    def _row_content_center_x(self, r) -> Optional[int]:
+        """消息行内非背景内容的水平重心（绝对坐标；截图失败返回 None）。
+
+        微信消息行 rect 是全宽：对方消息内容靠左、自己发送的靠右。方向
+        判定与右键落点共用本方法（方向不能按半个屏幕估算，必须在行内
+        实测，否则自己气泡偏右时点击会落到气泡外）。
+        """
+        try:
+            from PIL import ImageGrab as IG
+            import numpy as np
+            img = IG.grab(bbox=(r.left, r.top, r.right, r.bottom))
+            arr = np.array(img.convert("RGB"))
+            bg = (arr.max(axis=2) > 235) & ((arr.max(axis=2) - arr.min(axis=2)) < 22)
+            colc = (~bg).sum(axis=0)
+            total = int(colc.sum())
+            if total < 20:
+                return None
+            return int(r.left + sum(x * colc[x] for x in range(len(colc))) / total)
+        except Exception:
+            return None
+
+    def _latest_message_row(self, incoming_only: bool = False):
         """取可视区最底部（最新）的消息行 (控件, 矩形)；读不到返回 None。
 
         时间分隔行（ChatItemView）与系统提示行不算消息；高度 <40px 的行是
         尚未布局完的占位，右键会落到空白处，一并跳过。
+
+        ``incoming_only=True`` 时只返回对方发送的行（内容靠左）：微信
+        不支持引用自己发送的消息，私聊里「引用最新一条」在自己刚回复过
+        时右键到自己的气泡，菜单没有「引用」必然失败（2026-11-28 实测）。
         """
         lst = self._message_list()
         if lst is None:
@@ -2291,10 +2556,26 @@ class WeChatUIA:
         if not candidates:
             return None
         # 最新消息在可视区底部（消息列表打开即定位在最新），取 bottom 最大者
-        return max(candidates, key=lambda t: t[1].bottom)
+        candidates.sort(key=lambda t: t[1].bottom, reverse=True)
+        if not incoming_only:
+            return candidates[0]
+        for ch, r in candidates:
+            cx = self._row_content_center_x(r)
+            if cx is None:
+                continue
+            if cx < (r.left + r.right) // 2:
+                return (ch, r)
+        wxlog.debug("可视区内没有对方发送的消息行（最新是自发消息），"
+                    "无法建立引用")
+        return None
 
-    def _right_click_latest_row(self, who: Optional[str] = None) -> Optional[Tuple[int, int]]:
-        """打开会话并右键最新一条消息行，返回气泡内右键坐标 (x, y)；失败返回 None。"""
+    def _right_click_latest_row(self, who: Optional[str] = None,
+                                incoming_only: bool = False) -> Optional[Tuple[int, int]]:
+        """打开会话并右键最新一条消息行，返回气泡内右键坐标 (x, y)；失败返回 None。
+
+        ``incoming_only=True``：跳过自己发送的消息（微信不支持引用自己的
+        消息），供引用回复使用；撤回自己的消息仍用默认的 False。
+        """
         if not self.ensure_window():
             return None
         if who and not self.current_chat() == who:
@@ -2306,32 +2587,20 @@ class WeChatUIA:
         # 绝不降级成「不引用直接发」）。
         target = None
         for attempt in range(_LATEST_ROW_ATTEMPTS):
-            target = self._latest_message_row()
+            target = self._latest_message_row(incoming_only=incoming_only)
             if target is not None:
                 break
             if attempt < _LATEST_ROW_ATTEMPTS - 1:
                 time.sleep(_LATEST_ROW_WAIT)
         if target is None:
-            wxlog.debug("引用最新一条失败：消息列表连续 %d 次读空"
-                        "（窗口可能刚恢复或控件树未就绪）",
+            wxlog.debug("引用最新一条失败：连续 %d 次没读到可引用的消息行"
+                        "（窗口可能刚恢复、控件树未就绪，或最新是自发消息）",
                         _LATEST_ROW_ATTEMPTS)
             return None
         ch, r = target
         # 消息行内取内容重心 x（self 靠右、friend 靠左），y 取行垂直中心
-        try:
-            from PIL import ImageGrab as IG
-            img = IG.grab(bbox=(r.left, r.top, r.right, r.bottom))
-            import numpy as np
-            arr = np.array(img.convert("RGB"))
-            bg = (arr.max(axis=2) > 235) & ((arr.max(axis=2) - arr.min(axis=2)) < 22)
-            colc = (~bg).sum(axis=0)
-            total = int(colc.sum())
-            if total >= 20:
-                cx = sum(x * colc[x] for x in range(len(colc))) / total
-                cx = int(r.left + cx)
-            else:
-                cx = (r.left + r.right) // 2
-        except Exception:
+        cx = self._row_content_center_x(r)
+        if cx is None:
             cx = (r.left + r.right) // 2
         cy = (r.top + r.bottom) // 2
         self._set_cursor(cx, cy)
@@ -2341,40 +2610,89 @@ class WeChatUIA:
         return (cx, cy)
 
     def _uia_find_menu_item(self, name_sub: str, max_depth: int = 6):
-        """在主窗口树内查找菜单项控件（UIA 方案）。
+        """查找右键菜单项控件：先主窗口树，再微信浮层窗口。
 
-        微信 4.x 右键菜单在热激活后物化为 UIA 节点：``mmui::XMenu`` 下挂
-        ``mmui::XMenuView``（Name 即菜单文字）。只遍历主窗口子树，避免
-        触发 Windows UIA 根遍历的系统挂起 bug。返回匹配的控件或 None。
+        微信 4.x 的消息右键菜单是独立顶层浮层窗口（``mmui::XMenu`` /
+        ``MenuItemControl``，见 ``_wechat_popup_windows``），主窗口树里
+        根本没有菜单节点；只扫主窗口会导致「引用」永远点不到（撤回的
+        UIA 路径同样从未命中，一直靠 OCR 兜底掩盖）。两处都要求控件
+        可见（``IsOffscreen`` 为 False），避免命中关闭后的残留节点。
+        返回匹配的控件或 None。
         """
-        w = self._win
+
+        def visible(c) -> bool:
+            try:
+                return not c.IsOffscreen
+            except Exception:
+                return True
+
+        w = getattr(self, "_win", None)
+        if w is not None:
+            found = [None]
+
+            def walk(c, d=0):
+                if found[0] is not None or d > max_depth:
+                    return
+                try:
+                    children = c.GetChildren()
+                except Exception:
+                    return
+                for ch in children:
+                    try:
+                        nm = ch.Name or ""
+                        cn = ch.ClassName or ""
+                    except Exception:
+                        nm = cn = ""
+                    if cn == "mmui::XMenuView" and name_sub in nm and visible(ch):
+                        found[0] = ch
+                        return
+                    walk(ch, d + 1)
+
+            try:
+                walk(w)
+            except Exception:
+                pass
+            if found[0] is not None:
+                return found[0]
+        popups = self._wechat_popup_windows()
+        for popup in popups:
+            for ch in self._menu_item_nodes(popup):
+                try:
+                    if name_sub in (ch.Name or "") and visible(ch):
+                        return ch
+                except Exception:
+                    continue
+        if popups:
+            # 菜单确实在浮层里但 UIA 没暴露可匹配的菜单项 → 交给 OCR 兜底
+            return None
+        return self._deep_menu_item(name_sub)
+
+    def _deep_menu_item(self, name_sub: str, max_depth: int = 12):
+        """主窗口深层子树里的菜单项（菜单嵌在聊天视图里的版本）。
+
+        聊天视图本身就在主窗口第 7 层开外，浅层遍历（``max_depth=6``）
+        根本到不了；用 ``searchFromControl`` 限定在主窗口内做一次定向
+        搜索，命中后要求控件可见，避免命中关闭后的残留节点。
+        """
+        w = getattr(self, "_win", None)
         if w is None:
             return None
-        found = [None]
-
-        def walk(c, d=0):
-            if found[0] is not None or d > max_depth:
-                return
-            try:
-                children = c.GetChildren()
-            except Exception:
-                return
-            for ch in children:
-                try:
-                    nm = ch.Name or ""
-                    cn = ch.ClassName or ""
-                except Exception:
-                    nm = cn = ""
-                if cn == "mmui::XMenuView" and name_sub in nm:
-                    found[0] = ch
-                    return
-                walk(ch, d + 1)
-
+        kwargs = dict(searchFromControl=w, searchDepth=max_depth,
+                      ClassName="mmui::XMenuView")
+        if name_sub:
+            kwargs["RegexName"] = f".*{re.escape(name_sub)}.*"
         try:
-            walk(w)
+            ctrl = auto.Control(**kwargs)
+            if ctrl is None or not ctrl.Exists(0, 0):
+                return None
+            try:
+                if ctrl.IsOffscreen:
+                    return None
+            except Exception:
+                pass
+            return ctrl
         except Exception:
             return None
-        return found[0]
 
     def _uia_click_menu_item(self, ctrl) -> bool:
         """通过 UIA Invoke/LegacyIAccessible 或鼠标点击菜单项控件。"""
