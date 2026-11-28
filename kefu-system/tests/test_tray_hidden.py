@@ -286,12 +286,14 @@ class TestTrayHiddenSender:
             is_alive=lambda: True,
             is_tray_hidden=lambda: False,
             _uia=None,
-            warm_up=lambda timeout=30.0: warmed.append(timeout) or True)
+            warm_up=lambda timeout=30.0, allow_rearm=True: warmed.append(
+                (timeout, allow_rearm)) or True)
         st._ensure_gui = lambda quiet=False: gui
         st._gui_lock = SimpleNamespace(acquire=lambda timeout=0.5: True,
                                        release=lambda: None)
         assert st._prewarm_once() == "warmed"
-        assert warmed == [30.0]
+        # 巡检短超时 + 禁止重触发（2026-11-28 打包版配额烧光回归）
+        assert warmed == [(12.0, False)]
 
     def test_tray_failure_message_is_actionable(self):
         tray_gui = SimpleNamespace(last_open_error=lambda: "tray_hidden",

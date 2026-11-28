@@ -1677,7 +1677,8 @@ class WeChatGUI:
             detail = ''
         return f'{default}：{detail}' if detail else default
 
-    def warm_up(self, timeout: float = 30.0) -> bool:
+    def warm_up(self, timeout: float = 30.0,
+                allow_rearm: bool = True) -> bool:
         """启动预热：把 UIA 引擎建好、控件树物化，**不激活窗口、不动前后台**。
 
         微信 4.x 的 UIA 树首次物化实测 15~30 秒（4.1.15 还要先热激活补丁），
@@ -1690,6 +1691,11 @@ class WeChatGUI:
         也不受打扰。失败时 ``_uia_tried`` 保持 False，第一次发送会再走完整
         的 ``ensure_window`` 流程；控件树仍不可用则按 fail-closed 直接判
         失败（不做截图/OCR 兜底）。
+
+        Args:
+            allow_rearm: 后台预热巡检传 False，禁止 1→0→1 重触发（无人值守
+                轮询反复写 gate byte 会烧光限流配额、写挂 Qt 输入；详见
+                :meth:`WeChatUIA.warm_tree`）。
 
         Returns:
             True = 引擎就绪（发送可立即开始）；False = 微信未启动或树未
@@ -1709,7 +1715,11 @@ class WeChatGUI:
             wxlog.debug('预热跳过（UIA 依赖不可用）：%s', e)
             return False
         eng = self._new_uia_engine()
-        if not eng.warm_tree(timeout=timeout):
+        try:
+            ok = eng.warm_tree(timeout=timeout, allow_rearm=allow_rearm)
+        except TypeError:      # 旧签名/测试桩只接受 timeout
+            ok = eng.warm_tree(timeout=timeout)
+        if not ok:
             return False                        # _uia_tried 保持 False
         self._uia = eng
         self._uia_tried = True
@@ -1745,8 +1755,12 @@ class WeChatGUI:
         self._last_open_error = ''
         uia = self._get_uia()
         if uia is None:
-            self._last_open_error = 'uia_unavailable'
-            wxlog.warning('打开会话 %s：UIA 不可用，fail-closed 直接返回失败', name)
+            # 限流生效时别再说「可能托盘/最小化」——真实原因在
+            # WeChatUIA._throttled_* 里，交给 last_open_error() 归一成
+            # tree_throttled，前端提示用户等冷却或重启微信。
+            self._last_open_error = self.last_open_error() or 'uia_unavailable'
+            wxlog.warning('打开会话 %s：UIA 不可用（%s），fail-closed 直接返回失败',
+                          name, self._last_open_error)
             if OCR_FALLBACK_ENABLED:
                 return self._open_chat_ocr(name)
             return False

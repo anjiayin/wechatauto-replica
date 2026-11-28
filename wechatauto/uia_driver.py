@@ -110,6 +110,19 @@ SECTION_HEADERS = {
     "企业微信联系人", "朋友圈", "搜索网络结果", "企业微信",
 }
 
+# 主窗口顶栏导航（聊天/通讯录/收藏/朋友圈...）：微信 4.x 为
+# mmui::MainTabBar，第一个按钮即「聊天」页。用户停在收藏/通讯录/发现等
+# 页面时，左栏没有全局搜索框或搜索只在当前页面内生效，发送链路会一直
+# 「未搜到目标」；发送前必须先切回聊天页（2026-11-28 实机日志证实）。
+CHAT_TAB_BAR_CLASS = "mmui::MainTabBar"
+CHAT_TAB_BAR_AIDS = ("main_tabbar", "MainView.main_tabbar")
+CHAT_TAB_NAMES = ("聊天", "微信", "Chats", "Weixin", "WeChat")
+# 聊天页标志：会话列表容器。存在即说明主窗口停在聊天页。
+CHAT_MASTER_CLASS = "mmui::ChatMasterView"
+# 微信自身的图片/视频预览浮窗（朋友圈/聊天里点开大图）。类名含
+# PreviewWindow；与主窗口同进程，会盖在搜索框上方截走物理点击。
+PREVIEW_WIN_CLASS_KEYWORD = "PreviewWindow"
+
 # ---------------------------------------------------------------------------
 # 无障碍“屏幕阅读器”系统标志 / Qt accessibility gate
 # ---------------------------------------------------------------------------
@@ -943,6 +956,7 @@ class WeChatUIA:
                 # gate byte；必须整体跳过，否则后台巡检会把 Qt 输入写挂。
                 wxlog.warning('微信在托盘，ensure_window 跳过唤醒分支（不写补丁）')
                 return False
+            self._last_patch_written = False
             if self._login_window() is not None:
                 self._auto_login()
             elif self._wechat_hwnds():
@@ -956,8 +970,28 @@ class WeChatUIA:
             else:
                 self._set_screen_reader_flag(True)
                 self.wake()
+            # 本窗口内是否真写过 gate byte（_wait_main 内部的补丁也算）
+            patched = bool(getattr(self, '_last_patch_written', False))
             self._wait_main(timeout)
-            return self._win is not None
+            patched = patched or bool(
+                getattr(self, '_last_patch_written', False))
+            if self._win is None:
+                return False
+            if not require_ready or self.is_ready():
+                return True
+            # 只有刚写过 gate byte 时，Qt 才可能正在后台重建 MainView：
+            # 实测根窗口出现后子控件还要 0.2~5s（2026-11-28 18:20 打包版
+            # 日志：补丁成功 2s 后找 MainTabBar 仍为空，3s 后本次发送被判
+            # tree_not_ready，而下一轮补丁后同一页面 4s 就切页成功）。
+            # 根窗口类名出现 ≠ 控件树可用，这里补等物化再放行，最多 10s；
+            # 没写补丁（gate 已 1/限流）时干等无益，立即按现状返回。
+            if patched:
+                deadline = time.time() + 10.0
+                while time.time() < deadline:
+                    if self.is_ready():
+                        return True
+                    time.sleep(0.25)
+            return self.is_ready()
         except UIATimeout:
             return False
         except Exception as e:
@@ -1054,6 +1088,131 @@ class WeChatUIA:
             if e.Exists(1.0, 0.2):
                 return e
         return None
+
+    # ------------------------------------------------------------ 页面/遮挡归一
+    def _chat_page_visible(self, win) -> bool:
+        """主窗口当前是否停在「聊天」页（会话列表页）。"""
+        if win is None:
+            return False
+        try:
+            return bool(win.GroupControl(
+                ClassName=CHAT_MASTER_CLASS).Exists(0.5, 0.1))
+        except Exception:
+            return False
+
+    def _chat_tab_button(self, win):
+        """定位顶栏的「聊天」按钮；找不到返回 None。"""
+        tabbar = None
+        for find in (lambda: win.ToolBarControl(ClassName=CHAT_TAB_BAR_CLASS),
+                     lambda: win.ToolBarControl(
+                         AutomationId=CHAT_TAB_BAR_AIDS[0]),
+                     lambda: win.ToolBarControl(
+                         AutomationId=CHAT_TAB_BAR_AIDS[1])):
+            try:
+                tb = find()
+                if tb.Exists(0.3, 0.1):
+                    tabbar = tb
+                    break
+            except Exception:
+                continue
+        if tabbar is None:
+            return None
+        for nm in CHAT_TAB_NAMES:
+            try:
+                b = tabbar.ButtonControl(Name=nm)
+                if b.Exists(0.2, 0.1):
+                    return b
+            except Exception:
+                continue
+        # 非中英文语言包兜底：聊天页永远是顶栏第一个按钮
+        try:
+            for c in tabbar.GetChildren():
+                if (c.ControlTypeName or "") == "ButtonControl":
+                    return c
+        except Exception:
+            pass
+        return None
+
+    def _ensure_chat_tab(self, win=None, force: bool = False) -> bool:
+        """把主窗口切回「聊天」页；返回切换后是否处于聊天页。
+
+        收藏/通讯录/发现/朋友圈等页面没有全局搜索框（或搜索只在当前页
+        内生效），`open_chat` 的搜索必然「未搜到目标」。优先 Invoke（不
+        依赖鼠标，窗口被部分遮挡也有效），不支持时退回物理点击。
+        """
+        win = win or self._win
+        if win is None:
+            return False
+        if not force and self._chat_page_visible(win):
+            return True
+        btn = self._chat_tab_button(win)
+        if btn is None:
+            wxlog.debug("切回聊天页失败：未找到 MainTabBar 聊天按钮")
+            return False
+        for how in ("invoke", "click"):
+            try:
+                if how == "invoke":
+                    pattern = btn.GetInvokePattern()
+                    if pattern is None:
+                        continue
+                    pattern.Invoke()
+                else:
+                    btn.Click()
+            except Exception:
+                continue
+            time.sleep(0.5)
+            if self._chat_page_visible(win):
+                wxlog.info("已把微信主窗口切回「聊天」页（%s）", how)
+                return True
+        return False
+
+    def _dismiss_preview_windows(self) -> int:
+        """关闭微信自身的图片/视频预览浮窗（朋友圈点开大图会盖住主窗口）。
+
+        预览窗与主窗口同属一个微信进程，``_minimize_blockers`` 只处理其它
+        进程的遮挡窗口（微信自身窗口不能最小化，Qt 会回收控件树）。预览窗
+        在上方时物理点击全部落到它身上，搜索框拿到空内容 → 「未搜到目标」。
+        这里只对类名含 PreviewWindow 的顶层窗口投递 WM_CLOSE（等价于点
+        右上角关闭大图），不动主窗口、不写 gate byte。
+        """
+        if not _HAS_WIN32 or self._win is None:
+            return 0
+        try:
+            pid = self._win.ProcessId
+        except Exception:
+            return 0
+        if not pid:
+            return 0
+        targets = []
+
+        def cb(h, _):
+            try:
+                if not win32gui.IsWindowVisible(h):
+                    return True
+                cls = win32gui.GetClassName(h) or ""
+                if PREVIEW_WIN_CLASS_KEYWORD not in cls:
+                    return True
+                if self._pid_from_hwnd(h) != pid:
+                    return True
+                targets.append(h)
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumWindows(cb, None)
+        except Exception:
+            return 0
+        for h in targets:
+            try:
+                win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
+            except Exception:
+                pass
+        if targets:
+            wxlog.info("已关闭微信图片/视频预览窗 %d 个（发送前清理遮挡）",
+                       len(targets))
+            time.sleep(0.3)
+        return len(targets)
 
     def _chat_input(self, win=None):
         win = win or self._win
@@ -1240,6 +1399,23 @@ class WeChatUIA:
             candidates = [c for c in candidates if c != kw] + [kw]
         return candidates
 
+    def _search_in_box(self, box, keywords: List[str], retries: int,
+                       prefer_openim: bool,
+                       openim_hint: str) -> Tuple[List[dict], str]:
+        """逐关键词在搜索框里搜索并采集候选；返回 (results, used_kw)。"""
+        for kw in keywords:
+            for _ in range(max(1, retries)):
+                self._paste_into(box, kw, clear=True)
+                time.sleep(0.8)
+                got = self._collect_results(
+                    kw, prefer_openim=prefer_openim,
+                    openim_hint=openim_hint,
+                    keep_freq=prefer_openim)
+                if got:
+                    return got, kw
+                time.sleep(0.4)
+        return [], (keywords[-1] if keywords else "")
+
     def open_chat(self, keyword: str, index: Optional[int] = None,
                   section: Optional[str] = None, retries: int = 2,
                   prefer_openim: bool = False,
@@ -1261,29 +1437,30 @@ class WeChatUIA:
         if not self.ensure_window():
             return False
         win = self._win
+        # 朋友圈点开大图时预览窗盖住主窗口：物理点击全部落空，先清遮挡。
+        self._dismiss_preview_windows()
+        # 非聊天页（收藏/通讯录/发现…）没有全局搜索框或只在页内搜索，
+        # 先切回聊天页，保证接下来的搜索走全局联系人搜索。
+        self._ensure_chat_tab(win)
         box = self._search_box(win)
+        if box is None:
+            # 切页后搜索框可能还没物化：强制再归一一次并重找。
+            self._ensure_chat_tab(win, force=True)
+            box = self._search_box(win)
         if box is None:
             return False
 
         keywords = self._resolve_search_keyword(keyword)
-        results = []
-        used_kw = keyword
-        for kw in keywords:
-            got = False
-            for attempt in range(max(1, retries)):
-                self._paste_into(box, kw, clear=True)
-                time.sleep(0.8)
-                got = self._collect_results(
-                    kw, prefer_openim=prefer_openim,
-                    openim_hint=openim_hint,
-                    keep_freq=prefer_openim)
-                if got:
-                    break
-                time.sleep(0.4)
-            if got:
-                results = got
-                used_kw = kw
-                break
+        results, used_kw = self._search_in_box(
+            box, keywords, retries, prefer_openim, openim_hint)
+        if not results:
+            # 空结果兜底：搜索框可能属于其它页面的局部搜索（例如收藏页
+            # 只搜收藏内容），切回聊天页清空重搜一轮再判失败。
+            self._ensure_chat_tab(win, force=True)
+            box = self._search_box(win)
+            if box is not None:
+                results, used_kw = self._search_in_box(
+                    box, keywords, retries, prefer_openim, openim_hint)
 
         if not results:
             return False
@@ -1488,7 +1665,8 @@ class WeChatUIA:
         except Exception:
             return False
 
-    def warm_tree(self, timeout: float = 30.0) -> bool:
+    def warm_tree(self, timeout: float = 30.0,
+                  allow_rearm: bool = True) -> bool:
         """预热控件树：只要求可访问性树就绪，**不激活窗口、不动前后台**。
 
         微信 4.x 的 UIA 树在被系统/微信自己回收后要重新物化，实测首次
@@ -1501,15 +1679,23 @@ class WeChatUIA:
         失败，必须走 ``_wake_and_wait_ready``（热激活补丁 + 等待物化）。
         否则预热在冷树场景下永远空转（2026-11-14 实测踩坑：预热日志一直
         「未完成」，首次发送仍然要付出完整物化耗时）。
+
+        Args:
+            allow_rearm: 后台预热巡检传 False，禁止 1→0→1 重触发。预热是
+                无人值守轮询，而重触发每次写 2 个 gate byte 并计入 5 次/
+                300s 限流配额——2026-11-28 18:06~18:13 打包版日志里巡检
+                在用户尚未发送时就连做 5 次重触发，把配额烧光后所有发送
+                直接判失败。发送路径仍保留重触发机会。
         """
         w = self._find_main()
         if w is not None:
             self._win = w
             if self.is_ready():
                 return True
-        return self._wake_and_wait_ready(timeout)
+        return self._wake_and_wait_ready(timeout, allow_rearm=allow_rearm)
 
-    def _wake_and_wait_ready(self, timeout: float = 30.0) -> bool:
+    def _wake_and_wait_ready(self, timeout: float = 30.0,
+                             allow_rearm: bool = True) -> bool:
         """热激活并等待控件树就绪（不主动置前，但必须保证窗口可见）。
 
         树物化的前提是窗口**可见**：用户把微信关到托盘/最小化后，光打补丁
@@ -1567,8 +1753,8 @@ class WeChatUIA:
                     wxlog.warning("等待控件树期间微信窗口又变为不可见，立即放弃")
                     return False
                 elapsed = time.time() - t0
-                if (not rearm_done and writes == 0 and elapsed >= 2.5
-                        and self._rearm_allowed()):
+                if (allow_rearm and not rearm_done and writes == 0
+                        and elapsed >= 2.5 and self._rearm_allowed()):
                     # gate=1 但树没物化：做唯一一次 0→1 脉冲强制重建。
                     self._wake_accessibility(rearm=True)
                     rearm_done = True
@@ -1578,7 +1764,10 @@ class WeChatUIA:
                         # 一次 rearm + 后续普通补丁 = 90s 内 4+ 次写入）。
                         writes += 2
                         wxlog.info("已对「gate=1 但树未物化」做一次受控重触发")
-                elif writes < WeChatUIA.MAX_WRITES_IN_WAIT:
+                elif writes < (WeChatUIA.MAX_WRITES_IN_WAIT if allow_rearm
+                               else 1):
+                    # 后台巡检（allow_rearm=False）最多补 1 个字节：它是无人
+                    # 值守轮询，写多了既没用又烧配额/伤 Qt 输入。
                     self._wake_accessibility()
                     if getattr(self, '_last_patch_written', False):
                         writes += 1

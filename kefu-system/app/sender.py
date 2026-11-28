@@ -172,8 +172,8 @@ class Sender:
         就结束，用户登录后的首次发送仍要付出 15~30 秒的树物化耗时（实测
         「打开会话 25.4s」的主体就是它）。因此改为常驻巡检：每轮检查
         「微信活着且引擎未就绪」才做一次 warm_up；warm 失败（微信活着但
-        树迟迟物化不了）按 15→30→60→120 秒退避，其余情况保持 15 秒轮询——
-        微信重启（rebind 清空引擎缓存）后也会再次自动预热。
+        树迟迟物化不了）按 15→30→60→…→300 秒退避，其余情况保持 15 秒
+        轮询——微信重启（rebind 清空引擎缓存）后也会再次自动预热。
 
         预热全程持 ``_gui_lock``——微信的 UIA provider 是单线程的，两个
         线程同时 ``ControlFromHandle``/``Exists`` 会互相排队，曾把一次发送
@@ -188,7 +188,7 @@ class Sender:
             except Exception:
                 logger.debug("微信预热巡检异常（忽略）", exc_info=True)
             if state == "failed":
-                interval = min(interval * 2, 120.0)
+                interval = min(interval * 2, 300.0)
             else:
                 interval = 15.0
             self._stop.wait(interval)
@@ -227,7 +227,14 @@ class Sender:
             return "failed"               # 发送正在占用窗口，稍后再试
         try:
             t0 = time.monotonic()
-            ok = gui.warm_up(timeout=30.0)
+            # 巡检禁用 1→0→1 重触发、最多补 1 个 gate byte（2026-11-28
+            # 18:06~18:13 实测：用户还没发送，巡检就连做 5 次重触发把
+            # 5 次/300s 配额烧光，之后所有发送直接判失败）。超时压到 12s，
+            # 树始终不物化时别长时间占着发送互斥锁。
+            try:
+                ok = gui.warm_up(timeout=12.0, allow_rearm=False)
+            except TypeError:          # 旧签名/测试桩只接受 timeout
+                ok = gui.warm_up(timeout=12.0)
             logger.info("微信预热%s（耗时 %.1fs）",
                         "完成（首次发送可立即开始）" if ok
                         else "未完成（微信就绪后会自动重试）",

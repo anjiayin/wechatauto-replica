@@ -155,10 +155,12 @@ class TestWarmTreeColdPath:
         monkeypatch.setattr(uia, "_find_main", lambda: next(findings, "main"))
         monkeypatch.setattr(uia, "is_ready", lambda: True)
         called = []
-        monkeypatch.setattr(uia, "_wake_and_wait_ready",
-                            lambda timeout: called.append(timeout) or True)
+        monkeypatch.setattr(
+            uia, "_wake_and_wait_ready",
+            lambda timeout, allow_rearm=True: called.append(
+                (timeout, allow_rearm)) or True)
         assert uia.warm_tree(timeout=30.0) is True
-        assert called == [30.0]  # 冷树必须走补丁等待路径
+        assert called == [(30.0, True)]  # 冷树必须走补丁等待路径
 
     def test_ready_tree_short_circuits(self, monkeypatch):
         """树已就绪：零操作直接成功，不碰补丁。"""
@@ -176,8 +178,19 @@ class TestWarmTreeColdPath:
         uia = self._uia()
         monkeypatch.setattr(uia, "_find_main", lambda: None)
         monkeypatch.setattr(uia, "_wake_and_wait_ready",
-                            lambda timeout: False)
+                            lambda timeout, allow_rearm=True: False)
         assert uia.warm_tree(timeout=30.0) is False
+
+    def test_background_warm_forwards_no_rearm(self, monkeypatch):
+        """巡检预热把 allow_rearm=False 一路传到等待路径（配额保护）。"""
+        uia = self._uia()
+        monkeypatch.setattr(uia, "_find_main", lambda: None)
+        seen = []
+        monkeypatch.setattr(
+            uia, "_wake_and_wait_ready",
+            lambda timeout, allow_rearm=True: seen.append(allow_rearm) or True)
+        assert uia.warm_tree(timeout=12.0, allow_rearm=False) is True
+        assert seen == [False]
 
 
 class TestPatchQuotaAccounting:

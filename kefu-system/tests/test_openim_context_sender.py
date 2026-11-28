@@ -139,8 +139,48 @@ def test_openim_self_message_still_me():
     assert wxdb.corp_calls == 0
 
 
-def test_friend_private_unchanged():
-    """普通好友私聊：仍按行内 sender_username 解析，不拼企业名。"""
+# ---------------------------------------------------------------------------
+# 普通好友私聊（多微信切换后 sender_username 映射错位，2026-11-28 反馈）
+# ---------------------------------------------------------------------------
+# 真机样本：会话 wxid_hu7azjb674f721（安佳胤）里对方消息 sender_id=64，
+# 行内按 message_resource.SenderName2Id 映射成 wxid_3akl98wezb6922
+# （「A梵听 جينغ」），而该消息所在 message_0.db 自己的 Name2Id 里
+# id=64 正是 wxid_hu7azjb674f721（安佳胤）。
+WRONG_FRIEND = "wxid_3akl98wezb6922"
+
+
+def test_private_friend_context_uses_session_partner():
+    """普通好友私聊上下文：发送方显示会话对端，不用行内错位映射。"""
+    msgs = [
+        make_message(1, sender_id=64, sender=WRONG_FRIEND,
+                     content="我要一块车窗玻璃"),
+        make_message(2, sender_id=2, sender="", content="好的"),
+    ]
+    wxdb = StubWxDb(msgs, names={FRIEND: "安佳胤",
+                                 WRONG_FRIEND: "A梵听 جينغ"})
+    svc = make_service(wxdb)
+    out, error = svc.get_messages_with_error(FRIEND, limit=5)
+    assert error == ""
+    assert [m["sender_name"] for m in out] == ["安佳胤", "我"]
+
+
+def test_private_chat_ignores_row_sender_mapping():
+    """_resolve_row_sender 私聊分支按会话 username 解析，不信任行内 ID。"""
+    svc = make_service(StubWxDb([], names={FRIEND: "安佳胤",
+                                            WRONG_FRIEND: "A梵听 جينغ"}))
+    name, clean = svc._resolve_row_sender(
+        FRIEND, "我要一块车窗玻璃", WRONG_FRIEND, 64)
+    assert (name, clean) == ("安佳胤", "我要一块车窗玻璃")
+
+
+def test_friend_private_uses_session_partner_without_corp():
+    """普通好友私聊：只按会话 username 解析，不拼企业名。
+
+    2026-11-28 用户反馈：多微信切换后行内 sender_username 映射错位
+    （上下文显示「A梵听 جينغ」而非「安佳胤」）。私聊发送人只可能是
+    「我」或会话对端，与实时监听口径一致（旧断言「按行内 ID 解析」
+    正是本次要修掉的行为）。
+    """
     wxdb = StubWxDb(
         [make_message(1, sender=FRIEND_OTHER, content="你好")],
         names={FRIEND: "会话昵称", FRIEND_OTHER: "张三"},
@@ -149,7 +189,7 @@ def test_friend_private_unchanged():
     svc = make_service(wxdb)
     out, error = svc.get_messages_with_error(FRIEND, limit=5)
     assert error == ""
-    assert out[0]["sender_name"] == "张三"
+    assert out[0]["sender_name"] == "会话昵称"
     assert wxdb.corp_calls == 0
 
 

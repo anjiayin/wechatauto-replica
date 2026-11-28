@@ -3066,9 +3066,10 @@ class WeChatService:
         群聊与实时监听同一权威口径：正文首部「发送者ID:\\n」前缀优先
         （SenderName2Id 映射不可靠，反馈 6 群昵称错乱）。只有前缀能对上
         群成员（wxid 或群显示名）时才剥离，避免误伤「9:30 开会」这类正文；
-        私聊发送人即会话对方，sender_id=2 为自己；企业微信/客服私聊按会话
-        username 补上企业简称（行内 sender_username 是内部工作号，不可用作
-        展示名，详见下方分支注释）。
+        私聊发送人即会话对方，sender_id=2 为自己；私聊一律按会话 username
+        解析对端显示名（行内 sender_username 来自不可靠的 SenderName2Id
+        映射，不可用作展示名，详见下方分支注释；企业微信/客服另补企业
+        简称）。
 
         批次 6 需求 6：群聊里自己发送的消息 ``sender_id = 2`` 且正文**没有**
         前缀，此前会落到 ``candidate or "未知用户"`` 分支显示「未知用户」。
@@ -3086,10 +3087,17 @@ class WeChatService:
                 # sender_username=25984983893057228@openim（昵称「杜飞」）。
                 # 微信 UI、商机列表与详情头部都按「会话对端」显示，这里必须
                 # 同口径：用会话 username 解析「昵称@企业简称」，不能用行内
-                # 的 fallback_wxid。普通好友私聊仍按原逻辑取行内发送人。
+                # 的 fallback_wxid。
                 name = self.display_name_with_corp(username)
             else:
-                name = self.get_display_name(fallback_wxid) if fallback_wxid else ""
+                # 普通私聊同理（2026-11-28 反馈：上下文发送方显示成无关好友
+                # 「A梵听」，应为「安佳胤」）：微信 4.x 的 real_sender_id
+                # 属于每个 message_N.db 自己 Name2Id 表的 rowid 命名空间，
+                # 行内 sender_username 却按 message_resource.SenderName2Id
+                # 解析——两套 rowid 互不相干（实测同一 id=64 在一处是安佳胤、
+                # 另一处是 A梵听），多账号切换后错位更明显。私聊发送人只可能
+                # 是「我」或会话对端，与实时监听口径一致，按 username 解析。
+                name = self.get_display_name(username)
             return name or "我", text
         # 群聊里 sender_id=2 = 自己发送：无前缀，显示「我」
         if sender_id in (2, "2"):

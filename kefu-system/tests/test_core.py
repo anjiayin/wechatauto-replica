@@ -1282,14 +1282,15 @@ class TestSenderPrewarm:
             def is_alive(self):
                 return True
 
-            def warm_up(self, timeout=30.0):
-                calls.append(timeout)
+            def warm_up(self, timeout=30.0, allow_rearm=True):
+                calls.append((timeout, allow_rearm))
                 return True
 
         sender = self._sender()
         sender._gui = FakeWarmGUI()
         assert sender._prewarm_once() == "warmed"
-        assert calls and calls[0] == 30.0
+        # 后台巡检：短超时 + 禁止 1→0→1 重触发（配额/写内存保护）
+        assert calls == [(12.0, False)]
 
     def test_prewarm_once_engine_ready_zero_cost(self):
         class FakeReadyGUI:
