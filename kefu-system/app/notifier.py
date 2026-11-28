@@ -82,6 +82,12 @@ class Notifier:
         """当前未读商机 id 快照（列表页批量标注用）。"""
         return set(self._unread)
 
+    @property
+    def client_count(self) -> int:
+        """当前在线的前端 WS 连接数（0 = 操作页面未打开）。"""
+        with self._lock:
+            return len(self._clients)
+
     def clear_unread(self, opportunity_id: int) -> bool:
         """清除未读；确实清除了返回 True。"""
         if opportunity_id in self._unread:

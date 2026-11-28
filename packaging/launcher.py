@@ -13,6 +13,8 @@
     KEFU_DATA_DIR/ASSETS_DIR/VERSION_FILE、KEFU_DELIVERY_SEED、DLL 搜索目录
   - 升级接力：轮询 data/update_handoff.json，增量升级装完自动原地重启后端，
     全量升级确认后弹托盘气泡「已升级到 x.y.z」（见 _start_handoff_watcher）
+  - 新商机系统通知：轮询 data/native_alert.json，弹托盘气泡；点击气泡用
+    默认浏览器打开 ?opportunity=<id> 深链（见 _start_alert_watcher）
   - 日志除 GUI 窗口外同步落 data/launcher.log（pythonw 没有控制台，这是事后
     唯一取证入口）
 
@@ -56,6 +58,13 @@ HANDOFF_TTL_SEC = 15 * 60          # 与 app/update_core.HANDOFF_TTL_SEC 一致
 HANDOFF_POLL_SEC = 2.0
 KIND_RESTART = "restart"
 KIND_NOTIFY = "notify"
+# 新商机桌面提醒（写入方 app/desktop_alert.py，schema 改动必须两边同步）。
+# TTL 只防「后端单独跑过又启动托盘」时的陈旧提醒；正常 ≤1s 就会消费掉。
+ALERT_FILE_NAME = "native_alert.json"
+ALERT_TTL_SEC = 2 * 60
+ALERT_POLL_SEC = 1.0
+# Shell_NotifyIcon 回调：用户点击气泡（win32con 未必导出，显式定义）
+NIN_BALLOONUSERCLICK = 0x0405
 
 def _fatal(msg: str) -> None:
     """pythonw 无控制台：致命错误写文件，便于排查。"""
@@ -83,6 +92,10 @@ _state = {
     # 只执行本次启动之后写入的接力请求：更早的请求属于上一个启动器进程，
     # 照它重启会杀掉刚起来的后端（还可能打断正在进行的下载/安装）。
     "started_at": int(time.time()), "exiting": False,
+    # 当前气泡点击要打开的深链；每次弹气泡覆盖（普通升级提示则为空 = 打开首页）
+    "alert_url": "",
+    # 已消费的提醒 (id, at)：文件删除失败时防止每秒重复弹同一条
+    "last_alert_key": None,
 }
 
 
@@ -521,6 +534,11 @@ def _ui_url(port: int) -> str:
     return f"http://127.0.0.1:{port}/"
 
 
+def _opportunity_url(port: int, opportunity_id: int) -> str:
+    """商机深链：前端启动时解析该参数并打开对应详情抽屉。"""
+    return f"{_ui_url(port)}?opportunity={opportunity_id}"
+
+
 def _port_ready(port: int, timeout: float = 30.0) -> bool:
     deadline = time.monotonic() + timeout
     url = _status_url(port)
@@ -541,6 +559,17 @@ def _open_ui():
     url = _ui_url(_state["port"])
     webbrowser.open(url)
     _state["opened"] = True
+
+
+def _open_alert_target():
+    """点击系统通知：有商机深链就打开对应详情，否则回到操作界面。"""
+    url = str(_state.get("alert_url") or "")
+    _state["alert_url"] = ""
+    if url:
+        webbrowser.open(url)
+        _state["opened"] = True
+    else:
+        _open_ui()
 
 
 # ---------------------------------------------------------------------------
@@ -668,12 +697,17 @@ def _take_handoff(now_ts: int | None = None) -> dict | None:
     return raw
 
 
-def _notify(title: str, text: str) -> bool:
+def _notify(title: str, text: str, url: str = "") -> bool:
     """托盘气泡提示（Vista 起的 Shell_NotifyIcon NIF_INFO）。
 
     pywin32 的 Shell_NotifyIcon 只吃 6 元组（NIM_ADD 那套），带不了 szInfo/
     szInfoTitle/dwInfoFlags，所以气泡必须用 ctypes 手搓 NOTIFYICONDATAW。
     提示看不见不能影响服务本身：任何失败都返回 False，由调用方落日志。
+
+    Args:
+        title: 气泡标题。
+        text: 气泡正文。
+        url: 点击气泡后要打开的地址；空 = 打开操作界面首页。
     """
     hwnd = _state["hwnd"]
     if not hwnd:
@@ -705,9 +739,12 @@ def _notify(title: str, text: str) -> bool:
         nid.szInfo = text[:254]
         nid.szInfoTitle = title[:62]
         nid.dwInfoFlags = 0x00000001             # NIIF_INFO（蓝色 i 图标）
-        return bool(ctypes.windll.shell32.Shell_NotifyIconW(0x00000001,
-                                                           ctypes.byref(nid)))
+        ok = bool(ctypes.windll.shell32.Shell_NotifyIconW(0x00000001,
+                                                         ctypes.byref(nid)))
+        _state["alert_url"] = url if ok else ""
+        return ok
     except Exception as exc:                     # noqa: BLE001
+        _state["alert_url"] = ""
         _log(f"[launcher] 托盘气泡提示失败：{exc}")
         return False
 
@@ -789,11 +826,80 @@ def _start_handoff_watcher():
     return t
 
 
+# ---------------------------------------------------------------------------
+# 新商机系统通知：后端写 data/native_alert.json，本进程弹托盘气泡
+# ---------------------------------------------------------------------------
+# 后端进程没有托盘图标（Shell_NotifyIcon 挂在启动器上），所以通知必须由
+# 本进程弹。文件用「原子替换 + 读后删除」交接；TTL 只用于忽略「后端单独
+# 运行过、文件残留」的陈旧提醒，正常情况下 1 秒内就会被消费。
+def _take_alert() -> dict | None:
+    """读走一条新商机提醒请求（读到即删），非法/过期返回 None。"""
+    path = DATA / ALERT_FILE_NAME
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None                              # 没有请求 / 读到半个 JSON
+    try:
+        path.unlink()
+    except OSError:
+        pass                                     # 删除失败靠 last_alert_key 去重
+    if not isinstance(raw, dict):
+        return None
+    oid = raw.get("id")
+    at = raw.get("at")
+    if (not isinstance(oid, int) or isinstance(oid, bool) or oid <= 0
+            or not isinstance(at, int) or isinstance(at, bool)):
+        return None
+    now = int(time.time())
+    if at > now + 60 or now - at > ALERT_TTL_SEC:
+        return None
+    key = (oid, at)
+    if key == _state.get("last_alert_key"):
+        return None
+    _state["last_alert_key"] = key
+    return raw
+
+
+def _show_alert(info: dict) -> None:
+    """按提醒请求弹气泡；点击气泡由 _open_alert_target 打开商机深链。"""
+    oid = int(info["id"])
+    title = str(info.get("title") or "收到新商机").strip() or "收到新商机"
+    body = str(info.get("body") or "").strip()
+    if _notify(title, body, url=_opportunity_url(_state["port"], oid)):
+        _log(f"[launcher] 已弹出系统提醒：商机 #{oid}")
+    else:
+        _log(f"[launcher] {title}：{body}（商机 #{oid}）")
+
+
+def _start_alert_watcher():
+    """守护线程轮询提醒文件；任何异常都只记日志，线程绝不退出。"""
+    def _loop():
+        while True:
+            try:
+                time.sleep(ALERT_POLL_SEC)
+                if _state["exiting"]:
+                    continue
+                info = _take_alert()
+                if info is not None:
+                    _show_alert(info)
+            except Exception as exc:             # noqa: BLE001
+                try:
+                    _log(f"[launcher] 桌面提醒轮询异常（自动恢复）：{exc}")
+                except Exception:                # noqa: BLE001
+                    pass
+
+    t = threading.Thread(target=_loop, daemon=True, name="kefu-alert-watch")
+    t.start()
+    return t
+
+
 def _wnd_proc(hwnd, msg, wparam, lparam):
     if msg == WM_APP_TRAY:
         event = lparam & 0xFFFF
         if event == win32con.WM_LBUTTONDBLCLK:
             _open_ui()
+        elif event == NIN_BALLOONUSERCLICK:
+            _open_alert_target()
         elif event == win32con.WM_RBUTTONUP:
             _show_menu(hwnd)
         return 0
@@ -872,6 +978,7 @@ def main() -> None:
     _add_tray(hwnd)
     # 托盘建好才能弹气泡（NIF_INFO 挂在已有图标上），故在 _add_tray 之后启动
     _start_handoff_watcher()
+    _start_alert_watcher()
 
     if _port_ready(_state["port"]):
         _log("后端就绪，正在打开操作界面。")

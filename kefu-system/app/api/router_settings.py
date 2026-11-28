@@ -8,7 +8,7 @@
 - GET/PUT /api/settings/monitor
 - GET/PUT /api/settings/image
 - GET/PUT /api/settings/server     启动端口（重启生效）
-- PUT     /api/settings/notify
+- GET/PUT /api/settings/notify
 """
 from __future__ import annotations
 
@@ -41,10 +41,11 @@ from app.config import (
     KEY_IMAGE_VISION_MODEL,
     KEY_MONITOR_MAX_TARGETS,
     KEY_NOTIFY_SOUND,
+    KEY_NOTIFY_SYSTEM,
     MERGE_WINDOW_SEC_DEFAULT,
 )
 from app.crypto import encrypt_api_key, mask_key
-from app.db import Database, read_monitor_max_targets
+from app.db import Database, read_monitor_max_targets, read_notify_settings
 from app.schemas import (
     AISettingsOut,
     AISettingsUpdate,
@@ -326,12 +327,22 @@ def update_server_settings(body: ServerSettingsUpdate, request: Request,
 # ---------------------------------------------------------------------------
 # 通知配置
 # ---------------------------------------------------------------------------
+@router.get("/notify")
+def get_notify_settings(db: Database = Depends(get_db)) -> dict:
+    """通知开关当前值（提示音 / 系统通知）。"""
+    return read_notify_settings(db)
+
+
 @router.put("/notify")
 def update_notify_settings(body: NotifyUpdate,
                            db: Database = Depends(get_db)) -> dict:
-    """提示音开关。"""
-    db.set_setting(KEY_NOTIFY_SOUND, "1" if body.sound_enabled else "0")
-    logger.info("通知设置已保存（sound_enabled=%s）", body.sound_enabled)
+    """更新通知开关；未提交的字段保持不变。"""
+    if body.sound_enabled is not None:
+        db.set_setting(KEY_NOTIFY_SOUND, "1" if body.sound_enabled else "0")
+    if body.system_enabled is not None:
+        db.set_setting(KEY_NOTIFY_SYSTEM, "1" if body.system_enabled else "0")
+    logger.info("通知设置已保存（sound_enabled=%s，system_enabled=%s）",
+                body.sound_enabled, body.system_enabled)
     return {"ok": True, "message": "通知设置已保存"}
 
 

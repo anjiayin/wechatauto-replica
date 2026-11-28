@@ -65,6 +65,12 @@ SESSION_LIST_AID = "session_list"
 SEARCH_LIST_AID = "search_list"
 RESULT_AID_PREFIX = "search_item_"                 # 真实可打开结果的 aid 前缀
 CHAT_INPUT_AID = "chat_input_field"                # 输入框；其 .Name == 当前聊天对象
+# 「引用最新一条」读消息列表的重试参数：窗口刚从托盘/最小化恢复、或 UIA 树
+# 刚重绑时消息列表会读空，一次读空就判失败会白丢一次发送（2026-11-28 实测
+# 「@ + 引用」1.3s 快速失败、8 分钟后同参数成功）。重试最多 4×0.4s≈1.6s，
+# 仍读不到照旧返回 None——不降级成「不引用直接发」。
+_LATEST_ROW_ATTEMPTS = 4
+_LATEST_ROW_WAIT = 0.4
 # 聊天标题栏里的「企业名」标签：**只有企业微信/客服会话才有**这个控件。
 # 打开会话后靠它判断「当前这个会话是不是企业微信身份的那一个」——同名
 # 好友与企业微信联系人（如「安佳胤」与「安佳胤@我的车车」）在搜索框里
@@ -1817,6 +1823,8 @@ class WeChatUIA:
             self._right_click()
             time.sleep(0.8)
             if not self._menu_click(("引用", "Quote")):
+                wxlog.debug("引用失败：已右键消息行但两次都没找到「引用」菜单项"
+                            "（菜单未弹出或控件树未物化）")
                 try:
                     from wechatauto.ui.component import Menu
                     Menu(self).close()
@@ -2257,20 +2265,17 @@ class WeChatUIA:
                     return True
         return False
 
-    def _right_click_latest_row(self, who: Optional[str] = None) -> Optional[Tuple[int, int]]:
-        """打开会话并右键最新一条消息行，返回气泡内右键坐标 (x, y)；失败返回 None。"""
-        if not self.ensure_window():
-            return None
-        if who and not self.current_chat() == who:
-            if not self.open_chat(who):
-                return None
+    def _latest_message_row(self):
+        """取可视区最底部（最新）的消息行 (控件, 矩形)；读不到返回 None。
+
+        时间分隔行（ChatItemView）与系统提示行不算消息；高度 <40px 的行是
+        尚未布局完的占位，右键会落到空白处，一并跳过。
+        """
         lst = self._message_list()
         if lst is None:
             return None
-        rows = list(lst.GetChildren())
-        # 取可视区内最底部（最新）的消息行；时间分隔行 ChatItemView 跳过
         candidates = []
-        for ch in rows:
+        for ch in list(lst.GetChildren()):
             try:
                 cn = ch.ClassName or ""
                 if not cn.startswith("mmui::Chat"):
@@ -2286,7 +2291,31 @@ class WeChatUIA:
         if not candidates:
             return None
         # 最新消息在可视区底部（消息列表打开即定位在最新），取 bottom 最大者
-        target = max(candidates, key=lambda t: t[1].bottom)
+        return max(candidates, key=lambda t: t[1].bottom)
+
+    def _right_click_latest_row(self, who: Optional[str] = None) -> Optional[Tuple[int, int]]:
+        """打开会话并右键最新一条消息行，返回气泡内右键坐标 (x, y)；失败返回 None。"""
+        if not self.ensure_window():
+            return None
+        if who and not self.current_chat() == who:
+            if not self.open_chat(who):
+                return None
+        # 窗口刚从托盘/最小化恢复、或 UIA 树刚重绑时，消息列表会读空（树还没
+        # 物化），一次读空就判失败会让整条「引用 / 引用+@」发送白丢一次。重试
+        # 上限 4 次 × 0.4s ≈ 1.6s，仍读不到照旧返回 None（fail-closed 不变，
+        # 绝不降级成「不引用直接发」）。
+        target = None
+        for attempt in range(_LATEST_ROW_ATTEMPTS):
+            target = self._latest_message_row()
+            if target is not None:
+                break
+            if attempt < _LATEST_ROW_ATTEMPTS - 1:
+                time.sleep(_LATEST_ROW_WAIT)
+        if target is None:
+            wxlog.debug("引用最新一条失败：消息列表连续 %d 次读空"
+                        "（窗口可能刚恢复或控件树未就绪）",
+                        _LATEST_ROW_ATTEMPTS)
+            return None
         ch, r = target
         # 消息行内取内容重心 x（self 靠右、friend 靠左），y 取行垂直中心
         try:

@@ -39,6 +39,7 @@ from app.config import (
     KEY_COMPLIANCE_CONFIRMED,
     KEY_MONITOR_MAX_TARGETS,
     KEY_NOTIFY_SOUND,
+    KEY_NOTIFY_SYSTEM,
     KEY_RUNTIME_MW_MIGRATED,
     KEY_RUNTIME_LOCALTIME_MIGRATED,
     KEY_RUNTIME_AI_USAGE_BACKFILLED,
@@ -2036,8 +2037,11 @@ def read_monitor_max_targets(db: Database) -> int:
 
 
 def read_notify_settings(db: Database) -> dict[str, bool]:
-    """读取通知配置。"""
-    return {"sound_enabled": db.get_bool(KEY_NOTIFY_SOUND)}
+    """读取通知配置（提示音 / 系统通知）。"""
+    return {
+        "sound_enabled": db.get_bool(KEY_NOTIFY_SOUND),
+        "system_enabled": db.get_bool(KEY_NOTIFY_SYSTEM),
+    }
 
 
 def iter_enabled_types(db: Database) -> Iterable[dict]:

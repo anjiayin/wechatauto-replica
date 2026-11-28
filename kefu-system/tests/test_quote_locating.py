@@ -31,6 +31,7 @@ import pytest
 from PIL import Image
 
 from app.sender import SendTask, Sender
+from wechatauto import uia_driver as uia_mod
 from wechatauto.text_norm import contains_normalized, normalize_match_text
 from wechatauto.uia_driver import WeChatUIA
 
@@ -150,6 +151,53 @@ class TestRightClickRow:
     def test_too_small_rect_returns_none(self, uia, monkeypatch):
         monkeypatch.setattr(uia, "_set_cursor", lambda x, y: None)
         assert uia._right_click_row(R(0, 0, 3, 3)) is None
+
+
+class TestLatestRowRetry:
+    """「引用最新一条」读消息列表：窗口刚从托盘/最小化恢复时树未物化，
+    一次读空就放弃会让整条发送白丢（2026-11-28 实测 1.3s 快速失败）。"""
+
+    def _prep(self, uia, monkeypatch):
+        monkeypatch.setattr(uia_mod, "_LATEST_ROW_WAIT", 0)   # 测试不真等
+        monkeypatch.setattr(uia, "ensure_window", lambda: True)
+        clicked = []
+        monkeypatch.setattr(uia, "_set_cursor", lambda x, y: None)
+        monkeypatch.setattr(uia, "_right_click", lambda: clicked.append(1))
+        monkeypatch.setattr("PIL.ImageGrab.grab", _fake_grab)
+        return clicked
+
+    def test_empty_list_retries_then_fails_closed(self, uia, monkeypatch):
+        """一直读空：重试到上限后仍返回 None，绝不右键、也不降级成直接发。"""
+        clicked = self._prep(uia, monkeypatch)
+        reads = []
+        monkeypatch.setattr(uia, "_message_list",
+                            lambda: reads.append(1) or None)
+        assert uia._right_click_latest_row(None) is None
+        assert len(reads) == uia_mod._LATEST_ROW_ATTEMPTS
+        assert clicked == []
+
+    def test_recovers_when_tree_materializes(self, uia, monkeypatch):
+        """第二次读到消息行就立刻右键，不再多轮询。"""
+        clicked = self._prep(uia, monkeypatch)
+        lists = [None, Lst([Row("图片消息")]), "不应再读"]
+        it = iter(lists)
+        monkeypatch.setattr(uia, "_message_list", lambda: next(it))
+        assert uia._right_click_latest_row(None) is not None
+        assert clicked == [1]
+        assert next(it, None) == "不应再读"
+
+    def test_picks_bottom_row_and_skips_separators(self, uia, monkeypatch):
+        """抽出 _latest_message_row 后筛选规则不变：跳过时间行/系统行/矮占位行。"""
+        rows = [Row("时间", R(100, 100, 300, 130), cls="mmui::ChatItemView"),
+                Row("系统", R(100, 140, 300, 170),
+                    cls="mmui::ChatSystemInfoItemView"),
+                Row("未布局", R(100, 180, 300, 190)),
+                Row("上一条", R(100, 200, 300, 260)),
+                Row("最新条", R(100, 300, 300, 380))]
+        monkeypatch.setattr(uia, "_message_list", lambda: Lst(rows))
+        ctrl, rect = uia._latest_message_row()
+        assert ctrl is rows[-1] and ctrl.Name == "最新条"
+        assert rect.top == 300
 
 
 # ---------------------------------------------------------------------------

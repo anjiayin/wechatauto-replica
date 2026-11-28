@@ -263,7 +263,10 @@ class AnalysisSettingsUpdate(BaseModel):
 
 
 class NotifyUpdate(BaseModel):
-    sound_enabled: bool
+    """通知设置（None = 本次不改该项，兼容旧前端只提交提示音）。"""
+
+    sound_enabled: Optional[bool] = None
+    system_enabled: Optional[bool] = None
 
 
 class MonitorSettingsOut(BaseModel):

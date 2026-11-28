@@ -27,7 +27,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Optional
 
-from app import analyzer, content_format, db as dbmod
+from app import analyzer, content_format, db as dbmod, desktop_alert
 from app.aggregator import AnalysisUnit
 from app.config import (
     AGGREGATOR_FORCE_FLUSH_FACTOR,
@@ -772,9 +772,25 @@ class Pipeline:
             **base_log)
         self._notifier.mark_new_opportunity(opp["id"])
         self._notifier.broadcast("opportunity_new", opp)
+        self._maybe_desktop_alert(opp)
         logger.info("新商机 #%d：%s/%s（%s，置信度 %d）",
                     opp["id"], unit.session_name, unit.sender_name,
                     type_name, result["confidence"])
+
+    def _maybe_desktop_alert(self, opp: dict) -> None:
+        """操作页面未打开时，请求托盘启动器弹 Windows 系统通知。
+
+        页面已连接（哪怕在后台）时不发：页面内有 toast/提示音，后台标签页
+        还有浏览器通知兜底，重复弹窗反而打扰。
+        """
+        try:
+            if self._notifier.client_count > 0:
+                return
+            if not dbmod.read_notify_settings(self._db).get("system_enabled"):
+                return
+            desktop_alert.request_desktop_alert(opp)
+        except Exception:  # noqa: BLE001 - 提醒失败绝不能影响商机落库
+            logger.exception("发送桌面提醒失败（已忽略）")
 
     # ------------------------------------------------------------------
     # 商机合并（第二级窗口：analysis.opp_merge_window_sec，默认 180 秒）
@@ -918,3 +934,4 @@ class Pipeline:
             **self._base_log_with_defaults(unit, base_log))
         self._notifier.mark_new_opportunity(opp["id"])
         self._notifier.broadcast("opportunity_new", opp)
+        self._maybe_desktop_alert(opp)

@@ -155,7 +155,7 @@ AI_DISABLE_THINKING_DEFAULT = True
 # 同步其余位置。这里运行时直接读文件，避免 APP_VERSION 变成第二份真源。
 # 打包后 version.txt 随包落在安装根 / app\<版本>\，也可用 KEFU_VERSION_FILE 指定。
 # 只有「version.txt 完全找不到」时才用兜底值；兜底值同样被 version_sync.py 校验。
-_FALLBACK_VERSION = "1.4.1"
+_FALLBACK_VERSION = "1.4.2"
 
 
 def _read_app_version() -> str:
@@ -215,6 +215,8 @@ KEY_ANALYSIS_CORRECTION_EXAMPLES = "analysis.correction_examples"  # JSON 数组
 # 是否过滤自己发送的消息（默认 "1"=过滤：不进入商机分析，仅记 skipped 日志）
 KEY_ANALYSIS_FILTER_SELF = "analysis.filter_self_messages"
 KEY_NOTIFY_SOUND = "notify.sound_enabled"
+# 系统通知：操作页面未打开/全部在后台时，经托盘启动器弹 Windows 通知
+KEY_NOTIFY_SYSTEM = "notify.system_enabled"
 # 语音消息自动转文字（本地离线识别，音频绝不上传外部服务）
 KEY_ASR_ENABLED = "asr.enabled"
 # 单条语音转写时长上限（秒）：超长语音直接放弃，避免长时间占用识别线程
@@ -300,6 +302,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     KEY_ANALYSIS_CORRECTION_EXAMPLES: "[]",
     KEY_ANALYSIS_FILTER_SELF: "1",   # 过滤自己发送的消息（默认开启）
     KEY_NOTIFY_SOUND: "0",
+    KEY_NOTIFY_SYSTEM: "1",        # 系统通知默认开（页面未打开时也能收到提醒）
     KEY_ASR_ENABLED: "1",          # 语音消息自动转文字（本地离线识别）
     KEY_ASR_MAX_SECONDS: "180",    # 单条语音转写时长上限（秒）
     KEY_IMAGE_VISION_ENABLED: "1",  # 图片内容识别（视觉模型，默认开启）
