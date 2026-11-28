@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -331,13 +332,18 @@ class TestWatermarkAdvanceIntegration:
 
     def test_add_listener_does_not_overwrite_advanced_watermark(
             self, monkeypatch, tmp_path):
-        """注册监听时不会用兜底查询覆盖已推进的 sort_seq。"""
-        wx = _FakeWxdb({"old@chatroom": [{"sort_seq": 5000}],
-                        "new@chatroom": [{"sort_seq": 8000}]})
+        """注册监听时不会用兜底查询覆盖已推进的 sort_seq。
+
+        sort_seq 是毫秒时间戳（create_time×1000），所以用「比启动时刻还新」
+        的值模拟新鲜缓存：启动水位下限不会抬升它。
+        """
+        fresh = int(time.time()) * 1000 + 60_000
+        wx = _FakeWxdb({"old@chatroom": [{"sort_seq": fresh}],
+                        "new@chatroom": [{"sort_seq": fresh + 3000}]})
         svc, listener = _started_svc(monkeypatch, tmp_path, wx)
         try:
-            assert listener.wm["old@chatroom"] == 5000
-            assert listener.wm["new@chatroom"] == 8000
+            assert listener.wm["old@chatroom"] == fresh
+            assert listener.wm["new@chatroom"] == fresh + 3000
             assert listener.wm["gone@chatroom"] == 5
             assert listener.started is True
             assert listener.registered == ["old@chatroom", "new@chatroom"]
@@ -347,8 +353,9 @@ class TestWatermarkAdvanceIntegration:
 
     def test_flush_persists_advanced_watermark(self, monkeypatch, tmp_path):
         """30s flush 把推进后的水位（而非旧水位/0）刷回持久层。"""
-        wx = _FakeWxdb({"old@chatroom": [{"sort_seq": 5000}],
-                        "new@chatroom": [{"sort_seq": 8000}]})
+        fresh = int(time.time()) * 1000 + 60_000
+        wx = _FakeWxdb({"old@chatroom": [{"sort_seq": fresh}],
+                        "new@chatroom": [{"sort_seq": fresh + 3000}]})
         svc, listener = _started_svc(monkeypatch, tmp_path, wx)
         try:
             db = svc._db
@@ -362,8 +369,8 @@ class TestWatermarkAdvanceIntegration:
             db.save_watermarks = _save_and_stop  # type: ignore[method-assign]
             svc._flush_loop()
             assert db.saved and db.saved[-1] == listener.wm
-            assert db.saved[-1]["old@chatroom"] == 5000
-            assert db.saved[-1]["new@chatroom"] == 8000
+            assert db.saved[-1]["old@chatroom"] == fresh
+            assert db.saved[-1]["new@chatroom"] == fresh + 3000
         finally:
             svc._stop.set()
 

@@ -60,7 +60,7 @@ pip install -e .
 
 ```python
 import wechatauto
-print(wechatauto.__version__)   # 1.4.5
+print(wechatauto.__version__)   # 1.4.6
 ```
 
 > ⚠️ 首次运行 `WeChatDB()` 会扫描微信进程内存提取数据库密钥，首次约 6 秒，
